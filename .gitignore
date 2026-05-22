@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Local runtime state
+.janus-code/
+.janus-runtime/
+.janus-overlay-test/
+
+# Generated benchmark output
+.benchmarks/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+
+# Logs and local env
+*.log
+.env
+.env.*
+

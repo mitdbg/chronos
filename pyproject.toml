@@ -1,0 +1,10 @@
+[tool.uv.workspace]
+members = [
+  "packages/janus-core",
+  "packages/janus-langchain",
+  "packages/janus-langgraph",
+  "packages/janus-code",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

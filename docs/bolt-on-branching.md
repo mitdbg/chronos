@@ -1,0 +1,1436 @@
+# Bolt-On Branching for Relational Data
+
+**Status:** Draft
+
+## Summary
+
+This document proposes a bolt-on branching layer for relational databases. The database continues to provide transactions, isolation, concurrency control, durability, indexing, and SQL execution. The branching layer adds mutable named branches, cheap forks, branch-local writes, branch isolation, diff, merge, and checkpointing.
+
+Applications keep using SQL against logical relational tables:
+
+```sql
+SELECT * FROM products WHERE sku = 'abc';
+
+UPDATE products
+SET price = 19.99
+WHERE sku = 'abc';
+```
+
+A checked-out branch determines which physical rows are visible to a branch-bound session across the database. A normal database `COMMIT` publishes changes to the current branch. There is no branch commit required for each transaction.
+
+The design uses interval-encoded branch segments. Each internal segment owns a range. A checked-out branch has a point inside its current segment. Branch visibility is tested with a constant-shape predicate:
+
+```sql
+live_lo <= current_branch_point()
+AND current_branch_point() < live_hi
+```
+
+The primary storage model is **write-time interval maintenance**. The system maintains non-overlapping live intervals per logical key, so branch reads are predicate-based and SQL predicates can be evaluated against a normal-looking branch view efficiently.
+
+## Goals
+
+- Preserve SQL and the relational model for application data.
+- Support fast branch creation through metadata-only forks.
+- Support fast branch-local queries with a simple branch visibility predicate.
+- Support fast writes on the current mutable branch segment.
+- Support flexible branch tree topology, including arbitrary width and deep branch chains.
+- Keep user-visible branches mutable after they are forked.
+- Let many database transactions mutate the same branch.
+- Provide branch isolation after fork.
+- Avoid copying whole tables or graphs at branch creation time.
+- Support branch-level time travel to fork points and explicit checkpoints.
+- Keep the branch visibility predicate independent of branch depth.
+
+## Operational Limits
+
+- Table schema changes are not supported in the first version. The base design branches row contents under a shared schema.
+- Fixed-width interval spaces require sparse allocation, relabeling, or explicit depth limits.
+- Hot keys can accumulate many interval fragments.
+- Multi-row writes evaluate the current branch view first, then splice matched keys.
+- Branch-local DDL is outside the first version.
+- The log-table backend needs a current-state projection for consistently fast arbitrary SQL reads.
+- Long-lived branches require retaining historical log records or interval fragments until all dependent branches, checkpoints, and retention policies release them.
+
+## User-Facing API
+
+Agents interact with a Python branch-layer API. Branch management is not exposed as SQL functions. SQL is still the data language, but SQL statements are submitted through a branch-bound session object.
+
+### Context
+
+Create a branching context over an existing database connection or connection pool:
+
+```python
+from janus_core.branching import JanusBranchContext
+
+ctx = JanusBranchContext.connect("postgresql://app@localhost/okg")
+```
+
+The context owns branch metadata, table registration, checkout, diff, merge, and SQL rewriting/execution.
+
+### API Surface
+
+```python
+class JanusBranchContext:
+    @classmethod
+    def connect(cls, database_url: str) -> "JanusBranchContext": ...
+
+    def register_table(self, table: str, primary_key: list[str]) -> None: ...
+
+    def create_branch(self, branch_id: str, from_branch: str) -> None: ...
+    def create_branch_from_checkpoint(
+        self,
+        branch_id: str,
+        checkpoint: str,
+    ) -> None: ...
+    def delete_branch(self, branch_id: str) -> None: ...
+    def list_branches(self) -> list["BranchInfo"]: ...
+    def get_branch(self, branch_id: str) -> "BranchInfo": ...
+
+    def checkout(self, branch_id: str) -> "BranchSession": ...
+    def checkout_checkpoint(self, checkpoint: str) -> "BranchSession": ...
+    def checkout_at(self, branch: str, lsn: int) -> "BranchSession": ...
+
+    def create_checkpoint(self, checkpoint: str, branch: str) -> None: ...
+
+    def diff(self, left: str, right: str) -> "BranchDiff": ...
+    def diff_rows(self, left: str, right: str, table: str) -> list["RowDiff"]: ...
+
+    def merge_preview(self, source: str, target: str) -> "MergePreview": ...
+    def merge_apply(
+        self,
+        source: str,
+        target: str,
+        resolution: "MergeResolution",
+    ) -> "MergeResult": ...
+
+
+class BranchSession:
+    branch_id: str
+
+    def query(self, sql: str, params: dict | None = None) -> list[dict]: ...
+    def execute(self, sql: str, params: dict | None = None) -> "ExecuteResult": ...
+    def transaction(self) -> "TransactionContext": ...
+    def branch_info(self) -> "BranchInfo": ...
+```
+
+### Table Registration
+
+All user/application tables are branchable data. A deployment registers the tables that belong to the branchable application state:
+
+```python
+ctx.register_table("products", primary_key=["sku"])
+ctx.register_table("orders", primary_key=["order_id"])
+ctx.register_table("nodes", primary_key=["node_id"])
+ctx.register_table("edges", primary_key=["edge_id"])
+```
+
+After registration, agents continue to use the logical table names in SQL. They do not refer to physical branched tables, segment tables, or interval columns.
+
+### Branch Lifecycle
+
+Create a branch:
+
+```python
+ctx.create_branch("exp_pricing", from_branch="main")
+```
+
+Delete a branch:
+
+```python
+ctx.delete_branch("exp_pricing")
+```
+
+List and inspect branches:
+
+```python
+branches = ctx.list_branches()
+info = ctx.get_branch("exp_pricing")
+```
+
+### Branch Sessions
+
+Checkout returns a branch-bound session:
+
+```python
+session = ctx.checkout("exp_pricing")
+```
+
+All SQL executed through the session runs against that branch's database-wide view:
+
+```python
+rows = session.query(
+    "SELECT * FROM products WHERE sku = :sku",
+    {"sku": "abc"},
+)
+
+neighbors = session.query(
+    "SELECT * FROM edges WHERE src_id = :node_id",
+    {"node_id": "n42"},
+)
+```
+
+Writes also go through the branch session:
+
+```python
+with session.transaction():
+    session.execute(
+        "UPDATE products SET price = :price WHERE sku = :sku",
+        {"price": 19.99, "sku": "abc"},
+    )
+    session.execute(
+        """
+        INSERT INTO orders (order_id, sku, quantity)
+        VALUES (:order_id, :sku, :quantity)
+        """,
+        {"order_id": "o1", "sku": "abc", "quantity": 2},
+    )
+```
+
+The underlying database transaction commits both writes atomically to the checked-out branch. There is no branch commit API.
+
+### Current Branch
+
+The session exposes its branch context directly:
+
+```python
+session.branch_id
+session.branch_info()
+```
+
+A transaction pins the branch context at transaction start. Agents should check out the intended branch before opening a transaction:
+
+```python
+session = ctx.checkout("exp_pricing")
+with session.transaction():
+    session.execute("UPDATE products SET price = 10 WHERE sku = 'abc'")
+```
+
+### Checkpoints
+
+Create a stable time-travel point for the current state of a branch:
+
+```python
+ctx.create_checkpoint("before_discount", branch="exp_pricing")
+```
+
+Open a read-only session on a checkpoint:
+
+```python
+checkpoint = ctx.checkout_checkpoint("before_discount")
+rows = checkpoint.query("SELECT * FROM products WHERE sku = 'abc'")
+```
+
+Promote a checkpoint to a new mutable branch:
+
+```python
+ctx.create_branch_from_checkpoint(
+    "restore_before_discount",
+    checkpoint="before_discount",
+)
+```
+
+### Diff
+
+Diff compares two database-wide branch states:
+
+```python
+diff = ctx.diff("main", "exp_pricing")
+```
+
+The result is grouped by table and primary key:
+
+```python
+diff.changes
+# [
+#   {"table": "products", "key": {"sku": "abc"}, "change": "modified"},
+#   {"table": "products", "key": {"sku": "def"}, "change": "added"},
+#   {"table": "orders", "key": {"order_id": "o9"}, "change": "deleted"},
+#   {"table": "nodes", "key": {"node_id": "n42"}, "change": "modified"},
+# ]
+```
+
+Detailed before/after rows can be requested for changed keys:
+
+```python
+rows = ctx.diff_rows("main", "exp_pricing", table="products")
+```
+
+### Merge
+
+A merge computes changes from a source branch and applies them to a target branch:
+
+```python
+preview = ctx.merge_preview(source="exp_pricing", target="main")
+ctx.merge_apply(source="exp_pricing", target="main", resolution=preview.resolution)
+```
+
+`merge_preview` reports additions, deletions, modifications, and conflicts. `merge_apply` runs in a normal database transaction and updates the target branch if conflicts are resolved.
+
+## System Model
+
+The design has two layers:
+
+```text
+Database transaction layer
+  - BEGIN / COMMIT / ROLLBACK
+  - isolation and concurrency control
+  - row locks, indexes, constraints
+  - crash recovery
+
+Branching layer
+  - branch checkout
+  - branch creation
+  - segment allocation
+  - branch-local writes
+  - checkpoints
+  - diff and merge metadata
+```
+
+The branch layer does not replace database transactions. A database transaction opened through a branch session runs on one checked-out branch. If the transaction commits, its changes become visible on that branch. If it rolls back, no branch state changes.
+
+## Branch Scope
+
+A branch represents the logical state of the application database, not one table. All user/application data tables are branched together under the same checked-out branch.
+
+For a branch `exp_a`, the branch view includes:
+
+```text
+products at exp_a
+orders at exp_a
+customers at exp_a
+nodes at exp_a
+edges at exp_a
+```
+
+The branch point is database-wide. Every branched table uses the same checked-out branch context:
+
+```text
+current_branch_id
+current_segment_id
+current_branch_point
+current_segment interval
+```
+
+So this transaction mutates one coherent branch state:
+
+```python
+session = ctx.checkout("exp_a")
+
+with session.transaction():
+    session.execute(
+        "UPDATE products SET price = :price WHERE sku = :sku",
+        {"price": 19.99, "sku": "abc"},
+    )
+    session.execute(
+        """
+        INSERT INTO orders (order_id, sku, quantity)
+        VALUES (:order_id, :sku, :quantity)
+        """,
+        {"order_id": "o1", "sku": "abc", "quantity": 2},
+    )
+```
+
+Both writes commit to the same branch. A later `ctx.create_branch(...)` forks the combined state of all branched tables.
+
+The branch layer manages all user/application data by default:
+
+- user data tables
+- graph node and edge tables
+- application-owned relational tables
+- table-level indexes generated for those branched tables
+
+The branch layer does not branch its own metadata tables:
+
+- `branches`
+- `segments`
+- checkpoint metadata
+- garbage-collection metadata
+
+System catalogs and database schema are shared in the first version. Branch-local DDL can be added later by versioning schema descriptors, but the base design branches all user row contents under a shared schema.
+
+## Core Concepts
+
+### User Branch
+
+A user branch is a mutable named workspace:
+
+```text
+main
+exp_a
+agent_17
+```
+
+Users create, check out, mutate, and compare branches.
+
+### Segment
+
+A segment is an internal stable inheritance scope. Segments preserve fork boundaries while allowing user branches to remain mutable.
+
+When a branch is forked, the source branch keeps its name but moves to a new continuation segment:
+
+```text
+Before:
+
+  x -> x_s1
+
+After `ctx.create_branch("y", from_branch="x")`:
+
+          x_s2   <- x continues here
+        /
+  x_s1           <- stable fork prefix
+        \
+          y_s1   <- y starts here
+```
+
+Future writes to `x` go to `x_s2`. Future writes to `y` go to `y_s1`. Both branches inherit rows visible at `x_s1`.
+
+### Interval Encoding
+
+Each segment receives a range and a branch point:
+
+```text
+segment  interval          point
+main_s1  [0, 1000000)      500000
+x_s1     [100000,200000)   150000
+x_s2     [120000,140000)   130000
+y_s1     [160000,180000)   170000
+```
+
+Child intervals are nested inside parent intervals:
+
+```text
+parent_lo < child_lo < child_hi <= parent_hi
+```
+
+A row range that contains the branch point is visible on that branch.
+
+## Metadata Tables
+
+```sql
+CREATE TABLE branches (
+  branch_id TEXT PRIMARY KEY,
+  current_segment_id TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+```
+
+```sql
+CREATE TABLE segments (
+  segment_id TEXT PRIMARY KEY,
+  parent_segment_id TEXT NULL,
+  owner_branch_id TEXT NULL,
+  live_lo NUMERIC(78, 0) NOT NULL,
+  live_hi NUMERIC(78, 0) NOT NULL,
+  branch_point NUMERIC(78, 0) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  CHECK (live_lo < branch_point),
+  CHECK (branch_point < live_hi)
+);
+```
+
+`branches.current_segment_id` points to the branch's mutable segment. `segments.parent_segment_id` supports management, visualization, diff, merge, and interval allocation. It is not on the hot read path.
+
+## Branched User Tables
+
+For each logical table, the system stores branch-visible live intervals.
+
+Logical table:
+
+```sql
+CREATE TABLE products (
+  sku TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  price NUMERIC NOT NULL
+);
+```
+
+Physical branched table:
+
+```sql
+CREATE TABLE products_b (
+  sku TEXT NOT NULL,
+  name TEXT NULL,
+  price NUMERIC NULL,
+  live_lo NUMERIC(78, 0) NOT NULL,
+  live_hi NUMERIC(78, 0) NOT NULL,
+  deleted BOOLEAN NOT NULL DEFAULT false,
+  PRIMARY KEY (sku, live_lo),
+  CHECK (live_lo < live_hi)
+);
+```
+
+The invariant is:
+
+```text
+For each logical primary key, live intervals do not overlap.
+```
+
+This invariant gives each branch point at most one visible physical row per logical key.
+
+Deletes are tombstones:
+
+```text
+deleted = true
+```
+
+A tombstone hides inherited rows inside its live interval.
+
+## Read Path
+
+A checked-out session has branch constants:
+
+```text
+current_segment_id
+current_branch_point()
+current_segment_lo()
+current_segment_hi()
+```
+
+Logical point lookup:
+
+```sql
+SELECT sku, name, price
+FROM products
+WHERE sku = 'abc';
+```
+
+Physical predicate:
+
+```sql
+SELECT sku, name, price
+FROM products_b
+WHERE sku = 'abc'
+  AND live_lo <= current_branch_point()
+  AND current_branch_point() < live_hi
+  AND deleted = false;
+```
+
+Logical scan:
+
+```sql
+SELECT sku, name, price
+FROM products
+WHERE price > 100;
+```
+
+Physical predicate:
+
+```sql
+SELECT sku, name, price
+FROM products_b
+WHERE live_lo <= current_branch_point()
+  AND current_branch_point() < live_hi
+  AND deleted = false
+  AND price > 100;
+```
+
+The read path is predicate-based because the write path maintains non-overlapping live intervals.
+
+## Write Path
+
+Writes target the current mutable segment of the checked-out branch:
+
+```text
+write scope = [current_segment_lo(), current_segment_hi())
+```
+
+Stable fork-prefix segments and checkpoints are read-only. When a branch is forked, the source branch moves to a new continuation segment. Future writes go to that continuation segment.
+
+### Update
+
+User SQL:
+
+```sql
+UPDATE products
+SET price = 19.99
+WHERE sku = 'abc';
+```
+
+The system splices the current segment's interval into the live interval map for `sku = 'abc'`.
+
+Find and lock overlapping fragments:
+
+```sql
+SELECT *
+FROM products_b
+WHERE sku = 'abc'
+  AND live_lo < current_segment_hi()
+  AND current_segment_lo() < live_hi
+FOR UPDATE;
+```
+
+For each overlapping fragment:
+
+```text
+old fragment:  [a, b)
+write scope:   [u_lo, u_hi)
+overlap:       [max(a,u_lo), min(b,u_hi))
+
+left remainder:   [a, u_lo) if a < u_lo
+replacement:      [max(a,u_lo), min(b,u_hi)) with new payload
+right remainder:  [u_hi, b) if u_hi < b
+```
+
+Example:
+
+```text
+old:
+abc = 10  [0,1000000)
+
+write in y_s1 [160000,180000):
+abc = 10  [0,160000)
+abc = 15  [160000,180000)
+abc = 10  [180000,1000000)
+```
+
+If the current segment already has the exact live interval for the key, repeated updates can modify that row in place:
+
+```sql
+UPDATE products_b
+SET price = 19.99,
+    deleted = false
+WHERE sku = 'abc'
+  AND live_lo = current_segment_lo()
+  AND live_hi = current_segment_hi();
+```
+
+### Delete
+
+Delete uses the same splice operation, but the replacement is a tombstone:
+
+```text
+old:
+abc = 10  [0,1000000)
+
+delete in y_s1 [160000,180000):
+abc = 10       [0,160000)
+abc = deleted  [160000,180000)
+abc = 10       [180000,1000000)
+```
+
+The tombstone is part of the logical state. It prevents inherited rows from reappearing inside the deleted branch interval.
+
+### Insert
+
+Insert first checks the row visible at the current branch point:
+
+```sql
+SELECT *
+FROM products_b
+WHERE sku = 'abc'
+  AND live_lo <= current_branch_point()
+  AND current_branch_point() < live_hi
+FOR UPDATE;
+```
+
+If a non-deleted row is visible, the logical primary key already exists. If no row is visible, insert the new row over the current segment interval. If a tombstone is visible, `UPSERT` semantics can replace it by using the same splice operation as update.
+
+### Multi-Row Writes
+
+For a predicate update:
+
+```sql
+UPDATE products
+SET price = price * 0.9
+WHERE price > 100;
+```
+
+the system first identifies matching logical keys in the current branch view:
+
+```sql
+SELECT sku
+FROM products_b
+WHERE live_lo <= current_branch_point()
+  AND current_branch_point() < live_hi
+  AND deleted = false
+  AND price > 100;
+```
+
+Then it splices each matched key. Batch execution should lock keys in deterministic primary-key order.
+
+## Branch Creation Protocol
+
+`ctx.create_branch("y", from_branch="x")` runs in one database transaction:
+
+1. Lock branch `x`.
+2. Read `x.current_segment_id`, called `S`.
+3. Allocate two child intervals inside `S`:
+   - one continuation segment for `x`
+   - one initial segment for `y`
+4. Insert both child segments.
+5. Update `x.current_segment_id` to the continuation segment.
+6. Insert branch `y` pointing to its initial segment.
+7. Commit.
+
+No user rows are copied.
+
+Existing live intervals continue to cover both child branch points until one branch writes an override.
+
+## Correctness Conditions
+
+The system is correct when these conditions hold:
+
+- Every logical key has non-overlapping live intervals.
+- Branch creation only writes metadata.
+- User writes target the current mutable segment.
+- Stable fork-prefix segments and checkpoints are immutable.
+- Deletes create tombstone intervals.
+- Splices are atomic database transactions.
+- Concurrent writers to the same key and overlapping interval are serialized.
+- Logical SQL operates on the branch-visible relation, not directly on internal metadata tables.
+
+With these conditions, a branch read is equivalent to reading an ordinary table containing the branch's current state.
+
+## Indexing
+
+Point reads:
+
+```sql
+CREATE INDEX products_b_point_read
+ON products_b (sku, live_lo)
+INCLUDE (live_hi, deleted, name, price);
+```
+
+Scans:
+
+```sql
+CREATE INDEX products_b_scan
+ON products_b (live_lo, live_hi)
+INCLUDE (deleted, sku, name, price);
+```
+
+Overlap maintenance:
+
+```sql
+CREATE INDEX products_b_overlap
+ON products_b (sku, live_lo, live_hi);
+```
+
+For range-aware databases, store a generated range:
+
+```sql
+live_span numrange
+  GENERATED ALWAYS AS (
+    numrange(live_lo, live_hi, '[)')
+  ) STORED
+```
+
+and use:
+
+```sql
+CREATE INDEX products_b_live_span
+ON products_b USING gist (live_span);
+```
+
+In PostgreSQL, the non-overlap invariant can be enforced with an exclusion constraint:
+
+```sql
+EXCLUDE USING gist (
+  sku WITH =,
+  live_span WITH &&
+);
+```
+
+Databases without exclusion constraints can enforce the invariant with serializable transactions, per-key locks, or trigger-based overlap checks.
+
+## Interval Allocation
+
+The initial interval space should be much larger than 64 bits:
+
+```text
+root: [0, 10^78)
+```
+
+Children are allocated as sub-intervals inside their parent.
+
+Fixed-width intervals have a depth/fanout tradeoff:
+
+```text
+max_depth ~= W / log2(fanout)
+```
+
+Approximate binary-chain depth:
+
+```text
+64-bit:       ~64 levels
+128-bit:      ~128 levels
+256-bit:      ~256 levels
+NUMERIC(78):  ~259 bits
+```
+
+The implementation should not rely on 64-bit intervals for correctness.
+
+Recommended first implementation:
+
+- use `NUMERIC(78,0)` or 256-bit integer intervals
+- allocate sparsely
+- reject branch creation when a local interval lacks space
+- include a subtree relabeling maintenance path
+
+For arbitrary adversarial depth, use variable-length lexicographic intervals:
+
+```text
+main_s1 label: 80
+x_s1    label: 80.40
+y_s1    label: 80.40.90
+
+main_s1 range: [80, 81)
+x_s1    range: [80.40, 80.41)
+y_s1    range: [80.40.90, 80.40.91)
+```
+
+The read predicate stays the same shape:
+
+```sql
+live_lo <= current_branch_label()
+AND current_branch_label() < live_hi
+```
+
+Variable-length labels support unbounded depth at the cost of wider labels and indexes.
+
+## Efficiency
+
+```text
+branch checkout:   O(1) metadata lookup
+branch creation:   O(1) metadata writes
+point read:        indexed branch-point predicate
+scan:              branch-point predicate over live intervals
+keyed update:      overlap lookup plus interval splice
+delete:            splice with tombstone replacement
+storage growth:    interval fragments for changed keys
+```
+
+With leaf-scoped writes, a keyed update normally overlaps one live fragment for that key. The expensive case is a heavily fragmented hot key or an administrative rewrite over a broad interval.
+
+Branch creation does not copy user rows. Storage grows when data changes, not when branches are created.
+
+## Alternative Backend: Branch Log Tables
+
+The same `JanusBranchContext` API can be implemented with append-only log tables instead of write-time interval maintenance. In this backend, a branch is a log timeline. Branch creation records a fork point and shares the parent log prefix. Writes append new log records to the branch's own timeline.
+
+This is closer to a WAL-timeline model:
+
+```text
+main: L1 -> L2 -> L3
+
+ctx.create_branch("exp", from_branch="main")
+
+main: L1 -> L2 -> L3 -> L4_main
+exp:  L1 -> L2 -> L3 -> L4_exp -> L5_exp
+```
+
+The physical log is stored in ordinary relational tables.
+
+### Timeline Metadata
+
+```sql
+CREATE TABLE branch_timelines (
+  branch_id TEXT PRIMARY KEY,
+  parent_branch_id TEXT NULL,
+  fork_lsn BIGINT NULL,
+  head_lsn BIGINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+```
+
+`fork_lsn` is the parent's head at branch creation time. `head_lsn` is the latest committed log sequence number on this branch.
+
+Transactions are recorded explicitly:
+
+```sql
+CREATE TABLE branch_txns (
+  txn_id BIGINT PRIMARY KEY,
+  branch_id TEXT NOT NULL,
+  begin_lsn BIGINT NOT NULL,
+  commit_lsn BIGINT NOT NULL,
+  committed_at TIMESTAMPTZ NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+```
+
+All row changes in a database transaction share a `txn_id` and commit atomically with the database transaction.
+
+### Log Tables
+
+Each user table gets an append-only log table. For `products`:
+
+```sql
+CREATE TABLE products_log (
+  log_id BIGINT PRIMARY KEY,
+  branch_id TEXT NOT NULL,
+  txn_id BIGINT NOT NULL,
+  lsn BIGINT NOT NULL,
+  op TEXT NOT NULL, -- insert, update, delete
+
+  sku TEXT NOT NULL,
+  name TEXT NULL,
+  price NUMERIC NULL,
+
+  row_hash TEXT NOT NULL,
+  committed_at TIMESTAMPTZ NOT NULL
+);
+```
+
+For graph data:
+
+```sql
+CREATE TABLE nodes_log (
+  log_id BIGINT PRIMARY KEY,
+  branch_id TEXT NOT NULL,
+  txn_id BIGINT NOT NULL,
+  lsn BIGINT NOT NULL,
+  op TEXT NOT NULL,
+
+  node_id TEXT NOT NULL,
+  label TEXT NULL,
+  properties JSONB NULL,
+
+  row_hash TEXT NOT NULL,
+  committed_at TIMESTAMPTZ NOT NULL
+);
+```
+
+```sql
+CREATE TABLE edges_log (
+  log_id BIGINT PRIMARY KEY,
+  branch_id TEXT NOT NULL,
+  txn_id BIGINT NOT NULL,
+  lsn BIGINT NOT NULL,
+  op TEXT NOT NULL,
+
+  edge_id TEXT NOT NULL,
+  src_id TEXT NOT NULL,
+  dst_id TEXT NOT NULL,
+  label TEXT NULL,
+  properties JSONB NULL,
+
+  row_hash TEXT NOT NULL,
+  committed_at TIMESTAMPTZ NOT NULL
+);
+```
+
+Deletes are log records with `op = 'delete'`. The key is retained, and payload columns may be null.
+
+### Branch Creation
+
+Branch creation is metadata-only:
+
+```python
+ctx.create_branch("exp", from_branch="main")
+```
+
+If `main.head_lsn = 100`, the new branch starts as:
+
+```text
+branch_id  parent_branch_id  fork_lsn  head_lsn
+main       null              null      100
+exp        main              100       100
+```
+
+No user rows and no log rows are copied.
+
+### Write Path
+
+Writes append log records to the checked-out branch.
+
+```python
+session = ctx.checkout("exp")
+
+with session.transaction():
+    session.execute(
+        "UPDATE products SET price = :price WHERE sku = :sku",
+        {"price": 19.99, "sku": "abc"},
+    )
+```
+
+The branch layer rewrites this into an append to `products_log`:
+
+```sql
+INSERT INTO products_log (
+  log_id,
+  branch_id,
+  txn_id,
+  lsn,
+  op,
+  sku,
+  name,
+  price,
+  row_hash,
+  committed_at
+)
+VALUES (
+  :log_id,
+  'exp',
+  :txn_id,
+  :lsn,
+  'update',
+  'abc',
+  'Widget',
+  19.99,
+  :row_hash,
+  now()
+);
+```
+
+`INSERT` and `DELETE` are also append-only:
+
+```sql
+-- insert
+INSERT INTO products_log (..., op, sku, name, price, row_hash)
+VALUES (..., 'insert', 'def', 'New Item', 4.99, :row_hash);
+
+-- delete
+INSERT INTO products_log (..., op, sku, row_hash)
+VALUES (..., 'delete', 'abc', :delete_hash);
+```
+
+The log table is the history source. It records every committed row mutation.
+
+### Visible Timeline Ranges
+
+To read branch `exp`, the system needs the ordered timeline ranges inherited by that branch.
+
+For a shallow branch:
+
+```text
+exp sees:
+  main [0, 100]
+  exp  [101, exp.head_lsn]
+```
+
+For a deep branch:
+
+```text
+main -> a -> b -> c
+
+c sees:
+  main [0, fork_a]
+  a    [fork_a + 1, fork_b]
+  b    [fork_b + 1, fork_c]
+  c    [fork_c + 1, c.head_lsn]
+```
+
+The branch context can materialize this at checkout:
+
+```python
+session = ctx.checkout("c")
+session.visible_ranges
+```
+
+Example:
+
+```text
+[
+  ("main", 0, 100),
+  ("a", 101, 150),
+  ("b", 151, 180),
+  ("c", 181, 220),
+]
+```
+
+The SQL rewriter injects these ranges as constants. It does not expose them to agents.
+
+### Point Query
+
+Agent query:
+
+```python
+session.query(
+    "SELECT * FROM products WHERE sku = :sku",
+    {"sku": "abc"},
+)
+```
+
+Physical query for a shallow branch:
+
+```sql
+SELECT sku, name, price, op
+FROM products_log
+WHERE sku = :sku
+  AND (
+    (branch_id = 'exp' AND lsn <= :exp_head_lsn)
+    OR
+    (branch_id = 'main' AND lsn <= :exp_fork_lsn)
+  )
+ORDER BY lsn DESC
+LIMIT 1;
+```
+
+If the latest row has `op = 'delete'`, the logical row is absent. Otherwise the payload is returned.
+
+For deep branches, the generated predicate uses the session's visible ranges:
+
+```sql
+SELECT sku, name, price, op
+FROM products_log
+WHERE sku = :sku
+  AND (
+    (branch_id = 'main' AND lsn BETWEEN 0 AND 100)
+    OR (branch_id = 'a' AND lsn BETWEEN 101 AND 150)
+    OR (branch_id = 'b' AND lsn BETWEEN 151 AND 180)
+    OR (branch_id = 'c' AND lsn BETWEEN 181 AND 220)
+  )
+ORDER BY lsn DESC
+LIMIT 1;
+```
+
+This is correct, but read cost grows with timeline depth unless the branch context caches visible ranges and the database has supporting indexes.
+
+### Full Table Query
+
+Agent query:
+
+```python
+session.query("SELECT * FROM products WHERE price > 100")
+```
+
+The branch layer reconstructs the current logical table first, then applies the user predicate:
+
+```sql
+WITH visible_log AS (
+  SELECT *
+  FROM products_log
+  WHERE
+    (branch_id = 'exp' AND lsn <= :exp_head_lsn)
+    OR
+    (branch_id = 'main' AND lsn <= :exp_fork_lsn)
+),
+current_products AS (
+  SELECT DISTINCT ON (sku)
+    sku,
+    name,
+    price,
+    op
+  FROM visible_log
+  ORDER BY sku, lsn DESC
+)
+SELECT sku, name, price
+FROM current_products
+WHERE op <> 'delete'
+  AND price > 100;
+```
+
+The order of operations matters:
+
+```text
+1. reconstruct the latest row per logical key for the branch
+2. remove tombstones
+3. apply the user's SQL predicate
+```
+
+This preserves normal SQL semantics.
+
+### Indexes
+
+Point reads:
+
+```sql
+CREATE INDEX products_log_point
+ON products_log (sku, branch_id, lsn DESC)
+INCLUDE (op, name, price, row_hash);
+```
+
+Branch-range scans:
+
+```sql
+CREATE INDEX products_log_branch_lsn
+ON products_log (branch_id, lsn)
+INCLUDE (sku, op, name, price, row_hash);
+```
+
+Graph adjacency:
+
+```sql
+CREATE INDEX edges_log_src
+ON edges_log (src_id, branch_id, lsn DESC)
+INCLUDE (edge_id, dst_id, op, label, properties, row_hash);
+
+CREATE INDEX edges_log_dst
+ON edges_log (dst_id, branch_id, lsn DESC)
+INCLUDE (edge_id, src_id, op, label, properties, row_hash);
+```
+
+### Current-State Projection
+
+The log backend should maintain an optional current-state projection for fast SQL reads:
+
+```text
+log tables                source of truth, history, time travel
+current-state projection  optimized branch query surface
+```
+
+Projection options:
+
+- interval live-range tables, as described in the primary backend
+- branch-head tables for selected hot branches
+- materialized current views for analytical workloads
+- cached reconstructed pages or row groups
+
+The projection is maintained in the same database transaction as the log append. The log remains the authoritative history; the projection is a derived read model.
+
+Without a projection, broad SQL queries reconstruct current rows from the log and can be expensive. With a projection, ordinary branch queries use the projection while history, audit, time travel, and replay use the log.
+
+### Diff
+
+Diff can use the log when branches share a known prefix:
+
+```text
+main and exp share prefix through lsn 100
+exp changes after 100 are candidate differences
+main changes after 100 are candidate differences
+```
+
+For exact state diff, the system compares reconstructed current rows at the two branch points:
+
+```text
+left_current(table, key)
+right_current(table, key)
+```
+
+`row_hash` avoids fetching full payloads for unchanged rows. If exact comparison is required, the implementation can fetch full rows for keys whose hashes differ.
+
+### Efficiency
+
+```text
+branch creation: O(1) timeline metadata
+writes:          append-only log records
+time travel:     natural by branch and LSN
+point read:      latest visible log record for key
+full scan:       reconstruct current row per key unless projected
+storage:         one log row per logical mutation
+```
+
+This backend is strongest when history, auditability, replay, and append-only writes matter. It needs a projection layer for consistently fast arbitrary SQL reads.
+
+## Time Travel and Checkpoints
+
+The interval backend supports time travel to structural states:
+
+- current branch heads
+- fork boundaries
+- explicit checkpoints
+
+Repeated updates inside the same current segment retain only the latest value for that segment. To preserve a state, create a checkpoint before further mutation:
+
+```python
+ctx.create_checkpoint("before_discount", branch="exp_pricing")
+```
+
+Checkpointing creates a stable segment boundary. It does not require copying user tables.
+
+The log-table backend can additionally support time travel by LSN because every row mutation is retained in the append-only log:
+
+```python
+historical = ctx.checkout_at(branch="exp_pricing", lsn=120)
+rows = historical.query("SELECT * FROM products WHERE sku = 'abc'")
+```
+
+This requires retaining the relevant log records.
+
+## Branch Diff
+
+Diff compares two database-wide branch states:
+
+```text
+left_branch_point
+right_branch_point
+```
+
+The system computes diff table by table for every branched user table. A row is compared by logical primary key. Each result is one of:
+
+```text
+added      key is absent on left and present on right
+deleted    key is present on left and absent on right
+modified   key is present on both sides but row contents differ
+unchanged  key is present on both sides and row contents match
+```
+
+The physical table should store a row hash to make diff efficient:
+
+```sql
+CREATE TABLE products_b (
+  sku TEXT NOT NULL,
+  name TEXT NULL,
+  price NUMERIC NULL,
+  live_lo NUMERIC(78, 0) NOT NULL,
+  live_hi NUMERIC(78, 0) NOT NULL,
+  deleted BOOLEAN NOT NULL DEFAULT false,
+  row_hash TEXT NOT NULL,
+  PRIMARY KEY (sku, live_lo),
+  CHECK (live_lo < live_hi)
+);
+```
+
+`row_hash` is computed from the logical row payload, excluding branch metadata:
+
+```text
+hash(name, price)
+```
+
+Tombstones participate in diff as absence. A deleted row is not present in that branch state.
+
+### Table Diff Query
+
+For a single table, collect rows visible at either branch point and collapse by logical key:
+
+```sql
+SELECT
+  sku,
+  bool_or(
+    live_lo <= :left_point
+    AND :left_point < live_hi
+    AND deleted = false
+  ) AS present_left,
+  bool_or(
+    live_lo <= :right_point
+    AND :right_point < live_hi
+    AND deleted = false
+  ) AS present_right,
+  max(row_hash) FILTER (
+    WHERE live_lo <= :left_point
+      AND :left_point < live_hi
+      AND deleted = false
+  ) AS left_hash,
+  max(row_hash) FILTER (
+    WHERE live_lo <= :right_point
+      AND :right_point < live_hi
+      AND deleted = false
+  ) AS right_hash
+FROM products_b
+WHERE (
+    live_lo <= :left_point
+    AND :left_point < live_hi
+  )
+  OR (
+    live_lo <= :right_point
+    AND :right_point < live_hi
+  )
+GROUP BY sku;
+```
+
+The non-overlap invariant guarantees that each branch point contributes at most one non-deleted row per key. The aggregate is therefore selecting a single value, not resolving competing versions.
+
+Classify each grouped row:
+
+```text
+present_left = false and present_right = true   -> added
+present_left = true  and present_right = false  -> deleted
+present_left = true  and present_right = true
+  and left_hash <> right_hash                   -> modified
+otherwise                                      -> unchanged
+```
+
+Most callers should suppress unchanged rows.
+
+### Diff Output
+
+The diff API returns database-wide results grouped by table:
+
+```text
+ctx.diff(left_branch_id, right_branch_id)
+  products
+    added:    [sku=def]
+    deleted:  [sku=old]
+    modified: [sku=abc]
+  orders
+    added:    [order_id=o1]
+  nodes
+    modified: [node_id=n42]
+  edges
+    deleted:  [edge_id=e9]
+```
+
+For detailed diffs, fetch before/after rows for changed keys:
+
+```sql
+SELECT *
+FROM products_b
+WHERE sku = :sku
+  AND live_lo <= :left_point
+  AND :left_point < live_hi;
+```
+
+```sql
+SELECT *
+FROM products_b
+WHERE sku = :sku
+  AND live_lo <= :right_point
+  AND :right_point < live_hi;
+```
+
+### Diff Efficiency
+
+Diff cost is proportional to rows visible at either branch point for each table:
+
+```text
+O(visible_rows(left) + visible_rows(right))
+```
+
+Indexes for diff:
+
+```sql
+CREATE INDEX products_b_diff_left_right
+ON products_b (live_lo, live_hi)
+INCLUDE (sku, deleted, row_hash);
+```
+
+For range-aware databases:
+
+```sql
+CREATE INDEX products_b_diff_span
+ON products_b USING gist (live_span);
+```
+
+Large database-wide diffs should stream table-by-table and key-by-key. The system can also maintain per-table change counters or per-segment touched-key summaries to skip tables that cannot differ.
+
+## Merge
+
+Merge uses the nearest common ancestor segment as the base:
+
+```text
+base = nearest common ancestor segment
+left = visible state of target branch
+right = visible state of source branch
+```
+
+The base design is state-based. It compares current values at branch heads and fork/checkpoint boundaries.
+
+## Garbage Collection
+
+Segments and row intervals can be collected when they are not reachable from:
+
+- live branch heads
+- explicit checkpoints
+- retained merge bases
+- active transactions
+- retention policies
+
+Garbage collection must preserve the non-overlap invariant for remaining live branch points.
+
+## Minimal Implementation Plan
+
+For the interval live-range backend:
+
+1. Add `branches` and `segments`.
+2. Implement checkout, branch creation, and checkpoint creation.
+3. Generate physical branched tables with `live_lo`, `live_hi`, and `deleted`.
+4. Implement branch-visible reads with injected branch constants.
+5. Implement keyed update, delete, insert, and interval splice.
+6. Add non-overlap enforcement.
+7. Add sparse interval allocation and depth checks.
+8. Add diff, merge, and garbage collection.
+
+For the log-table backend:
+
+1. Add `branch_timelines` and `branch_txns`.
+2. Generate per-table append-only log tables.
+3. Implement branch creation as timeline metadata.
+4. Implement branch session checkout with visible timeline ranges.
+5. Rewrite writes into append-only log records.
+6. Rewrite reads to reconstruct current rows from visible logs.
+7. Add indexes for point reads, adjacency reads, and branch-range scans.
+8. Add a maintained current-state projection for fast arbitrary SQL.
+9. Add log-aware diff, time travel by LSN, merge, and garbage collection.
