@@ -5,20 +5,30 @@ This folder contains benchmarks for the bolt-on branching physical backends.
 Run a quick smoke benchmark:
 
 ```bash
-PYTHONPATH=packages/janus-core/src \
-python bench/branching_backends.py --quick
+bench/run_branching_experiments.sh postgres --quick
 ```
 
-Run a broader benchmark:
+By default, `run_branching_experiments.sh` runs PostgreSQL. If
+`JANUS_BRANCH_POSTGRES_DSN` or `JANUS_BRANCH_DATABASE_URL` is not set, it starts
+a temporary `postgres:16-alpine` Docker container, waits for readiness, runs the
+benchmark, and stops the container.
+
+Run the broader default benchmark:
 
 ```bash
-PYTHONPATH=packages/janus-core/src \
-python3 bench/branching_backends.py \
-  --dataset-sizes 100000 \
-  --depths 1,4,8 \
-  --read-ops 5000 \
-  --write-ops 5000 \
-  --branch-mutations 100
+bench/run_branching_experiments.sh
+```
+
+Run SQLite instead:
+
+```bash
+bench/run_branching_experiments.sh sqlite
+```
+
+Run both SQLite and PostgreSQL:
+
+```bash
+bench/run_branching_experiments.sh both
 ```
 
 For each dataset size and depth, the benchmark first loads the data, registers
