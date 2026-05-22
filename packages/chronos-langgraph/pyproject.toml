@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chronos-langgraph"
+version = "0.1.0"
+description = "LangGraph integrations for Transactional Agent Runtime"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+  "chronos-core",
+  "langgraph>=0.2.0",
+  "langchain-core>=0.3.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7.0",
+  "pytest-asyncio>=0.21",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chronos_langgraph"]
+
+[tool.uv.sources]
+chronos-core = { workspace = true }
+

@@ -1,9 +1,9 @@
 [tool.uv.workspace]
 members = [
-  "packages/janus-core",
-  "packages/janus-langchain",
-  "packages/janus-langgraph",
-  "packages/janus-code",
+  "packages/chronos-core",
+  "packages/chronos-langchain",
+  "packages/chronos-langgraph",
+  "packages/chronos-code",
 ]
 
 [tool.pytest.ini_options]

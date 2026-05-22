@@ -20,9 +20,9 @@ dist/
 .eggs/
 
 # Local runtime state
-.janus-code/
-.janus-runtime/
-.janus-overlay-test/
+.chronos-code/
+.chronos-runtime/
+.chronos-overlay-test/
 
 # Generated benchmark output
 .benchmarks/

@@ -60,9 +60,9 @@ Agents interact with a Python branch-layer API. Branch management is not exposed
 Create a branching context over an existing database connection or connection pool:
 
 ```python
-from janus_core.branching import JanusBranchContext
+from chronos_core.branching import ChronosBranchContext
 
-ctx = JanusBranchContext.connect("postgresql://app@localhost/okg")
+ctx = ChronosBranchContext.connect("postgresql://app@localhost/okg")
 ```
 
 The context owns branch metadata, table registration, checkout, diff, merge, and SQL rewriting/execution.
@@ -70,9 +70,9 @@ The context owns branch metadata, table registration, checkout, diff, merge, and
 ### API Surface
 
 ```python
-class JanusBranchContext:
+class ChronosBranchContext:
     @classmethod
-    def connect(cls, database_url: str) -> "JanusBranchContext": ...
+    def connect(cls, database_url: str) -> "ChronosBranchContext": ...
 
     def register_table(self, table: str, primary_key: list[str]) -> None: ...
 
@@ -808,7 +808,7 @@ Branch creation does not copy user rows. Storage grows when data changes, not wh
 
 ## Alternative Backend: Branch Log Tables
 
-The same `JanusBranchContext` API can be implemented with append-only log tables instead of write-time interval maintenance. In this backend, a branch is a log timeline. Branch creation records a fork point and shares the parent log prefix. Writes append new log records to the branch's own timeline.
+The same `ChronosBranchContext` API can be implemented with append-only log tables instead of write-time interval maintenance. In this backend, a branch is a log timeline. Branch creation records a fork point and shares the parent log prefix. Writes append new log records to the branch's own timeline.
 
 This is closer to a WAL-timeline model:
 

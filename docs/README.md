@@ -1,6 +1,6 @@
-# Janus Quickstart: Reliable Agents with LangChain and LangGraph
+# Chronos Quickstart: Reliable Agents with LangChain and LangGraph
 
-This quickstart shows how to use Janus (Transactional Agent Runtime) to build agents that can safely edit files, run commands, and update structured memory with commit/rollback guarantees.
+This quickstart shows how to use Chronos (Transactional Agent Runtime) to build agents that can safely edit files, run commands, and update structured memory with commit/rollback guarantees.
 
 ## What you get
 
@@ -22,10 +22,10 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 
-pip install -e packages/janus-core \
-  -e packages/janus-langchain \
-  -e packages/janus-langgraph \
-  -e packages/janus-code
+pip install -e packages/chronos-core \
+  -e packages/chronos-langchain \
+  -e packages/chronos-langgraph \
+  -e packages/chronos-code
 ```
 
 ## Quickstart 1: App-Controlled Reliability (Recommended)
@@ -37,15 +37,15 @@ from pathlib import Path
 
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
-from langchain_janus import JanusContext
+from langchain_chronos import ChronosContext
 
 project_dir = Path("./demo_project").resolve()
 project_dir.mkdir(parents=True, exist_ok=True)
 
 model = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
 
-with JanusContext(project_dir, enable_sqlite=True, enable_vectorstore=False) as janus:
-    tools = janus.get_tools()  # janus_file_editor, janus_memory, janus_bash, janus_sqlite
+with ChronosContext(project_dir, enable_sqlite=True, enable_vectorstore=False) as chronos:
+    tools = chronos.get_tools()  # chronos_file_editor, chronos_memory, chronos_bash, chronos_sqlite
 
     agent = create_agent(
         model=model,
@@ -67,15 +67,15 @@ with JanusContext(project_dir, enable_sqlite=True, enable_vectorstore=False) as 
         }
     )
 
-    print("Pending Janus changes:", len(janus.get_changes()))
+    print("Pending Chronos changes:", len(chronos.get_changes()))
 
     # App-level guardrails go here (tests, policy checks, reviewers, etc.)
     checks_passed = True
 
     if checks_passed:
-        janus.commit()
+        chronos.commit()
     else:
-        janus.abort()
+        chronos.abort()
 ```
 
 Run with root privileges:
@@ -86,33 +86,33 @@ sudo -E python quickstart_app_control.py
 
 ## Quickstart 2: Model-Controlled Savepoints (More Autonomous)
 
-Use this when you want the model to call transaction primitives (`janus_txn`) directly.
+Use this when you want the model to call transaction primitives (`chronos_txn`) directly.
 
 ```python
 from pathlib import Path
 
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
-from langchain_janus import JanusContext
-from langchain_janus.context import JanusTransactionControl
+from langchain_chronos import ChronosContext
+from langchain_chronos.context import ChronosTransactionControl
 
 project_dir = Path("./demo_project").resolve()
 model = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
 
-ctx = JanusContext(project_dir, enable_sqlite=True, enable_vectorstore=False)
-ctx.begin()  # Start once; model controls savepoint/rollback/commit via janus_txn.
+ctx = ChronosContext(project_dir, enable_sqlite=True, enable_vectorstore=False)
+ctx.begin()  # Start once; model controls savepoint/rollback/commit via chronos_txn.
 
-txn_tool = JanusTransactionControl(janus_context=ctx)
+txn_tool = ChronosTransactionControl(chronos_context=ctx)
 tools = ctx.get_tools() + [txn_tool]
 
 graph = create_react_agent(
     model,
     tools=tools,
     prompt=(
-        "A Janus transaction is already active. "
-        "Before risky edits, call janus_txn(action='savepoint', name='...'). "
-        "If verification fails, call janus_txn(action='rollback'). "
-        "Only call janus_txn(action='commit') when all checks pass."
+        "A Chronos transaction is already active. "
+        "Before risky edits, call chronos_txn(action='savepoint', name='...'). "
+        "If verification fails, call chronos_txn(action='rollback'). "
+        "Only call chronos_txn(action='commit') when all checks pass."
     ),
 )
 

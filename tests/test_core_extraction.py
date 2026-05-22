@@ -1,4 +1,4 @@
-from janus_core.transaction import SQLiteShim, TransactionCoordinator
+from chronos_core.transaction import SQLiteShim, TransactionCoordinator
 
 
 def test_sqlite_shim_commits_visible_update() -> None:

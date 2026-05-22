@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-chronos"
+version = "0.1.0"
+description = "LangChain adapter tools for Transactional Agent Runtime"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+  "chronos-core",
+  "langchain-core>=0.3.0",
+  "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7.0",
+  "pytest-asyncio>=0.21",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/langchain_chronos"]
+
+[tool.uv.sources]
+chronos-core = { workspace = true }
+

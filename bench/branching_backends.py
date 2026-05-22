@@ -18,7 +18,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from janus_core.branching import JanusBranchContext
+from chronos_core.branching import ChronosBranchContext
 
 
 BACKENDS = ("copy", "interval", "log")
@@ -104,8 +104,8 @@ def make_context(
     backend: str,
     dataset_size: int,
     database_url: str,
-) -> JanusBranchContext:
-    ctx = JanusBranchContext.connect(database_url, backend=backend)
+) -> ChronosBranchContext:
+    ctx = ChronosBranchContext.connect(database_url, backend=backend)
     db = ctx.db
     if database_url.startswith(("postgres://", "postgresql://")):
         rows = db.execute(
@@ -113,14 +113,14 @@ def make_context(
             SELECT tablename
             FROM pg_tables
             WHERE schemaname = 'public'
-              AND (tablename IN ('products', 'orders') OR tablename LIKE '_janus%')
+              AND (tablename IN ('products', 'orders') OR tablename LIKE '_chronos%')
             """
         ).fetchall()
         for row in rows:
             db.drop_table(row["tablename"])
         db.commit()
         ctx.close()
-        ctx = JanusBranchContext.connect(database_url, backend=backend)
+        ctx = ChronosBranchContext.connect(database_url, backend=backend)
         db = ctx.db
     db.execute(
         """
@@ -170,7 +170,7 @@ def make_context(
 
 
 def mutate_branch_state(
-    ctx: JanusBranchContext,
+    ctx: ChronosBranchContext,
     branch_id: str,
     case: BenchCase,
     level: int,
@@ -230,7 +230,7 @@ def mutate_branch_state(
 
 
 def build_depth_chain(
-    ctx: JanusBranchContext,
+    ctx: ChronosBranchContext,
     case: BenchCase,
     mutations_per_branch: int,
 ) -> tuple[str, dict[str, float], list[str]]:
@@ -248,7 +248,7 @@ def build_depth_chain(
 
 
 def benchmark_branch_deletes(
-    ctx: JanusBranchContext, case: BenchCase, branch_names: list[str]
+    ctx: ChronosBranchContext, case: BenchCase, branch_names: list[str]
 ) -> dict[str, Any]:
     delete_ops = [
         (lambda branch=branch: ctx.delete_branch(branch))
@@ -259,7 +259,7 @@ def benchmark_branch_deletes(
 
 
 def benchmark_reads(
-    ctx: JanusBranchContext,
+    ctx: ChronosBranchContext,
     branch_id: str,
     case: BenchCase,
     read_ops: int,
@@ -310,7 +310,7 @@ def benchmark_reads(
 
 
 def benchmark_writes(
-    ctx: JanusBranchContext,
+    ctx: ChronosBranchContext,
     branch_id: str,
     case: BenchCase,
     write_ops: int,
@@ -537,7 +537,7 @@ def write_markdown_summary(
         f"![{plot.stem}]({plot.name})" for plot in plot_paths
     )
     path.write_text(
-        "# Janus Branching Backend Benchmark\n\n"
+        "# Chronos Branching Backend Benchmark\n\n"
         f"Generated at `{config['generated_at']}`.\n\n"
         "## Config\n\n"
         f"```json\n{json.dumps(config, indent=2, sort_keys=True)}\n```\n\n"
@@ -549,15 +549,15 @@ def write_markdown_summary(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Benchmark Janus branch physical backends."
+        description="Benchmark Chronos branch physical backends."
     )
     parser.add_argument("--backends", default="copy,interval,log")
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("JANUS_BRANCH_DATABASE_URL", "sqlite:///:memory:"),
+        default=os.environ.get("CHRONOS_BRANCH_DATABASE_URL", "sqlite:///:memory:"),
         help=(
             "SQL database URL for benchmark setup. Defaults to sqlite:///:memory:. "
-            "Set JANUS_BRANCH_DATABASE_URL to use PostgreSQL without changing commands."
+            "Set CHRONOS_BRANCH_DATABASE_URL to use PostgreSQL without changing commands."
         ),
     )
     parser.add_argument("--dataset-sizes", type=parse_int_list, default=[100, 1000])
@@ -619,7 +619,7 @@ def main() -> None:
         "database_url": args.database_url,
     }
     rows: list[dict[str, Any]] = []
-    with tempfile.TemporaryDirectory(prefix="janus-branch-bench-"):
+    with tempfile.TemporaryDirectory(prefix="chronos-branch-bench-"):
         for backend in backends:
             for dataset_size in dataset_sizes:
                 for depth in depths:

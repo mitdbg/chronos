@@ -3,15 +3,15 @@ import uuid
 
 import pytest
 
-from janus_core.transaction import PostgresShim, TransactionCoordinator
-from janus_core.transaction.coordinator import CommitConflictError
-from janus_core.transaction.shim_postgres import WriteConflictError
+from chronos_core.transaction import PostgresShim, TransactionCoordinator
+from chronos_core.transaction.coordinator import CommitConflictError
+from chronos_core.transaction.shim_postgres import WriteConflictError
 
 
 def _dsn() -> str:
-    dsn = os.environ.get("JANUS_POSTGRES_DSN")
+    dsn = os.environ.get("CHRONOS_POSTGRES_DSN")
     if not dsn:
-        pytest.skip("set JANUS_POSTGRES_DSN to run PostgreSQL shim tests")
+        pytest.skip("set CHRONOS_POSTGRES_DSN to run PostgreSQL shim tests")
     return dsn
 
 

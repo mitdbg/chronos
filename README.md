@@ -1,15 +1,15 @@
-# Janus
+# Chronos
 
-Janus gives state-modifying AI agents isolation over the data they touch.
+Chronos gives state-modifying AI agents isolation over the data they touch.
 Agents can edit files, run commands, update relational state, write memory, use
 vector storage, and explore named database branches without leaking partial
 side effects into the shared state.
 
-Janus is built for agent workflows where "try it and see what happens" is useful
+Chronos is built for agent workflows where "try it and see what happens" is useful
 but unsafe without isolation: code editing, debugging, data repair, structured
 memory updates, RAG indexing, and multi-step tool plans.
 
-## What Janus Provides
+## What Chronos Provides
 
 - **Isolated execution:** tool calls run against transaction-local state.
 - **Atomic commit/abort:** all enrolled backends commit or roll back together.
@@ -28,7 +28,7 @@ memory updates, RAG indexing, and multi-step tool plans.
 
 ## Current Scope
 
-Janus has two related but separate surfaces.
+Chronos has two related but separate surfaces.
 
 The transaction runtime provides short-lived, transaction-scoped virtual
 branches over stateful tools:
@@ -56,19 +56,19 @@ with SQL through a branch-bound session object.
 
 ```text
 packages/
-  janus-core        Core coordinator, transaction types, and backend shims
-  langchain-janus  LangChain tools backed by Janus transactions
-  janus-langgraph  LangGraph helpers using public LangGraph APIs
-  janus-code       Transactional coding-agent CLI and MCP server
+  chronos-core        Core coordinator, transaction types, and backend shims
+  langchain-chronos  LangChain tools backed by Chronos transactions
+  chronos-langgraph  LangGraph helpers using public LangGraph APIs
+  chronos-code       Transactional coding-agent CLI and MCP server
 ```
 
-### `janus-core`
+### `chronos-core`
 
 Framework-independent runtime components:
 
 - `TransactionCoordinator`
 - `ToolShim` interface
-- `JanusBranchContext` and `BranchSession`
+- `ChronosBranchContext` and `BranchSession`
 - `OverlayFSShim`
 - `SQLiteShim`
 - `PostgresShim`
@@ -77,19 +77,19 @@ Framework-independent runtime components:
 - transaction handles, snapshots, savepoints, branch diffs, change records, and
   vote types
 
-### `langchain-janus`
+### `langchain-chronos`
 
 LangChain tools for agent use:
 
-- `JanusContext`
-- `JanusFileEditor`
-- `JanusBash`
-- `JanusMemory`
-- `JanusSQLite`
-- `JanusVectorStore`
-- `JanusTransactionControl`
+- `ChronosContext`
+- `ChronosFileEditor`
+- `ChronosBash`
+- `ChronosMemory`
+- `ChronosSQLite`
+- `ChronosVectorStore`
+- `ChronosTransactionControl`
 
-### `janus-langgraph`
+### `chronos-langgraph`
 
 LangGraph integration helpers:
 
@@ -101,11 +101,11 @@ LangGraph integration helpers:
 This package uses public LangGraph package APIs such as `langgraph.prebuilt`,
 `langgraph.types`, and `langgraph.store`.
 
-### `janus-code`
+### `chronos-code`
 
-A coding-agent application built on Janus:
+A coding-agent application built on Chronos:
 
-- `janus-code` CLI
+- `chronos-code` CLI
 - session and transaction manager
 - coding tools for read/write/edit/bash/glob/ripgrep/todos/memory
 - sub-agent and parallel-agent orchestration
@@ -122,16 +122,16 @@ uv sync --all-extras
 For editable installs without `uv`:
 
 ```bash
-python -m pip install -e packages/janus-core
-python -m pip install -e packages/janus-langchain
-python -m pip install -e packages/janus-langgraph
-python -m pip install -e packages/janus-code
+python -m pip install -e packages/chronos-core
+python -m pip install -e packages/chronos-langchain
+python -m pip install -e packages/chronos-langgraph
+python -m pip install -e packages/chronos-code
 ```
 
 If you do not install the packages, run commands with:
 
 ```bash
-PYTHONPATH=packages/janus-core/src:packages/janus-langchain/src:packages/janus-langgraph/src:packages/janus-code/src
+PYTHONPATH=packages/chronos-core/src:packages/chronos-langchain/src:packages/chronos-langgraph/src:packages/chronos-code/src
 ```
 
 ## System Requirements
@@ -141,9 +141,9 @@ PYTHONPATH=packages/janus-core/src:packages/janus-langchain/src:packages/janus-l
 - `fuse-overlayfs` for unprivileged filesystem transactions, or root privileges
   for kernel OverlayFS mounts
 - PostgreSQL only when using `PostgresShim`
-- `rg` for ripgrep-backed Janus-code tests/tools
+- `rg` for ripgrep-backed Chronos-code tests/tools
 - `mcp[cli]` for MCP server functionality
-- model provider credentials for live Janus-code agent runs
+- model provider credentials for live Chronos-code agent runs
 
 Install `fuse-overlayfs` on Ubuntu/Debian:
 
@@ -159,18 +159,18 @@ kept.
 ```python
 from pathlib import Path
 
-from langchain_janus import JanusContext
+from langchain_chronos import ChronosContext
 
 project = Path("./demo_project").resolve()
 project.mkdir(exist_ok=True)
 
-ctx = JanusContext(project, enable_sqlite=True, enable_vectorstore=False)
+ctx = ChronosContext(project, enable_sqlite=True, enable_vectorstore=False)
 ctx.begin()
 
 ctx.file_editor.invoke({
     "command": "create",
     "path": "README.md",
-    "file_text": "# Demo\n\nCreated inside a Janus transaction.\n",
+    "file_text": "# Demo\n\nCreated inside a Chronos transaction.\n",
 })
 
 ctx.bash.invoke({"command": "ls"})
@@ -188,9 +188,9 @@ the real project is unchanged until `commit()`.
 ## Quickstart: Savepoint And Rollback
 
 ```python
-from langchain_janus import JanusContext
+from langchain_chronos import ChronosContext
 
-ctx = JanusContext("./demo_project", enable_sqlite=True, enable_vectorstore=False)
+ctx = ChronosContext("./demo_project", enable_sqlite=True, enable_vectorstore=False)
 ctx.begin()
 
 ctx.file_editor.invoke({
@@ -219,7 +219,7 @@ The final commit keeps `stable.txt` and discards `experiment.txt`.
 ## Quickstart: SQLite Transactions
 
 ```python
-from janus_core.transaction import SQLiteShim, TransactionCoordinator
+from chronos_core.transaction import SQLiteShim, TransactionCoordinator
 
 shim = SQLiteShim(":memory:")
 shim.register_table(
@@ -239,7 +239,7 @@ assert shim.get(txn, "users", "u1")["credits"] == 90
 coordinator.commit(txn.id)
 ```
 
-SQLite rows are versioned with Janus metadata columns:
+SQLite rows are versioned with Chronos metadata columns:
 
 - `_begin_txn`: transaction numeric ID that created the version
 - `_end_txn`: transaction numeric ID that superseded/deleted the version
@@ -250,14 +250,14 @@ old version and insert a new version.
 
 ## Quickstart: Relational Branching
 
-Use `JanusBranchContext` when you want named, mutable branches over SQL tables.
+Use `ChronosBranchContext` when you want named, mutable branches over SQL tables.
 The application manages branches with Python APIs, while agents and application
 code continue to issue SQL against logical table names.
 
 ```python
-from janus_core.branching import JanusBranchContext
+from chronos_core.branching import ChronosBranchContext
 
-ctx = JanusBranchContext.connect("sqlite:///:memory:", backend="interval")
+ctx = ChronosBranchContext.connect("sqlite:///:memory:", backend="interval")
 conn = ctx.conn
 
 conn.execute(
@@ -377,7 +377,7 @@ ctx.create_branch_from_checkpoint(
 
 ### Branch Backend Choices
 
-`JanusBranchContext.connect(..., backend=...)` supports SQLite and PostgreSQL
+`ChronosBranchContext.connect(..., backend=...)` supports SQLite and PostgreSQL
 database URLs with three physical branch implementations:
 
 | Backend | How it stores branch state | Read behavior | Write behavior | Good for |
@@ -394,9 +394,9 @@ latest visible operation per key.
 ## Quickstart: PostgreSQL Shim
 
 ```python
-from janus_core.transaction import PostgresShim, TransactionCoordinator
+from chronos_core.transaction import PostgresShim, TransactionCoordinator
 
-shim = PostgresShim("postgresql://postgres:postgres@localhost:5432/janus")
+shim = PostgresShim("postgresql://postgres:postgres@localhost:5432/chronos")
 shim.register_table(
     "users",
     ["id TEXT", "name TEXT", "credits INTEGER"],
@@ -418,38 +418,38 @@ PostgreSQL transactions for durable SQL execution.
 
 ```python
 from langgraph.prebuilt import create_react_agent
-from langchain_janus import JanusContext
-from langchain_janus.context import JanusTransactionControl
+from langchain_chronos import ChronosContext
+from langchain_chronos.context import ChronosTransactionControl
 
-ctx = JanusContext("./demo_project", enable_sqlite=True, enable_vectorstore=False)
+ctx = ChronosContext("./demo_project", enable_sqlite=True, enable_vectorstore=False)
 ctx.begin()
 
-tools = ctx.get_tools() + [JanusTransactionControl(janus_context=ctx)]
+tools = ctx.get_tools() + [ChronosTransactionControl(chronos_context=ctx)]
 
 agent = create_react_agent(
     model,
     tools=tools,
     prompt=(
-        "A Janus transaction is active. Use savepoints before risky changes. "
+        "A Chronos transaction is active. Use savepoints before risky changes. "
         "Commit only after checks pass."
     ),
 )
 ```
 
-`janus-langgraph` also provides helpers for constructing transaction-management
+`chronos-langgraph` also provides helpers for constructing transaction-management
 tools and wrapping tool calls with automatic savepoints.
 
-## Janus-Code CLI
+## Chronos-Code CLI
 
 Run a transactional coding-agent session:
 
 ```bash
-janus-code --project /path/to/project
+chronos-code --project /path/to/project
 ```
 
-The CLI creates a Janus-backed session so edits, commands, memory, and SQLite
+The CLI creates a Chronos-backed session so edits, commands, memory, and SQLite
 state can be committed or aborted together. It also includes MCP server support
-for exposing Janus tools to external agents.
+for exposing Chronos tools to external agents.
 
 ## Backend Semantics
 
@@ -458,15 +458,15 @@ Transaction shims participate in `TransactionCoordinator`:
 | Backend | Isolation mechanism | Commit behavior |
 | --- | --- | --- |
 | Filesystem | OverlayFS or `fuse-overlayfs` copy-on-write layer | Copy changed files into the base project |
-| SQLite | Janus MVCC columns and visibility predicates | Mark transaction IDs committed |
-| PostgreSQL | Janus MVCC columns and visibility predicates | PostgreSQL-backed row versioning |
+| SQLite | Chronos MVCC columns and visibility predicates | Mark transaction IDs committed |
+| PostgreSQL | Chronos MVCC columns and visibility predicates | PostgreSQL-backed row versioning |
 | Vector store | sqlite-vec style transactional records | Commit visible vector records |
 | LangGraph store | Branch-prefixed namespaces | Flush branch entries into main namespace |
 
 All registered shims participate in the same coordinator commit. If one
 participant votes abort during prepare, the coordinator aborts the transaction.
 
-Relational branch backends are used through `JanusBranchContext`:
+Relational branch backends are used through `ChronosBranchContext`:
 
 | Branch backend | Branch creation | Query path | Storage cost |
 | --- | --- | --- | --- |
@@ -482,21 +482,21 @@ the database's normal transaction mechanism through `session.transaction()`.
 Run fast unit and integration tests that do not require live model calls:
 
 ```bash
-PYTHONPATH=packages/janus-core/src:packages/janus-langchain/src:packages/janus-langgraph/src:packages/janus-code/src \
+PYTHONPATH=packages/chronos-core/src:packages/chronos-langchain/src:packages/chronos-langgraph/src:packages/chronos-code/src \
 pytest -q \
   tests/test_adapter_imports.py \
   tests/test_branching.py \
   tests/test_postgres_shim.py \
-  tests/janus_code/unit \
-  tests/janus_code/integration \
-  --ignore=tests/janus_code/integration/test_cli_live_e2e.py
+  tests/chronos_code/unit \
+  tests/chronos_code/integration \
+  --ignore=tests/chronos_code/integration/test_cli_live_e2e.py
 ```
 
-Run LangChain Janus tests:
+Run LangChain Chronos tests:
 
 ```bash
-PYTHONPATH=packages/janus-core/src:packages/janus-langchain/src:packages/janus-langgraph/src:packages/janus-code/src \
-pytest -q -rs tests/langchain_janus
+PYTHONPATH=packages/chronos-core/src:packages/chronos-langchain/src:packages/chronos-langgraph/src:packages/chronos-code/src \
+pytest -q -rs tests/langchain_chronos
 ```
 
 Many of these tests require filesystem transaction support. Some filesystem
@@ -506,25 +506,25 @@ also use `fuse-overlayfs` on systems where it is installed.
 Run PostgreSQL shim tests:
 
 ```bash
-docker run --rm -d --name janus-postgres-test \
+docker run --rm -d --name chronos-postgres-test \
   -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=janus_test \
+  -e POSTGRES_DB=chronos_test \
   -p 55432:5432 \
   postgres:16-alpine
 
-JANUS_POSTGRES_DSN=postgresql://postgres:postgres@localhost:55432/janus_test \
-PYTHONPATH=packages/janus-core/src:packages/janus-langchain/src:packages/janus-langgraph/src:packages/janus-code/src \
+CHRONOS_POSTGRES_DSN=postgresql://postgres:postgres@localhost:55432/chronos_test \
+PYTHONPATH=packages/chronos-core/src:packages/chronos-langchain/src:packages/chronos-langgraph/src:packages/chronos-code/src \
 pytest -q tests/test_postgres_shim.py
 
-docker stop janus-postgres-test
+docker stop chronos-postgres-test
 ```
 
 Run live CLI tests only when model credentials are available:
 
 ```bash
 OPENROUTER_API_KEY=... \
-PYTHONPATH=packages/janus-core/src:packages/janus-langchain/src:packages/janus-langgraph/src:packages/janus-code/src \
-pytest -q tests/janus_code/integration/test_cli_live_e2e.py
+PYTHONPATH=packages/chronos-core/src:packages/chronos-langchain/src:packages/chronos-langgraph/src:packages/chronos-code/src \
+pytest -q tests/chronos_code/integration/test_cli_live_e2e.py
 ```
 
 ## Limitations
@@ -534,11 +534,11 @@ pytest -q tests/janus_code/integration/test_cli_live_e2e.py
 - Durable transaction metadata is not yet externalized for multi-process use.
 - Branching currently supports shared schema row branching; branch-local schema
   changes and DDL are not supported.
-- `JanusBranchContext.connect()` currently has SQLite and PostgreSQL database
+- `ChronosBranchContext.connect()` currently has SQLite and PostgreSQL database
   adapters. Additional SQL databases need an adapter implementation.
 - Branch write SQL supports a focused subset: `INSERT ... VALUES`, simple
   `UPDATE` assignments, and `DELETE`. Branch reads can use richer `SELECT`
-  statements because Janus rewrites table references before execution.
+  statements because Chronos rewrites table references before execution.
 - The interval backend uses fixed-width integer interval allocation. Very deep
   single-child chains can exhaust interval space without future relabeling or a
   wider numeric representation.
@@ -552,14 +552,14 @@ pytest -q tests/janus_code/integration/test_cli_live_e2e.py
 
 The design documents in `docs/` describe the broader research direction:
 
-- `Janus-design.md`: architecture and transaction model
-- `Janus-implementation-plan.md`: implementation roadmap
-- `Janus-summary.md`: technical overview
+- `Chronos-design.md`: architecture and transaction model
+- `Chronos-implementation-plan.md`: implementation roadmap
+- `Chronos-summary.md`: technical overview
 - `bolt-on-branching.md`: relational branch/versioning layer
 
 ## Development Guidelines
 
-- Keep `janus-core` independent of LangChain and LangGraph.
+- Keep `chronos-core` independent of LangChain and LangGraph.
 - Use public LangChain and LangGraph package APIs in adapter packages.
 - Do not depend on internal LangChain or LangGraph module paths.
 - Keep transaction semantics in shims explicit: begin, prepare, commit, abort,

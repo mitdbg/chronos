@@ -3,25 +3,25 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Run Janus branching backend benchmarks for SQLite and/or PostgreSQL.
+Run Chronos branching backend benchmarks for SQLite and/or PostgreSQL.
 
 Usage:
   bench/run_branching_experiments.sh [sqlite|postgres|both] [extra benchmark args...]
 
 Environment:
-  JANUS_BRANCH_POSTGRES_DSN     PostgreSQL URL used for the postgres run.
-  JANUS_BRANCH_DATABASE_URL     Fallback PostgreSQL URL if JANUS_BRANCH_POSTGRES_DSN is unset.
-  JANUS_BENCH_POSTGRES_IMAGE    Docker image. Default: postgres:16-alpine.
-  JANUS_BENCH_POSTGRES_NAME     Docker container name. Default: janus-branch-postgres.
-  JANUS_BENCH_POSTGRES_PORT     Host port. Default: 55433.
-  JANUS_BENCH_POSTGRES_DB       Database name. Default: janus_branch_test.
-  JANUS_BENCH_POSTGRES_PASSWORD Password. Default: postgres.
-  JANUS_BENCH_POSTGRES_KEEP     Set to 1 to leave a script-started container running.
+  CHRONOS_BRANCH_POSTGRES_DSN     PostgreSQL URL used for the postgres run.
+  CHRONOS_BRANCH_DATABASE_URL     Fallback PostgreSQL URL if CHRONOS_BRANCH_POSTGRES_DSN is unset.
+  CHRONOS_BENCH_POSTGRES_IMAGE    Docker image. Default: postgres:16-alpine.
+  CHRONOS_BENCH_POSTGRES_NAME     Docker container name. Default: chronos-branch-postgres.
+  CHRONOS_BENCH_POSTGRES_PORT     Host port. Default: 55433.
+  CHRONOS_BENCH_POSTGRES_DB       Database name. Default: chronos_branch_test.
+  CHRONOS_BENCH_POSTGRES_PASSWORD Password. Default: postgres.
+  CHRONOS_BENCH_POSTGRES_KEEP     Set to 1 to leave a script-started container running.
   PYTHON                        Python executable. Default: python3.
 
 Defaults:
   mode:               postgres
-  dataset sizes:      100000
+  dataset sizes:      1000000
   depths:             1,4,8
   read ops:           5000
   write ops:          5000
@@ -41,11 +41,11 @@ USAGE
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python3}"
 MODE="${1:-postgres}"
-POSTGRES_CONTAINER="${JANUS_BENCH_POSTGRES_NAME:-janus-branch-postgres}"
-POSTGRES_IMAGE="${JANUS_BENCH_POSTGRES_IMAGE:-postgres:16-alpine}"
-POSTGRES_PORT="${JANUS_BENCH_POSTGRES_PORT:-55433}"
-POSTGRES_DB="${JANUS_BENCH_POSTGRES_DB:-janus_branch_test}"
-POSTGRES_PASSWORD="${JANUS_BENCH_POSTGRES_PASSWORD:-postgres}"
+POSTGRES_CONTAINER="${CHRONOS_BENCH_POSTGRES_NAME:-chronos-branch-postgres}"
+POSTGRES_IMAGE="${CHRONOS_BENCH_POSTGRES_IMAGE:-postgres:16-alpine}"
+POSTGRES_PORT="${CHRONOS_BENCH_POSTGRES_PORT:-55433}"
+POSTGRES_DB="${CHRONOS_BENCH_POSTGRES_DB:-chronos_branch_test}"
+POSTGRES_PASSWORD="${CHRONOS_BENCH_POSTGRES_PASSWORD:-postgres}"
 POSTGRES_STARTED_BY_SCRIPT=0
 
 if [[ "${MODE}" == "-h" || "${MODE}" == "--help" ]]; then
@@ -65,7 +65,7 @@ case "${MODE}" in
 esac
 
 DEFAULT_ARGS=(
-  --dataset-sizes 100000
+  --dataset-sizes 100000,1000000
   --depths 1,4,8
   --read-ops 5000
   --write-ops 5000
@@ -73,11 +73,11 @@ DEFAULT_ARGS=(
 )
 
 EXTRA_ARGS=("$@")
-PYTHONPATH_VALUE="${ROOT_DIR}/packages/janus-core/src${PYTHONPATH:+:${PYTHONPATH}}"
+PYTHONPATH_VALUE="${ROOT_DIR}/packages/chronos-core/src${PYTHONPATH:+:${PYTHONPATH}}"
 RUN_STAMP="$(date +%Y%m%d-%H%M%S)"
 
 cleanup() {
-  if [[ "${POSTGRES_STARTED_BY_SCRIPT}" == "1" && "${JANUS_BENCH_POSTGRES_KEEP:-0}" != "1" ]]; then
+  if [[ "${POSTGRES_STARTED_BY_SCRIPT}" == "1" && "${CHRONOS_BENCH_POSTGRES_KEEP:-0}" != "1" ]]; then
     echo "==> Stopping PostgreSQL container ${POSTGRES_CONTAINER}"
     docker stop "${POSTGRES_CONTAINER}" >/dev/null || true
   fi
@@ -138,7 +138,7 @@ run_one() {
 
   (
     cd "${ROOT_DIR}"
-    JANUS_BRANCH_DATABASE_URL="${database_url}" \
+    CHRONOS_BRANCH_DATABASE_URL="${database_url}" \
       PYTHONPATH="${PYTHONPATH_VALUE}" \
       "${PYTHON_BIN}" bench/branching_backends.py \
         "${DEFAULT_ARGS[@]}" \
@@ -152,8 +152,8 @@ if [[ "${MODE}" == "sqlite" || "${MODE}" == "both" ]]; then
 fi
 
 if [[ "${MODE}" == "postgres" || "${MODE}" == "both" ]]; then
-  if [[ -n "${JANUS_BRANCH_POSTGRES_DSN:-}" || -n "${JANUS_BRANCH_DATABASE_URL:-}" ]]; then
-    POSTGRES_DSN="${JANUS_BRANCH_POSTGRES_DSN:-${JANUS_BRANCH_DATABASE_URL:-}}"
+  if [[ -n "${CHRONOS_BRANCH_POSTGRES_DSN:-}" || -n "${CHRONOS_BRANCH_DATABASE_URL:-}" ]]; then
+    POSTGRES_DSN="${CHRONOS_BRANCH_POSTGRES_DSN:-${CHRONOS_BRANCH_DATABASE_URL:-}}"
   else
     start_postgres_container
     POSTGRES_DSN="postgresql://postgres:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/${POSTGRES_DB}"

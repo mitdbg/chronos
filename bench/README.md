@@ -9,7 +9,7 @@ bench/run_branching_experiments.sh postgres --quick
 ```
 
 By default, `run_branching_experiments.sh` runs PostgreSQL. If
-`JANUS_BRANCH_POSTGRES_DSN` or `JANUS_BRANCH_DATABASE_URL` is not set, it starts
+`CHRONOS_BRANCH_POSTGRES_DSN` or `CHRONOS_BRANCH_DATABASE_URL` is not set, it starts
 a temporary `postgres:16-alpine` Docker container, waits for readiness, runs the
 benchmark, and stops the container.
 

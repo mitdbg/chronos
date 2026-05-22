@@ -1,14 +1,14 @@
 def test_langchain_adapter_imports() -> None:
-    import langchain_janus
+    import langchain_chronos
 
-    assert hasattr(langchain_janus, "JanusContext")
-    assert hasattr(langchain_janus, "JanusSQLite")
+    assert hasattr(langchain_chronos, "ChronosContext")
+    assert hasattr(langchain_chronos, "ChronosSQLite")
 
 
 def test_langgraph_adapter_imports() -> None:
-    import janus_langgraph
-    from janus_langgraph.transactional import create_transaction_tools
+    import chronos_langgraph
+    from chronos_langgraph.transactional import create_transaction_tools
 
-    assert hasattr(janus_langgraph, "BranchAwareStore")
+    assert hasattr(chronos_langgraph, "BranchAwareStore")
     assert callable(create_transaction_tools)
 
