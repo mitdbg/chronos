@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import statistics
 import tempfile
 import time
@@ -99,10 +100,29 @@ def measure_each_in_transaction(session: Any, ops: list[Callable[[], Any]]) -> d
     return stats_from_timings(timings_ms, total_ms)
 
 
-def make_context(backend: str, dataset_size: int) -> JanusBranchContext:
-    ctx = JanusBranchContext.connect("sqlite:///:memory:", backend=backend)
-    conn = ctx.conn
-    conn.execute(
+def make_context(
+    backend: str,
+    dataset_size: int,
+    database_url: str,
+) -> JanusBranchContext:
+    ctx = JanusBranchContext.connect(database_url, backend=backend)
+    db = ctx.db
+    if database_url.startswith(("postgres://", "postgresql://")):
+        rows = db.execute(
+            """
+            SELECT tablename
+            FROM pg_tables
+            WHERE schemaname = 'public'
+              AND (tablename IN ('products', 'orders') OR tablename LIKE '_janus%')
+            """
+        ).fetchall()
+        for row in rows:
+            db.drop_table(row["tablename"])
+        db.commit()
+        ctx.close()
+        ctx = JanusBranchContext.connect(database_url, backend=backend)
+        db = ctx.db
+    db.execute(
         """
         CREATE TABLE products (
           sku TEXT PRIMARY KEY,
@@ -112,7 +132,7 @@ def make_context(backend: str, dataset_size: int) -> JanusBranchContext:
         )
         """
     )
-    conn.execute(
+    db.execute(
         """
         CREATE TABLE orders (
           order_id TEXT PRIMARY KEY,
@@ -138,9 +158,9 @@ def make_context(backend: str, dataset_size: int) -> JanusBranchContext:
         )
         for idx in range(max(dataset_size, 1))
     ]
-    conn.executemany("INSERT INTO products VALUES (?, ?, ?, ?)", products)
-    conn.executemany("INSERT INTO orders VALUES (?, ?, ?)", orders)
-    conn.commit()
+    db.executemany("INSERT INTO products VALUES (?, ?, ?, ?)", products)
+    db.executemany("INSERT INTO orders VALUES (?, ?, ?)", orders)
+    db.commit()
     ctx.register_table("products", ["sku"])
     ctx.register_table("orders", ["order_id"])
     ctx.create_index("products", ["sku"], name="products_sku_lookup")
@@ -370,12 +390,13 @@ def result_row(
 
 def run_case(
     case: BenchCase,
+    database_url: str,
     read_ops: int,
     write_ops: int,
     mutations_per_branch: int,
     include_join_aggregate: bool,
 ) -> list[dict[str, Any]]:
-    ctx = make_context(case.backend, case.dataset_size)
+    ctx = make_context(case.backend, case.dataset_size, database_url)
     try:
         terminal_branch, create_stats, branch_names = build_depth_chain(
             ctx, case, mutations_per_branch
@@ -531,6 +552,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="Benchmark Janus branch physical backends."
     )
     parser.add_argument("--backends", default="copy,interval,log")
+    parser.add_argument(
+        "--database-url",
+        default=os.environ.get("JANUS_BRANCH_DATABASE_URL", "sqlite:///:memory:"),
+        help=(
+            "SQL database URL for benchmark setup. Defaults to sqlite:///:memory:. "
+            "Set JANUS_BRANCH_DATABASE_URL to use PostgreSQL without changing commands."
+        ),
+    )
     parser.add_argument("--dataset-sizes", type=parse_int_list, default=[100, 1000])
     parser.add_argument("--depths", type=parse_int_list, default=[0, 4, 8])
     parser.add_argument("--read-ops", type=int, default=20)
@@ -587,6 +616,7 @@ def main() -> None:
         "write_ops": write_ops,
         "branch_mutations": branch_mutations,
         "include_join_aggregate": args.include_join_aggregate,
+        "database_url": args.database_url,
     }
     rows: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="janus-branch-bench-"):
@@ -601,6 +631,7 @@ def main() -> None:
                     rows.extend(
                         run_case(
                             case,
+                            args.database_url,
                             read_ops,
                             write_ops,
                             branch_mutations,

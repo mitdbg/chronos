@@ -1,10 +1,9 @@
-# Transactional Agent Runtime
+# Janus
 
-Janus, the Transactional Agent Runtime, gives state-modifying AI agents a
-transaction boundary. Agents can edit files, run commands, update relational
-state, write memory, and use vector storage inside an isolated virtual branch.
-The application can then commit the whole attempt or abort it without leaving
-partial side effects behind.
+Janus gives state-modifying AI agents isolation over the data they touch.
+Agents can edit files, run commands, update relational state, write memory, use
+vector storage, and explore named database branches without leaking partial
+side effects into the shared state.
 
 Janus is built for agent workflows where "try it and see what happens" is useful
 but unsafe without isolation: code editing, debugging, data repair, structured
@@ -18,6 +17,8 @@ memory updates, RAG indexing, and multi-step tool plans.
   the failed part.
 - **Snapshot-style reads:** relational and vector shims use MVCC metadata so a
   transaction sees a stable view plus its own writes.
+- **Long-lived relational branches:** applications can create, check out, query,
+  mutate, diff, and merge named SQL branches.
 - **Zero-copy filesystem branching:** file operations use OverlayFS or
   `fuse-overlayfs` copy-on-write layers.
 - **Agent-facing tools:** LangChain tools expose file editing, bash, memory,
@@ -27,7 +28,10 @@ memory updates, RAG indexing, and multi-step tool plans.
 
 ## Current Scope
 
-The current implementation supports transaction-scoped virtual branches:
+Janus has two related but separate surfaces.
+
+The transaction runtime provides short-lived, transaction-scoped virtual
+branches over stateful tools:
 
 ```text
 begin transaction -> isolated branch
@@ -37,9 +41,16 @@ commit -> merge into real state
 abort  -> discard branch
 ```
 
-Named, long-lived database branches and branch diff/merge are design targets
-described in `docs/bolt-on-branching.md`. They are not exposed as a
-stable API in this package yet.
+The relational branching API provides named, long-lived SQL branches:
+
+```text
+create branch -> checkout branch session -> query/write with SQL
+checkpoint -> read stable historical state
+diff/merge -> compare or apply branch changes
+```
+
+Branch management is Python API driven. User data is still stored and queried
+with SQL through a branch-bound session object.
 
 ## Packages
 
@@ -57,11 +68,14 @@ Framework-independent runtime components:
 
 - `TransactionCoordinator`
 - `ToolShim` interface
+- `JanusBranchContext` and `BranchSession`
 - `OverlayFSShim`
 - `SQLiteShim`
 - `PostgresShim`
 - `SqliteVecShim`
-- transaction handles, snapshots, savepoints, change records, and vote types
+- relational branch backends: `interval`, `log`, and `copy`
+- transaction handles, snapshots, savepoints, branch diffs, change records, and
+  vote types
 
 ### `langchain-janus`
 
@@ -234,6 +248,149 @@ SQLite rows are versioned with Janus metadata columns:
 Reads apply the transaction snapshot visibility predicate. Updates close the
 old version and insert a new version.
 
+## Quickstart: Relational Branching
+
+Use `JanusBranchContext` when you want named, mutable branches over SQL tables.
+The application manages branches with Python APIs, while agents and application
+code continue to issue SQL against logical table names.
+
+```python
+from janus_core.branching import JanusBranchContext
+
+ctx = JanusBranchContext.connect("sqlite:///:memory:", backend="interval")
+conn = ctx.conn
+
+conn.execute(
+    """
+    CREATE TABLE products (
+      sku TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      price INTEGER NOT NULL,
+      stock INTEGER NOT NULL
+    )
+    """
+)
+conn.execute(
+    "INSERT INTO products VALUES ('abc', 'Keyboard', 100, 5)"
+)
+conn.commit()
+
+ctx.register_table("products", primary_key=["sku"])
+ctx.create_index("products", ["sku"], name="products_sku_lookup")
+
+ctx.create_branch("agent_experiment", from_branch="main")
+session = ctx.checkout("agent_experiment")
+
+with session.transaction():
+    session.execute(
+        "UPDATE products SET price = :price WHERE sku = :sku",
+        {"price": 90, "sku": "abc"},
+    )
+    session.execute(
+        """
+        INSERT INTO products (sku, name, price, stock)
+        VALUES (:sku, :name, :price, :stock)
+        """,
+        {"sku": "def", "name": "Mouse", "price": 25, "stock": 10},
+    )
+
+rows = session.query(
+    "SELECT sku, price FROM products ORDER BY sku"
+)
+
+main_rows = ctx.checkout("main").query(
+    "SELECT sku, price FROM products ORDER BY sku"
+)
+
+assert rows == [
+    {"sku": "abc", "price": 90},
+    {"sku": "def", "price": 25},
+]
+assert main_rows == [{"sku": "abc", "price": 100}]
+```
+
+`checkout()` returns a reusable `BranchSession`. Reusing the session is
+important for performance because it caches branch metadata such as interval
+segment bounds or log lineage. Use `session.transaction()` to group several
+writes into one underlying database transaction.
+
+### Branching Multiple Tables
+
+A branch represents the logical state of the registered database tables
+together. Register all application tables that should branch as one coherent
+state:
+
+```python
+ctx.register_table("nodes", primary_key=["node_id"])
+ctx.register_table("edges", primary_key=["edge_id"])
+ctx.register_table("documents", primary_key=["doc_id"])
+```
+
+After registration, SQL uses the logical names:
+
+```python
+graph = ctx.checkout("agent_graph_search")
+
+neighbors = graph.query(
+    """
+    SELECT e.dst_id, n.label
+    FROM edges AS e
+    JOIN nodes AS n ON n.node_id = e.dst_id
+    WHERE e.src_id = :node_id
+    """,
+    {"node_id": "n42"},
+)
+```
+
+The branch layer rewrites logical table references to backend-specific physical
+tables or subqueries before sending SQL to the database.
+
+### Checkpoints, Diff, And Merge
+
+```python
+ctx.create_checkpoint("before_agent_run", branch="agent_experiment")
+
+checkpoint = ctx.checkout_checkpoint("before_agent_run")
+snapshot_rows = checkpoint.query("SELECT * FROM products")
+
+diff = ctx.diff("main", "agent_experiment")
+for change in diff.changes:
+    print(change.table, change.key, change.change)
+
+preview = ctx.merge_preview(source="agent_experiment", target="main")
+ctx.merge_apply(
+    source="agent_experiment",
+    target="main",
+    resolution=preview.resolution,
+)
+```
+
+Checkpoint sessions are read-only. `create_branch_from_checkpoint()` can promote
+a checkpoint into a new mutable branch.
+
+```python
+ctx.create_branch_from_checkpoint(
+    "retry_from_before_agent_run",
+    checkpoint="before_agent_run",
+)
+```
+
+### Branch Backend Choices
+
+`JanusBranchContext.connect(..., backend=...)` supports SQLite and PostgreSQL
+database URLs with three physical branch implementations:
+
+| Backend | How it stores branch state | Read behavior | Write behavior | Good for |
+| --- | --- | --- | --- | --- |
+| `interval` | User rows plus `live_lo`, `live_hi`, and logical delete metadata | Constant-shape visibility predicate using a prepared branch point | Splits overlapping row fragments for the current branch interval | Default branch backend and SQL-heavy reads |
+| `log` | Append-only per-table operation log with branch lineage metadata | Reconstructs latest visible row per key from shared log prefixes | Appends update/insert/delete records | Cheap branch creation and studying log-based designs |
+| `copy` | Full physical table copy per branch/checkpoint | Direct SQL against private branch tables | Direct writes to private branch tables | Correctness baseline and small datasets |
+
+The default recommendation is `backend="interval"`. The `copy` backend is
+simple and useful for validating behavior. The `log` backend avoids copying at
+branch creation but has heavier arbitrary SQL reads because it resolves the
+latest visible operation per key.
+
 ## Quickstart: PostgreSQL Shim
 
 ```python
@@ -296,6 +453,8 @@ for exposing Janus tools to external agents.
 
 ## Backend Semantics
 
+Transaction shims participate in `TransactionCoordinator`:
+
 | Backend | Isolation mechanism | Commit behavior |
 | --- | --- | --- |
 | Filesystem | OverlayFS or `fuse-overlayfs` copy-on-write layer | Copy changed files into the base project |
@@ -307,6 +466,17 @@ for exposing Janus tools to external agents.
 All registered shims participate in the same coordinator commit. If one
 participant votes abort during prepare, the coordinator aborts the transaction.
 
+Relational branch backends are used through `JanusBranchContext`:
+
+| Branch backend | Branch creation | Query path | Storage cost |
+| --- | --- | --- | --- |
+| `interval` | Metadata-only segment split | SQL rewrite plus interval visibility predicate | Stores row fragments only when writes overlap branch intervals |
+| `log` | Metadata-only lineage fork | SQL rewrite to log replay subqueries | Stores append-only operation records |
+| `copy` | Copies every registered table | SQL rewrite to branch-private physical tables | Duplicates registered tables per branch/checkpoint |
+
+These are independent of the transaction shims. A branch session can still use
+the database's normal transaction mechanism through `session.transaction()`.
+
 ## Running Tests
 
 Run fast unit and integration tests that do not require live model calls:
@@ -315,6 +485,7 @@ Run fast unit and integration tests that do not require live model calls:
 PYTHONPATH=packages/janus-core/src:packages/janus-langchain/src:packages/janus-langgraph/src:packages/janus-code/src \
 pytest -q \
   tests/test_adapter_imports.py \
+  tests/test_branching.py \
   tests/test_postgres_shim.py \
   tests/janus_code/unit \
   tests/janus_code/integration \
@@ -361,10 +532,18 @@ pytest -q tests/janus_code/integration/test_cli_live_e2e.py
 - The coordinator is currently an in-process coordinator, not a distributed
   transaction manager.
 - Durable transaction metadata is not yet externalized for multi-process use.
-- The relational shims support row-versioned data, not branch-local schema
-  changes.
-- Named long-lived branches, branch diff, and branch merge are design targets,
-  not stable runtime APIs yet.
+- Branching currently supports shared schema row branching; branch-local schema
+  changes and DDL are not supported.
+- `JanusBranchContext.connect()` currently has SQLite and PostgreSQL database
+  adapters. Additional SQL databases need an adapter implementation.
+- Branch write SQL supports a focused subset: `INSERT ... VALUES`, simple
+  `UPDATE` assignments, and `DELETE`. Branch reads can use richer `SELECT`
+  statements because Janus rewrites table references before execution.
+- The interval backend uses fixed-width integer interval allocation. Very deep
+  single-child chains can exhaust interval space without future relabeling or a
+  wider numeric representation.
+- The log backend can be much slower for arbitrary reads because it resolves
+  branch-visible rows from log lineage at read time.
 - Filesystem isolation requires Linux OverlayFS support or `fuse-overlayfs`.
 - Non-transactional external APIs require compensating actions; generic saga
   support is not production-complete in this package.
@@ -376,7 +555,7 @@ The design documents in `docs/` describe the broader research direction:
 - `Janus-design.md`: architecture and transaction model
 - `Janus-implementation-plan.md`: implementation roadmap
 - `Janus-summary.md`: technical overview
-- `bolt-on-branching.md`: future relational branch/versioning layer
+- `bolt-on-branching.md`: relational branch/versioning layer
 
 ## Development Guidelines
 

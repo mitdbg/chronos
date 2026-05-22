@@ -546,9 +546,9 @@ class _IntervalBackend(_SQLBranchBackend):
               segment_id TEXT PRIMARY KEY,
               parent_segment_id TEXT,
               owner_branch_id TEXT,
-              live_lo INTEGER NOT NULL,
-              live_hi INTEGER NOT NULL,
-              branch_point INTEGER NOT NULL,
+              live_lo BIGINT NOT NULL,
+              live_hi BIGINT NOT NULL,
+              branch_point BIGINT NOT NULL,
               created_at TEXT NOT NULL,
               metadata TEXT NOT NULL,
               CHECK (live_lo < branch_point),
@@ -616,8 +616,8 @@ class _IntervalBackend(_SQLBranchBackend):
             f"""
             CREATE TABLE {_quote(physical)} (
               {user_defs},
-              live_lo INTEGER NOT NULL,
-              live_hi INTEGER NOT NULL,
+              live_lo BIGINT NOT NULL,
+              live_hi BIGINT NOT NULL,
               deleted INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY ({pk_sql}, live_lo),
               CHECK (live_lo < live_hi)
@@ -1211,8 +1211,8 @@ class _LogBackend(_SQLBranchBackend):
             CREATE TABLE IF NOT EXISTS _janus_branch_log_branches (
               branch_id TEXT PRIMARY KEY,
               parent_branch_id TEXT,
-              fork_txn_id INTEGER,
-              head_txn_id INTEGER NOT NULL,
+              fork_txn_id BIGINT,
+              head_txn_id BIGINT NOT NULL,
               created_at TEXT NOT NULL,
               metadata TEXT NOT NULL
             )
@@ -1223,7 +1223,7 @@ class _LogBackend(_SQLBranchBackend):
             CREATE TABLE IF NOT EXISTS _janus_branch_log_checkpoints (
               checkpoint_id TEXT PRIMARY KEY,
               branch_id TEXT NOT NULL,
-              head_txn_id INTEGER NOT NULL,
+              head_txn_id BIGINT NOT NULL,
               created_at TEXT NOT NULL,
               metadata TEXT NOT NULL
             )
@@ -1258,7 +1258,7 @@ class _LogBackend(_SQLBranchBackend):
             f"""
             CREATE TABLE {_quote(physical)} (
               log_id {self.db.auto_increment_primary_key},
-              txn_id INTEGER NOT NULL,
+              txn_id BIGINT NOT NULL,
               branch_id TEXT NOT NULL,
               op TEXT NOT NULL,
               {user_defs}

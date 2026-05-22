@@ -2,6 +2,31 @@
 
 Core Transactional Agent Runtime primitives and framework-independent shims.
 
+## Relational branching
+
+`JanusBranchContext` provides named SQL branches over SQLite or PostgreSQL:
+
+```python
+from janus_core.branching import JanusBranchContext
+
+ctx = JanusBranchContext.connect(
+    "postgresql://postgres:postgres@localhost:5432/janus",
+    backend="interval",
+)
+
+ctx.register_table("products", ["sku"])
+ctx.create_branch("agent_experiment", from_branch="main")
+
+session = ctx.checkout("agent_experiment")
+with session.transaction():
+    session.execute(
+        "UPDATE products SET price = :price WHERE sku = :sku",
+        {"price": 90, "sku": "abc"},
+    )
+```
+
+Supported branch backends are `interval`, `log`, and `copy`.
+
 ## PostgreSQL shim
 
 `PostgresShim` provides the same MVCC-style transactional table interface as
