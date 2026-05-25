@@ -4,17 +4,19 @@ import atexit
 import os
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from chronos_core.branching import (
     BranchAlreadyExistsError,
+    BranchNotFoundError,
     BranchingError,
     DuplicateKeyError,
     TableNotRegisteredError,
     ChronosBranchContext,
-    UnsupportedSQLError,
 )
+from chronos_core.branching.sql_adapters import connect_sql_database
 
 
 BRANCH_BACKENDS = ("copy", "interval", "log")
@@ -315,6 +317,239 @@ def test_create_branch_storage_behavior_for_user_records(ctx: ChronosBranchConte
     else:
         assert before == after
     assert {branch.branch_id for branch in ctx.list_branches()} == {"main", "exp"}
+
+
+def test_postgres_interval_create_branch_locks_parent_before_split(monkeypatch) -> None:
+    ctx = _make_context("postgres", "interval")
+    try:
+        original_execute = ctx.db.execute
+        calls: list[str] = []
+
+        def counted_execute(sql, params=()):
+            calls.append(str(sql))
+            return original_execute(sql, params)
+
+        monkeypatch.setattr(ctx.db, "execute", counted_execute)
+        ctx.create_branch("exp", from_branch="main")
+
+        assert any("FOR UPDATE" in call for call in calls)
+        assert any("current_segment_id = ?" in call for call in calls)
+        assert _product(ctx.checkout("exp"), "abc")["price"] == 10
+        assert _product(ctx.checkout("main"), "abc")["price"] == 10
+    finally:
+        ctx.close()
+
+
+def test_postgres_interval_create_branch_fast_path_preserves_errors() -> None:
+    ctx = _make_context("postgres", "interval")
+    try:
+        with pytest.raises(BranchNotFoundError):
+            ctx.create_branch("orphan", from_branch="missing")
+
+        ctx.create_branch("exp", from_branch="main")
+        with pytest.raises(BranchAlreadyExistsError):
+            ctx.create_branch("exp", from_branch="main")
+    finally:
+        ctx.close()
+
+
+def test_postgres_interval_uses_numeric_32_visibility_columns() -> None:
+    ctx = _make_context("postgres", "interval")
+    try:
+        rows = ctx.db.execute(
+            """
+            SELECT table_name, column_name, data_type, numeric_precision, numeric_scale
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name IN (
+                '_chronos_branch_interval_segments',
+                '_chronos_b_interval_products'
+              )
+              AND column_name IN ('live_lo', 'live_hi', 'branch_point')
+            ORDER BY table_name, column_name
+            """
+        ).fetchall()
+        assert rows
+        for row in rows:
+            assert row["data_type"] == "numeric"
+            assert int(row["numeric_precision"]) == 32
+            assert int(row["numeric_scale"]) == 0
+    finally:
+        ctx.close()
+
+
+def test_postgres_interval_numeric_space_expands_repeated_root_fanout() -> None:
+    ctx = _make_products_only_context("postgres", "interval")
+    try:
+        width = 20
+        for idx in range(width):
+            ctx.create_branch(f"trial_{idx}", from_branch="main")
+
+        branches = {branch.branch_id for branch in ctx.list_branches()}
+        assert len(branches) == width + 1
+        assert "main" in branches
+
+        first = ctx.checkout("trial_0")
+        middle = ctx.checkout("trial_10")
+        last = ctx.checkout("trial_19")
+        last.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 999, "sku": "abc"},
+        )
+
+        assert _product(last, "abc")["price"] == 999
+        assert _product(first, "abc")["price"] == 10
+        assert _product(middle, "abc")["price"] == 10
+        assert _product(ctx.checkout("main"), "abc")["price"] == 10
+
+        row = ctx.db.execute(
+            """
+            SELECT MIN(live_hi - live_lo) AS min_width
+            FROM _chronos_branch_interval_segments
+            """
+        ).fetchone()
+        assert int(row["min_width"]) > 0
+    finally:
+        ctx.close()
+
+
+def test_postgres_interval_concurrent_wide_branch_creation_serializes_parent() -> None:
+    _reset_postgres_schema()
+    root = ChronosBranchContext.connect(
+        _postgres_dsn(),
+        backend="interval",
+        interval_continuation_percent=98,
+    )
+    try:
+        root.db.execute(
+            "CREATE TABLE products (sku TEXT PRIMARY KEY, name TEXT, price INTEGER)"
+        )
+        root.db.execute("INSERT INTO products VALUES (?, ?, ?)", ("abc", "Alpha", 10))
+        root.db.commit()
+        root.register_table("products", ["sku"])
+    finally:
+        root.close()
+
+    def create_child(index: int) -> None:
+        ctx = ChronosBranchContext.connect(
+            _postgres_dsn(),
+            backend="interval",
+            interval_continuation_percent=98,
+        )
+        try:
+            ctx.create_branch(f"trial_{index}", from_branch="main")
+        finally:
+            ctx.close()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(create_child, range(30)))
+
+    ctx = ChronosBranchContext.connect(
+        _postgres_dsn(),
+        backend="interval",
+        interval_continuation_percent=98,
+    )
+    try:
+        assert len(ctx.list_branches()) == 31
+        ctx.checkout("trial_29").execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 29, "sku": "abc"},
+        )
+        assert _product(ctx.checkout("trial_29"), "abc")["price"] == 29
+        assert _product(ctx.checkout("trial_0"), "abc")["price"] == 10
+        assert _product(ctx.checkout("main"), "abc")["price"] == 10
+    finally:
+        ctx.close()
+
+
+def test_interval_split_default_favors_depth_and_can_be_configured_for_width() -> None:
+    default_ctx = _make_products_only_context("sqlite", "interval")
+    try:
+        default_backend = default_ctx._backend  # type: ignore[attr-defined]
+        assert default_backend.continuation_percent == 5
+    finally:
+        default_ctx.close()
+
+    wide_ctx = ChronosBranchContext.connect(
+        "sqlite:///:memory:",
+        backend="interval",
+        interval_continuation_percent=98,
+    )
+    try:
+        wide_ctx.db.execute(
+            "CREATE TABLE products (sku TEXT PRIMARY KEY, name TEXT, price INTEGER)"
+        )
+        wide_ctx.db.execute("INSERT INTO products VALUES (?, ?, ?)", ("abc", "Alpha", 10))
+        wide_ctx.db.commit()
+        wide_ctx.register_table("products", ["sku"])
+        wide_backend = wide_ctx._backend  # type: ignore[attr-defined]
+        assert wide_backend.continuation_percent == 98
+
+        for index in range(30):
+            wide_ctx.create_branch(f"trial_{index}", from_branch="main")
+
+        last = wide_ctx.checkout("trial_29")
+        last.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 29, "sku": "abc"},
+        )
+        assert _product(last, "abc")["price"] == 29
+        assert _product(wide_ctx.checkout("trial_0"), "abc")["price"] == 10
+        assert _product(wide_ctx.checkout("main"), "abc")["price"] == 10
+    finally:
+        wide_ctx.close()
+
+
+def test_interval_split_rejects_invalid_continuation_percent() -> None:
+    with pytest.raises(ValueError):
+        ChronosBranchContext.connect(
+            "sqlite:///:memory:",
+            backend="interval",
+            interval_continuation_percent=0,
+        )
+    with pytest.raises(ValueError):
+        ChronosBranchContext.connect(
+            "sqlite:///:memory:",
+            backend="interval",
+            interval_continuation_percent=100,
+        )
+
+
+def test_postgres_concurrent_metadata_initialization_and_registration() -> None:
+    _reset_postgres_schema()
+    db = connect_sql_database(_postgres_dsn())
+    try:
+        db.execute("CREATE TABLE products (sku TEXT PRIMARY KEY, price INTEGER)")
+        db.execute("INSERT INTO products VALUES (?, ?)", ("abc", 10))
+        db.commit()
+    finally:
+        db.close()
+
+    def register_from_new_context(_: int) -> None:
+        context = ChronosBranchContext.connect(_postgres_dsn(), backend="interval")
+        try:
+            context.register_table("products", ["sku"])
+        finally:
+            context.close()
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(register_from_new_context, range(3)))
+
+    context = ChronosBranchContext.connect(_postgres_dsn(), backend="interval")
+    try:
+        row = context.db.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM _chronos_branch_tables
+            WHERE backend = 'interval' AND table_name = 'products'
+            """
+        ).fetchone()
+        assert int(row["count"]) == 1
+        assert context.checkout("main").query("SELECT sku, price FROM products") == [
+            {"sku": "abc", "price": 10}
+        ]
+    finally:
+        context.close()
 
 
 def test_users_can_add_logical_indexes_to_registered_tables(ctx: ChronosBranchContext) -> None:
@@ -839,7 +1074,7 @@ def test_subquery_driven_update_and_delete_match_branch_view(
     ]
 
 
-def test_noop_update_and_delete_return_zero_and_do_not_fragment_state(
+def test_noop_update_and_delete_return_zero_and_do_not_change_physical_rows(
     ctx: ChronosBranchContext,
 ) -> None:
     ctx.create_branch("noop", from_branch="main")
@@ -1125,10 +1360,29 @@ def test_duplicate_insert_and_duplicate_branch_errors(ctx: ChronosBranchContext)
         ctx.create_branch("exp", from_branch="main")
 
 
-def test_unsupported_write_expression_is_rejected(ctx: ChronosBranchContext) -> None:
+def test_arithmetic_update_expressions_are_branch_local(ctx: ChronosBranchContext) -> None:
     session = ctx.checkout("main")
-    with pytest.raises(UnsupportedSQLError):
-        session.execute("UPDATE products SET price = price + 1 WHERE sku = 'abc'")
+    result = session.execute(
+        """
+        UPDATE products
+        SET price = (price + :delta) * 2 - 5
+        WHERE sku = :sku AND price >= :min_price
+        """,
+        {"delta": 3, "sku": "abc", "min_price": 5},
+    )
+
+    assert result.rowcount == 1
+    assert _product(session, "abc")["price"] == 21
+
+    ctx.create_branch("exp", from_branch="main")
+    exp = ctx.checkout("exp")
+    exp.execute(
+        "UPDATE products SET price = price - :delta WHERE sku = :sku",
+        {"delta": 4, "sku": "abc"},
+    )
+
+    assert _product(exp, "abc")["price"] == 17
+    assert _product(session, "abc")["price"] == 21
 
 
 def test_deep_branch_chain_has_isolated_leaf_state(ctx: ChronosBranchContext) -> None:
@@ -1153,6 +1407,28 @@ def test_deep_branch_chain_has_isolated_leaf_state(ctx: ChronosBranchContext) ->
     ) == [{"score": 1}]
 
 
+def test_interval_backend_supports_deep_spine_beyond_midpoint_limit(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    parent = "main"
+    for index in range(100):
+        child = f"deep_{index}"
+        ctx.create_branch(child, from_branch=parent)
+        if index in {0, 62, 99}:
+            ctx.checkout(child).execute(
+                "UPDATE products SET price = :price WHERE sku = :sku",
+                {"price": index + 100, "sku": "abc"},
+            )
+        parent = child
+
+    assert _product(ctx.checkout("deep_99"), "abc")["price"] == 199
+    assert _product(ctx.checkout("deep_62"), "abc")["price"] == 162
+    assert _product(ctx.checkout("deep_0"), "abc")["price"] == 100
+    assert _product(ctx.checkout("main"), "abc")["price"] == 10
+    ctx.close()
+
+
 def test_parent_writes_after_child_fork_do_not_leak_to_child(
     ctx: ChronosBranchContext,
 ) -> None:
@@ -1169,7 +1445,7 @@ def test_parent_writes_after_child_fork_do_not_leak_to_child(
     assert _product(main, "abc")["price"] == 99
 
 
-def test_interval_backend_splices_fragments_without_copying_whole_table(
+def test_interval_backend_splices_physical_rows_without_copying_whole_table(
     sql_backend: str,
 ) -> None:
     ctx = _make_products_only_context(sql_backend, "interval")
@@ -1182,7 +1458,7 @@ def test_interval_backend_splices_fragments_without_copying_whole_table(
         {"price": 15, "sku": "abc"},
     )
 
-    fragments = ctx.db.execute(
+    physical_rows = ctx.db.execute(
         """
         SELECT sku, price, live_lo, live_hi, deleted
         FROM _chronos_b_interval_products
@@ -1190,9 +1466,9 @@ def test_interval_backend_splices_fragments_without_copying_whole_table(
         ORDER BY live_lo
         """
     ).fetchall()
-    assert len(fragments) == 3
-    assert [row["price"] for row in fragments] == [10, 15, 10]
-    assert all(not row["deleted"] for row in fragments)
+    assert len(physical_rows) == 3
+    assert [row["price"] for row in physical_rows] == [10, 15, 10]
+    assert all(not row["deleted"] for row in physical_rows)
     assert _physical_change_count(ctx, "products") == 4
     ctx.close()
 
@@ -1228,6 +1504,264 @@ def test_interval_session_reuses_prepared_segment_metadata(sql_backend: str) -> 
     ]
 
     assert metadata_reads == 0
+    ctx.close()
+
+
+def test_interval_checkout_uses_current_ref_without_extra_branch_lookup(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    ctx.create_branch("exp", from_branch="main")
+    metadata_reads = {"branch": 0, "segment": 0}
+    original_execute = ctx.db.execute
+
+    def counting_execute(sql, params=()):
+        normalized = " ".join(str(sql).split())
+        if (
+            "_chronos_branch_interval_branches" in normalized
+            and normalized.upper().startswith("SELECT")
+        ):
+            metadata_reads["branch"] += 1
+        if (
+            "_chronos_branch_interval_segments" in normalized
+            and normalized.upper().startswith("SELECT")
+        ):
+            metadata_reads["segment"] += 1
+        return original_execute(sql, params)
+
+    ctx.db.execute = counting_execute  # type: ignore[method-assign]
+    session = ctx.checkout("exp")
+
+    assert metadata_reads == {"branch": 1, "segment": 1}
+    assert _product(session, "abc")["price"] == 10
+    ctx.close()
+
+
+def test_interval_stale_session_refreshes_to_latest_segment_after_branching(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    main = ctx.checkout("main")
+    ctx.create_branch("child", from_branch="main")
+
+    main.execute(
+        "UPDATE products SET price = :price WHERE sku = :sku",
+        {"price": 55, "sku": "abc"},
+    )
+
+    assert _product(main, "abc")["price"] == 55
+    assert _product(ctx.checkout("child"), "abc")["price"] == 10
+    ctx.close()
+
+
+def test_interval_session_caches_repeated_statement_parses(
+    sql_backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    ctx.create_branch("exp", from_branch="main")
+    session = ctx.checkout("exp")
+
+    import chronos_core.branching._runtime as runtime
+
+    parse_calls = 0
+    original_parse_one = runtime.sqlglot.parse_one
+
+    def counting_parse_one(*args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_parse_one(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.sqlglot, "parse_one", counting_parse_one)
+    for price in range(5):
+        session.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": price + 30, "sku": "abc"},
+        )
+
+    assert parse_calls == 1
+    assert _product(session, "abc")["price"] == 34
+    ctx.close()
+
+
+def test_interval_multi_row_insert_batches_direct_physical_rows(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    ctx.create_branch("exp", from_branch="main")
+    session = ctx.checkout("exp")
+    executemany_calls = 0
+    physical_insert_executes = 0
+    original_execute = ctx.db.execute
+    original_executemany = ctx.db.executemany
+
+    def counting_execute(sql, params=()):
+        nonlocal physical_insert_executes
+        if (
+            sql.lstrip().upper().startswith("INSERT INTO")
+            and "_chronos_b_interval_products" in sql
+        ):
+            physical_insert_executes += 1
+        return original_execute(sql, params)
+
+    def counting_executemany(sql, params):
+        nonlocal executemany_calls
+        if "_chronos_b_interval_products" in sql:
+            executemany_calls += 1
+        return original_executemany(sql, params)
+
+    ctx.db.execute = counting_execute  # type: ignore[method-assign]
+    ctx.db.executemany = counting_executemany  # type: ignore[method-assign]
+    result = session.execute(
+        """
+        INSERT INTO products (sku, name, price)
+        VALUES ('ghi', 'Gamma', 30), ('jkl', 'Juliet', 40)
+        """
+    )
+
+    assert result.rowcount == 2
+    assert executemany_calls == 1
+    assert physical_insert_executes == 0
+    assert session.query("SELECT sku, name, price FROM products WHERE sku >= 'ghi' ORDER BY sku") == [
+        {"sku": "ghi", "name": "Gamma", "price": 30},
+        {"sku": "jkl", "name": "Juliet", "price": 40},
+    ]
+    assert ctx.checkout("main").query("SELECT sku FROM products WHERE sku = 'ghi'") == []
+    ctx.close()
+
+
+def test_interval_multi_row_insert_duplicate_detection(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    ctx.create_branch("exp", from_branch="main")
+    session = ctx.checkout("exp")
+
+    with pytest.raises(DuplicateKeyError):
+        session.execute(
+            """
+            INSERT INTO products (sku, name, price)
+            VALUES ('abc', 'Again', 99), ('ghi', 'Gamma', 30)
+            """
+        )
+    with pytest.raises(DuplicateKeyError):
+        session.execute(
+            """
+            INSERT INTO products (sku, name, price)
+            VALUES ('dup', 'First', 30), ('dup', 'Second', 40)
+            """
+        )
+    assert session.query("SELECT sku FROM products WHERE sku IN ('ghi', 'dup')") == []
+    ctx.close()
+
+
+def test_interval_multi_row_insert_splices_deleted_keys_and_batches_new_keys(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    ctx.create_branch("exp", from_branch="main")
+    session = ctx.checkout("exp")
+    session.execute("DELETE FROM products WHERE sku = 'abc'")
+
+    result = session.execute(
+        """
+        INSERT INTO products (sku, name, price)
+        VALUES ('abc', 'Alpha Reloaded', 15), ('ghi', 'Gamma', 30)
+        """
+    )
+
+    assert result.rowcount == 2
+    assert session.query(
+        "SELECT sku, name, price FROM products WHERE sku IN ('abc', 'ghi') ORDER BY sku"
+    ) == [
+        {"sku": "abc", "name": "Alpha Reloaded", "price": 15},
+        {"sku": "ghi", "name": "Gamma", "price": 30},
+    ]
+    assert _product(ctx.checkout("main"), "abc")["price"] == 10
+    ctx.close()
+
+
+def test_interval_update_fetches_matching_rows_in_batch(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    ctx.create_branch("exp", from_branch="main")
+    session = ctx.checkout("exp")
+    visible_row_selects = 0
+    original_execute = ctx.db.execute
+
+    def counting_execute(sql, params=()):
+        nonlocal visible_row_selects
+        normalized = " ".join(sql.split())
+        if (
+            normalized.upper().startswith("SELECT")
+            and "_chronos_b_interval_products" in normalized
+            and "AND ? < live_hi" in normalized
+            and "deleted = 0" in normalized
+        ):
+            visible_row_selects += 1
+        return original_execute(sql, params)
+
+    ctx.db.execute = counting_execute  # type: ignore[method-assign]
+    result = session.execute(
+        "UPDATE products SET price = :price WHERE price >= :min_price",
+        {"price": 77, "min_price": 10},
+    )
+
+    assert result.rowcount == 2
+    assert visible_row_selects == 0
+    assert session.query("SELECT sku, price FROM products ORDER BY sku") == [
+        {"sku": "abc", "price": 77},
+        {"sku": "def", "price": 77},
+    ]
+    assert ctx.checkout("main").query("SELECT sku, price FROM products ORDER BY sku") == [
+        {"sku": "abc", "price": 10},
+        {"sku": "def", "price": 20},
+    ]
+    ctx.close()
+
+
+def test_context_autocommit_false_leaves_logical_write_uncommitted(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    ctx.autocommit = False
+    session = ctx.checkout("main")
+
+    session.execute(
+        "UPDATE products SET price = :price WHERE sku = :sku",
+        {"price": 44, "sku": "abc"},
+    )
+
+    assert ctx.db.in_transaction
+    assert _product(session, "abc")["price"] == 44
+    ctx.db.rollback()
+    assert _product(session, "abc")["price"] == 10
+    ctx.close()
+
+
+def test_interval_autocommit_rolls_back_failed_logical_write(
+    sql_backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    ctx.create_branch("exp", from_branch="main")
+    session = ctx.checkout("exp")
+    backend = ctx._backend  # type: ignore[attr-defined]
+    original_insert_physical_row = backend._insert_physical_row
+    insert_calls = 0
+
+    def failing_insert_physical_row(*args, **kwargs):
+        nonlocal insert_calls
+        insert_calls += 1
+        if insert_calls > 1:
+            raise RuntimeError("injected failure after partial interval splice")
+        return original_insert_physical_row(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "_insert_physical_row", failing_insert_physical_row)
+
+    with pytest.raises(RuntimeError):
+        session.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 44, "sku": "abc"},
+        )
+
+    assert session.query("SELECT sku, price FROM products ORDER BY sku") == [
+        {"sku": "abc", "price": 10},
+        {"sku": "def", "price": 20},
+    ]
     ctx.close()
 
 

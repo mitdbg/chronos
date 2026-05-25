@@ -45,11 +45,11 @@ The primary storage model is **write-time interval maintenance**. The system mai
 
 - Table schema changes are not supported in the first version. The base design branches row contents under a shared schema.
 - Fixed-width interval spaces require sparse allocation, relabeling, or explicit depth limits.
-- Hot keys can accumulate many interval fragments.
+- Hot keys can accumulate many physical rows.
 - Multi-row writes evaluate the current branch view first, then splice matched keys.
 - Branch-local DDL is outside the first version.
 - The log-table backend needs a current-state projection for consistently fast arbitrary SQL reads.
-- Long-lived branches require retaining historical log records or interval fragments until all dependent branches, checkpoints, and retention policies release them.
+- Long-lived branches require retaining historical log records or interval physical rows until all dependent branches, checkpoints, and retention policies release them.
 
 ## User-Facing API
 
@@ -550,7 +550,7 @@ WHERE sku = 'abc';
 
 The system splices the current segment's interval into the live interval map for `sku = 'abc'`.
 
-Find and lock overlapping fragments:
+Find and lock overlapping physical rows:
 
 ```sql
 SELECT *
@@ -561,10 +561,10 @@ WHERE sku = 'abc'
 FOR UPDATE;
 ```
 
-For each overlapping fragment:
+For each overlapping physical row:
 
 ```text
-old fragment:  [a, b)
+old physical row:  [a, b)
 write scope:   [u_lo, u_hi)
 overlap:       [max(a,u_lo), min(b,u_hi))
 
@@ -799,10 +799,10 @@ point read:        indexed branch-point predicate
 scan:              branch-point predicate over live intervals
 keyed update:      overlap lookup plus interval splice
 delete:            splice with tombstone replacement
-storage growth:    interval fragments for changed keys
+storage growth:    interval physical rows for changed keys
 ```
 
-With leaf-scoped writes, a keyed update normally overlaps one live fragment for that key. The expensive case is a heavily fragmented hot key or an administrative rewrite over a broad interval.
+With leaf-scoped writes, a keyed update normally overlaps one live physical row for that key. The expensive case is a hot key with many physical rows or an administrative rewrite over a broad interval.
 
 Branch creation does not copy user rows. Storage grows when data changes, not when branches are created.
 

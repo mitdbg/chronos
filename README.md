@@ -382,7 +382,7 @@ database URLs with three physical branch implementations:
 
 | Backend | How it stores branch state | Read behavior | Write behavior | Good for |
 | --- | --- | --- | --- | --- |
-| `interval` | User rows plus `live_lo`, `live_hi`, and logical delete metadata | Constant-shape visibility predicate using a prepared branch point | Splits overlapping row fragments for the current branch interval | Default branch backend and SQL-heavy reads |
+| `interval` | User rows plus `live_lo`, `live_hi`, and logical delete metadata | Constant-shape visibility predicate using a prepared branch point | Splits overlapping physical rows for the current branch interval | Default branch backend and SQL-heavy reads |
 | `log` | Append-only per-table operation log with branch lineage metadata | Reconstructs latest visible row per key from shared log prefixes | Appends update/insert/delete records | Cheap branch creation and studying log-based designs |
 | `copy` | Full physical table copy per branch/checkpoint | Direct SQL against private branch tables | Direct writes to private branch tables | Correctness baseline and small datasets |
 
@@ -470,7 +470,7 @@ Relational branch backends are used through `ChronosBranchContext`:
 
 | Branch backend | Branch creation | Query path | Storage cost |
 | --- | --- | --- | --- |
-| `interval` | Metadata-only segment split | SQL rewrite plus interval visibility predicate | Stores row fragments only when writes overlap branch intervals |
+| `interval` | Metadata-only segment split | SQL rewrite plus interval visibility predicate | Stores extra physical rows only when writes overlap branch intervals |
 | `log` | Metadata-only lineage fork | SQL rewrite to log replay subqueries | Stores append-only operation records |
 | `copy` | Copies every registered table | SQL rewrite to branch-private physical tables | Duplicates registered tables per branch/checkpoint |
 
