@@ -3,7 +3,9 @@ from __future__ import annotations
 from chronos_core.branching._common import *
 from chronos_core.branching._copy_backend import _CopyBackend
 from chronos_core.branching._interval_backend import _IntervalBackend
+from chronos_core.branching._litetree_backend import _LiteTreeBackend
 from chronos_core.branching._log_backend import _LogBackend
+from chronos_core.branching._orpheus_backend import _OrpheusBackend
 
 class BranchSession:
     """Checked-out branch handle used by agents and applications.
@@ -21,6 +23,12 @@ class BranchSession:
     @property
     def branch_id(self) -> str:
         return self._ref.branch_id
+
+    @property
+    def current_ref(self) -> str:
+        """Stable backend reference captured by this checkout."""
+
+        return self._ref.ref
 
     def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         self._ensure_fresh()
@@ -58,8 +66,10 @@ class BranchSession:
 
         root = self._transaction_depth == 0
         if root:
+            self._ensure_fresh()
             if self._context._db.in_transaction:
                 self._context._db.commit()
+            self._context._backend.prepare_transaction(self._ref)
             self._context._db.begin()
         self._transaction_depth += 1
         try:
@@ -76,6 +86,38 @@ class BranchSession:
 
     def branch_info(self) -> BranchInfo:
         return self._context.get_branch(self.branch_id)
+
+    def upsert_rows(self, table: str, rows: list[dict[str, Any]]) -> ExecuteResult:
+        self._ensure_fresh()
+        if self._ref.readonly:
+            raise BranchingError("checkpoint sessions are read-only")
+        try:
+            self._context._backend.upsert_rows(self.branch_id, table, rows)
+            self._ref = self._context._backend.refresh_ref_after_execute(self._ref)
+            self._context._stamp_prepared_ref(self._ref)
+        except Exception:
+            if self._transaction_depth == 0:
+                self._context._rollback_autocommit()
+            raise
+        if self._transaction_depth == 0:
+            self._context._commit_autocommit()
+        return ExecuteResult(len(rows))
+
+    def delete_keys(self, table: str, keys: list[dict[str, Any]]) -> ExecuteResult:
+        self._ensure_fresh()
+        if self._ref.readonly:
+            raise BranchingError("checkpoint sessions are read-only")
+        try:
+            self._context._backend.delete_keys(self.branch_id, table, keys)
+            self._ref = self._context._backend.refresh_ref_after_execute(self._ref)
+            self._context._stamp_prepared_ref(self._ref)
+        except Exception:
+            if self._transaction_depth == 0:
+                self._context._rollback_autocommit()
+            raise
+        if self._transaction_depth == 0:
+            self._context._commit_autocommit()
+        return ExecuteResult(len(keys))
 
     def _ensure_fresh(self) -> None:
         if self._ref.readonly:
@@ -115,7 +157,23 @@ class ChronosBranchContext:
         ensure_metadata: bool = True,
     ) -> ChronosBranchContext:
         db = connect_sql_database(database_url)
+        return cls.from_database_adapter(
+            db,
+            backend=backend,
+            autocommit=autocommit,
+            interval_continuation_percent=interval_continuation_percent,
+            ensure_metadata=ensure_metadata,
+        )
 
+    @classmethod
+    def from_database_adapter(
+        cls,
+        db: SQLDatabaseAdapter,
+        backend: BranchBackendName = "interval",
+        autocommit: bool = True,
+        interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
+        ensure_metadata: bool = True,
+    ) -> ChronosBranchContext:
         def build_backend() -> _SQLBranchBackend:
             if backend == "interval":
                 return _IntervalBackend(
@@ -126,6 +184,10 @@ class ChronosBranchContext:
                 return _LogBackend(db)
             if backend == "copy":
                 return _CopyBackend(db)
+            if backend == "orpheus":
+                return _OrpheusBackend(db)
+            if backend == "litetree":
+                return _LiteTreeBackend(db)
             raise ValueError(f"unknown branch backend: {backend}")
 
         if ensure_metadata:
@@ -188,14 +250,31 @@ class ChronosBranchContext:
     def list_indexes(self, table: str | None = None) -> list[IndexInfo]:
         return self._backend.list_indexes(table)
 
-    def create_branch(self, branch_id: str, from_branch: str = "main") -> None:
+    def create_branch(
+        self,
+        branch_id: str,
+        from_branch: str = "main",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         try:
-            self._backend.create_branch(branch_id, from_branch)
+            self._backend.create_branch(branch_id, from_branch, metadata)
         except Exception:
             self._rollback_autocommit()
             raise
         self._commit_autocommit()
         self._metadata_epoch += 1
+
+    def update_branch_metadata(
+        self, branch_id: str, metadata: dict[str, Any]
+    ) -> BranchInfo:
+        try:
+            info = self._backend.update_branch_metadata(branch_id, metadata)
+        except Exception:
+            self._rollback_autocommit()
+            raise
+        self._commit_autocommit()
+        self._metadata_epoch += 1
+        return info
 
     def create_branch_from_checkpoint(self, branch_id: str, checkpoint: str) -> None:
         try:
@@ -234,15 +313,30 @@ class ChronosBranchContext:
             self._prepare_ref(self._backend.checkout_checkpoint(checkpoint)),
         )
 
-    def create_checkpoint(self, checkpoint: str, branch: str = "main") -> CheckpointInfo:
+    def create_checkpoint(
+        self,
+        checkpoint: str,
+        branch: str = "main",
+        metadata: dict[str, Any] | None = None,
+    ) -> CheckpointInfo:
         try:
-            info = self._backend.create_checkpoint(checkpoint, branch)
+            info = self._backend.create_checkpoint(checkpoint, branch, metadata)
         except Exception:
             self._rollback_autocommit()
             raise
         self._commit_autocommit()
         self._metadata_epoch += 1
         return info
+
+    def get_checkpoint(self, checkpoint: str) -> CheckpointInfo:
+        return self._backend.get_checkpoint(checkpoint)
+
+    def list_checkpoints(
+        self,
+        branch: str | None = None,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[CheckpointInfo]:
+        return self._backend.list_checkpoints(branch, metadata_filter)
 
     def _commit_autocommit(self) -> None:
         if self._autocommit:

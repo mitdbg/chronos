@@ -24,12 +24,14 @@ from chronos_core.branching import ChronosBranchContext
 from chronos_core.branching.sql_adapters import SQLDatabaseAdapter, connect_sql_database
 
 
-BACKENDS = ("copy", "interval", "log", "doltgres")
-COPY_MAX_BRANCH_SPAN = 8
+BACKENDS = ("copy", "interval", "log", "orpheus", "litetree", "doltgres")
+COPY_MAX_BRANCH_SPAN = 32
 BACKEND_LABELS = {
     "copy": "copy",
     "interval": "chronos",
     "log": "log",
+    "orpheus": "orpheusdb",
+    "litetree": "sqlite-branch",
     "doltgres": "doltgres",
 }
 METRICS = (
@@ -303,6 +305,9 @@ def make_context(
         ctx = DoltgresBranchContext.connect(database_url)
         db = ctx.db
     else:
+        if backend == "litetree" and database_url == "sqlite:///:memory:":
+            path = tempfile.mktemp(prefix="chronos-litetree-bench-", suffix=".db")
+            database_url = f"file:{path}?branches=on"
         ctx = ChronosBranchContext.connect(
             database_url,
             backend=backend,
@@ -315,8 +320,9 @@ def make_context(
                 SELECT tablename
                 FROM pg_tables
                 WHERE schemaname = 'public'
-                  AND (tablename IN ('products', 'orders') OR tablename LIKE '_chronos%')
-                """
+                  AND (tablename IN ('products', 'orders') OR tablename LIKE ?)
+                """,
+                ("_chronos%",),
             ).fetchall()
             for row in rows:
                 db.drop_table(row["tablename"])
@@ -999,6 +1005,8 @@ def write_metric_plot(
         "copy": "#16a34a",
         "interval": "#2563eb",
         "log": "#dc2626",
+        "orpheus": "#ea580c",
+        "litetree": "#0891b2",
         "doltgres": "#7c3aed",
     }
     for backend_idx, backend in enumerate(backends):
@@ -1009,7 +1017,7 @@ def write_metric_plot(
             y_values,
             width=width,
             label=BACKEND_LABELS.get(backend, backend),
-            color=colors[backend],
+            color=colors.get(backend, "#525252"),
         )
     title_prefix = f"{prefix.title()} " if prefix else ""
     ax.set_title(f"{title_prefix}{metric.replace('_', ' ').title()}")
@@ -1043,6 +1051,8 @@ def write_summary_plot(
         "copy": "#16a34a",
         "interval": "#2563eb",
         "log": "#dc2626",
+        "orpheus": "#ea580c",
+        "litetree": "#0891b2",
         "doltgres": "#7c3aed",
     }
     for backend_idx, backend in enumerate(backends):
@@ -1056,7 +1066,7 @@ def write_summary_plot(
             y_values,
             width=width,
             label=BACKEND_LABELS.get(backend, backend),
-            color=colors[backend],
+            color=colors.get(backend, "#525252"),
         )
     title_prefix = f"{prefix.title()} " if prefix else ""
     ax.set_title(f"{title_prefix}Backend Comparison Summary")
