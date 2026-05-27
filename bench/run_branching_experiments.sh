@@ -94,16 +94,16 @@ case "${MODE}" in
 esac
 
 DEFAULT_ARGS=(
-  --dataset-sizes 1000000
+  --dataset-sizes 100000
   --depths 1,4,8,16,32
   --widths 1,4,8,16
   --benchmark-shapes depth,width
-  --read-ops 1000
+  --read-ops 500
   --range-read-ops 100
-  --write-ops 1000
+  --write-ops 500
   --warmup-ops 200
   --post-branch-warmup auto
-  --branch-mutations 500
+  --branch-mutations 1
 )
 
 EXTRA_ARGS=("$@")
