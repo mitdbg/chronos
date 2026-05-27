@@ -14,7 +14,7 @@ from sqlglot import exp
 
 from chronos_core.branching.sql_adapters import SQLDatabaseAdapter, connect_sql_database
 
-BranchBackendName = Literal["interval", "log", "copy"]
+BranchBackendName = Literal["interval", "log", "copy", "orpheus", "litetree"]
 
 # Interval backends assign branches/subtrees numeric visibility ranges. SQLite
 # is limited to signed 64-bit integers. PostgreSQL can use exact NUMERIC
@@ -222,6 +222,19 @@ def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
+def _quote_table_name(table: str) -> str:
+    """Quote a logical table name, preserving schema qualification."""
+
+    return ".".join(_quote(part) for part in table.split("."))
+
+
+def _table_key(table: exp.Table) -> str:
+    """Return the registry key for a parsed SQL table expression."""
+
+    parts = [part for part in (table.catalog, table.db, table.name) if part]
+    return ".".join(parts)
+
+
 def _placeholders(count: int) -> str:
     return ", ".join("?" for _ in range(count))
 
@@ -234,6 +247,12 @@ def _identifier_token(value: str) -> str:
     token = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_") or "value"
     digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
     return f"{token[:48]}_{digest}"
+
+
+def _physical_table_suffix(table: str) -> str:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+        return table
+    return _identifier_token(table)
 
 
 def _table_defs(db: SQLDatabaseAdapter, table: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -360,6 +379,8 @@ def _expr_value(
         return -value
     if isinstance(node, exp.Paren):
         return _expr_value(node.this, params, row)
+    if isinstance(node, exp.Cast):
+        return _expr_value(node.this, params, row)
     if isinstance(node, exp.Add):
         return _expr_value(node.this, params, row) + _expr_value(node.expression, params, row)
     if isinstance(node, exp.Sub):
@@ -391,10 +412,11 @@ def _rewrite_tree_tables(
     """
 
     def replace(node: exp.Expression) -> exp.Expression:
-        if isinstance(node, exp.Table) and node.name in replacements:
+        if isinstance(node, exp.Table) and _table_key(node) in replacements:
             alias = node.args.get("alias")
-            replacement = replacements[node.name]
-            if replacement.lstrip().upper().startswith("SELECT"):
+            replacement = replacements[_table_key(node)]
+            replacement_sql = replacement.lstrip().upper()
+            if replacement_sql.startswith("SELECT") or replacement_sql.startswith("WITH"):
                 parsed = sqlglot.parse_one(replacement, read=dialect)
                 return exp.Subquery(this=parsed, alias=alias)
             table = exp.Table(this=exp.to_identifier(replacement, quoted=True))
@@ -410,14 +432,14 @@ def _target_table(tree: exp.Expression) -> str:
     table = next(tree.find_all(exp.Table), None)
     if table is None:
         raise UnsupportedSQLError("statement does not target a table")
-    return table.name
+    return _table_key(table)
 
 
 def _build_insert_plan(tree: exp.Insert) -> _InsertPlan:
     schema = tree.this
     if not isinstance(schema, exp.Schema) or not isinstance(schema.this, exp.Table):
         raise UnsupportedSQLError("INSERT must specify a table and column list")
-    table = schema.this.name
+    table = _table_key(schema.this)
     columns = _insert_columns(tree)
     values = tree.expression
     if not isinstance(values, exp.Values):
@@ -545,7 +567,12 @@ class _SQLBranchBackend:
     def register_table(self, table: str, primary_key: list[str]) -> None:
         raise NotImplementedError
 
-    def create_branch(self, branch_id: str, from_branch: str) -> None:
+    def create_branch(
+        self, branch_id: str, from_branch: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        raise NotImplementedError
+
+    def update_branch_metadata(self, branch_id: str, metadata: dict[str, Any]) -> BranchInfo:
         raise NotImplementedError
 
     def create_branch_from_checkpoint(self, branch_id: str, checkpoint: str) -> None:
@@ -560,7 +587,19 @@ class _SQLBranchBackend:
     def get_branch(self, branch_id: str) -> BranchInfo:
         raise NotImplementedError
 
-    def create_checkpoint(self, checkpoint: str, branch: str) -> CheckpointInfo:
+    def create_checkpoint(
+        self, checkpoint: str, branch: str, metadata: dict[str, Any] | None = None
+    ) -> CheckpointInfo:
+        raise NotImplementedError
+
+    def get_checkpoint(self, checkpoint: str) -> CheckpointInfo:
+        raise NotImplementedError
+
+    def list_checkpoints(
+        self,
+        branch: str | None = None,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[CheckpointInfo]:
         raise NotImplementedError
 
     def checkout_checkpoint(self, checkpoint: str) -> _BranchRef:
@@ -576,6 +615,11 @@ class _SQLBranchBackend:
 
         return ref
 
+    def prepare_transaction(self, ref: _PreparedBranchRef) -> None:
+        """Hook for backends that must select branch state before BEGIN."""
+
+        return None
+
     def query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         raise NotImplementedError
 
@@ -590,6 +634,18 @@ class _SQLBranchBackend:
 
     def delete_key(self, branch_id: str, table: str, key: dict[str, Any]) -> None:
         raise NotImplementedError
+
+    def upsert_rows(
+        self, branch_id: str, table: str, rows: list[dict[str, Any]]
+    ) -> None:
+        for row in rows:
+            self.upsert_row(branch_id, table, row)
+
+    def delete_keys(
+        self, branch_id: str, table: str, keys: list[dict[str, Any]]
+    ) -> None:
+        for key in keys:
+            self.delete_key(branch_id, table, key)
 
     def create_index(
         self, table: str, columns: list[str], name: str | None = None

@@ -18,14 +18,28 @@ WHERE sku = 'abc';
 
 A checked-out branch determines which physical rows are visible to a branch-bound session across the database. A normal database `COMMIT` publishes changes to the current branch. There is no branch commit required for each transaction.
 
-The design uses interval-encoded branch segments. Each internal segment owns a range. A checked-out branch has a point inside its current segment. Branch visibility is tested with a constant-shape predicate:
+The interval backend can be understood with one number-line model:
+
+- each branch owns one `branch_point` in an integer space
+- each physical row version owns a visibility interval `[live_lo, live_hi)`
+- the same physical row version can be shared by many branches
+- a branch sees a row version when its `branch_point` falls inside that row's interval
+
+Branch visibility is tested with a constant-shape predicate:
 
 ```sql
 live_lo <= current_branch_point()
 AND current_branch_point() < live_hi
+AND deleted = false
 ```
 
-The primary storage model is **write-time interval maintenance**. The system maintains non-overlapping live intervals per logical key, so branch reads are predicate-based and SQL predicates can be evaluated against a normal-looking branch view efficiently.
+Chronos adds this predicate to every user query over a registered logical table.
+
+The primary storage model is **write-time interval maintenance**. Branch creation
+only partitions interval metadata; it does not copy user rows. Writes preserve
+correctness by splitting physical row intervals, so reads stay predicate-based
+and SQL predicates can be evaluated against a normal-looking branch view
+efficiently.
 
 ## Goals
 
@@ -49,7 +63,7 @@ The primary storage model is **write-time interval maintenance**. The system mai
 - Multi-row writes evaluate the current branch view first, then splice matched keys.
 - Branch-local DDL is outside the first version.
 - The log-table backend needs a current-state projection for consistently fast arbitrary SQL reads.
-- Long-lived branches require retaining historical log records or interval physical rows until all dependent branches, checkpoints, and retention policies release them.
+- Long-lived branches require retaining historical log records or physical rows until all dependent branches, checkpoints, and retention policies release them.
 
 ## User-Facing API
 
@@ -364,9 +378,18 @@ Users create, check out, mutate, and compare branches.
 
 ### Segment
 
-A segment is an internal stable inheritance scope. Segments preserve fork boundaries while allowing user branches to remain mutable.
+A segment is the part of the integer space currently managed by a branch. The
+branch's `branch_point` is an interior point of that segment, and all registered
+tables use that point for visibility checks.
 
-When a branch is forked, the source branch keeps its name but moves to a new continuation segment:
+When a branch is forked, Chronos recursively partitions the source branch's
+current segment into two new segments:
+
+- one continuation segment for the source branch
+- one initial segment for the new child branch
+
+This is not allocation from a global append-only counter. Each fork splits the
+parent branch's current interval.
 
 ```text
 Before:
@@ -386,7 +409,9 @@ Future writes to `x` go to `x_s2`. Future writes to `y` go to `y_s1`. Both branc
 
 ### Interval Encoding
 
-Each segment receives a range and a branch point:
+Each segment receives a range and a branch point. The branch point is not the
+split point; it is a stable point inside the segment used to evaluate row
+visibility.
 
 ```text
 segment  interval          point
@@ -402,7 +427,17 @@ Child intervals are nested inside parent intervals:
 parent_lo < child_lo < child_hi <= parent_hi
 ```
 
-A row range that contains the branch point is visible on that branch.
+A physical row version is visible on a branch when the row's interval contains
+that branch's point:
+
+```text
+row.live_lo <= branch.branch_point < row.live_hi
+AND row.deleted = false
+```
+
+This keeps reads independent of branch depth. A read does not walk from a branch
+to its parent, then grandparent, and so on. It evaluates one point against row
+intervals.
 
 ## Metadata Tables
 
@@ -434,7 +469,9 @@ CREATE TABLE segments (
 
 ## Branched User Tables
 
-For each logical table, the system stores branch-visible live intervals.
+For each logical table, the system stores physical row versions with
+branch-visible live intervals. A single logical row can therefore have multiple
+physical rows, each visible to a different region of branch space.
 
 Logical table:
 
@@ -461,13 +498,20 @@ CREATE TABLE products_b (
 );
 ```
 
-The invariant is:
+The key invariant is:
 
 ```text
-For each logical primary key, live intervals do not overlap.
+For a given logical key K and branch b, there is at most one physical row r
+such that:
+
+  r.key = K
+  r.live_lo <= b.branch_point < r.live_hi
+  r.deleted = false
 ```
 
-This invariant gives each branch point at most one visible physical row per logical key.
+In other words, a branch point sees at most one live physical row per logical
+key. This is the property that makes the branch-visible relation behave like an
+ordinary SQL table.
 
 Deletes are tombstones:
 
@@ -488,6 +532,10 @@ current_segment_lo()
 current_segment_hi()
 ```
 
+The read path is a **predicate rewrite layer**. User SQL refers to logical table
+names. Chronos rewrites those table references to physical interval tables plus
+the branch visibility predicate.
+
 Logical point lookup:
 
 ```sql
@@ -496,7 +544,7 @@ FROM products
 WHERE sku = 'abc';
 ```
 
-Physical predicate:
+Rewritten physical query:
 
 ```sql
 SELECT sku, name, price
@@ -515,7 +563,7 @@ FROM products
 WHERE price > 100;
 ```
 
-Physical predicate:
+Rewritten physical query:
 
 ```sql
 SELECT sku, name, price
@@ -526,17 +574,40 @@ WHERE live_lo <= current_branch_point()
   AND price > 100;
 ```
 
-The read path is predicate-based because the write path maintains non-overlapping live intervals.
+The important property is that the added predicate has constant shape:
+
+```text
+live_lo <= current_branch_point()
+AND current_branch_point() < live_hi
+AND deleted = false
+```
+
+It does not grow with branch depth or branch width. The read path is simple
+because the write path maintains the interval invariant.
 
 ## Write Path
 
-Writes target the current mutable segment of the checked-out branch:
+Writes are the maintenance step. They target the current mutable segment of the
+checked-out branch:
 
 ```text
 write scope = [current_segment_lo(), current_segment_hi())
 ```
 
 Stable fork-prefix segments and checkpoints are read-only. When a branch is forked, the source branch moves to a new continuation segment. Future writes go to that continuation segment.
+
+When a branch updates or deletes a logical row, Chronos finds physical rows for
+the same logical key whose intervals overlap the branch's current segment. It
+then replaces each overlap with up to three pieces:
+
+```text
+old value before the branch segment
+new branch-local value inside the branch segment
+old value after the branch segment
+```
+
+This preserves the invariant that each branch point sees at most one live
+version of each logical row.
 
 ### Update
 
@@ -564,7 +635,7 @@ FOR UPDATE;
 For each overlapping physical row:
 
 ```text
-old physical row:  [a, b)
+old physical row: [a, b)
 write scope:   [u_lo, u_hi)
 overlap:       [max(a,u_lo), min(b,u_hi))
 
@@ -584,6 +655,9 @@ abc = 10  [0,160000)
 abc = 15  [160000,180000)
 abc = 10  [180000,1000000)
 ```
+
+This is the central tradeoff of the interval backend: reads are simple because
+writes split row intervals when needed.
 
 If the current segment already has the exact live interval for the key, repeated updates can modify that row in place:
 
@@ -610,7 +684,8 @@ abc = deleted  [160000,180000)
 abc = 10       [180000,1000000)
 ```
 
-The tombstone is part of the logical state. It prevents inherited rows from reappearing inside the deleted branch interval.
+The tombstone is part of the logical state. It prevents inherited rows from
+reappearing inside the deleted branch interval.
 
 ### Insert
 
@@ -656,7 +731,7 @@ Then it splices each matched key. Batch execution should lock keys in determinis
 
 1. Lock branch `x`.
 2. Read `x.current_segment_id`, called `S`.
-3. Allocate two child intervals inside `S`:
+3. Split `S` into two child intervals:
    - one continuation segment for `x`
    - one initial segment for `y`
 4. Insert both child segments.
@@ -672,7 +747,7 @@ Existing live intervals continue to cover both child branch points until one bra
 
 The system is correct when these conditions hold:
 
-- Every logical key has non-overlapping live intervals.
+- For each logical key and branch point, at most one non-deleted physical row is visible.
 - Branch creation only writes metadata.
 - User writes target the current mutable segment.
 - Stable fork-prefix segments and checkpoints are immutable.
@@ -743,7 +818,7 @@ The initial interval space should be much larger than 64 bits:
 root: [0, 10^78)
 ```
 
-Children are allocated as sub-intervals inside their parent.
+Children are created by splitting the parent segment into sub-intervals.
 
 Fixed-width intervals have a depth/fanout tradeoff:
 
@@ -792,17 +867,31 @@ Variable-length labels support unbounded depth at the cost of wider labels and i
 
 ## Efficiency
 
+Let:
+
 ```text
-branch checkout:   O(1) metadata lookup
-branch creation:   O(1) metadata writes
-point read:        indexed branch-point predicate
-scan:              branch-point predicate over live intervals
-keyed update:      overlap lookup plus interval splice
-delete:            splice with tombstone replacement
-storage growth:    interval physical rows for changed keys
+D = branch depth
+W = branch width / number of sibling branches
+K = number of physical row intervals for the logical keys touched by a write
 ```
 
-With leaf-scoped writes, a keyed update normally overlaps one live physical row for that key. The expensive case is a hot key with many physical rows or an administrative rewrite over a broad interval.
+```text
+branch checkout:   O(1) with respect to D and W
+branch creation:   O(1) metadata writes with respect to D and W
+point read:        O(1) branch overhead; indexed branch-point predicate
+scan:              O(1) branch overhead; branch-point predicate over live intervals
+keyed update:      O(K) overlap lookup plus interval splice
+delete:            O(K) splice with tombstone replacement
+storage growth:    physical rows for changed keys
+```
+
+Reads do not walk branch ancestry and do not scan sibling branches. They bind
+one `branch_point` and evaluate the same visibility predicate for every
+registered table.
+
+With leaf-scoped writes, a keyed update normally overlaps one live physical row
+for that key. The expensive case is a heavily fragmented hot key or an
+administrative rewrite over a broad interval.
 
 Branch creation does not copy user rows. Storage grows when data changes, not when branches are created.
 

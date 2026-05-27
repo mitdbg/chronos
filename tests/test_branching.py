@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import atexit
+import glob
 import os
 import subprocess
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -17,9 +19,13 @@ from chronos_core.branching import (
     ChronosBranchContext,
 )
 from chronos_core.branching.sql_adapters import connect_sql_database
+from chronos_core.branching.sql_adapters import PostgresDatabaseAdapter
 
 
-BRANCH_BACKENDS = ("copy", "interval", "log")
+BRANCH_BACKENDS = ("copy", "interval", "log", "orpheus", "litetree")
+POSTGRES_BRANCH_BACKENDS = tuple(
+    backend for backend in BRANCH_BACKENDS if backend != "litetree"
+)
 SQL_BACKENDS = ("sqlite", "postgres")
 TEST_POSTGRES_CONTAINER = os.environ.get(
     "CHRONOS_BRANCH_TEST_POSTGRES_NAME", "chronos-branch-postgres-tests"
@@ -32,10 +38,89 @@ _POSTGRES_DSN: str | None = os.environ.get("CHRONOS_BRANCH_POSTGRES_DSN") or os.
     "CHRONOS_POSTGRES_DSN"
 )
 _POSTGRES_STARTED_BY_TESTS = False
+_LITETREE_TEST_PATHS: list[str] = []
 
 
-def _database_url(sql_backend: str) -> str:
+def _cleanup_litetree_files() -> None:
+    for path in _LITETREE_TEST_PATHS:
+        for candidate in glob.glob(f"{path}*"):
+            try:
+                os.remove(candidate)
+            except OSError:
+                pass
+
+
+atexit.register(_cleanup_litetree_files)
+
+
+def test_postgres_param_translation_ignores_sql_literals() -> None:
+    sql = """
+    SELECT ':not_a_param', "also:not_a_param", $$:still_not_a_param$$
+    FROM okg.graph_nodes
+    WHERE node_id = :node_id
+      AND kind = 'review:alpha'
+      AND attrs ? ':literal_key'
+      AND payload::jsonb ? :json_key
+    """
+
+    translated = PostgresDatabaseAdapter._translate_named(sql)
+
+    assert "%(node_id)s" in translated
+    assert "%(json_key)s" in translated
+    assert "review:alpha" in translated
+    assert "':not_a_param'" in translated
+    assert '"also:not_a_param"' in translated
+    assert "$$:still_not_a_param$$" in translated
+    assert "%(not_a_param)s" not in translated
+    assert "%(alpha)s" not in translated
+    assert "%(literal_key)s" not in translated
+    assert "payload::jsonb" in translated
+
+
+def test_postgres_percent_escaping_preserves_placeholders() -> None:
+    sql = "SELECT 'ad-%', score % 10 FROM docs WHERE id = %(id)s AND body LIKE %s"
+
+    escaped = PostgresDatabaseAdapter._escape_pyformat_percents(sql)
+
+    assert "'ad-%%'" in escaped
+    assert "score %% 10" in escaped
+    assert "%(id)s" in escaped
+    assert "LIKE %s" in escaped
+
+
+@pytest.mark.parametrize("sql_backend", SQL_BACKENDS)
+def test_interval_register_table_adds_new_source_columns(sql_backend: str) -> None:
+    ctx = ChronosBranchContext.connect(_database_url(sql_backend), backend="interval")
+    try:
+        ctx.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT)")
+        ctx.db.commit()
+        ctx.register_table("docs", ["id"])
+        ctx.db.execute("ALTER TABLE docs ADD COLUMN source TEXT")
+        ctx.db.commit()
+
+        ctx.register_table("docs", ["id"])
+        session = ctx.checkout("main")
+        session.upsert_rows("docs", [{
+            "id": "doc:1",
+            "title": "one",
+            "source": "fixture",
+        }])
+
+        rows = session.query(
+            "SELECT source FROM docs WHERE id = :id",
+            {"id": "doc:1"},
+        )
+        assert rows == [{"source": "fixture"}]
+    finally:
+        ctx.close()
+
+
+def _database_url(sql_backend: str, branch_backend: str | None = None) -> str:
     if sql_backend == "sqlite":
+        if branch_backend == "litetree":
+            path = tempfile.mktemp(prefix="chronos-litetree-test-", suffix=".db")
+            _LITETREE_TEST_PATHS.append(path)
+            return f"file:{path}?branches=on"
         return "sqlite:///:memory:"
     return _postgres_dsn()
 
@@ -120,28 +205,30 @@ def _postgres_dsn() -> str:
 
 
 def _reset_postgres_schema() -> None:
-    context = ChronosBranchContext.connect(_postgres_dsn(), backend="interval")
+    db = connect_sql_database(_postgres_dsn())
     try:
-        rows = context.db.execute(
-            """
-            SELECT tablename
-            FROM pg_tables
-            WHERE schemaname = 'public'
-            """
-        ).fetchall()
-        for row in rows:
-            context.db.drop_table(row["tablename"])
-        context.db.commit()
+        db.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        db.execute("CREATE SCHEMA public")
+        db.commit()
     finally:
-        context.close()
+        db.close()
 
 
 def _make_context(sql_backend: str, branch_backend: str) -> ChronosBranchContext:
+    if branch_backend == "litetree" and sql_backend != "sqlite":
+        pytest.skip("LiteTree backend only runs on SQLite")
+    if branch_backend == "orpheus" and sql_backend != "postgres":
+        pytest.skip("Orpheus backend requires PostgreSQL array-backed vlist")
     if sql_backend == "postgres":
         _reset_postgres_schema()
-    context = ChronosBranchContext.connect(
-        _database_url(sql_backend), backend=branch_backend
-    )
+    try:
+        context = ChronosBranchContext.connect(
+            _database_url(sql_backend, branch_backend), backend=branch_backend
+        )
+    except BranchingError as exc:
+        if branch_backend == "litetree" and "LiteTree backend requires" in str(exc):
+            pytest.skip(str(exc))
+        raise
     context._test_sql_backend = sql_backend  # type: ignore[attr-defined]
     db = context.db
     db.execute(
@@ -212,6 +299,14 @@ def _physical_change_count(ctx: ChronosBranchContext, table: str) -> int:
         row = ctx.db.execute(
             f"SELECT COUNT(*) AS count FROM _chronos_b_log_{table}"
         ).fetchone()
+        return int(row["count"])
+    if ctx.backend_name == "orpheus":
+        row = ctx.db.execute(
+            f"SELECT COUNT(*) AS count FROM _chronos_b_orpheus_{table}_datatable"
+        ).fetchone()
+        return int(row["count"])
+    if ctx.backend_name == "litetree":
+        row = ctx.db.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
         return int(row["count"])
     backend = ctx._backend  # type: ignore[attr-defined]
     return sum(
@@ -293,9 +388,20 @@ def _table_exists(ctx: ChronosBranchContext, table: str) -> bool:
 def _make_products_only_context(
     sql_backend: str, branch_backend: str
 ) -> ChronosBranchContext:
+    if branch_backend == "litetree" and sql_backend != "sqlite":
+        pytest.skip("LiteTree backend only runs on SQLite")
+    if branch_backend == "orpheus" and sql_backend != "postgres":
+        pytest.skip("Orpheus backend requires PostgreSQL array-backed vlist")
     if sql_backend == "postgres":
         _reset_postgres_schema()
-    ctx = ChronosBranchContext.connect(_database_url(sql_backend), backend=branch_backend)
+    try:
+        ctx = ChronosBranchContext.connect(
+            _database_url(sql_backend, branch_backend), backend=branch_backend
+        )
+    except BranchingError as exc:
+        if branch_backend == "litetree" and "LiteTree backend requires" in str(exc):
+            pytest.skip(str(exc))
+        raise
     ctx._test_sql_backend = sql_backend  # type: ignore[attr-defined]
     ctx.db.execute("CREATE TABLE products (sku TEXT PRIMARY KEY, name TEXT, price INTEGER)")
     ctx.db.executemany(
@@ -374,6 +480,53 @@ def test_postgres_interval_uses_numeric_32_visibility_columns() -> None:
             assert row["data_type"] == "numeric"
             assert int(row["numeric_precision"]) == 32
             assert int(row["numeric_scale"]) == 0
+    finally:
+        ctx.close()
+
+
+def test_postgres_orpheus_uses_vlist_schema_types_by_default() -> None:
+    ctx = _make_context("postgres", "orpheus")
+    try:
+        rows = ctx.db.execute(
+            """
+            SELECT table_name, column_name, data_type, udt_name, column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND (
+                table_name IN (
+                  '_chronos_branch_orpheus_versiontable',
+                  '_chronos_b_orpheus_products_indextable'
+                )
+                OR table_name = '_chronos_b_orpheus_products_datatable'
+              )
+              AND column_name IN ('rid', 'vid', 'parent', 'children', 'vlist')
+            """
+        ).fetchall()
+        by_column = {
+            (row["table_name"], row["column_name"]): row
+            for row in rows
+        }
+
+        datatable_rid = by_column[("_chronos_b_orpheus_products_datatable", "rid")]
+        assert datatable_rid["data_type"] == "integer"
+        assert "nextval" in datatable_rid["column_default"]
+
+        version_vid = by_column[("_chronos_branch_orpheus_versiontable", "vid")]
+        assert version_vid["data_type"] == "integer"
+
+        for column in ("parent", "children"):
+            version_array = by_column[
+                ("_chronos_branch_orpheus_versiontable", column)
+            ]
+            assert version_array["data_type"] == "ARRAY"
+            assert version_array["udt_name"] == "_int4"
+
+        index_rid = by_column[("_chronos_b_orpheus_products_indextable", "rid")]
+        assert index_rid["data_type"] == "integer"
+
+        vlist = by_column[("_chronos_b_orpheus_products_indextable", "vlist")]
+        assert vlist["data_type"] == "ARRAY"
+        assert vlist["udt_name"] == "_int4"
     finally:
         ctx.close()
 
@@ -567,6 +720,10 @@ def test_users_can_add_logical_indexes_to_registered_tables(ctx: ChronosBranchCo
             "_chronos_idx_interval_products_price_sku"
             if ctx.backend_name == "interval"
             else "_chronos_idx_log_products_price_sku"
+            if ctx.backend_name == "log"
+            else "products_price_sku"
+            if ctx.backend_name == "litetree"
+            else "_chronos_idx_orpheus_products_price_sku"
         )
         assert _index_exists(ctx, name=index_name)
     assert ctx.checkout("main").query(
@@ -629,6 +786,60 @@ def test_many_transactions_can_mutate_same_branch(ctx: ChronosBranchContext) -> 
     assert _product(session, "abc")["price"] == 30
     assert _product(session, "ghi")["price"] == 41
     assert ctx.checkout("main").query("SELECT * FROM products WHERE sku = 'ghi'") == []
+
+
+@pytest.mark.parametrize("branch_backend", POSTGRES_BRANCH_BACKENDS)
+def test_postgres_schema_qualified_tables_and_batch_edits(branch_backend: str) -> None:
+    _reset_postgres_schema()
+    context = ChronosBranchContext.connect(_postgres_dsn(), backend=branch_backend)
+    try:
+        context.db.execute("DROP SCHEMA IF EXISTS okg CASCADE")
+        context.db.execute("CREATE SCHEMA okg")
+        context.db.execute(
+            """
+            CREATE TABLE okg.graph_nodes (
+              node_id TEXT PRIMARY KEY,
+              subtype TEXT,
+              attrs JSONB
+            )
+            """
+        )
+        context.db.execute(
+            """
+            INSERT INTO okg.graph_nodes VALUES
+              ('n1', 'concept', '{"name": "one"}'::jsonb)
+            """
+        )
+        context.db.commit()
+        context.register_table("okg.graph_nodes", ["node_id"])
+
+        context.create_branch("default", from_branch="main")
+        session = context.checkout("default")
+        with session.transaction():
+            session.upsert_rows(
+                "okg.graph_nodes",
+                [
+                    {"node_id": "n1", "subtype": "concept", "attrs": {"name": "uno"}},
+                    {"node_id": "n2", "subtype": "claim", "attrs": {"name": "two"}},
+                ],
+            )
+            session.delete_keys("okg.graph_nodes", [{"node_id": "missing"}])
+
+        assert session.query(
+            """
+            SELECT node_id, subtype, attrs
+            FROM okg.graph_nodes
+            ORDER BY node_id
+            """
+        ) == [
+            {"node_id": "n1", "subtype": "concept", "attrs": {"name": "uno"}},
+            {"node_id": "n2", "subtype": "claim", "attrs": {"name": "two"}},
+        ]
+        assert context.checkout("main").query(
+            "SELECT node_id, attrs FROM okg.graph_nodes ORDER BY node_id"
+        ) == [{"node_id": "n1", "attrs": {"name": "one"}}]
+    finally:
+        context.close()
 
 
 def test_rollback_discards_branch_writes(ctx: ChronosBranchContext) -> None:
@@ -1316,6 +1527,88 @@ def test_create_branch_from_checkpoint(ctx: ChronosBranchContext) -> None:
 
     assert _product(restored, "abc")["price"] == 16
     assert _product(exp, "abc")["price"] == 25
+
+
+@pytest.mark.parametrize("branch_backend", BRANCH_BACKENDS)
+def test_branch_metadata_round_trips_across_backends(branch_backend: str) -> None:
+    ctx = _make_context("sqlite", branch_backend)
+    try:
+        ctx.create_branch(
+            "exp",
+            from_branch="main",
+            metadata={"owner": "okg", "state": "mutable"},
+        )
+        assert ctx.get_branch("exp").metadata == {"owner": "okg", "state": "mutable"}
+
+        updated = ctx.update_branch_metadata(
+            "exp", {"owner": "okg", "state": "abandoned"}
+        )
+
+        assert updated.metadata == {"owner": "okg", "state": "abandoned"}
+        assert ctx.get_branch("exp").metadata == updated.metadata
+        assert {
+            branch.branch_id: branch.metadata for branch in ctx.list_branches()
+        }["exp"] == updated.metadata
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("branch_backend", BRANCH_BACKENDS)
+def test_checkpoint_metadata_round_trips_across_backends(branch_backend: str) -> None:
+    ctx = _make_context("sqlite", branch_backend)
+    try:
+        ctx.create_branch("exp", from_branch="main")
+        exp = ctx.checkout("exp")
+        exp.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 15, "sku": "abc"},
+        )
+
+        metadata = {
+            "deployment": "test",
+            "catalog_version_id": 7,
+            "status": "published",
+        }
+        created = ctx.create_checkpoint("generation-1", branch="exp", metadata=metadata)
+
+        assert created.metadata == metadata
+        assert ctx.get_checkpoint("generation-1").metadata == metadata
+        assert [
+            checkpoint.checkpoint_id
+            for checkpoint in ctx.list_checkpoints(metadata_filter={"status": "published"})
+        ] == ["generation-1"]
+        assert [
+            checkpoint.checkpoint_id
+            for checkpoint in ctx.list_checkpoints(branch="exp")
+        ] == ["generation-1"]
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("branch_backend", BRANCH_BACKENDS)
+def test_checkpoint_list_filters_by_branch_and_metadata(branch_backend: str) -> None:
+    ctx = _make_context("sqlite", branch_backend)
+    try:
+        ctx.create_branch("left", from_branch="main")
+        ctx.create_branch("right", from_branch="main")
+        ctx.create_checkpoint("left-draft", branch="left", metadata={"status": "draft"})
+        ctx.create_checkpoint(
+            "right-published",
+            branch="right",
+            metadata={"status": "published"},
+        )
+
+        assert [
+            checkpoint.checkpoint_id
+            for checkpoint in ctx.list_checkpoints(branch="left")
+        ] == ["left-draft"]
+        assert [
+            checkpoint.checkpoint_id
+            for checkpoint in ctx.list_checkpoints(metadata_filter={"status": "published"})
+        ] == ["right-published"]
+        assert ctx.checkout_checkpoint("right-published").branch_id == "right"
+    finally:
+        ctx.close()
 
 
 def test_diff_rows_and_merge_apply(ctx: ChronosBranchContext) -> None:

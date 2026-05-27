@@ -61,7 +61,7 @@ class _CopyBackend(_SQLBranchBackend):
         self.db.execute(
             f"""
             INSERT INTO {_quote(physical)} ({cols})
-            SELECT {cols} FROM {_quote(table)}
+            SELECT {cols} FROM {_quote_table_name(table)}
             """
         )
         self.db.execute(
@@ -100,7 +100,9 @@ class _CopyBackend(_SQLBranchBackend):
                 self._create_physical_index(meta, index, checkpoint, checkpoint=True)
         return IndexInfo(index.name, index.table, index.columns, index.backend)
 
-    def create_branch(self, branch_id: str, from_branch: str) -> None:
+    def create_branch(
+        self, branch_id: str, from_branch: str, metadata: dict[str, Any] | None = None
+    ) -> None:
         if self._branch_row(branch_id) is not None:
             raise BranchAlreadyExistsError(branch_id)
         if self._branch_row(from_branch) is None:
@@ -120,8 +122,19 @@ class _CopyBackend(_SQLBranchBackend):
             (branch_id, created_at, metadata)
             VALUES (?, ?, ?)
             """,
-            (branch_id, _utc_now(), "{}"),
+            (branch_id, _utc_now(), _json_dumps(metadata)),
         )
+
+    def update_branch_metadata(
+        self, branch_id: str, metadata: dict[str, Any]
+    ) -> BranchInfo:
+        if self._branch_row(branch_id) is None:
+            raise BranchNotFoundError(branch_id)
+        self.db.execute(
+            "UPDATE _chronos_branch_copy_branches SET metadata = ? WHERE branch_id = ?",
+            (_json_dumps(metadata), branch_id),
+        )
+        return self.get_branch(branch_id)
 
     def create_branch_from_checkpoint(self, branch_id: str, checkpoint: str) -> None:
         if self._branch_row(branch_id) is not None:
@@ -187,7 +200,9 @@ class _CopyBackend(_SQLBranchBackend):
             metadata=_json_loads(row["metadata"]),
         )
 
-    def create_checkpoint(self, checkpoint: str, branch: str) -> CheckpointInfo:
+    def create_checkpoint(
+        self, checkpoint: str, branch: str, metadata: dict[str, Any] | None = None
+    ) -> CheckpointInfo:
         if self._checkpoint_row(checkpoint) is not None:
             raise BranchAlreadyExistsError(checkpoint)
         if self._branch_row(branch) is None:
@@ -206,15 +221,62 @@ class _CopyBackend(_SQLBranchBackend):
             (checkpoint_id, branch_id, created_at, metadata)
             VALUES (?, ?, ?, ?)
             """,
-            (checkpoint, branch, now, "{}"),
+            (checkpoint, branch, now, _json_dumps(metadata)),
         )
-        return CheckpointInfo(checkpoint, branch, checkpoint, now)
+        return CheckpointInfo(checkpoint, branch, checkpoint, now, metadata or {})
 
-    def checkout_checkpoint(self, checkpoint: str) -> _BranchRef:
+    def get_checkpoint(self, checkpoint: str) -> CheckpointInfo:
         row = self._checkpoint_row(checkpoint)
         if row is None:
             raise BranchNotFoundError(f"checkpoint:{checkpoint}")
-        return _BranchRef(row["branch_id"], checkpoint, readonly=True)
+        return CheckpointInfo(
+            row["checkpoint_id"],
+            row["branch_id"],
+            row["checkpoint_id"],
+            row["created_at"],
+            _json_loads(row["metadata"]),
+        )
+
+    def list_checkpoints(
+        self,
+        branch: str | None = None,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[CheckpointInfo]:
+        params: list[Any] = []
+        where = ""
+        if branch is not None:
+            where = "WHERE branch_id = ?"
+            params.append(branch)
+        rows = self.db.execute(
+            f"""
+            SELECT checkpoint_id, branch_id, created_at, metadata
+            FROM _chronos_branch_copy_checkpoints
+            {where}
+            ORDER BY created_at, checkpoint_id
+            """,
+            tuple(params),
+        ).fetchall()
+        infos = [
+            CheckpointInfo(
+                row["checkpoint_id"],
+                row["branch_id"],
+                row["checkpoint_id"],
+                row["created_at"],
+                _json_loads(row["metadata"]),
+            )
+            for row in rows
+        ]
+        if metadata_filter:
+            infos = [
+                info
+                for info in infos
+                if all(info.metadata.get(key) == value for key, value in metadata_filter.items())
+            ]
+        return infos
+
+    def checkout_checkpoint(self, checkpoint: str) -> _BranchRef:
+        cp = self.get_checkpoint(checkpoint)
+        return _BranchRef(cp.branch_id, cp.ref, readonly=True)
 
     def prepare_ref(self, ref: _BranchRef) -> _PreparedBranchRef:
         return _PreparedBranchRef(
@@ -266,7 +328,7 @@ class _CopyBackend(_SQLBranchBackend):
 
     def visible_rows(self, branch_id: str, table: str) -> list[dict[str, Any]]:
         ref = self.prepare_ref(_BranchRef(branch_id, branch_id))
-        return self.query(ref, f"SELECT * FROM {_quote(table)}", {})
+        return self.query(ref, f"SELECT * FROM {_quote_table_name(table)}", {})
 
     def upsert_row(self, branch_id: str, table: str, row: dict[str, Any]) -> None:
         meta = self._require_table(table)

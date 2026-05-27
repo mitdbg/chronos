@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlparse
 import psycopg
 from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 
 SQLRow = Mapping[str, Any]
@@ -101,16 +102,19 @@ class SQLDatabaseAdapter(ABC):
 class SQLiteDatabaseAdapter(SQLDatabaseAdapter):
     dialect = "sqlite"
 
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, database_path: str):
         self._conn = conn
+        self.database_path = database_path
 
     @classmethod
     def connect(cls, database_url: str) -> SQLiteDatabaseAdapter:
         parsed = urlparse(database_url)
-        if parsed.scheme not in ("", "sqlite"):
+        if parsed.scheme not in ("", "sqlite", "file"):
             raise ValueError(f"not a SQLite URL: {database_url}")
         if database_url in (":memory:", "sqlite:///:memory:"):
             path = ":memory:"
+        elif parsed.scheme == "file":
+            path = database_url
         elif parsed.scheme == "":
             path = database_url
         elif parsed.netloc and parsed.netloc not in ("", "localhost"):
@@ -123,13 +127,20 @@ class SQLiteDatabaseAdapter(SQLDatabaseAdapter):
                 path = path.lstrip("/")
             if not path:
                 raise ValueError(f"SQLite URL is missing a path: {database_url}")
-        if path != ":memory:":
+        uri = False
+        if parsed.scheme == "sqlite" and parsed.query:
+            path = f"file:{path}?{parsed.query}"
+            uri = True
+        elif parsed.scheme in ("", "file") and database_url.startswith("file:"):
+            uri = True
+        if path != ":memory:" and not path.startswith("file:"):
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path, check_same_thread=False)
+        conn = sqlite3.connect(path, check_same_thread=False, uri=uri)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=OFF")
         conn.execute("PRAGMA journal_mode=WAL")
-        return cls(conn)
+        database_path = parsed.path if parsed.scheme == "file" else path
+        return cls(conn, database_path)
 
     def execute(
         self, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()
@@ -186,6 +197,7 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
     dialect = "postgres"
 
     _named_param = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
+    _dollar_quote = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
 
     def __init__(self, conn: psycopg.Connection[Any]):
         self._conn = conn
@@ -198,17 +210,34 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
     def execute(
         self, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()
     ) -> psycopg.Cursor[Any]:
+        execute = self._execute_with_dict_rows
         if not params:
-            return self._conn.execute(sql)
+            return execute(sql)
         translated_sql, translated_params = self._translate_params(sql, params)
-        return self._conn.execute(translated_sql, translated_params)
+        translated_sql = self._escape_pyformat_percents(translated_sql)
+        translated_params = self._adapt_params(translated_params)
+        return execute(translated_sql, translated_params)
+
+    def _execute_with_dict_rows(
+        self,
+        sql: str,
+        params: Sequence[Any] | Mapping[str, Any] = (),
+    ) -> psycopg.Cursor[Any]:
+        if getattr(self._conn, "row_factory", None) is dict_row:
+            return self._conn.execute(sql, params)
+        cursor = self._conn.cursor(row_factory=dict_row)
+        return cursor.execute(sql, params)
 
     def executemany(
         self, sql: str, params: Iterable[Sequence[Any]]
     ) -> psycopg.Cursor[Any]:
         translated_sql = self._translate_qmark(sql)
+        translated_sql = self._escape_pyformat_percents(translated_sql)
         cursor = self._conn.cursor()
-        cursor.executemany(translated_sql, params)
+        cursor.executemany(
+            translated_sql,
+            (self._adapt_params(row) for row in params),
+        )
         return cursor
 
     def commit(self) -> None:
@@ -280,11 +309,160 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
 
     @classmethod
     def _translate_named(cls, sql: str) -> str:
-        return cls._named_param.sub(r"%(\1)s", sql)
+        if ":" not in sql:
+            return sql
+        if not any(marker in sql for marker in ("'", "--", "/*", "$", "::")):
+            return cls._named_param.sub(r"%(\1)s", sql)
+
+        def replace(segment: str, index: int) -> tuple[str, int] | None:
+            if segment[index] != ":":
+                return None
+            if index > 0 and segment[index - 1] == ":":
+                return None
+            if index + 1 >= len(segment):
+                return None
+            first = segment[index + 1]
+            if not (first.isalpha() or first == "_"):
+                return None
+            end = index + 2
+            while end < len(segment):
+                char = segment[end]
+                if not (char.isalnum() or char == "_"):
+                    break
+                end += 1
+            return f"%({segment[index + 1:end]})s", end
+
+        return cls._rewrite_outside_sql_literals(sql, replace)
+
+    @classmethod
+    def _translate_qmark(cls, sql: str) -> str:
+        if "?" not in sql:
+            return sql
+        if not any(marker in sql for marker in ("'", "--", "/*", "$")):
+            return sql.replace("?", "%s")
+
+        def replace(segment: str, index: int) -> tuple[str, int] | None:
+            if segment[index] == "?":
+                return "%s", index + 1
+            return None
+
+        return cls._rewrite_outside_sql_literals(sql, replace)
 
     @staticmethod
-    def _translate_qmark(sql: str) -> str:
-        return sql.replace("?", "%s")
+    def _escape_pyformat_percents(sql: str) -> str:
+        """Escape literal percent signs for psycopg's pyformat parser.
+
+        psycopg scans the full SQL string for ``%`` placeholders even inside
+        quoted SQL literals. Chronos injects internal bound parameters into
+        checked-out queries, so user SQL like ``LIKE 'doc:%'`` must become
+        ``LIKE 'doc:%%'`` while generated placeholders such as ``%(id)s`` and
+        ``%s`` remain intact.
+        """
+        if "%" not in sql:
+            return sql
+        output: list[str] = []
+        index = 0
+        length = len(sql)
+        while index < length:
+            char = sql[index]
+            if char != "%":
+                output.append(char)
+                index += 1
+                continue
+            if index + 1 < length and sql[index + 1] in {"s", "b", "t"}:
+                output.append(sql[index:index + 2])
+                index += 2
+                continue
+            if index + 1 < length and sql[index + 1] == "(":
+                end = sql.find(")s", index + 2)
+                if end != -1:
+                    output.append(sql[index:end + 2])
+                    index = end + 2
+                    continue
+            output.append("%%")
+            index += 1
+        return "".join(output)
+
+    @classmethod
+    def _rewrite_outside_sql_literals(
+        cls,
+        sql: str,
+        replace,
+    ) -> str:
+        output: list[str] = []
+        index = 0
+        length = len(sql)
+        while index < length:
+            char = sql[index]
+            if char == "'":
+                index = cls._copy_single_quoted(sql, index, output)
+                continue
+            if char == '"':
+                index = cls._copy_double_quoted(sql, index, output)
+                continue
+            if sql.startswith("--", index):
+                newline = sql.find("\n", index + 2)
+                end = length if newline == -1 else newline + 1
+                output.append(sql[index:end])
+                index = end
+                continue
+            if sql.startswith("/*", index):
+                end = sql.find("*/", index + 2)
+                end = length if end == -1 else end + 2
+                output.append(sql[index:end])
+                index = end
+                continue
+            if char == "$":
+                match = cls._dollar_quote.match(sql, index)
+                if match:
+                    tag = match.group(0)
+                    end = sql.find(tag, match.end())
+                    end = length if end == -1 else end + len(tag)
+                    output.append(sql[index:end])
+                    index = end
+                    continue
+            replacement = replace(sql, index)
+            if replacement is not None:
+                text, index = replacement
+                output.append(text)
+                continue
+            output.append(char)
+            index += 1
+        return "".join(output)
+
+    @staticmethod
+    def _copy_single_quoted(sql: str, index: int, output: list[str]) -> int:
+        output.append(sql[index])
+        index += 1
+        length = len(sql)
+        while index < length:
+            output.append(sql[index])
+            if sql[index] == "'":
+                if index + 1 < length and sql[index + 1] == "'":
+                    output.append(sql[index + 1])
+                    index += 2
+                    continue
+                index += 1
+                break
+            index += 1
+        return index
+
+    @staticmethod
+    def _copy_double_quoted(sql: str, index: int, output: list[str]) -> int:
+        output.append(sql[index])
+        index += 1
+        length = len(sql)
+        while index < length:
+            output.append(sql[index])
+            if sql[index] == '"':
+                if index + 1 < length and sql[index + 1] == '"':
+                    output.append(sql[index + 1])
+                    index += 2
+                    continue
+                index += 1
+                break
+            index += 1
+        return index
 
     @staticmethod
     def _split_table_name(table: str) -> tuple[str, str]:
@@ -319,10 +497,31 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
             return "TIMESTAMPTZ"
         return str(data_type).upper()
 
+    @staticmethod
+    def _adapt_params(
+        params: Sequence[Any] | Mapping[str, Any]
+    ) -> Sequence[Any] | Mapping[str, Any]:
+        if isinstance(params, Mapping):
+            adapted_mapping: dict[str, Any] | None = None
+            for key, value in params.items():
+                if isinstance(value, dict):
+                    if adapted_mapping is None:
+                        adapted_mapping = dict(params)
+                    adapted_mapping[key] = Jsonb(value)
+            return params if adapted_mapping is None else adapted_mapping
+
+        adapted_sequence: list[Any] | None = None
+        for index, value in enumerate(params):
+            if isinstance(value, dict):
+                if adapted_sequence is None:
+                    adapted_sequence = list(params)
+                adapted_sequence[index] = Jsonb(value)
+        return params if adapted_sequence is None else adapted_sequence
+
 
 def connect_sql_database(database_url: str) -> SQLDatabaseAdapter:
     parsed = urlparse(database_url)
-    if parsed.scheme in ("", "sqlite"):
+    if parsed.scheme in ("", "sqlite", "file"):
         return SQLiteDatabaseAdapter.connect(database_url)
     if parsed.scheme in ("postgres", "postgresql"):
         return PostgresDatabaseAdapter.connect(database_url)

@@ -47,7 +47,7 @@ Examples:
 
   bench/run_branching_experiments.sh sqlite
 
-  bench/run_branching_experiments.sh postgres --backends interval,copy
+  bench/run_branching_experiments.sh postgres --backends interval,copy,orpheus
 
   bench/run_branching_experiments.sh doltgres --backends doltgres
 
@@ -55,7 +55,7 @@ Examples:
 
   bench/run_branching_experiments.sh all
 
-  bench/run_branching_experiments.sh both --backends interval,copy
+  bench/run_branching_experiments.sh both --backends interval,copy,orpheus,litetree
 USAGE
 }
 
@@ -94,24 +94,34 @@ case "${MODE}" in
 esac
 
 DEFAULT_ARGS=(
-  --dataset-sizes 10000000
-  --depths 1,4,8,16,32,64
+  --dataset-sizes 100000
+  --depths 1,4,8,16,32
   --widths 1,4,8,16
   --benchmark-shapes depth,width
-  --read-ops 1000
+  --read-ops 500
   --range-read-ops 100
-  --write-ops 1000
+  --write-ops 500
   --warmup-ops 200
   --post-branch-warmup auto
-  --branch-mutations 500
+  --branch-mutations 1
 )
 
 EXTRA_ARGS=("$@")
 PYTHONPATH_VALUE="${ROOT_DIR}/packages/chronos-core/src${PYTHONPATH:+:${PYTHONPATH}}"
 RUN_STAMP="$(date +%Y%m%d-%H%M%S)"
 RUN_OUTPUT_DIR="${CHRONOS_BENCH_OUTPUT_DIR:-${ROOT_DIR}/.benchmarks/branching-${RUN_STAMP}}"
+case "${RUN_OUTPUT_DIR}" in
+  /*) ;;
+  *) RUN_OUTPUT_DIR="$(pwd)/${RUN_OUTPUT_DIR}" ;;
+esac
 REQUESTED_BACKENDS=""
 FILTERED_EXTRA_ARGS=()
+SQLITE_SUPPORTED_BACKENDS="interval,litetree,copy"
+SQLITE_DEFAULT_BACKENDS="${SQLITE_SUPPORTED_BACKENDS}"
+POSTGRES_SUPPORTED_BACKENDS="interval,orpheus,copy"
+POSTGRES_DEFAULT_BACKENDS="${POSTGRES_SUPPORTED_BACKENDS}"
+DOLTGRES_SUPPORTED_BACKENDS="doltgres"
+DOLTGRES_DEFAULT_BACKENDS="${DOLTGRES_SUPPORTED_BACKENDS}"
 
 for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
   arg="${EXTRA_ARGS[$i]}"
@@ -333,6 +343,104 @@ select_backends() {
   echo "${joined}"
 }
 
+engine_label() {
+  case "$1" in
+    sqlite)
+      echo "sqlite-branching"
+      ;;
+    postgres)
+      echo "postgres-branching"
+      ;;
+    doltgres)
+      echo "doltgres-branching"
+      ;;
+    *)
+      echo "unknown engine: $1" >&2
+      return 2
+      ;;
+  esac
+}
+
+engine_supported_backends() {
+  case "$1" in
+    sqlite)
+      echo "${SQLITE_SUPPORTED_BACKENDS}"
+      ;;
+    postgres)
+      echo "${POSTGRES_SUPPORTED_BACKENDS}"
+      ;;
+    doltgres)
+      echo "${DOLTGRES_SUPPORTED_BACKENDS}"
+      ;;
+    *)
+      echo "unknown engine: $1" >&2
+      return 2
+      ;;
+  esac
+}
+
+engine_default_backends() {
+  case "$1" in
+    sqlite)
+      echo "${SQLITE_DEFAULT_BACKENDS}"
+      ;;
+    postgres)
+      echo "${POSTGRES_DEFAULT_BACKENDS}"
+      ;;
+    doltgres)
+      echo "${DOLTGRES_DEFAULT_BACKENDS}"
+      ;;
+    *)
+      echo "unknown engine: $1" >&2
+      return 2
+      ;;
+  esac
+}
+
+engine_database_url() {
+  local engine="$1"
+  case "${engine}" in
+    sqlite)
+      echo "sqlite:///:memory:"
+      ;;
+    postgres)
+      if [[ -n "${CHRONOS_BRANCH_POSTGRES_DSN:-}" || -n "${CHRONOS_BRANCH_DATABASE_URL:-}" ]]; then
+        echo "${CHRONOS_BRANCH_POSTGRES_DSN:-${CHRONOS_BRANCH_DATABASE_URL:-}}"
+      else
+        start_postgres_container >&2
+        echo "postgresql://postgres:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/${POSTGRES_DB}"
+      fi
+      ;;
+    doltgres)
+      if [[ -n "${CHRONOS_BRANCH_DOLTGRES_DSN:-}" ]]; then
+        echo "${CHRONOS_BRANCH_DOLTGRES_DSN}"
+      else
+        start_doltgres_container >&2
+        echo "postgresql://postgres:${DOLTGRES_PASSWORD}@localhost:${DOLTGRES_PORT}/postgres"
+      fi
+      ;;
+    *)
+      echo "unknown engine: ${engine}" >&2
+      return 2
+      ;;
+  esac
+}
+
+selected_backends_for_engine() {
+  local engine="$1"
+  select_backends "$(engine_supported_backends "${engine}")" \
+    "$(engine_default_backends "${engine}")"
+}
+
+run_engine() {
+  local engine="$1"
+  local backend_csv label database_url
+  backend_csv="$(selected_backends_for_engine "${engine}")"
+  label="$(engine_label "${engine}")"
+  database_url="$(engine_database_url "${engine}")"
+  run_one "${label}" "${database_url}" "${backend_csv}"
+}
+
 run_one() {
   local label="$1"
   local database_url="$2"
@@ -392,67 +500,33 @@ merge_results() {
   )
 }
 
-run_sqlite=false
-run_postgres=false
-run_doltgres=false
+RUN_ENGINES=()
 
 case "${MODE}" in
   sqlite)
-    run_sqlite=true
+    RUN_ENGINES=(sqlite)
     ;;
   postgres)
-    run_postgres=true
+    RUN_ENGINES=(postgres)
     ;;
   doltgres)
-    run_doltgres=true
+    RUN_ENGINES=(doltgres)
     ;;
   both)
-    # Legacy mode: local SQLite plus PostgreSQL.
-    run_sqlite=true
-    run_postgres=true
+    RUN_ENGINES=(sqlite postgres)
     ;;
   postgres-doltgres|all)
-    run_postgres=true
-    run_doltgres=true
+    RUN_ENGINES=(postgres doltgres)
     ;;
 esac
 
 echo "==> Selected benchmark runs:"
-if [[ "${run_sqlite}" == "true" ]]; then
-  echo "    sqlite:   $(select_backends "copy,interval,log" "copy,interval,log")"
-fi
-if [[ "${run_postgres}" == "true" ]]; then
-  echo "    postgres: $(select_backends "copy,interval,log" "copy,interval,log")"
-fi
-if [[ "${run_doltgres}" == "true" ]]; then
-  echo "    doltgres: $(select_backends "doltgres" "doltgres")"
-fi
+for engine in "${RUN_ENGINES[@]}"; do
+  printf '    %-8s %s\n' "${engine}:" "$(selected_backends_for_engine "${engine}")"
+done
 
-if [[ "${run_sqlite}" == "true" ]]; then
-  run_one "sqlite-branching" "sqlite:///:memory:" \
-    "$(select_backends "copy,interval,log" "copy,interval,log")"
-fi
-
-if [[ "${run_postgres}" == "true" ]]; then
-  if [[ -n "${CHRONOS_BRANCH_POSTGRES_DSN:-}" || -n "${CHRONOS_BRANCH_DATABASE_URL:-}" ]]; then
-    POSTGRES_DSN="${CHRONOS_BRANCH_POSTGRES_DSN:-${CHRONOS_BRANCH_DATABASE_URL:-}}"
-  else
-    start_postgres_container
-    POSTGRES_DSN="postgresql://postgres:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/${POSTGRES_DB}"
-  fi
-  run_one "postgres-branching" "${POSTGRES_DSN}" \
-    "$(select_backends "copy,interval,log" "copy,interval,log")"
-fi
-
-if [[ "${run_doltgres}" == "true" ]]; then
-  if [[ -n "${CHRONOS_BRANCH_DOLTGRES_DSN:-}" ]]; then
-    DOLTGRES_DSN="${CHRONOS_BRANCH_DOLTGRES_DSN}"
-  else
-    start_doltgres_container
-    DOLTGRES_DSN="postgresql://postgres:${DOLTGRES_PASSWORD}@localhost:${DOLTGRES_PORT}/postgres"
-  fi
-  run_one "doltgres-branching" "${DOLTGRES_DSN}" \
-    "$(select_backends "doltgres" "doltgres")"
-fi
+for engine in "${RUN_ENGINES[@]}"; do
+  run_engine "${engine}"
+done
 
 merge_results

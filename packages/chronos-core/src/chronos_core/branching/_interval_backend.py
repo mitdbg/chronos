@@ -105,14 +105,49 @@ class _IntervalBackend(_SQLBranchBackend):
         self.db.commit()
 
     def register_table(self, table: str, primary_key: list[str]) -> None:
-        if table in self.tables:
-            return
-        interval_type = self._interval_sql_type()
         columns, defs = _table_defs(self.db, table)
         missing = set(primary_key) - set(columns)
         if missing:
             raise TableNotRegisteredError(f"primary key columns missing from {table}: {missing}")
-        physical = f"_chronos_b_interval_{table}"
+        if table in self.tables:
+            meta = self.tables[table]
+            existing = set(meta.columns)
+            additions = [
+                (column, definition)
+                for column, definition in zip(columns, defs)
+                if column not in existing
+            ]
+            if not additions:
+                return
+            for _column, definition in additions:
+                self.db.execute(
+                    f"ALTER TABLE {_quote(meta.physical_name)} "
+                    f"ADD COLUMN {definition}"
+                )
+            self.db.execute(
+                """
+                UPDATE _chronos_branch_tables
+                   SET columns = ?, column_defs = ?
+                 WHERE backend = ? AND table_name = ?
+                """,
+                (
+                    json.dumps(columns),
+                    json.dumps(defs),
+                    self.name,
+                    table,
+                ),
+            )
+            self.tables[table] = _TableMeta(
+                name=meta.name,
+                physical_name=meta.physical_name,
+                pk_columns=meta.pk_columns,
+                columns=columns,
+                column_defs=defs,
+                backend=meta.backend,
+            )
+            return
+        interval_type = self._interval_sql_type()
+        physical = f"_chronos_b_interval_{_physical_table_suffix(table)}"
         user_defs = ", ".join(defs)
         pk_sql = ", ".join(_quote(c) for c in primary_key)
         # The physical table keeps user columns plus visibility metadata. The
@@ -131,11 +166,11 @@ class _IntervalBackend(_SQLBranchBackend):
             """
         )
         self.db.execute(
-            f"CREATE INDEX {_quote(f'idx_{physical}_visible')} "
+            f"CREATE INDEX IF NOT EXISTS {_quote(f'idx_{physical}_visible')} "
             f"ON {_quote(physical)} (live_lo, live_hi, deleted)"
         )
         self.db.execute(
-            f"CREATE INDEX {_quote(f'idx_{physical}_pk_hi')} "
+            f"CREATE INDEX IF NOT EXISTS {_quote(f'idx_{physical}_pk_hi')} "
             f"ON {_quote(physical)} ({pk_sql}, live_hi)"
         )
         cols = ", ".join(_quote(c) for c in columns)
@@ -143,7 +178,7 @@ class _IntervalBackend(_SQLBranchBackend):
             f"""
             INSERT INTO {_quote(physical)}
             ({cols}, live_lo, live_hi, deleted)
-            SELECT {cols}, 0, ?, 0 FROM {_quote(table)}
+            SELECT {cols}, 0, ?, 0 FROM {_quote_table_name(table)}
             """,
             (self._max_interval(),),
         )
@@ -188,9 +223,11 @@ class _IntervalBackend(_SQLBranchBackend):
             self._record_index(index)
         return IndexInfo(index.name, index.table, index.columns, index.backend)
 
-    def create_branch(self, branch_id: str, from_branch: str) -> None:
+    def create_branch(
+        self, branch_id: str, from_branch: str, metadata: dict[str, Any] | None = None
+    ) -> None:
         if self.db.dialect == "postgres":
-            self._create_branch_postgres_locked(branch_id, from_branch)
+            self._create_branch_postgres_locked(branch_id, from_branch, metadata)
             return
         if self._branch_row(branch_id) is not None:
             raise BranchAlreadyExistsError(branch_id)
@@ -253,10 +290,12 @@ class _IntervalBackend(_SQLBranchBackend):
             (branch_id, current_segment_id, created_at, metadata)
             VALUES (?, ?, ?, ?)
             """,
-            (branch_id, child["segment_id"], now, "{}"),
+            (branch_id, child["segment_id"], now, _json_dumps(metadata)),
         )
 
-    def _create_branch_postgres_locked(self, branch_id: str, from_branch: str) -> None:
+    def _create_branch_postgres_locked(
+        self, branch_id: str, from_branch: str, metadata: dict[str, Any] | None = None
+    ) -> None:
         """Create a branch while serializing concurrent forks of one parent.
 
         The parent branch row is locked before reading its current segment. This
@@ -335,7 +374,7 @@ class _IntervalBackend(_SQLBranchBackend):
                 (branch_id, current_segment_id, created_at, metadata)
                 VALUES (?, ?, ?, ?)
                 """,
-                (branch_id, child["segment_id"], now, "{}"),
+                (branch_id, child["segment_id"], now, _json_dumps(metadata)),
             )
 
     def _create_branch_postgres_pipeline(self, branch_id: str, from_branch: str) -> None:
@@ -627,6 +666,17 @@ class _IntervalBackend(_SQLBranchBackend):
             (branch_id, child["segment_id"], now, "{}"),
         )
 
+    def update_branch_metadata(
+        self, branch_id: str, metadata: dict[str, Any]
+    ) -> BranchInfo:
+        if self._branch_row(branch_id) is None:
+            raise BranchNotFoundError(branch_id)
+        self.db.execute(
+            "UPDATE _chronos_branch_interval_branches SET metadata = ? WHERE branch_id = ?",
+            (_json_dumps(metadata), branch_id),
+        )
+        return self.get_branch(branch_id)
+
     def delete_branch(self, branch_id: str) -> None:
         if branch_id == "main":
             raise BranchingError("main cannot be deleted")
@@ -668,7 +718,9 @@ class _IntervalBackend(_SQLBranchBackend):
             metadata=_json_loads(row["metadata"]),
         )
 
-    def create_checkpoint(self, checkpoint: str, branch: str) -> CheckpointInfo:
+    def create_checkpoint(
+        self, checkpoint: str, branch: str, metadata: dict[str, Any] | None = None
+    ) -> CheckpointInfo:
         if (
             self.db.execute(
                 "SELECT 1 FROM _chronos_branch_interval_checkpoints WHERE checkpoint_id = ?",
@@ -719,18 +771,65 @@ class _IntervalBackend(_SQLBranchBackend):
             (checkpoint_id, branch_id, segment_id, created_at, metadata)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (checkpoint, branch, snapshot["segment_id"], now, "{}"),
+            (checkpoint, branch, snapshot["segment_id"], now, _json_dumps(metadata)),
         )
-        return CheckpointInfo(checkpoint, branch, snapshot["segment_id"], now)
+        return CheckpointInfo(checkpoint, branch, snapshot["segment_id"], now, metadata or {})
 
-    def checkout_checkpoint(self, checkpoint: str) -> _BranchRef:
+    def get_checkpoint(self, checkpoint: str) -> CheckpointInfo:
         cp = self.db.execute(
             "SELECT * FROM _chronos_branch_interval_checkpoints WHERE checkpoint_id = ?",
             (checkpoint,),
         ).fetchone()
         if cp is None:
             raise BranchNotFoundError(f"checkpoint:{checkpoint}")
-        return _BranchRef(cp["branch_id"], cp["segment_id"], readonly=True)
+        return CheckpointInfo(
+            cp["checkpoint_id"],
+            cp["branch_id"],
+            cp["segment_id"],
+            cp["created_at"],
+            _json_loads(cp["metadata"]),
+        )
+
+    def list_checkpoints(
+        self,
+        branch: str | None = None,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[CheckpointInfo]:
+        params: list[Any] = []
+        where = ""
+        if branch is not None:
+            where = "WHERE branch_id = ?"
+            params.append(branch)
+        rows = self.db.execute(
+            f"""
+            SELECT checkpoint_id, branch_id, segment_id, created_at, metadata
+            FROM _chronos_branch_interval_checkpoints
+            {where}
+            ORDER BY created_at, checkpoint_id
+            """,
+            tuple(params),
+        ).fetchall()
+        infos = [
+            CheckpointInfo(
+                row["checkpoint_id"],
+                row["branch_id"],
+                row["segment_id"],
+                row["created_at"],
+                _json_loads(row["metadata"]),
+            )
+            for row in rows
+        ]
+        if metadata_filter:
+            infos = [
+                info
+                for info in infos
+                if all(info.metadata.get(key) == value for key, value in metadata_filter.items())
+            ]
+        return infos
+
+    def checkout_checkpoint(self, checkpoint: str) -> _BranchRef:
+        cp = self.get_checkpoint(checkpoint)
+        return _BranchRef(cp.branch_id, cp.ref, readonly=True)
 
     def prepare_ref(self, ref: _BranchRef) -> _PreparedBranchRef:
         # Cache the segment and table rewrites once per checkout. For repeated
@@ -816,7 +915,7 @@ class _IntervalBackend(_SQLBranchBackend):
 
     def visible_rows(self, branch_id: str, table: str) -> list[dict[str, Any]]:
         ref = self.prepare_ref(_BranchRef(branch_id, self._branch_segment_id(branch_id)))
-        return self.query(ref, f"SELECT * FROM {_quote(table)}", {})
+        return self.query(ref, f"SELECT * FROM {_quote_table_name(table)}", {})
 
     def upsert_row(self, branch_id: str, table: str, row: dict[str, Any]) -> None:
         self._insert_visible(branch_id, table, row, allow_replace=True)
@@ -983,7 +1082,11 @@ class _IntervalBackend(_SQLBranchBackend):
     ) -> list[dict[str, Any]]:
         meta = self._require_table(table)
         select_cols = ", ".join(_quote(c) for c in meta.columns)
-        return self.query(ref, f"SELECT {select_cols} FROM {_quote(table)}{where}", params)
+        return self.query(
+            ref,
+            f"SELECT {select_cols} FROM {_quote_table_name(table)}{where}",
+            params,
+        )
 
     def _visible_where_for_user_filter(self, where: str) -> str:
         visible = (
