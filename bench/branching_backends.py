@@ -612,9 +612,10 @@ def mutate_branch_state(
     progress(f"{label} start iterations={mutations_per_branch}")
     session = ctx.checkout(branch_id)
     mutation_count = min(mutations_per_branch, case.dataset_size)
+    report_every = progress_interval(case, mutation_count)
+    start_total = time.perf_counter_ns()
     with session.transaction():
         for idx in range(mutation_count):
-            progress(f"{label} iteration {idx + 1}/{mutation_count} start")
             base_idx = (level * mutations_per_branch + idx) % case.dataset_size
             sku = f"sku_{base_idx:08d}"
             order_id = f"order_{base_idx:08d}"
@@ -660,8 +661,14 @@ def mutate_branch_state(
                 "DELETE FROM orders WHERE order_id = :order_id",
                 {"order_id": f"order_{delete_idx:08d}"},
             )
-            progress(f"{label} iteration {idx + 1}/{mutation_count} done")
-    progress(f"{label} done")
+            op_number = idx + 1
+            if should_report_progress(op_number, mutation_count, report_every):
+                progress(
+                    f"{label} {progress_percent(op_number, mutation_count)} "
+                    f"({op_number}/{mutation_count}) done"
+                )
+    total_ms = (time.perf_counter_ns() - start_total) / 1_000_000
+    progress(f"{label} done iterations={mutation_count} total_ms={total_ms:.3f}")
 
 
 def build_depth_chain(
