@@ -77,12 +77,26 @@ class BranchSession:
         except Exception:
             self._transaction_depth -= 1
             if root:
+                rollback = getattr(self._context._backend, "rollback_transaction", None)
+                if callable(rollback):
+                    rollback(self._ref)
                 self._context._db.rollback()
             raise
         else:
             self._transaction_depth -= 1
             if root:
-                self._context._db.commit()
+                try:
+                    commit = getattr(self._context._backend, "commit_transaction", None)
+                    if callable(commit):
+                        self._ref = commit(self._ref)
+                        self._context._stamp_prepared_ref(self._ref)
+                    self._context._db.commit()
+                except Exception:
+                    rollback = getattr(self._context._backend, "rollback_transaction", None)
+                    if callable(rollback):
+                        rollback(self._ref)
+                    self._context._db.rollback()
+                    raise
 
     def branch_info(self) -> BranchInfo:
         return self._context.get_branch(self.branch_id)

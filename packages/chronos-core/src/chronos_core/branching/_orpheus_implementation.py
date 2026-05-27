@@ -11,9 +11,9 @@ storage model is still small and useful:
 * ``<dataset>_versiontable`` stores version metadata and parent/child links.
 
 Chronos uses that model behind ``ChronosBranchContext`` instead of shelling out
-to the CLI. The PostgreSQL backend defaults to the Orpheus v-list variant:
+to the CLI. The PostgreSQL backend defaults to the Orpheus r-list variant:
 integer ``rid`` in the datatable, integer ``vid`` in the versiontable,
-``rid`` plus integer-array ``vlist`` in the indextable, and integer-array
+``vid`` plus integer-array ``rlist`` in the indextable, and integer-array
 parent/children fields in the version table.
 """
 

@@ -218,7 +218,7 @@ def _make_context(sql_backend: str, branch_backend: str) -> ChronosBranchContext
     if branch_backend == "litetree" and sql_backend != "sqlite":
         pytest.skip("LiteTree backend only runs on SQLite")
     if branch_backend == "orpheus" and sql_backend != "postgres":
-        pytest.skip("Orpheus backend requires PostgreSQL array-backed vlist")
+        pytest.skip("Orpheus backend requires PostgreSQL array-backed rlist")
     if sql_backend == "postgres":
         _reset_postgres_schema()
     try:
@@ -391,7 +391,7 @@ def _make_products_only_context(
     if branch_backend == "litetree" and sql_backend != "sqlite":
         pytest.skip("LiteTree backend only runs on SQLite")
     if branch_backend == "orpheus" and sql_backend != "postgres":
-        pytest.skip("Orpheus backend requires PostgreSQL array-backed vlist")
+        pytest.skip("Orpheus backend requires PostgreSQL array-backed rlist")
     if sql_backend == "postgres":
         _reset_postgres_schema()
     try:
@@ -484,7 +484,7 @@ def test_postgres_interval_uses_numeric_32_visibility_columns() -> None:
         ctx.close()
 
 
-def test_postgres_orpheus_uses_vlist_schema_types_by_default() -> None:
+def test_postgres_orpheus_uses_rlist_schema_types_by_default() -> None:
     ctx = _make_context("postgres", "orpheus")
     try:
         rows = ctx.db.execute(
@@ -499,7 +499,7 @@ def test_postgres_orpheus_uses_vlist_schema_types_by_default() -> None:
                 )
                 OR table_name = '_chronos_b_orpheus_products_datatable'
               )
-              AND column_name IN ('rid', 'vid', 'parent', 'children', 'vlist')
+              AND column_name IN ('rid', 'vid', 'parent', 'children', 'rlist')
             """
         ).fetchall()
         by_column = {
@@ -521,12 +521,69 @@ def test_postgres_orpheus_uses_vlist_schema_types_by_default() -> None:
             assert version_array["data_type"] == "ARRAY"
             assert version_array["udt_name"] == "_int4"
 
-        index_rid = by_column[("_chronos_b_orpheus_products_indextable", "rid")]
-        assert index_rid["data_type"] == "integer"
+        index_vid = by_column[("_chronos_b_orpheus_products_indextable", "vid")]
+        assert index_vid["data_type"] == "integer"
 
-        vlist = by_column[("_chronos_b_orpheus_products_indextable", "vlist")]
-        assert vlist["data_type"] == "ARRAY"
-        assert vlist["udt_name"] == "_int4"
+        rlist = by_column[("_chronos_b_orpheus_products_indextable", "rlist")]
+        assert rlist["data_type"] == "ARRAY"
+        assert rlist["udt_name"] == "_int4"
+    finally:
+        ctx.close()
+
+
+def test_postgres_orpheus_materializes_version_on_checkpoint() -> None:
+    ctx = _make_context("postgres", "orpheus")
+    try:
+        ctx.create_branch("work", from_branch="main")
+        session = ctx.checkout("work")
+
+        with session.transaction():
+            session.execute(
+                "UPDATE products SET price = :price WHERE sku = :sku",
+                {"price": 11, "sku": "abc"},
+            )
+            session.execute(
+                "UPDATE products SET price = :price WHERE sku = :sku",
+                {"price": 22, "sku": "def"},
+            )
+            session.execute(
+                """
+                INSERT INTO products (sku, name, price)
+                VALUES (:sku, :name, :price)
+                """,
+                {"sku": "ghi", "name": "Gamma", "price": 33},
+            )
+
+        version_count = ctx.db.execute(
+            "SELECT COUNT(*) AS count, MAX(vid) AS max_vid "
+            "FROM _chronos_branch_orpheus_versiontable"
+        ).fetchone()
+        work = ctx.db.execute(
+            "SELECT current_vid FROM _chronos_branch_orpheus_branches "
+            "WHERE branch_id = 'work'"
+        ).fetchone()
+
+        assert dict(version_count) == {"count": 1, "max_vid": 1}
+        assert int(work["current_vid"]) == 1
+        assert session.query("SELECT sku, price FROM products ORDER BY sku") == [
+            {"sku": "abc", "price": 11},
+            {"sku": "def", "price": 22},
+            {"sku": "ghi", "price": 33},
+        ]
+
+        ctx.create_checkpoint("work-snap", branch="work")
+
+        version_count = ctx.db.execute(
+            "SELECT COUNT(*) AS count, MAX(vid) AS max_vid "
+            "FROM _chronos_branch_orpheus_versiontable"
+        ).fetchone()
+        work = ctx.db.execute(
+            "SELECT current_vid FROM _chronos_branch_orpheus_branches "
+            "WHERE branch_id = 'work'"
+        ).fetchone()
+
+        assert dict(version_count) == {"count": 2, "max_vid": 2}
+        assert int(work["current_vid"]) == 2
     finally:
         ctx.close()
 
