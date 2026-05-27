@@ -222,37 +222,130 @@ def stats_from_timings(timings_ms: list[float], total_ms: float | None = None) -
     }
 
 
-def measure_each(ops: list[Callable[[], Any]]) -> dict[str, float]:
+def progress(message: str) -> None:
+    print(f"  progress: {message}", flush=True)
+
+
+def case_label(case: BenchCase) -> str:
+    dimension = f"width={case.width}" if case.shape == "width" else f"depth={case.depth}"
+    return (
+        f"backend={case.backend} shape={case.shape} "
+        f"dataset={case.dataset_size} {dimension}"
+    )
+
+
+def progress_interval(case: BenchCase, operations: int) -> int:
+    if operations <= 0:
+        return 1
+    return max(1, operations // 10)
+
+
+def should_report_progress(index: int, total: int, every: int) -> bool:
+    return index == 1 or index == total or index % every == 0
+
+
+def progress_percent(index: int, total: int) -> str:
+    if total <= 0:
+        return "100%"
+    percent = (index / total) * 100
+    if percent < 1:
+        return f"{percent:.1f}%"
+    return f"{percent:.0f}%"
+
+
+def measure_each(
+    ops: list[Callable[[], Any]],
+    *,
+    label: str | None = None,
+    report_every: int | None = None,
+) -> dict[str, float]:
     timings_ms: list[float] = []
     start_total = time.perf_counter_ns()
-    for op in ops:
+    total = len(ops)
+    for idx, op in enumerate(ops, start=1):
+        if label and report_every and should_report_progress(idx, total, report_every):
+            progress(
+                f"{label} {progress_percent(idx, total)} "
+                f"({idx}/{total}) start"
+            )
         start = time.perf_counter_ns()
         op()
-        timings_ms.append((time.perf_counter_ns() - start) / 1_000_000)
+        elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000
+        timings_ms.append(elapsed_ms)
+        if label and report_every and should_report_progress(idx, total, report_every):
+            progress(
+                f"{label} {progress_percent(idx, total)} "
+                f"({idx}/{total}) done elapsed_ms={elapsed_ms:.3f}"
+            )
     total_ms = (time.perf_counter_ns() - start_total) / 1_000_000
+    if label:
+        progress(f"{label} done operations={total} total_ms={total_ms:.3f}")
     return stats_from_timings(timings_ms, total_ms)
 
 
-def warmup_each(ops: list[Callable[[], Any]], warmup_ops: int) -> None:
+def warmup_each(
+    ops: list[Callable[[], Any]],
+    warmup_ops: int,
+    *,
+    label: str | None = None,
+    report_every: int | None = None,
+) -> None:
     if warmup_ops <= 0 or not ops:
         return
     for idx in range(warmup_ops):
+        op_number = idx + 1
+        if label and report_every and should_report_progress(
+            op_number, warmup_ops, report_every
+        ):
+            progress(
+                f"{label} warmup {progress_percent(op_number, warmup_ops)} "
+                f"({op_number}/{warmup_ops}) start"
+            )
         ops[idx % len(ops)]()
+        if label and report_every and should_report_progress(
+            op_number, warmup_ops, report_every
+        ):
+            progress(
+                f"{label} warmup {progress_percent(op_number, warmup_ops)} "
+                f"({op_number}/{warmup_ops}) done"
+            )
 
 
-def measure_each_in_transaction(session: Any, ops: list[Callable[[], Any]]) -> dict[str, float]:
+def measure_each_in_transaction(
+    session: Any,
+    ops: list[Callable[[], Any]],
+    *,
+    label: str | None = None,
+    report_every: int | None = None,
+) -> dict[str, float]:
     # The branching API is expected to support a batch of work on one checked
     # out branch. This helper measures per-operation latency while committing
     # the batch once, matching the intended agent workflow more closely than an
     # implicit commit after every statement.
     timings_ms: list[float] = []
     start_total = time.perf_counter_ns()
+    total = len(ops)
+    if label:
+        progress(f"{label} transaction start operations={total}")
     with session.transaction():
-        for op in ops:
+        for idx, op in enumerate(ops, start=1):
+            if label and report_every and should_report_progress(idx, total, report_every):
+                progress(
+                    f"{label} {progress_percent(idx, total)} "
+                    f"({idx}/{total}) start"
+                )
             start = time.perf_counter_ns()
             op()
-            timings_ms.append((time.perf_counter_ns() - start) / 1_000_000)
+            elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000
+            timings_ms.append(elapsed_ms)
+            if label and report_every and should_report_progress(idx, total, report_every):
+                progress(
+                    f"{label} {progress_percent(idx, total)} "
+                    f"({idx}/{total}) done elapsed_ms={elapsed_ms:.3f}"
+                )
     total_ms = (time.perf_counter_ns() - start_total) / 1_000_000
+    if label:
+        progress(f"{label} transaction done operations={total} total_ms={total_ms:.3f}")
     return stats_from_timings(timings_ms, total_ms)
 
 
@@ -301,6 +394,7 @@ def make_context(
 ) -> ChronosBranchContext | DoltgresBranchContext:
     backend = case.backend
     dataset_size = case.dataset_size
+    progress(f"{case_label(case)} context start")
     if backend == "doltgres":
         ctx = DoltgresBranchContext.connect(database_url)
         db = ctx.db
@@ -334,6 +428,7 @@ def make_context(
                 interval_continuation_percent=case.interval_continuation_percent,
             )
             db = ctx.db
+    progress(f"{case_label(case)} create logical tables")
     db.execute(
         """
         CREATE TABLE products (
@@ -374,9 +469,12 @@ def make_context(
         _insert_rows_chunked(db, "products", 4, products)
         _insert_rows_chunked(db, "orders", 3, orders)
     else:
+        progress(f"{case_label(case)} load products rows={len(products)}")
         db.executemany("INSERT INTO products VALUES (?, ?, ?, ?)", products)
+        progress(f"{case_label(case)} load orders rows={len(orders)}")
         db.executemany("INSERT INTO orders VALUES (?, ?, ?)", orders)
     db.commit()
+    progress(f"{case_label(case)} base data committed")
     if isinstance(ctx, DoltgresBranchContext):
         db.execute("CREATE INDEX products_sku_lookup ON products (sku)")
         db.execute("CREATE INDEX products_price_category ON products (price, category)")
@@ -389,6 +487,7 @@ def make_context(
         ctx.create_index("products", ["sku"], name="products_sku_lookup")
         ctx.create_index("products", ["price", "category"], name="products_price_category")
         ctx.create_index("orders", ["sku"], name="orders_sku_lookup")
+    progress(f"{case_label(case)} context ready")
     return ctx
 
 
@@ -509,10 +608,13 @@ def mutate_branch_state(
 ) -> None:
     if mutations_per_branch <= 0:
         return
+    label = f"{case_label(case)} branch={branch_id} setup_mutations"
+    progress(f"{label} start iterations={mutations_per_branch}")
     session = ctx.checkout(branch_id)
     mutation_count = min(mutations_per_branch, case.dataset_size)
     with session.transaction():
         for idx in range(mutation_count):
+            progress(f"{label} iteration {idx + 1}/{mutation_count} start")
             base_idx = (level * mutations_per_branch + idx) % case.dataset_size
             sku = f"sku_{base_idx:08d}"
             order_id = f"order_{base_idx:08d}"
@@ -558,6 +660,8 @@ def mutate_branch_state(
                 "DELETE FROM orders WHERE order_id = :order_id",
                 {"order_id": f"order_{delete_idx:08d}"},
             )
+            progress(f"{label} iteration {idx + 1}/{mutation_count} done")
+    progress(f"{label} done")
 
 
 def build_depth_chain(
@@ -569,9 +673,14 @@ def build_depth_chain(
     create_timings_ms: list[float] = []
     parent = "main"
     for level, branch in enumerate(branch_names):
+        progress(
+            f"{case_label(case)} create depth branch {level + 1}/{case.depth} "
+            f"branch={branch} parent={parent}"
+        )
         start = time.perf_counter_ns()
         ctx.create_branch(branch, from_branch=parent)
         create_timings_ms.append((time.perf_counter_ns() - start) / 1_000_000)
+        progress(f"{case_label(case)} created branch={branch}")
         mutate_branch_state(ctx, branch, case, level, mutations_per_branch)
         if mutations_per_branch > 0 and hasattr(ctx, "commit_working_set"):
             ctx.commit_working_set(branch, f"benchmark mutations depth {level}")
@@ -588,9 +697,14 @@ def build_width_fanout(
     branch_names = [f"width_{idx}" for idx in range(case.width)]
     create_timings_ms: list[float] = []
     for level, branch in enumerate(branch_names):
+        progress(
+            f"{case_label(case)} create width branch {level + 1}/{case.width} "
+            f"branch={branch} parent=main"
+        )
         start = time.perf_counter_ns()
         ctx.create_branch(branch, from_branch="main")
         create_timings_ms.append((time.perf_counter_ns() - start) / 1_000_000)
+        progress(f"{case_label(case)} created branch={branch}")
         mutate_branch_state(ctx, branch, case, level, mutations_per_branch)
         if mutations_per_branch > 0 and hasattr(ctx, "commit_working_set"):
             ctx.commit_working_set(branch, f"benchmark mutations width {level}")
@@ -604,7 +718,12 @@ def benchmark_branch_deletes(
         (lambda branch=branch: ctx.delete_branch(branch))
         for branch in reversed(branch_names)
     ]
-    delete_stats = measure_each(delete_ops)
+    label = f"{case_label(case)} branch_delete"
+    delete_stats = measure_each(
+        delete_ops,
+        label=label,
+        report_every=progress_interval(case, len(delete_ops)),
+    )
     return result_row(case, "branch_delete", delete_stats)
 
 
@@ -637,10 +756,13 @@ def benchmark_reads(
     # Checkout prepares backend metadata once. The measured reads reuse the
     # same session so interval segments or log lineage are not reloaded for
     # every query.
+    base_label = f"{case_label(case)} branch={branch_id}"
+    progress(f"{base_label} reads checkout")
     session = ctx.checkout(branch_id)
     keys = random_existing_skus(
         case, branch_id, "point_read", read_ops, unique=False
     )
+    point_label = f"{base_label} point_read"
 
     point_ops = [
         (
@@ -651,8 +773,17 @@ def benchmark_reads(
         )
         for key in keys
     ]
-    warmup_each(point_ops, warmup_ops)
-    point_stats = measure_each(point_ops)
+    warmup_each(
+        point_ops,
+        warmup_ops,
+        label=point_label,
+        report_every=progress_interval(case, warmup_ops),
+    )
+    point_stats = measure_each(
+        point_ops,
+        label=point_label,
+        report_every=progress_interval(case, len(point_ops)),
+    )
     rows = [result_row(case, "point_read", point_stats)]
 
     range_width = min(100, case.dataset_size)
@@ -681,8 +812,18 @@ def benchmark_reads(
         )
         for start in range_starts
     ]
-    warmup_each(range_ops, warmup_ops)
-    range_stats = measure_each(range_ops)
+    range_label = f"{base_label} range_read"
+    warmup_each(
+        range_ops,
+        warmup_ops,
+        label=range_label,
+        report_every=progress_interval(case, warmup_ops),
+    )
+    range_stats = measure_each(
+        range_ops,
+        label=range_label,
+        report_every=progress_interval(case, len(range_ops)),
+    )
     rows.append(result_row(case, "range_read", range_stats))
 
     if not include_join_aggregate:
@@ -705,8 +846,18 @@ def benchmark_reads(
         )
         for idx in range(read_ops)
     ]
-    warmup_each(aggregate_ops, warmup_ops)
-    aggregate_stats = measure_each(aggregate_ops)
+    aggregate_label = f"{base_label} join_aggregate_read"
+    warmup_each(
+        aggregate_ops,
+        warmup_ops,
+        label=aggregate_label,
+        report_every=progress_interval(case, warmup_ops),
+    )
+    aggregate_stats = measure_each(
+        aggregate_ops,
+        label=aggregate_label,
+        report_every=progress_interval(case, len(aggregate_ops)),
+    )
     rows.append(result_row(case, "join_aggregate_read", aggregate_stats))
 
     return rows
@@ -722,7 +873,11 @@ def benchmark_reads_across_branches(
     include_join_aggregate: bool,
 ) -> list[dict[str, Any]]:
     metric_stats: dict[str, list[dict[str, float]]] = {}
-    for branch_id in branch_ids:
+    for idx, branch_id in enumerate(branch_ids, start=1):
+        progress(
+            f"{case_label(case)} reads branch {idx}/{len(branch_ids)} "
+            f"branch={branch_id}"
+        )
         for row in benchmark_reads(
             ctx,
             branch_id,
@@ -756,6 +911,8 @@ def benchmark_writes(
     # Writes are measured on the terminal branch after the depth chain has been
     # built and mutated. Each write category uses one transaction to isolate
     # branch-backend costs from repeated commit overhead.
+    base_label = f"{case_label(case)} branch={branch_id}"
+    progress(f"{base_label} writes checkout")
     session = ctx.checkout(branch_id)
     update_count = min(write_ops, case.dataset_size)
     delete_count = min(write_ops, case.dataset_size)
@@ -776,7 +933,13 @@ def benchmark_writes(
         )
         for idx, key in enumerate(update_keys)
     ]
-    update_stats = measure_each_in_transaction(session, update_ops)
+    update_label = f"{base_label} update_write"
+    update_stats = measure_each_in_transaction(
+        session,
+        update_ops,
+        label=update_label,
+        report_every=progress_interval(case, len(update_ops)),
+    )
 
     insert_ops = [
         (
@@ -795,7 +958,13 @@ def benchmark_writes(
         )
         for idx, key in enumerate(insert_keys)
     ]
-    insert_stats = measure_each_in_transaction(session, insert_ops)
+    insert_label = f"{base_label} insert_write"
+    insert_stats = measure_each_in_transaction(
+        session,
+        insert_ops,
+        label=insert_label,
+        report_every=progress_interval(case, len(insert_ops)),
+    )
 
     delete_ops = [
         (
@@ -806,7 +975,13 @@ def benchmark_writes(
         )
         for key in delete_keys
     ]
-    delete_stats = measure_each_in_transaction(session, delete_ops)
+    delete_label = f"{base_label} delete_write"
+    delete_stats = measure_each_in_transaction(
+        session,
+        delete_ops,
+        label=delete_label,
+        report_every=progress_interval(case, len(delete_ops)),
+    )
 
     return [
         result_row(case, "update_write", update_stats),
@@ -822,7 +997,11 @@ def benchmark_writes_across_branches(
     write_ops: int,
 ) -> list[dict[str, Any]]:
     metric_stats: dict[str, list[dict[str, float]]] = {}
-    for branch_id in branch_ids:
+    for idx, branch_id in enumerate(branch_ids, start=1):
+        progress(
+            f"{case_label(case)} writes branch {idx}/{len(branch_ids)} "
+            f"branch={branch_id}"
+        )
         for row in benchmark_writes(ctx, branch_id, case, write_ops):
             metric_stats.setdefault(row["metric"], []).append(
                 {
@@ -872,21 +1051,32 @@ def run_case(
     include_join_aggregate: bool,
     post_branch_warmup: str,
 ) -> list[dict[str, Any]]:
+    label = case_label(case)
+    progress(f"{label} case start")
     ctx = make_context(case, database_url)
     try:
         if case.shape == "width":
+            progress(f"{label} branch construction start")
             branch_names, create_stats = build_width_fanout(
                 ctx, case, mutations_per_branch
             )
             target_branches = branch_names or ["main"]
         else:
+            progress(f"{label} branch construction start")
             terminal_branch, create_stats, branch_names = build_depth_chain(
                 ctx, case, mutations_per_branch
             )
             target_branches = [terminal_branch]
+        progress(
+            f"{label} branch construction done target_branches="
+            f"{','.join(target_branches)}"
+        )
+        progress(f"{label} post-branch warmup start mode={post_branch_warmup}")
         warm_after_branching(ctx, target_branches, post_branch_warmup)
+        progress(f"{label} post-branch warmup done")
         rows = [result_row(case, "branch_create", create_stats)]
         if case.shape == "width":
+            progress(f"{label} read benchmarks start")
             rows.extend(
                 benchmark_reads_across_branches(
                     ctx,
@@ -898,6 +1088,8 @@ def run_case(
                     include_join_aggregate,
                 )
             )
+            progress(f"{label} read benchmarks done")
+            progress(f"{label} write benchmarks start")
             rows.extend(
                 benchmark_writes_across_branches(
                     ctx,
@@ -906,7 +1098,9 @@ def run_case(
                     write_ops,
                 )
             )
+            progress(f"{label} write benchmarks done")
         else:
+            progress(f"{label} read benchmarks start")
             rows.extend(
                 benchmark_reads(
                     ctx,
@@ -918,8 +1112,14 @@ def run_case(
                     include_join_aggregate,
                 )
             )
+            progress(f"{label} read benchmarks done")
+            progress(f"{label} write benchmarks start")
             rows.extend(benchmark_writes(ctx, target_branches[0], case, write_ops))
+            progress(f"{label} write benchmarks done")
+        progress(f"{label} branch delete benchmark start")
         rows.append(benchmark_branch_deletes(ctx, case, branch_names))
+        progress(f"{label} branch delete benchmark done")
+        progress(f"{label} case done")
         return rows
     finally:
         ctx.close()
