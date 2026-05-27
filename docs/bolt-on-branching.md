@@ -18,12 +18,16 @@ WHERE sku = 'abc';
 
 A checked-out branch determines which physical rows are visible to a branch-bound session across the database. A normal database `COMMIT` publishes changes to the current branch. There is no branch commit required for each transaction.
 
-The interval backend can be understood with one number-line model:
+The interval branching model can be understood with one number-line model:
 
-- each branch owns one `branch_point` in an integer space
+- each branch owns a monotonically shrinking segment `[lo, hi)` in an integer
+  space
+- each branch also has one read point inside its current segment
 - each physical row version owns a visibility interval `[live_lo, live_hi)`
-- the same physical row version can be shared by many branches
-- a branch sees a row version when its `branch_point` falls inside that row's interval
+- a new row version gets its interval from the current segment of the branch
+  that writes it
+- the same physical row version can be shared by many branches when its
+  interval contains their read points
 
 Branch visibility is tested with a constant-shape predicate:
 
@@ -36,10 +40,23 @@ AND deleted = false
 Chronos adds this predicate to every user query over a registered logical table.
 
 The primary storage model is **write-time interval maintenance**. Branch creation
-only partitions interval metadata; it does not copy user rows. Writes preserve
-correctness by splitting physical row intervals, so reads stay predicate-based
-and SQL predicates can be evaluated against a normal-looking branch view
-efficiently.
+only partitions branch segment metadata; it does not copy user rows. Writes
+create row versions over the writer branch's current segment. Updates and
+deletes preserve correctness by splitting overlapping old row intervals, so
+reads stay predicate-based and SQL predicates can be evaluated against a
+normal-looking branch view efficiently.
+
+At a high level:
+
+```text
+1. Branches own monotonically shrinking interval segments.
+2. Forking a branch splits the parent's current segment into two segments.
+3. Rows written by a branch receive that branch's current segment as their
+   visibility interval.
+4. Reads use one point inside the branch segment to filter visible rows.
+5. Updates/deletes splice old row intervals so that each branch point sees at
+   most one live physical row for each logical key.
+```
 
 ## Goals
 
@@ -62,7 +79,7 @@ efficiently.
 - Hot keys can accumulate many physical rows.
 - Multi-row writes evaluate the current branch view first, then splice matched keys.
 - Branch-local DDL is outside the first version.
-- The log-table backend needs a current-state projection for consistently fast arbitrary SQL reads.
+- The log-table representation needs a current-state projection for consistently fast arbitrary SQL reads.
 - Long-lived branches require retaining historical log records or physical rows until all dependent branches, checkpoints, and retention policies release them.
 
 ## User-Facing API
@@ -378,9 +395,13 @@ Users create, check out, mutate, and compare branches.
 
 ### Segment
 
-A segment is the part of the integer space currently managed by a branch. The
-branch's `branch_point` is an interior point of that segment, and all registered
-tables use that point for visibility checks.
+A segment is the part of the integer space currently managed by a branch. A
+branch's segment shrinks monotonically: every time the branch forks a child,
+Chronos partitions the current segment and gives the branch a smaller
+continuation segment. The branch's `branch_point` is an interior read point of
+the current segment, and all registered tables use that point for visibility
+checks. The segment is the write/inheritance scope; the point is the read
+identity.
 
 When a branch is forked, Chronos recursively partitions the source branch's
 current segment into two new segments:
@@ -405,13 +426,16 @@ After `ctx.create_branch("y", from_branch="x")`:
           y_s1   <- y starts here
 ```
 
-Future writes to `x` go to `x_s2`. Future writes to `y` go to `y_s1`. Both branches inherit rows visible at `x_s1`.
+Future writes to `x` go to `x_s2`. Future writes to `y` go to `y_s1`. The
+segment owned by `x` has shrunk from `x_s1` to `x_s2`. Both branches inherit
+rows whose intervals covered the old `x_s1` segment.
 
 ### Interval Encoding
 
 Each segment receives a range and a branch point. The branch point is not the
-split point; it is a stable point inside the segment used to evaluate row
-visibility.
+split point. It is a representative point inside the segment used to evaluate
+row visibility. A branch's point can change when the branch is forked because
+the branch moves to a new continuation segment.
 
 ```text
 segment  interval          point
@@ -438,6 +462,10 @@ AND row.deleted = false
 This keeps reads independent of branch depth. A read does not walk from a branch
 to its parent, then grandparent, and so on. It evaluates one point against row
 intervals.
+
+The branch point is deliberately not used as the write scope. Writes use the
+entire current segment, so future descendants can inherit those writes until
+they override them.
 
 ## Metadata Tables
 
@@ -472,6 +500,19 @@ CREATE TABLE segments (
 For each logical table, the system stores physical row versions with
 branch-visible live intervals. A single logical row can therefore have multiple
 physical rows, each visible to a different region of branch space.
+
+The most important rule is how a physical row gets its interval:
+
+```text
+on insert/update in branch b:
+  new_row.live_lo = b.current_segment.live_lo
+  new_row.live_hi = b.current_segment.live_hi
+```
+
+That write scope is what makes inheritance work. A row written before a fork
+has an interval that covers both resulting branch points after the fork. A row
+written after a fork is restricted to the writer's continuation segment, so
+sibling branches do not see it.
 
 Logical table:
 
@@ -587,14 +628,30 @@ because the write path maintains the interval invariant.
 
 ## Write Path
 
-Writes are the maintenance step. They target the current mutable segment of the
-checked-out branch:
+Writes assign intervals to new physical row versions and maintain the interval
+map for old versions. They target the current mutable segment of the checked-out
+branch:
 
 ```text
 write scope = [current_segment_lo(), current_segment_hi())
 ```
 
 Stable fork-prefix segments and checkpoints are read-only. When a branch is forked, the source branch moves to a new continuation segment. Future writes go to that continuation segment.
+
+For a new logical row, the write path is simple: insert one physical row whose
+`live_lo` and `live_hi` equal the current segment bounds.
+
+```text
+current segment: [20, 40)
+INSERT sku = 'abc', price = 15
+
+physical row:
+  abc = 15  [20, 40)
+```
+
+For an update/delete, the new physical row also gets the current segment. The
+extra work is removing that segment from any old physical row intervals for the
+same logical key.
 
 When a branch updates or deletes a logical row, Chronos finds physical rows for
 the same logical key whose intervals overlap the branch's current segment. It
@@ -608,6 +665,13 @@ old value after the branch segment
 
 This preserves the invariant that each branch point sees at most one live
 version of each logical row.
+
+The rule is therefore:
+
+```text
+row intervals are assigned on write from the writer's current segment;
+old intervals are split only when they overlap that write segment.
+```
 
 ### Update
 
@@ -656,7 +720,7 @@ abc = 15  [160000,180000)
 abc = 10  [180000,1000000)
 ```
 
-This is the central tradeoff of the interval backend: reads are simple because
+This is the central tradeoff of the interval model: reads are simple because
 writes split row intervals when needed.
 
 If the current segment already has the exact live interval for the key, repeated updates can modify that row in place:
@@ -895,9 +959,12 @@ administrative rewrite over a broad interval.
 
 Branch creation does not copy user rows. Storage grows when data changes, not when branches are created.
 
-## Alternative Backend: Branch Log Tables
+## Alternative Representation: Branch Log Tables
 
-The same `ChronosBranchContext` API can be implemented with append-only log tables instead of write-time interval maintenance. In this backend, a branch is a log timeline. Branch creation records a fork point and shares the parent log prefix. Writes append new log records to the branch's own timeline.
+The same `ChronosBranchContext` API can be implemented with append-only log
+tables instead of write-time interval maintenance. In this representation, a
+branch is a log timeline. Branch creation records a fork point and shares the
+parent log prefix. Writes append new log records to the branch's own timeline.
 
 This is closer to a WAL-timeline model:
 
@@ -1244,7 +1311,7 @@ INCLUDE (edge_id, src_id, op, label, properties, row_hash);
 
 ### Current-State Projection
 
-The log backend should maintain an optional current-state projection for fast SQL reads:
+The log-table representation should maintain an optional current-state projection for fast SQL reads:
 
 ```text
 log tables                source of truth, history, time travel
@@ -1253,7 +1320,7 @@ current-state projection  optimized branch query surface
 
 Projection options:
 
-- interval live-range tables, as described in the primary backend
+- interval live-range tables, as described in the primary representation
 - branch-head tables for selected hot branches
 - materialized current views for analytical workloads
 - cached reconstructed pages or row groups
@@ -1292,11 +1359,11 @@ full scan:       reconstruct current row per key unless projected
 storage:         one log row per logical mutation
 ```
 
-This backend is strongest when history, auditability, replay, and append-only writes matter. It needs a projection layer for consistently fast arbitrary SQL reads.
+This representation is strongest when history, auditability, replay, and append-only writes matter. It needs a projection layer for consistently fast arbitrary SQL reads.
 
 ## Time Travel and Checkpoints
 
-The interval backend supports time travel to structural states:
+The interval model supports time travel to structural states:
 
 - current branch heads
 - fork boundaries
@@ -1310,7 +1377,7 @@ ctx.create_checkpoint("before_discount", branch="exp_pricing")
 
 Checkpointing creates a stable segment boundary. It does not require copying user tables.
 
-The log-table backend can additionally support time travel by LSN because every row mutation is retained in the append-only log:
+The log-table representation can additionally support time travel by LSN because every row mutation is retained in the append-only log:
 
 ```python
 historical = ctx.checkout_at(branch="exp_pricing", lsn=120)
@@ -1501,7 +1568,7 @@ Garbage collection must preserve the non-overlap invariant for remaining live br
 
 ## Minimal Implementation Plan
 
-For the interval live-range backend:
+For the interval live-range representation:
 
 1. Add `branches` and `segments`.
 2. Implement checkout, branch creation, and checkpoint creation.
@@ -1512,7 +1579,7 @@ For the interval live-range backend:
 7. Add sparse interval allocation and depth checks.
 8. Add diff, merge, and garbage collection.
 
-For the log-table backend:
+For the log-table representation:
 
 1. Add `branch_timelines` and `branch_txns`.
 2. Generate per-table append-only log tables.

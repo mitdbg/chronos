@@ -9,7 +9,7 @@ vision is to provide one unified branching abstraction across many state stores:
 relational databases, filesystems, sandboxes, vector stores, object stores, and
 other application-managed state. Agents should be able to fork, mutate,
 evaluate, compare, discard, and merge speculative execution paths without
-reasoning separately about each backend's native snapshot mechanism.
+reasoning separately about each store's native snapshot mechanism.
 
 Chronos is designed to layer on top of TAR, the Transactional Agent Runtime. TAR
 provides the execution substrate: tool coordination, transaction boundaries,
@@ -22,9 +22,10 @@ Databases still provide the serial, durable, isolated execution primitive.
 Chronos uses those transactions to update branch metadata and branch-local data
 atomically, while presenting agents with Git-like branching semantics.
 
-For the relational backend, Chronos is bolt-on: applications keep using SQL over
-logical tables, and Chronos rewrites queries to expose the state of the checked
-out branch.
+For relational data, Chronos is bolt-on: applications keep using SQL over
+logical tables, and Chronos rewrites queries to expose the state of the
+checked-out branch.
+
 ## Why Agentic Systems Need Branching
 
 Agentic applications are increasingly stateful. They update short-term memory,
@@ -60,7 +61,7 @@ Chronos adopts this view, but broadens the scope from database branching alone
 to agent state management across heterogeneous stores. The goal is a system that
 supports CRUD over branchable application state with consistency and reliability
 guarantees, whether that state lives in relational tables, files, sandboxed
-program state, vector indexes, or other backend systems.
+program state, vector indexes, or other state systems.
 
 ## Why Transactions Alone Are Not Enough
 
@@ -124,11 +125,11 @@ Chronos branching layer
   - diff, compare, merge
   - branch garbage collection
 
-Predicate rewrite and backend adapters
+Predicate rewrite and state adapters
   - SQL query rewrite
   - filesystem/sandbox overlays
   - vector or memory overlays
-  - backend-specific visibility rules
+  - store-specific visibility rules
 
 TAR transaction layer
   - begin / commit / abort
@@ -174,7 +175,7 @@ state model to the agent.
 
 ## Relational Branching In One Picture
 
-The relational backend has three conceptual layers:
+The relational design has three conceptual layers:
 
 ```text
 User SQL
@@ -188,23 +189,29 @@ Predicate rewrite layer
     AND :branch_point < live_hi
     AND deleted = false
 
-Interval backend
-  - branches own points in integer space
-  - row versions own visibility intervals
-  - writes split intervals to preserve branch isolation
+Interval branching model
+  - branches own segments in integer space
+  - row versions get intervals from the segment that wrote them
+  - branch points are read positions inside branch segments
+  - updates split old row intervals to preserve isolation
 ```
 
 Applications continue to use logical table names. The branch session determines
 which branch state those table names refer to.
 
-## Interval Backend: Core Idea
+## Interval Branching Model
 
-The interval backend represents branch visibility with a number-line model:
+The interval model represents branching with a number-line model:
 
-- Every branch owns a unique `branch_point` in an integer space.
+- Every branch owns a monotonically shrinking segment `[lo, hi)` in an integer
+  space.
+- Each branch also has a representative read point inside that segment.
 - Every physical row version owns a visibility interval `[live_lo, live_hi)`.
-- One physical row version can be shared by many branches.
-- A row version is visible in branch `b` when:
+- A row version gets its interval from the segment of the branch that wrote it.
+- One physical row version can be shared by many branches when its interval
+  covers their read points.
+
+Reads use the branch's representative point:
 
 ```text
 row.live_lo <= b.branch_point < row.live_hi
@@ -215,10 +222,21 @@ Chronos adds this predicate to every user query over a registered logical table.
 Reads do not walk the branch lineage. They evaluate one branch point against row
 intervals.
 
+Writes use the branch's current segment:
+
+```text
+new_row.live_lo = branch.segment.lo
+new_row.live_hi = branch.segment.hi
+```
+
+A row written by branch `X` is visible over `X`'s current segment. If a child is later forked from `X`, and
+that row interval covers the child segment, the child inherits the same physical
+row without copying it.
+
 ## Branching
 
-Each branch owns a segment of the integer space. When Chronos forks a child
-branch, it splits the parent branch's current segment:
+Each branch owns a monotonically shrinking segment of the integer space. When
+Chronos forks a child branch, it splits the parent branch's current segment:
 
 ```text
 Before:
@@ -236,15 +254,34 @@ After fork:
 ```
 
 The parent continues in one subsegment. The child receives the other subsegment.
-Each segment receives an interior branch point. This partitioning recurses as
-branches fork from branches.
+The parent's future segment is smaller than its previous segment, so a branch's
+owned segment shrinks monotonically as it forks children. Each segment receives
+an interior read point. This partitioning recurses as branches fork from
+branches.
 
 Branch creation is metadata-only. No user rows are copied when a branch is
-created.
+created. Existing row intervals are left unchanged, so rows written before the
+fork can remain shared by both sides of the fork.
 
 ## Writes
 
-Writes are the maintenance step that preserves logical branch isolation.
+Writes are the step that assigns row intervals and maintains logical branch
+isolation.
+
+When a branch inserts a new logical row, Chronos creates a physical row version
+with the branch's current segment as its visibility interval:
+
+```text
+branch segment:
+  [20, 40)
+
+insert value B:
+  B over [20, 40)
+```
+
+When a branch updates an inherited row, Chronos cannot simply add the new row.
+It must also remove the writer's segment from the old row's interval; otherwise
+the branch point could see both the old and new versions.
 
 For a given logical primary key and branch, Chronos maintains this invariant:
 
@@ -281,6 +318,16 @@ A over [40, 100)
 This is why Chronos can avoid copying full tables at branch creation time while
 still giving each branch an isolated logical table view.
 
+The overall process is:
+
+```text
+1. Branch creation splits only branch metadata.
+2. New rows receive the writer branch's current segment as their interval.
+3. Reads test one branch point against row intervals.
+4. Updates/deletes split overlapping old row intervals and install a replacement
+   over the writer's current segment.
+```
+
 ## Guarantees and Design Goals
 
 Chronos aims to provide:
@@ -291,7 +338,7 @@ Chronos aims to provide:
   rolls back atomically.
 - Unified branching: agents use one branch/checkpoint/diff/merge abstraction
   across relational data, files, sandboxes, vector stores, and other state
-  backends.
+  state systems.
 - Constant-shape read visibility: reads use a fixed predicate independent of
   branch depth.
 - Shared physical storage: unchanged rows are shared across branches.
@@ -312,9 +359,9 @@ existing databases and compatible with ordinary SQL, but it creates trade-offs:
   intervals.
 - Fixed-width interval spaces require careful allocation, relabeling, or depth
   limits.
-- Branch-local schema changes are outside the first relational backend design;
+- Branch-local schema changes are outside the first relational design;
   the initial model branches row contents under a shared schema.
-- Cross-backend consistency depends on TAR coordination and backend adapters.
+- Cross-store consistency depends on TAR coordination and state adapters.
 
 These are different trade-offs from systems that implement branching in the
 storage layer, WAL layer, or a custom content-addressed storage engine. Chronos

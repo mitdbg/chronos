@@ -31,7 +31,7 @@ Environment:
   PYTHON                        Python executable. Default: python3.
 
 Defaults:
-  mode:               postgres
+  mode:               postgres-doltgres
   dataset sizes:      10000000
   depths:             1,4,8,16,32
   widths:             1,4,8,16,32
@@ -61,7 +61,7 @@ USAGE
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python3}"
-MODE="${1:-postgres}"
+MODE="${1:-postgres-doltgres}"
 POSTGRES_CONTAINER="${CHRONOS_BENCH_POSTGRES_NAME:-chronos-branch-postgres}"
 POSTGRES_IMAGE="${CHRONOS_BENCH_POSTGRES_IMAGE:-postgres:16-alpine}"
 POSTGRES_PORT="${CHRONOS_BENCH_POSTGRES_PORT:-55433}"
@@ -94,7 +94,7 @@ case "${MODE}" in
 esac
 
 DEFAULT_ARGS=(
-  --dataset-sizes 1000000
+  --dataset-sizes 5000000
   --depths 1,4,8,16,32
   --widths 1,4,8,16
   --benchmark-shapes depth,width
