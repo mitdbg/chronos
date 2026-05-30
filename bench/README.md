@@ -9,6 +9,26 @@ Run a quick smoke benchmark:
 bench/run_branching_experiments.sh postgres --quick
 ```
 
+Run the branch-local schema-change benchmark:
+
+```bash
+bench/run_schema_branching_experiments.sh postgres-doltgres --quick
+```
+
+The schema benchmark compares Chronos interval, Chronos copy, and native
+Doltgres branches for `ALTER TABLE products ADD COLUMN ...` on a child branch.
+It runs both `ADD COLUMN bench_no_default INTEGER` and
+`ADD COLUMN bench_default INTEGER DEFAULT 7` so engines with instant/default
+DDL can be compared with engines that copy or rewrite branch-local storage.
+Unsupported cases are recorded in `results.csv` with `status=unsupported`
+instead of aborting the run.
+
+The schema benchmark keeps `first_point_read_new_column` as the cold first read
+after the schema change. Before the later steady-state phases, it runs
+`--warmup-ops` unmeasured operations on the same branch and schema state. The
+default wrapper passes `--warmup-ops 1`, warming point read, range read, count,
+update, and insert phases without timing the warmup operation.
+
 By default, `run_branching_experiments.sh` runs PostgreSQL. If
 `CHRONOS_BRANCH_POSTGRES_DSN` or `CHRONOS_BRANCH_DATABASE_URL` is not set, it starts
 a temporary `postgres:16-alpine` Docker container, waits for readiness, runs the
