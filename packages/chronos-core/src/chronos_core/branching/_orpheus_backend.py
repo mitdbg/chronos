@@ -196,14 +196,7 @@ class _OrpheusBackend(_SQLBranchBackend):
             backend=self.name,
         )
         self.tables[table] = meta
-        source_cols = ", ".join(_quote(column) for column in columns)
-        rows = self.db.execute(
-            f"SELECT {source_cols} FROM {_quote_table_name(table)}"
-        ).fetchall()
-        initial_rids = []
-        for row in rows:
-            initial_rids.append(self._insert_physical_row(meta, dict(row)))
-        self._insert_version_rlist(meta, 1, initial_rids)
+        self._copy_source_rows_to_version(meta, table, 1)
         self._refresh_version_record_count(1)
 
     def create_index(
@@ -931,6 +924,32 @@ class _OrpheusBackend(_SQLBranchBackend):
             DO UPDATE SET rlist = EXCLUDED.rlist
             """,
             (self._vid(version_id), rids),
+        )
+
+    def _copy_source_rows_to_version(
+        self,
+        meta: _TableMeta,
+        source_table: str,
+        version_id: str | int,
+    ) -> None:
+        cols = ", ".join(_quote(column) for column in meta.columns)
+        self.db.execute(
+            f"""
+            WITH inserted AS (
+              INSERT INTO {_quote(meta.physical_name)}
+              ({cols})
+              SELECT {cols}
+              FROM {_quote_table_name(source_table)}
+              RETURNING rid
+            )
+            INSERT INTO {_quote(self._index_table(meta))}
+            (vid, rlist)
+            SELECT ?, COALESCE(array_agg(rid ORDER BY rid), ARRAY[]::integer[])
+            FROM inserted
+            ON CONFLICT (vid)
+            DO UPDATE SET rlist = EXCLUDED.rlist
+            """,
+            (self._vid(version_id),),
         )
 
     def _insert_workspace_row(self, meta: _TableMeta, row: dict[str, Any]) -> int:

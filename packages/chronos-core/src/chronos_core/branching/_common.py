@@ -667,6 +667,12 @@ class _SQLBranchBackend:
             for index in sorted(indexes, key=lambda i: (i.table, i.name))
         ]
 
+    def diff_tables(self) -> list[str]:
+        return sorted(self.tables)
+
+    def table_meta_for_branch(self, branch_id: str, table: str) -> _TableMeta:
+        return self._require_table(table)
+
     def _require_table(self, table: str) -> _TableMeta:
         try:
             return self.tables[table]

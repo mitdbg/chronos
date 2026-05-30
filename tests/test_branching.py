@@ -90,6 +90,8 @@ def test_postgres_percent_escaping_preserves_placeholders() -> None:
 
 @pytest.mark.parametrize("sql_backend", SQL_BACKENDS)
 def test_interval_register_table_adds_new_source_columns(sql_backend: str) -> None:
+    if sql_backend == "postgres":
+        _reset_postgres_schema()
     ctx = ChronosBranchContext.connect(_database_url(sql_backend), backend="interval")
     try:
         ctx.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT)")
@@ -111,6 +113,144 @@ def test_interval_register_table_adds_new_source_columns(sql_backend: str) -> No
             {"id": "doc:1"},
         )
         assert rows == [{"source": "fixture"}]
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("sql_backend", SQL_BACKENDS)
+def test_interval_batched_upsert_rows_bulk_insert_and_replace(sql_backend: str) -> None:
+    if sql_backend == "postgres":
+        _reset_postgres_schema()
+    ctx = ChronosBranchContext.connect(_database_url(sql_backend), backend="interval")
+    try:
+        ctx.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT, revision INTEGER)")
+        ctx.db.commit()
+        ctx.register_table("docs", ["id"])
+        session = ctx.checkout("main")
+
+        session.upsert_rows(
+            "docs",
+            [
+                {"id": f"doc:{idx}", "title": f"v1:{idx}", "revision": 1}
+                for idx in range(1200)
+            ]
+            + [
+                {"id": "doc:0", "title": "v1:duplicate-overwritten", "revision": 11}
+            ],
+        )
+        assert session.query("SELECT count(*) AS c FROM docs") == [{"c": 1200}]
+        assert session.query("SELECT title, revision FROM docs WHERE id = :id", {"id": "doc:0"}) == [
+            {"title": "v1:duplicate-overwritten", "revision": 11}
+        ]
+        assert session.query("SELECT title FROM docs WHERE id = :id", {"id": "doc:1100"}) == [
+            {"title": "v1:1100"}
+        ]
+
+        session.upsert_rows(
+            "docs",
+            [
+                {"id": f"doc:{idx}", "title": f"v2:{idx}", "revision": 2}
+                for idx in range(500)
+            ]
+            + [
+                {"id": f"doc:{idx}", "title": f"v1:{idx}", "revision": 1}
+                for idx in range(1200, 1500)
+            ],
+        )
+
+        assert session.query("SELECT count(*) AS c FROM docs") == [{"c": 1500}]
+        assert session.query(
+            "SELECT id FROM docs GROUP BY id HAVING count(*) > 1"
+        ) == []
+        assert session.query("SELECT title, revision FROM docs WHERE id = :id", {"id": "doc:0"}) == [
+            {"title": "v2:0", "revision": 2}
+        ]
+        assert session.query("SELECT title, revision FROM docs WHERE id = :id", {"id": "doc:900"}) == [
+            {"title": "v1:900", "revision": 1}
+        ]
+        assert session.query("SELECT title, revision FROM docs WHERE id = :id", {"id": "doc:1400"}) == [
+            {"title": "v1:1400", "revision": 1}
+        ]
+        assert ctx.db.execute(
+            "SELECT count(*) AS c FROM _chronos_b_interval_docs"
+        ).fetchone()["c"] == 1500
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("sql_backend", SQL_BACKENDS)
+def test_interval_batched_upsert_rows_uses_branch_local_schema(sql_backend: str) -> None:
+    if sql_backend == "postgres":
+        _reset_postgres_schema()
+    ctx = ChronosBranchContext.connect(
+        _database_url(sql_backend),
+        backend="interval",
+        enable_schema_branching=True,
+    )
+    try:
+        ctx.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT)")
+        ctx.db.commit()
+        ctx.register_table("docs", ["id"])
+        ctx.create_branch("exp", from_branch="main")
+        session = ctx.checkout("exp")
+        session.execute("ALTER TABLE docs ADD COLUMN score INTEGER")
+
+        session.upsert_rows(
+            "docs",
+            [
+                {"id": f"doc:{idx}", "title": f"title:{idx}", "score": idx}
+                for idx in range(1005)
+            ],
+        )
+        assert session.query("SELECT count(*) AS c FROM docs") == [{"c": 1005}]
+        assert session.query("SELECT score FROM docs WHERE id = :id", {"id": "doc:1001"}) == [
+            {"score": 1001}
+        ]
+        with pytest.raises(Exception):
+            ctx.checkout("main").query("SELECT score FROM docs")
+    finally:
+        ctx.close()
+
+
+def test_postgres_interval_batched_upsert_rows_large_scale_performance() -> None:
+    _reset_postgres_schema()
+    ctx = ChronosBranchContext.connect(_postgres_dsn(), backend="interval")
+    try:
+        ctx.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT, revision INTEGER)")
+        ctx.db.commit()
+        ctx.register_table("docs", ["id"])
+        session = ctx.checkout("main")
+
+        initial_rows = [
+            {"id": f"doc:{idx}", "title": f"v1:{idx}", "revision": 1}
+            for idx in range(20_000)
+        ]
+        start = time.perf_counter()
+        session.upsert_rows("docs", initial_rows)
+        initial_elapsed = time.perf_counter() - start
+
+        assert session.query("SELECT count(*) AS c FROM docs") == [{"c": 20_000}]
+        assert 20_000 / initial_elapsed > 2_000
+
+        mixed_rows = [
+            {"id": f"doc:{idx}", "title": f"v2:{idx}", "revision": 2}
+            for idx in range(5_000)
+        ] + [
+            {"id": f"doc:{idx}", "title": f"v1:{idx}", "revision": 1}
+            for idx in range(20_000, 25_000)
+        ]
+        start = time.perf_counter()
+        session.upsert_rows("docs", mixed_rows)
+        mixed_elapsed = time.perf_counter() - start
+
+        assert session.query("SELECT count(*) AS c FROM docs") == [{"c": 25_000}]
+        assert session.query(
+            "SELECT id FROM docs GROUP BY id HAVING count(*) > 1 LIMIT 1"
+        ) == []
+        assert session.query("SELECT title, revision FROM docs WHERE id = :id", {"id": "doc:0"}) == [
+            {"title": "v2:0", "revision": 2}
+        ]
+        assert 10_000 / mixed_elapsed > 1_000
     finally:
         ctx.close()
 

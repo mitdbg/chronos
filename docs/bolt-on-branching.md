@@ -74,11 +74,17 @@ At a high level:
 
 ## Operational Limits
 
-- Table schema changes are not supported in the first version. The base design branches row contents under a shared schema.
+- The base implementation branches row contents under a shared schema.
+- Branch-local schema changes should be added with the hybrid schema-version
+  design in this document: DDL creates a new interval-backed physical table
+  version for the affected logical table and branch-visible table bindings
+  choose the active schema version.
 - Fixed-width interval spaces require sparse allocation, relabeling, or explicit depth limits.
 - Hot keys can accumulate many physical rows.
 - Multi-row writes evaluate the current branch view first, then splice matched keys.
-- Branch-local DDL is outside the first version.
+- Branch-local DDL initially copies visible rows for the affected table into
+  the new schema version. Later optimizations can add lazy migration or
+  superset schemas for additive changes.
 - The log-table representation needs a current-state projection for consistently fast arbitrary SQL reads.
 - Long-lived branches require retaining historical log records or physical rows until all dependent branches, checkpoints, and retention policies release them.
 
@@ -370,14 +376,17 @@ The branch layer manages all user/application data by default:
 - application-owned relational tables
 - table-level indexes generated for those branched tables
 
-The branch layer does not branch its own metadata tables:
+The branch layer does not branch its own global metadata tables:
 
 - `branches`
 - `segments`
 - checkpoint metadata
 - garbage-collection metadata
 
-System catalogs and database schema are shared in the first version. Branch-local DDL can be added later by versioning schema descriptors, but the base design branches all user row contents under a shared schema.
+In the base implementation, system catalogs and database schema are shared.
+Branch-local DDL is added by versioning logical table schema descriptors and
+binding branch intervals to schema versions. Chronos metadata remains global;
+user table schemas become branch-visible data.
 
 ## Core Concepts
 
@@ -561,6 +570,190 @@ deleted = true
 ```
 
 A tombstone hides inherited rows inside its live interval.
+
+## Branch-Local Schema Changes
+
+Chronos should support branch-local DDL with a hybrid schema-version design.
+The key rule is that a table with a divergent schema must remain branchable by
+the interval backend. DDL must not turn the table into a dead-end physical copy
+that future forks cannot share cheaply.
+
+The relational store therefore versions **logical table schemas** and maps each
+branch interval to the schema version visible at that branch point.
+
+### Schema Versions
+
+Each logical table can have multiple schema versions:
+
+```text
+logical table: products
+
+schema version v1:
+  physical table: _chronos_b_interval_products_v1
+  columns: sku, name, price
+  primary key: sku
+  row storage: interval rows
+
+schema version v2:
+  physical table: _chronos_b_interval_products_v2
+  columns: sku, name, price, score
+  primary key: sku
+  row storage: interval rows
+```
+
+Both physical tables are interval-backed. They include `live_lo`, `live_hi`,
+and `deleted`, and they use the same row-branching rules as the base interval
+design.
+
+### Branch-Visible Table Bindings
+
+The active schema version for a logical table is itself branch-visible:
+
+```text
+_chronos_table_schema_versions
+  table_name
+  schema_version_id
+  parent_schema_version_id
+  physical_table
+  columns
+  primary_key
+  ddl_op
+  created_at
+  metadata
+
+_chronos_table_bindings
+  table_name
+  schema_version_id
+  live_lo
+  live_hi
+```
+
+Resolving a table during checkout or query planning becomes:
+
+```text
+schema_version =
+  visible binding for table_name where
+    live_lo <= current_branch_point < live_hi
+
+physical_table = schema_version.physical_table
+```
+
+This is the schema-level analogue of row visibility. A branch point sees one
+active schema version for each logical table.
+
+### DDL Flow for an Inherited Table
+
+Given:
+
+```sql
+ALTER TABLE products ADD COLUMN score DOUBLE PRECISION;
+```
+
+and a branch `exp` currently seeing `products@v1`, Chronos performs:
+
+1. Resolve the current branch segment and branch point.
+2. Resolve the visible schema version: `products@v1`.
+3. Create a new schema version: `products@v2`.
+4. Create a new physical interval table for `v2` with the new columns.
+5. Copy rows visible to `exp` from `v1` into `v2`.
+6. Assign copied rows visibility over `exp`'s current segment.
+7. Splice `_chronos_table_bindings` so `exp` and descendants see `v2`.
+8. Keep all other branches bound to `v1`.
+9. Route future SQL for `products` in `exp` to the `v2` physical table.
+
+The copied rows remain interval rows:
+
+```text
+new_v2_row.live_lo = exp.current_segment.live_lo
+new_v2_row.live_hi = exp.current_segment.live_hi
+```
+
+Future writes in `exp` and future forks from `exp` continue to use interval
+splicing inside `_chronos_b_interval_products_v2`.
+
+### Forking After Divergence
+
+After schema divergence:
+
+```text
+main -> exp -> child_a
+            -> child_b
+```
+
+`child_a` and `child_b` inherit the table binding:
+
+```text
+products -> v2
+```
+
+Branch creation is still metadata-only. It does not copy the `products@v2`
+rows. The children continue sharing inherited `v2` row intervals until one
+child writes an override.
+
+This is the central requirement of the hybrid design: divergent schema tables
+must stay first-class branchable tables.
+
+### CREATE TABLE
+
+For branch-local `CREATE TABLE`, Chronos creates:
+
+```text
+schema version v1 for the new logical table
+physical interval table for v1
+binding visible only over the current branch segment
+```
+
+Other branches see the table as absent because they have no visible binding for
+that logical table.
+
+### DROP TABLE
+
+For branch-local `DROP TABLE`, Chronos creates a tombstone table binding for
+the current branch segment rather than dropping physical storage:
+
+```text
+table_name = products
+schema_version_id = NULL
+tombstone = true
+live_lo/live_hi = current branch segment
+```
+
+Branches outside that interval keep seeing the previous schema version.
+Descendants of the dropping branch inherit table absence until a later DDL
+recreates the table.
+
+### Repeated DDL
+
+DDL on an already-diverged table creates another schema version:
+
+```text
+products@v1 -> products@v2 -> products@v3
+```
+
+Each transition uses the same mechanics: create a new interval-backed physical
+table, copy the branch-visible rows from the previous version, and splice the
+table binding over the current branch segment.
+
+### Tradeoffs
+
+This hybrid design copies visible rows for the affected table at DDL time. That
+is the cost paid to preserve correct SQL semantics without implementing a full
+logical catalog immediately.
+
+The benefit is that:
+
+- ordinary DML remains interval-backed
+- branch creation after DDL remains cheap
+- unaffected tables remain on their existing interval physical tables
+- branches that did not perform the DDL keep seeing the old schema
+- implementation can fall back to normal physical SQL table definitions for
+  complex DDL
+
+Later optimizations can reduce DDL copy cost:
+
+- lazy row migration from old schema versions to new schema versions
+- superset physical schemas for additive `ADD COLUMN`
+- schema-version compaction after old branches and checkpoints are collected
 
 ## Read Path
 
@@ -1578,6 +1771,14 @@ For the interval live-range representation:
 6. Add non-overlap enforcement.
 7. Add sparse interval allocation and depth checks.
 8. Add diff, merge, and garbage collection.
+9. Add branch-local schema versions:
+   - `_chronos_table_schema_versions`
+   - `_chronos_table_bindings`
+   - table resolution from `(logical table, branch point)` to physical table
+   - DDL flow that creates a new interval-backed physical table version
+   - row copy from the previous visible schema version into the new branch
+     segment
+   - binding splices for `CREATE TABLE`, `ALTER TABLE`, and `DROP TABLE`
 
 For the log-table representation:
 

@@ -169,6 +169,7 @@ class ChronosBranchContext:
         autocommit: bool = True,
         interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         ensure_metadata: bool = True,
+        enable_schema_branching: bool = False,
     ) -> ChronosBranchContext:
         db = connect_sql_database(database_url)
         return cls.from_database_adapter(
@@ -177,6 +178,7 @@ class ChronosBranchContext:
             autocommit=autocommit,
             interval_continuation_percent=interval_continuation_percent,
             ensure_metadata=ensure_metadata,
+            enable_schema_branching=enable_schema_branching,
         )
 
     @classmethod
@@ -187,17 +189,21 @@ class ChronosBranchContext:
         autocommit: bool = True,
         interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         ensure_metadata: bool = True,
+        enable_schema_branching: bool = False,
     ) -> ChronosBranchContext:
         def build_backend() -> _SQLBranchBackend:
             if backend == "interval":
                 return _IntervalBackend(
                     db,
                     continuation_percent=interval_continuation_percent,
+                    enable_schema_branching=enable_schema_branching,
                 )
+            if enable_schema_branching and backend not in {"copy"}:
+                raise ValueError("schema branching is currently supported only by the interval and copy backends")
             if backend == "log":
                 return _LogBackend(db)
             if backend == "copy":
-                return _CopyBackend(db)
+                return _CopyBackend(db, enable_schema_branching=enable_schema_branching)
             if backend == "orpheus":
                 return _OrpheusBackend(db)
             if backend == "litetree":
@@ -370,12 +376,22 @@ class ChronosBranchContext:
 
     def diff(self, left: str, right: str) -> BranchDiff:
         changes: list[RowDiff] = []
-        for table in self._backend.tables:
+        for table in self._backend.diff_tables():
             changes.extend(self.diff_rows(left, right, table))
         return BranchDiff(left=left, right=right, changes=changes)
 
     def diff_rows(self, left: str, right: str, table: str) -> list[RowDiff]:
-        meta = self._backend._require_table(table)
+        try:
+            left_meta = self._backend.table_meta_for_branch(left, table)
+        except TableNotRegisteredError:
+            left_meta = None
+        try:
+            right_meta = self._backend.table_meta_for_branch(right, table)
+        except TableNotRegisteredError:
+            right_meta = None
+        meta = left_meta or right_meta
+        if meta is None:
+            return []
         left_rows = self._rows_by_key(left, table, meta)
         right_rows = self._rows_by_key(right, table, meta)
         diffs: list[RowDiff] = []
@@ -418,7 +434,10 @@ class ChronosBranchContext:
     def _rows_by_key(
         self, branch_id: str, table: str, meta: _TableMeta
     ) -> dict[tuple[Any, ...], dict[str, Any]]:
-        rows = self._backend.visible_rows(branch_id, table)
+        try:
+            rows = self._backend.visible_rows(branch_id, table)
+        except TableNotRegisteredError:
+            rows = []
         return {
             tuple(row[column] for column in meta.pk_columns): row
             for row in rows
