@@ -288,18 +288,19 @@ def _chronos_metadata_lock(db: SQLDatabaseAdapter) -> Iterator[None]:
 
 
 def _parse_table_registry(db: SQLDatabaseAdapter, backend: str) -> dict[str, _TableMeta]:
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS _chronos_branch_tables (
-          table_name TEXT PRIMARY KEY,
-          physical_table TEXT NOT NULL,
-          pk_columns TEXT NOT NULL,
-          columns TEXT NOT NULL,
-          column_defs TEXT NOT NULL,
-          backend TEXT NOT NULL
+    with _chronos_metadata_lock(db):
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _chronos_branch_tables (
+              table_name TEXT PRIMARY KEY,
+              physical_table TEXT NOT NULL,
+              pk_columns TEXT NOT NULL,
+              columns TEXT NOT NULL,
+              column_defs TEXT NOT NULL,
+              backend TEXT NOT NULL
+            )
+            """
         )
-        """
-    )
     tables: dict[str, _TableMeta] = {}
     for row in db.execute(
         "SELECT * FROM _chronos_branch_tables WHERE backend = ?", (backend,)
@@ -316,17 +317,18 @@ def _parse_table_registry(db: SQLDatabaseAdapter, backend: str) -> dict[str, _Ta
 
 
 def _ensure_index_registry(db: SQLDatabaseAdapter) -> None:
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS _chronos_branch_indexes (
-          backend TEXT NOT NULL,
-          index_name TEXT NOT NULL,
-          table_name TEXT NOT NULL,
-          columns TEXT NOT NULL,
-          PRIMARY KEY (backend, index_name)
+    with _chronos_metadata_lock(db):
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _chronos_branch_indexes (
+              backend TEXT NOT NULL,
+              index_name TEXT NOT NULL,
+              table_name TEXT NOT NULL,
+              columns TEXT NOT NULL,
+              PRIMARY KEY (backend, index_name)
+            )
+            """
         )
-        """
-    )
 
 
 def _parse_index_registry(db: SQLDatabaseAdapter, backend: str) -> dict[str, _IndexMeta]:

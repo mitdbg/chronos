@@ -902,6 +902,30 @@ def test_postgres_concurrent_metadata_initialization_and_registration() -> None:
         context.close()
 
 
+def test_postgres_metadata_bootstrap_waits_for_advisory_lock() -> None:
+    _reset_postgres_schema()
+    holder = connect_sql_database(_postgres_dsn())
+    try:
+        holder.execute("SELECT pg_advisory_lock(1720812901, 19840717)")
+
+        def connect_context() -> None:
+            context = ChronosBranchContext.connect(_postgres_dsn(), backend="interval")
+            context.close()
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(connect_context)
+            time.sleep(0.25)
+            assert not future.done()
+            holder.execute("SELECT pg_advisory_unlock(1720812901, 19840717)")
+            future.result(timeout=5)
+    finally:
+        try:
+            holder.execute("SELECT pg_advisory_unlock(1720812901, 19840717)")
+        except Exception:
+            holder.rollback()
+        holder.close()
+
+
 def test_users_can_add_logical_indexes_to_registered_tables(ctx: ChronosBranchContext) -> None:
     index = ctx.create_index("products", ["price", "sku"], name="products_price_sku")
 
