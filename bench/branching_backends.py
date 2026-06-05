@@ -44,6 +44,7 @@ METRICS = (
     "insert_write",
     "delete_write",
 )
+LOG_SCALE_METRICS = {"branch_create", "branch_delete"}
 CSV_FIELDS = [
     "backend",
     "shape",
@@ -1228,7 +1229,11 @@ def write_metric_plot(
         )
     title_prefix = f"{prefix.title()} " if prefix else ""
     ax.set_title(f"{title_prefix}{metric.replace('_', ' ').title()}")
-    ax.set_ylabel("Median milliseconds per operation")
+    if metric in LOG_SCALE_METRICS:
+        ax.set_yscale("log")
+        ax.set_ylabel("Median milliseconds per operation (log scale)")
+    else:
+        ax.set_ylabel("Median milliseconds per operation")
     axis = "width" if prefix == "width" else "depth"
     ax.set_xlabel(f"Dataset / branch {axis}")
     ax.set_xticks(x_positions)

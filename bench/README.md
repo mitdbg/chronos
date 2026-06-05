@@ -15,6 +15,38 @@ Run the branch-local schema-change benchmark:
 bench/run_schema_branching_experiments.sh postgres-doltgres --quick
 ```
 
+Run the single-threaded branching-transaction benchmark:
+
+```bash
+bench/run_branching_transaction_experiments.sh postgres-doltgres --quick
+```
+
+The branching-transaction benchmark compares three ways to execute one logical
+agent transaction:
+
+- Chronos interval branch transaction on PostgreSQL: fork from `main`, run
+  branch-local SQL, and merge clean row-level changes back to `main`.
+- Native Doltgres branch transaction: create a Doltgres branch, run SQL, commit
+  the branch, and merge it into `main`.
+- Plain PostgreSQL transaction: run the same SQL directly in one database
+  transaction. This is the upper-bound reference for a non-branching store.
+
+The benchmark is intentionally single-threaded. Each branch transaction forks
+from the current `main` state and then merges back, so `main` maintains the same
+serial order as native transactions. The default workload is YCSB-like: each
+transaction runs point reads and primary-key point updates. It avoids range DML
+so the benchmark measures branch transaction overhead rather than a backend's
+set-based range update implementation. Chronos uses `interval_child_width=2` by
+default so each temporary branch consumes a fixed amount of interval space
+instead of geometrically shrinking `main` through percentage allocation. Results
+are streamed to `branching_transaction_details.csv` and
+`branching_transaction_summary.csv`; figures are written after all requested
+configs finish. Passing `--delete-branches` also deletes each Chronos and
+Doltgres branch after merge and includes `branch_delete` latency.
+The cross-backend `merge_apply` phase includes whatever validation the backend
+requires to commit a branch transaction: Chronos performs row-level merge
+validation inside `merge_apply`, while Doltgres performs its native merge logic.
+
 The schema benchmark compares Chronos interval, Chronos copy, and native
 Doltgres branches for `ALTER TABLE products ADD COLUMN ...` on a child branch.
 It runs both `ADD COLUMN bench_no_default INTEGER` and
