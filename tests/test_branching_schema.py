@@ -222,7 +222,7 @@ def test_interval_schema_copy_preserves_writer_provenance(sql_backend: str) -> N
             f"""
             SELECT sku, score, writer_segment_id
             FROM {physical}
-            WHERE deleted = 0
+            WHERE deleted = FALSE
             ORDER BY sku
             """
         ).fetchall()

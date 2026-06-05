@@ -273,7 +273,7 @@ class _IntervalBackend(_SQLBranchBackend):
 
     Each logical row version is stored once with a half-open numeric interval.
     Reading a branch becomes a constant-size predicate over the branch point:
-    live_lo <= point < live_hi and deleted = 0. Writes maintain correctness by
+    live_lo <= point < live_hi and deleted = FALSE. Writes maintain correctness by
     splitting any overlapping physical rows for the branch's current interval.
     """
 
@@ -635,7 +635,7 @@ class _IntervalBackend(_SQLBranchBackend):
               live_lo {interval_type} NOT NULL,
               live_hi {interval_type} NOT NULL,
               writer_segment_id INTEGER NOT NULL,
-              deleted INTEGER NOT NULL DEFAULT 0,
+              deleted BOOLEAN NOT NULL DEFAULT FALSE,
               PRIMARY KEY ({pk_sql}, live_lo),
               CHECK (live_lo < live_hi)
             )
@@ -648,7 +648,7 @@ class _IntervalBackend(_SQLBranchBackend):
             f"""
             INSERT INTO {_quote(physical)}
             ({cols}, live_lo, live_hi, writer_segment_id, deleted)
-            SELECT {cols}, 0, ?, ?, 0 FROM {_quote_table_name(table)}
+            SELECT {cols}, 0, ?, ?, FALSE FROM {_quote_table_name(table)}
             """,
             (self._max_interval(), 1),
         )
@@ -2109,7 +2109,7 @@ class _IntervalBackend(_SQLBranchBackend):
             FROM {_quote(meta.physical_name)}
             WHERE live_lo <= ?
               AND ? < live_hi
-              AND deleted = 0
+              AND deleted = FALSE
             """,
             (segment.branch_point, segment.branch_point),
         ).fetchall()
@@ -2231,7 +2231,7 @@ class _IntervalBackend(_SQLBranchBackend):
             f"SELECT {cols} FROM {_quote(meta.physical_name)} "
             "WHERE live_lo <= :_chronos_branch_point "
             "AND :_chronos_branch_point < live_hi "
-            "AND deleted = 0"
+            "AND deleted = FALSE"
         )
 
     def _tables_for_ref(self, ref: _PreparedBranchRef) -> dict[str, _TableMeta]:
@@ -2796,7 +2796,7 @@ class _IntervalBackend(_SQLBranchBackend):
               live_lo {interval_type} NOT NULL,
               live_hi {interval_type} NOT NULL,
               writer_segment_id INTEGER NOT NULL,
-              deleted INTEGER NOT NULL DEFAULT 0,
+              deleted BOOLEAN NOT NULL DEFAULT FALSE,
               PRIMARY KEY ({pk_sql}, live_lo),
               CHECK (live_lo < live_hi)
             )
@@ -2836,7 +2836,7 @@ class _IntervalBackend(_SQLBranchBackend):
                 select_exprs.append(f"{default_sql_by_column[column]} AS {_quote(column)}")
             else:
                 select_exprs.append(f"NULL AS {_quote(column)}")
-        select_exprs.extend(["?", "?", _quote("writer_segment_id"), "0"])
+        select_exprs.extend(["?", "?", _quote("writer_segment_id"), "FALSE"])
         select_sql = ", ".join(select_exprs)
         self.db.execute(
             f"""
@@ -2846,7 +2846,7 @@ class _IntervalBackend(_SQLBranchBackend):
             FROM {_quote(old_meta.physical_name)}
             WHERE {_quote("live_lo")} <= ?
               AND ? < {_quote("live_hi")}
-              AND deleted = 0
+              AND deleted = FALSE
             """,
             (
                 segment.live_lo,
@@ -3077,7 +3077,7 @@ class _IntervalBackend(_SQLBranchBackend):
             WHERE {where}
               AND live_lo <= ?
               AND ? < live_hi
-              AND deleted = 0
+              AND deleted = FALSE
             """,
             [*self._key_values(meta, key), point, point],
         ).fetchone()
@@ -3160,7 +3160,7 @@ class _IntervalBackend(_SQLBranchBackend):
             [f"{_quote(column)} = v.{_quote(column)}" for column in meta.columns]
             + [
                 f"{_quote('writer_segment_id')} = :__chronos_batch_update_writer_segment_id",
-                f"{_quote('deleted')} = 0",
+                f"{_quote('deleted')} = FALSE",
             ]
         )
         bound = dict(params)
@@ -3181,7 +3181,7 @@ class _IntervalBackend(_SQLBranchBackend):
                 FROM {_quote(meta.physical_name)} AS {source_alias}
                 WHERE {source_alias}.{_quote("live_lo")} <= :__chronos_batch_update_branch_point
                   AND :__chronos_batch_update_branch_point < {source_alias}.{_quote("live_hi")}
-                  AND {source_alias}.{_quote("deleted")} = 0
+                  AND {source_alias}.{_quote("deleted")} = FALSE
                 """,
                 bound,
             )
@@ -3245,7 +3245,7 @@ class _IntervalBackend(_SQLBranchBackend):
                        GREATEST(o.{_quote("live_lo")}, :__chronos_batch_update_live_lo),
                        LEAST(o.{_quote("live_hi")}, :__chronos_batch_update_live_hi),
                        :__chronos_batch_update_writer_segment_id,
-                       0
+                       FALSE
                 FROM {_quote(overlap_table)} AS o
                 JOIN {_quote(visible_table)} AS v ON {overlap_visible_join}
                 WHERE GREATEST(o.{_quote("live_lo")}, :__chronos_batch_update_live_lo)
@@ -3308,7 +3308,7 @@ class _IntervalBackend(_SQLBranchBackend):
             value_sql = self._physical_expression_sql(expr, meta)
             assignments.append(f"{_quote(column)} = {value_sql}")
         assignments.append(f"{_quote('writer_segment_id')} = :__chronos_writer_segment_id")
-        assignments.append(f"{_quote('deleted')} = 0")
+        assignments.append(f"{_quote('deleted')} = FALSE")
         if not assignments:
             return 0
 
@@ -3424,7 +3424,7 @@ class _IntervalBackend(_SQLBranchBackend):
                 FROM {_quote(meta.physical_name)}
                 WHERE {_quote("live_lo")} <= :__chronos_canonical_branch_point
                   AND :__chronos_canonical_branch_point < {_quote("live_hi")}
-                  AND {_quote("deleted")} = 0
+                  AND {_quote("deleted")} = FALSE
                 """,
                 {"__chronos_canonical_branch_point": segment.branch_point},
             )
@@ -3436,7 +3436,7 @@ class _IntervalBackend(_SQLBranchBackend):
                        :__chronos_canonical_live_lo,
                        :__chronos_canonical_live_hi,
                        {_quote("writer_segment_id")},
-                       0
+                       FALSE
                 FROM {_quote(visible_table)}
                 """,
                 {
@@ -3531,7 +3531,7 @@ class _IntervalBackend(_SQLBranchBackend):
         visible = (
             "live_lo <= :_chronos_branch_point "
             "AND :_chronos_branch_point < live_hi "
-            "AND deleted = 0"
+            "AND deleted = FALSE"
         )
         stripped = where.strip()
         if not stripped:
@@ -3576,7 +3576,7 @@ class _IntervalBackend(_SQLBranchBackend):
             WHERE ({predicate})
               AND live_lo <= ?
               AND ? < live_hi
-              AND deleted = 0
+              AND deleted = FALSE
             """,
             [*values, segment.branch_point, segment.branch_point],
         )
@@ -3719,7 +3719,7 @@ class _IntervalBackend(_SQLBranchBackend):
             live_lo,
             live_hi,
             writer_segment_id,
-            1 if deleted else 0,
+            deleted,
         ]
         self.db.execute(
             f"""
@@ -3744,7 +3744,7 @@ class _IntervalBackend(_SQLBranchBackend):
         cols = [*meta.columns, "live_lo", "live_hi", "writer_segment_id", "deleted"]
         values = [
             [row.get(column) for column in meta.columns]
-            + [live_lo, live_hi, writer_segment_id, 1 if deleted else 0]
+            + [live_lo, live_hi, writer_segment_id, deleted]
             for row in rows
         ]
         self.db.executemany(

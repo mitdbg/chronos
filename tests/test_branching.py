@@ -2008,7 +2008,7 @@ def test_interval_branch_creation_records_one_unit_fork_base(sql_backend: str) -
             WHERE sku = 'abc'
               AND live_lo <= ?
               AND ? < live_hi
-              AND deleted = 0
+              AND deleted = FALSE
             """,
             (fork_base["branch_point"], fork_base["branch_point"]),
         ).fetchone()
@@ -2499,7 +2499,7 @@ def test_interval_writer_provenance_ignores_sibling_preservation_rows(
             WHERE sku = 'abc'
               AND live_lo <= ?
               AND ? < live_hi
-              AND deleted = 0
+              AND deleted = FALSE
             """,
             (b_segment["branch_point"], b_segment["branch_point"]),
         ).fetchone()
@@ -2961,7 +2961,7 @@ def test_interval_update_fetches_matching_rows_in_batch(sql_backend: str) -> Non
             normalized.upper().startswith("SELECT")
             and "_chronos_b_interval_products" in normalized
             and "AND ? < live_hi" in normalized
-            and "deleted = 0" in normalized
+            and "deleted = FALSE" in normalized
         ):
             visible_row_selects += 1
         return original_execute(sql, params)
