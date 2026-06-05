@@ -23,7 +23,8 @@ from chronos_core.branching import ChronosBranchContext
 from chronos_core.branching.sql_adapters import SQLDatabaseAdapter, connect_sql_database
 
 
-BACKENDS = ("chronos", "doltgres", "native_txn")
+BACKENDS = ("chronos", "orpheus", "doltgres", "native_txn")
+DEFAULT_BACKENDS = ("chronos", "doltgres", "native_txn")
 PHASES = (
     "branch_create",
     "branch_workload",
@@ -62,6 +63,23 @@ SUMMARY_FIELDS = [
     "peak_memory_bytes",
     "peak_memory_mb",
 ]
+VERIFICATION_FIELDS = [
+    "backend",
+    "dataset_size",
+    "transaction_count",
+    "warmup_iterations",
+    "changes_per_operation",
+    "read_count",
+    "delete_branches",
+    "matched",
+    "reference_row_count",
+    "backend_row_count",
+    "reference_quantity_sum",
+    "backend_quantity_sum",
+    "reference_changed_rows",
+    "backend_changed_rows",
+    "message",
+]
 
 
 @dataclass(frozen=True)
@@ -74,6 +92,13 @@ class TxnCase:
     warmup_iterations: int = 100
     delete_branches: bool = False
     interval_child_width: int | None = 2
+
+
+@dataclass(frozen=True)
+class TableState:
+    row_count: int
+    quantity_sum: int
+    changed_rows: tuple[tuple[str, int, str, str], ...]
 
 
 class Timer:
@@ -283,15 +308,24 @@ def create_items_table_with_chunked_load(
     )
     for start in range(1, dataset_size + 1, chunk_size):
         stop = min(dataset_size + 1, start + chunk_size)
-        rows = [(record_key(idx), idx % 100, "open", "seed") for idx in range(start, stop)]
-        placeholders = ", ".join(["(?, ?, ?, ?)"] * len(rows))
-        values = [value for row in rows for value in row]
-        db.execute(f"INSERT INTO txn_items VALUES {placeholders}", values)
+        # Doltgres currently mis-adapts integer bind parameters through psycopg
+        # in this benchmark path (e.g. 1 round-trips as 65537). The seed data is
+        # deterministic and generated locally, so use SQL literals here while
+        # keeping the workload operations themselves parameterized.
+        rows = ", ".join(
+            f"({sql_text_literal(record_key(idx))}, {idx % 100}, 'open', 'seed')"
+            for idx in range(start, stop)
+        )
+        db.execute(f"INSERT INTO txn_items VALUES {rows}")
         db.commit()
 
 
 def record_key(value: int) -> str:
     return f"user:{value:012d}"
+
+
+def sql_text_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def ycsb_key(case: TxnCase, iteration: int, op_index: int, *, stream: int) -> str:
@@ -364,6 +398,52 @@ def execute_workload_db(db: SQLDatabaseAdapter, case: TxnCase, iteration: int) -
             ),
         )
     return rows_read
+
+
+def table_state_from_rows(
+    aggregate_rows: list[dict[str, Any]],
+    changed_rows: list[dict[str, Any]],
+) -> TableState:
+    aggregate = aggregate_rows[0]
+    return TableState(
+        row_count=int(aggregate["row_count"]),
+        quantity_sum=int(aggregate["quantity_sum"] or 0),
+        changed_rows=tuple(
+            (
+                str(row["id"]),
+                int(row["quantity"]),
+                str(row["status"]),
+                str(row["note"]),
+            )
+            for row in changed_rows
+        ),
+    )
+
+
+def table_state_from_query(query: Any) -> TableState:
+    aggregate_rows = query(
+        """
+        SELECT COUNT(*) AS row_count,
+               COALESCE(SUM(quantity), 0) AS quantity_sum
+        FROM txn_items
+        """
+    )
+    changed_rows = query(
+        """
+        SELECT id, quantity, status, note
+        FROM txn_items
+        WHERE note <> 'seed' OR status <> 'open'
+        ORDER BY id
+        """
+    )
+    return table_state_from_rows(aggregate_rows, changed_rows)
+
+
+def table_state_from_db(db: SQLDatabaseAdapter) -> TableState:
+    def query(sql: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in db.execute(sql).fetchall()]
+
+    return table_state_from_query(query)
 
 
 class DoltgresSession:
@@ -519,17 +599,26 @@ def record(
     )
 
 
-def run_chronos_case(database_url: str, case: TxnCase) -> list[dict[str, Any]]:
+def run_chronos_case(
+    database_url: str,
+    case: TxnCase,
+    *,
+    branch_backend: str = "interval",
+) -> list[dict[str, Any]]:
     validate_case(case)
     db = connect_sql_database(database_url)
     reset_postgres_schema(db)
     create_items_table(db, case.dataset_size)
     db.close()
 
+    connect_kwargs: dict[str, Any] = {"backend": branch_backend}
+    if branch_backend == "interval":
+        connect_kwargs["interval_child_width"] = case.interval_child_width
+    if branch_backend == "orpheus":
+        connect_kwargs["enable_diff_merge_tracking"] = True
     ctx = ChronosBranchContext.connect(
         database_url,
-        backend="interval",
-        interval_child_width=case.interval_child_width,
+        **connect_kwargs,
     )
     detail_rows: list[dict[str, Any]] = []
     try:
@@ -669,6 +758,177 @@ def run_native_txn_case(database_url: str, case: TxnCase) -> list[dict[str, Any]
     return detail_rows
 
 
+def run_chronos_final_state(
+    database_url: str,
+    case: TxnCase,
+    *,
+    branch_backend: str = "interval",
+) -> TableState:
+    validate_case(case)
+    db = connect_sql_database(database_url)
+    reset_postgres_schema(db)
+    create_items_table(db, case.dataset_size)
+    db.close()
+
+    connect_kwargs: dict[str, Any] = {"backend": branch_backend}
+    if branch_backend == "interval":
+        connect_kwargs["interval_child_width"] = case.interval_child_width
+    if branch_backend == "orpheus":
+        connect_kwargs["enable_diff_merge_tracking"] = True
+    ctx = ChronosBranchContext.connect(database_url, **connect_kwargs)
+    try:
+        ctx.register_table("txn_items", ["id"])
+
+        def run_one(iteration: int, *, prefix: str) -> None:
+            branch_id = f"{prefix}_{case.dataset_size}_{iteration}"
+            ctx.create_branch(branch_id, from_branch="main")
+            session = ctx.checkout(branch_id)
+            with session.transaction():
+                execute_workload_sql(session, case, iteration)
+            ctx.merge_apply(source=branch_id, target="main")
+            if case.delete_branches:
+                ctx.delete_branch(branch_id)
+
+        for iteration in range(case.warmup_iterations):
+            run_one(iteration, prefix="warmup")
+        ctx.wait_for_background_work()
+        for iteration in range(case.iterations):
+            run_one(iteration, prefix="txn")
+        ctx.wait_for_background_work()
+        return table_state_from_query(ctx.checkout("main").query)
+    finally:
+        ctx.close()
+
+
+def run_doltgres_final_state(database_url: str, case: TxnCase) -> TableState:
+    validate_case(case)
+    ctx = DoltgresBranchContext.connect(database_url)
+    try:
+        create_items_table_with_chunked_load(ctx.db, case.dataset_size)
+        ctx.commit_branch("main", f"load {case.dataset_size} rows")
+
+        def run_one(iteration: int, *, prefix: str) -> None:
+            branch_id = f"{prefix}_{case.dataset_size}_{iteration}"
+            ctx.create_branch(branch_id, from_branch="main")
+            session = ctx.checkout(branch_id)
+            with session.transaction():
+                execute_workload_sql(session, case, iteration)
+            committed = (
+                ctx.commit_branch(branch_id, f"branch txn {iteration}")
+                if case.changes > 0
+                else False
+            )
+            if committed:
+                ctx.merge_into_main(branch_id)
+            if case.delete_branches:
+                ctx.delete_branch(branch_id)
+
+        for iteration in range(case.warmup_iterations):
+            run_one(iteration, prefix="warmup")
+        for iteration in range(case.iterations):
+            run_one(iteration, prefix="txn")
+        ctx._checkout("main")
+        return table_state_from_db(ctx.db)
+    finally:
+        ctx.close()
+
+
+def run_native_txn_final_state(database_url: str, case: TxnCase) -> TableState:
+    validate_case(case)
+    db = connect_sql_database(database_url)
+    reset_postgres_schema(db)
+    create_items_table(db, case.dataset_size)
+    try:
+        def run_one(iteration: int) -> None:
+            db.begin()
+            try:
+                execute_workload_db(db, case, iteration)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+        for iteration in range(case.warmup_iterations):
+            run_one(iteration)
+        for iteration in range(case.iterations):
+            run_one(iteration)
+        return table_state_from_db(db)
+    finally:
+        db.close()
+
+
+def run_backend_final_state(
+    postgres_url: str | None,
+    doltgres_url: str | None,
+    case: TxnCase,
+) -> TableState:
+    if case.backend == "native_txn":
+        if not postgres_url:
+            raise SystemExit("--postgres-url or CHRONOS_BRANCH_POSTGRES_DSN is required")
+        return run_native_txn_final_state(postgres_url, case)
+    if case.backend == "chronos":
+        if not postgres_url:
+            raise SystemExit("--postgres-url or CHRONOS_BRANCH_POSTGRES_DSN is required")
+        return run_chronos_final_state(postgres_url, case)
+    if case.backend == "orpheus":
+        if not postgres_url:
+            raise SystemExit("--postgres-url or CHRONOS_BRANCH_POSTGRES_DSN is required")
+        return run_chronos_final_state(postgres_url, case, branch_backend="orpheus")
+    if case.backend == "doltgres":
+        if not doltgres_url:
+            raise SystemExit("--doltgres-url or CHRONOS_BRANCH_DOLTGRES_DSN is required")
+        return run_doltgres_final_state(doltgres_url, case)
+    raise AssertionError(case.backend)
+
+
+def verification_message(reference: TableState, actual: TableState) -> str:
+    if reference == actual:
+        return "ok"
+    if reference.row_count != actual.row_count:
+        return f"row count mismatch: native={reference.row_count} backend={actual.row_count}"
+    if reference.quantity_sum != actual.quantity_sum:
+        return (
+            "quantity sum mismatch: "
+            f"native={reference.quantity_sum} backend={actual.quantity_sum}"
+        )
+    if len(reference.changed_rows) != len(actual.changed_rows):
+        return (
+            "changed row count mismatch: "
+            f"native={len(reference.changed_rows)} backend={len(actual.changed_rows)}"
+        )
+    for index, (expected, observed) in enumerate(
+        zip(reference.changed_rows, actual.changed_rows)
+    ):
+        if expected != observed:
+            return f"changed row mismatch at {index}: native={expected} backend={observed}"
+    return "table state mismatch"
+
+
+def verification_row(
+    case: TxnCase,
+    reference: TableState,
+    actual: TableState,
+) -> dict[str, Any]:
+    message = verification_message(reference, actual)
+    return {
+        "backend": case.backend,
+        "dataset_size": case.dataset_size,
+        "transaction_count": case.iterations,
+        "warmup_iterations": case.warmup_iterations,
+        "changes_per_operation": case.changes,
+        "read_count": case.read_count,
+        "delete_branches": case.delete_branches,
+        "matched": message == "ok",
+        "reference_row_count": reference.row_count,
+        "backend_row_count": actual.row_count,
+        "reference_quantity_sum": reference.quantity_sum,
+        "backend_quantity_sum": actual.quantity_sum,
+        "reference_changed_rows": len(reference.changed_rows),
+        "backend_changed_rows": len(actual.changed_rows),
+        "message": message,
+    }
+
+
 def summarize_detail_rows(
     detail_rows: list[dict[str, Any]],
     *,
@@ -721,6 +981,20 @@ def initialize_result_files(output_dir: Path) -> tuple[Path, Path]:
     with summary_path.open("w", newline="") as f:
         csv.DictWriter(f, fieldnames=SUMMARY_FIELDS).writeheader()
     return detail_path, summary_path
+
+
+def initialize_verification_file(output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    verification_path = output_dir / "branching_transaction_verification.csv"
+    with verification_path.open("w", newline="") as f:
+        csv.DictWriter(f, fieldnames=VERIFICATION_FIELDS).writeheader()
+    return verification_path
+
+
+def append_verification_row(output_dir: Path, row: dict[str, Any]) -> None:
+    with (output_dir / "branching_transaction_verification.csv").open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=VERIFICATION_FIELDS)
+        writer.writerow(row)
 
 
 def append_result_rows(
@@ -800,6 +1074,7 @@ def plot_stacked_breakdown(
     facet_values = sorted({_summary_int(row, facet_field) for row in phase_rows})
     labels = {
         "chronos": "Chronos",
+        "orpheus": "OrpheusDB",
         "doltgres": "Doltgres",
         "native_txn": "PostgreSQL txn",
     }
@@ -958,7 +1233,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Single-threaded benchmark for branch-transaction latency using "
-            "Chronos interval branches, native Doltgres branches, and plain PostgreSQL transactions."
+            "Chronos interval branches, OrpheusDB-style versioning, "
+            "native Doltgres branches, and plain PostgreSQL transactions."
         )
     )
     parser.add_argument("--postgres-url", default=os.environ.get("CHRONOS_BRANCH_POSTGRES_DSN"))
@@ -979,7 +1255,7 @@ def main() -> None:
         default=float(os.environ.get("CHRONOS_BENCH_MEMORY_SAMPLE_INTERVAL", "1.0")),
         help="Seconds between Docker memory samples. Default: 1.0.",
     )
-    parser.add_argument("--backends", type=parse_backends, default=list(BACKENDS))
+    parser.add_argument("--backends", type=parse_backends, default=list(DEFAULT_BACKENDS))
     parser.add_argument(
         "--dataset-sizes",
         type=parse_int_list,
@@ -1018,6 +1294,19 @@ def main() -> None:
     )
     parser.add_argument("--output-dir", default=os.environ.get("CHRONOS_BENCH_OUTPUT_DIR"))
     parser.add_argument(
+        "--verify-against-native",
+        action="store_true",
+        help=(
+            "Replay each non-native backend case and compare the final table "
+            "state against a native PostgreSQL transaction replay."
+        ),
+    )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="Run final-state verification without collecting timing results.",
+    )
+    parser.add_argument(
         "--quick",
         action="store_true",
         help="Use a small smoke-test configuration.",
@@ -1029,16 +1318,32 @@ def main() -> None:
         args.changes = 10
         args.read_count = 10
 
-    if any(backend in args.backends for backend in ("chronos", "native_txn")) and not args.postgres_url:
+    if args.verify_only:
+        args.verify_against_native = True
+
+    if (
+        any(backend in args.backends for backend in ("chronos", "orpheus", "native_txn"))
+        or args.verify_against_native
+    ) and not args.postgres_url:
         raise SystemExit("--postgres-url or CHRONOS_BRANCH_POSTGRES_DSN is required")
     if "doltgres" in args.backends and not args.doltgres_url:
         raise SystemExit("--doltgres-url or CHRONOS_BRANCH_DOLTGRES_DSN is required")
 
     output_dir = resolve_output_dir(args.output_dir)
-    detail_path, summary_path = initialize_result_files(output_dir)
+    if args.verify_only:
+        detail_path = summary_path = None
+    else:
+        detail_path, summary_path = initialize_result_files(output_dir)
+    verification_path = (
+        initialize_verification_file(output_dir)
+        if args.verify_against_native
+        else None
+    )
     all_summary_rows: list[dict[str, Any]] = []
+    native_state_cache: dict[tuple[int, int, int, int, int, bool], TableState] = {}
     backend_containers = {
         "chronos": args.postgres_container,
+        "orpheus": args.postgres_container,
         "native_txn": args.postgres_container,
         "doltgres": args.doltgres_container,
     }
@@ -1060,31 +1365,82 @@ def main() -> None:
                     f"warmup={args.warmup_iterations} changes={args.changes} "
                     f"read_count={args.read_count} delete_branches={args.delete_branches}"
                 )
-                container_name = backend_containers[backend]
-                with MemoryTracker(
-                    container_name,
-                    interval_seconds=max(0.1, args.memory_sample_interval),
-                ) as memory:
-                    if backend == "chronos":
-                        detail_rows = run_chronos_case(args.postgres_url, case)
-                    elif backend == "doltgres":
-                        detail_rows = run_doltgres_case(args.doltgres_url, case)
-                    elif backend == "native_txn":
-                        detail_rows = run_native_txn_case(args.postgres_url, case)
-                    else:
-                        raise AssertionError(backend)
-                all_summary_rows.extend(
-                    append_result_rows(
-                        output_dir,
-                        detail_rows,
-                        final_memory_bytes=memory.final_bytes,
-                        peak_memory_bytes=memory.peak_bytes,
+                if not args.verify_only:
+                    container_name = backend_containers[backend]
+                    with MemoryTracker(
+                        container_name,
+                        interval_seconds=max(0.1, args.memory_sample_interval),
+                    ) as memory:
+                        if backend == "chronos":
+                            detail_rows = run_chronos_case(args.postgres_url, case)
+                        elif backend == "orpheus":
+                            detail_rows = run_chronos_case(
+                                args.postgres_url,
+                                case,
+                                branch_backend="orpheus",
+                            )
+                        elif backend == "doltgres":
+                            detail_rows = run_doltgres_case(args.doltgres_url, case)
+                        elif backend == "native_txn":
+                            detail_rows = run_native_txn_case(args.postgres_url, case)
+                        else:
+                            raise AssertionError(backend)
+                    all_summary_rows.extend(
+                        append_result_rows(
+                            output_dir,
+                            detail_rows,
+                            final_memory_bytes=memory.final_bytes,
+                            peak_memory_bytes=memory.peak_bytes,
+                        )
                     )
-                )
+                if args.verify_against_native and backend != "native_txn":
+                    progress(
+                        f"verify backend={backend} dataset={dataset_size} "
+                        f"iterations={iteration_count}"
+                    )
+                    cache_key = (
+                        dataset_size,
+                        iteration_count,
+                        args.warmup_iterations,
+                        args.changes,
+                        args.read_count,
+                        args.delete_branches,
+                    )
+                    reference = native_state_cache.get(cache_key)
+                    if reference is None:
+                        native_case = TxnCase(
+                            backend="native_txn",
+                            dataset_size=dataset_size,
+                            iterations=iteration_count,
+                            changes=args.changes,
+                            read_count=args.read_count,
+                            warmup_iterations=args.warmup_iterations,
+                            delete_branches=args.delete_branches,
+                            interval_child_width=args.interval_child_width,
+                        )
+                        reference = run_native_txn_final_state(
+                            args.postgres_url,
+                            native_case,
+                        )
+                        native_state_cache[cache_key] = reference
+                    actual = run_backend_final_state(
+                        args.postgres_url,
+                        args.doltgres_url,
+                        case,
+                    )
+                    row = verification_row(case, reference, actual)
+                    append_verification_row(output_dir, row)
+                    if not row["matched"]:
+                        raise SystemExit(
+                            f"verification failed for {backend}: {row['message']}"
+                        )
 
-    plot_results(output_dir, all_summary_rows)
-    print(f"Wrote detail results to {detail_path}")
-    print(f"Wrote summary results to {summary_path}")
+    if not args.verify_only:
+        plot_results(output_dir, all_summary_rows)
+        print(f"Wrote detail results to {detail_path}")
+        print(f"Wrote summary results to {summary_path}")
+    if verification_path is not None:
+        print(f"Wrote verification results to {verification_path}")
 
 
 if __name__ == "__main__":
