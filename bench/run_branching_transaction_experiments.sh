@@ -30,6 +30,8 @@ Environment:
   CHRONOS_BENCH_DB_MEMORY          Docker memory limit. Default: 10g.
   CHRONOS_BENCH_DB_BUFFER          PostgreSQL shared_buffers / Doltgres GOMEMLIMIT. Default: 5g.
   CHRONOS_BENCH_DOCKER_DEVICE      Required Docker storage backing device. Default: /dev/nvme0n1p2.
+  CHRONOS_BENCH_MEMORY_SAMPLE_INTERVAL
+                                  Seconds between Docker memory samples. Default: 1.0.
   CHRONOS_BENCH_OUTPUT_DIR         Output directory. Default: .benchmarks/branching-transaction-<timestamp>.
   PYTHON                           Python executable. Default: python3.
 
@@ -268,6 +270,8 @@ export PYTHONPATH="${ROOT_DIR}/packages/chronos-core/src${PYTHONPATH:+:${PYTHONP
 "${PYTHON_BIN}" "${ROOT_DIR}/bench/branching_transactions.py" \
   --backends "${BACKENDS}" \
   --output-dir "${OUTPUT_DIR}" \
+  --postgres-container "${POSTGRES_CONTAINER}" \
+  --doltgres-container "${DOLTGRES_CONTAINER}" \
   "${ARGS[@]}"
 
 echo "RESULT_DIR=${OUTPUT_DIR}"

@@ -5,6 +5,8 @@ import csv
 import math
 import os
 import statistics
+import subprocess
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -55,6 +57,10 @@ SUMMARY_FIELDS = [
     "avg_ms",
     "p95_ms",
     "total_ms",
+    "final_memory_bytes",
+    "final_memory_mb",
+    "peak_memory_bytes",
+    "peak_memory_mb",
 ]
 
 
@@ -86,6 +92,102 @@ class Timer:
 
 def progress(message: str) -> None:
     print(f"  progress: {message}", flush=True)
+
+
+_MEMORY_UNITS = {
+    "B": 1,
+    "KB": 1_000,
+    "MB": 1_000_000,
+    "GB": 1_000_000_000,
+    "TB": 1_000_000_000_000,
+    "KIB": 1024,
+    "MIB": 1024**2,
+    "GIB": 1024**3,
+    "TIB": 1024**4,
+}
+
+
+class MemoryTracker:
+    def __init__(self, container_name: str | None, interval_seconds: float = 1.0):
+        self.container_name = container_name
+        self.interval_seconds = interval_seconds
+        self.final_bytes: int | None = None
+        self.peak_bytes: int | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> MemoryTracker:
+        if self.container_name:
+            self._sample()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_seconds * 2))
+        self._sample()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            self._sample()
+
+    def _sample(self) -> None:
+        if not self.container_name:
+            return
+        memory = docker_container_memory_bytes(self.container_name)
+        if memory is None:
+            return
+        self.final_bytes = memory
+        if self.peak_bytes is None or memory > self.peak_bytes:
+            self.peak_bytes = memory
+
+
+def docker_container_memory_bytes(container_name: str) -> int | None:
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "stats",
+                "--no-stream",
+                "--format",
+                "{{.MemUsage}}",
+                container_name,
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    first_line = result.stdout.strip().splitlines()
+    if not first_line:
+        return None
+    usage = first_line[0].split("/", 1)[0].strip()
+    return parse_memory_value(usage)
+
+
+def parse_memory_value(value: str) -> int | None:
+    compact = value.strip().replace(" ", "").upper()
+    if not compact:
+        return None
+    for unit in sorted(_MEMORY_UNITS, key=len, reverse=True):
+        if compact.endswith(unit):
+            number = compact[: -len(unit)]
+            try:
+                return int(float(number) * _MEMORY_UNITS[unit])
+            except ValueError:
+                return None
+    return None
+
+
+def memory_mb(value: int | None) -> float | None:
+    return None if value is None else value / 1_000_000
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -567,7 +669,12 @@ def run_native_txn_case(database_url: str, case: TxnCase) -> list[dict[str, Any]
     return detail_rows
 
 
-def summarize_detail_rows(detail_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def summarize_detail_rows(
+    detail_rows: list[dict[str, Any]],
+    *,
+    final_memory_bytes: int | None = None,
+    peak_memory_bytes: int | None = None,
+) -> list[dict[str, Any]]:
     by_group: dict[tuple[str, int, int, int, str], list[float]] = {}
     for row in detail_rows:
         by_group.setdefault(
@@ -596,6 +703,10 @@ def summarize_detail_rows(detail_rows: list[dict[str, Any]]) -> list[dict[str, A
                 "avg_ms": stats["avg_ms"],
                 "p95_ms": stats["p95_ms"],
                 "total_ms": stats["total_ms"],
+                "final_memory_bytes": final_memory_bytes,
+                "final_memory_mb": memory_mb(final_memory_bytes),
+                "peak_memory_bytes": peak_memory_bytes,
+                "peak_memory_mb": memory_mb(peak_memory_bytes),
             }
         )
     return summary_rows
@@ -612,12 +723,22 @@ def initialize_result_files(output_dir: Path) -> tuple[Path, Path]:
     return detail_path, summary_path
 
 
-def append_result_rows(output_dir: Path, detail_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def append_result_rows(
+    output_dir: Path,
+    detail_rows: list[dict[str, Any]],
+    *,
+    final_memory_bytes: int | None = None,
+    peak_memory_bytes: int | None = None,
+) -> list[dict[str, Any]]:
     if not detail_rows:
         return []
     detail_path = output_dir / "branching_transaction_details.csv"
     summary_path = output_dir / "branching_transaction_summary.csv"
-    summary_rows = summarize_detail_rows(detail_rows)
+    summary_rows = summarize_detail_rows(
+        detail_rows,
+        final_memory_bytes=final_memory_bytes,
+        peak_memory_bytes=peak_memory_bytes,
+    )
     with detail_path.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=DETAIL_FIELDS)
         writer.writerows(detail_rows)
@@ -842,6 +963,22 @@ def main() -> None:
     )
     parser.add_argument("--postgres-url", default=os.environ.get("CHRONOS_BRANCH_POSTGRES_DSN"))
     parser.add_argument("--doltgres-url", default=os.environ.get("CHRONOS_BRANCH_DOLTGRES_DSN"))
+    parser.add_argument(
+        "--postgres-container",
+        default=os.environ.get("CHRONOS_BENCH_POSTGRES_CONTAINER"),
+        help="Docker container name used to sample memory for Chronos/native PostgreSQL configs.",
+    )
+    parser.add_argument(
+        "--doltgres-container",
+        default=os.environ.get("CHRONOS_BENCH_DOLTGRES_CONTAINER"),
+        help="Docker container name used to sample memory for Doltgres configs.",
+    )
+    parser.add_argument(
+        "--memory-sample-interval",
+        type=float,
+        default=float(os.environ.get("CHRONOS_BENCH_MEMORY_SAMPLE_INTERVAL", "1.0")),
+        help="Seconds between Docker memory samples. Default: 1.0.",
+    )
     parser.add_argument("--backends", type=parse_backends, default=list(BACKENDS))
     parser.add_argument(
         "--dataset-sizes",
@@ -900,6 +1037,11 @@ def main() -> None:
     output_dir = resolve_output_dir(args.output_dir)
     detail_path, summary_path = initialize_result_files(output_dir)
     all_summary_rows: list[dict[str, Any]] = []
+    backend_containers = {
+        "chronos": args.postgres_container,
+        "native_txn": args.postgres_container,
+        "doltgres": args.doltgres_container,
+    }
     for backend in args.backends:
         for dataset_size in args.dataset_sizes:
             for iteration_count in args.iterations:
@@ -918,15 +1060,27 @@ def main() -> None:
                     f"warmup={args.warmup_iterations} changes={args.changes} "
                     f"read_count={args.read_count} delete_branches={args.delete_branches}"
                 )
-                if backend == "chronos":
-                    detail_rows = run_chronos_case(args.postgres_url, case)
-                elif backend == "doltgres":
-                    detail_rows = run_doltgres_case(args.doltgres_url, case)
-                elif backend == "native_txn":
-                    detail_rows = run_native_txn_case(args.postgres_url, case)
-                else:
-                    raise AssertionError(backend)
-                all_summary_rows.extend(append_result_rows(output_dir, detail_rows))
+                container_name = backend_containers[backend]
+                with MemoryTracker(
+                    container_name,
+                    interval_seconds=max(0.1, args.memory_sample_interval),
+                ) as memory:
+                    if backend == "chronos":
+                        detail_rows = run_chronos_case(args.postgres_url, case)
+                    elif backend == "doltgres":
+                        detail_rows = run_doltgres_case(args.doltgres_url, case)
+                    elif backend == "native_txn":
+                        detail_rows = run_native_txn_case(args.postgres_url, case)
+                    else:
+                        raise AssertionError(backend)
+                all_summary_rows.extend(
+                    append_result_rows(
+                        output_dir,
+                        detail_rows,
+                        final_memory_bytes=memory.final_bytes,
+                        peak_memory_bytes=memory.peak_bytes,
+                    )
+                )
 
     plot_results(output_dir, all_summary_rows)
     print(f"Wrote detail results to {detail_path}")

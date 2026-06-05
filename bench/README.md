@@ -42,7 +42,10 @@ instead of geometrically shrinking `main` through percentage allocation. Results
 are streamed to `branching_transaction_details.csv` and
 `branching_transaction_summary.csv`; figures are written after all requested
 configs finish. Passing `--delete-branches` also deletes each Chronos and
-Doltgres branch after merge and includes `branch_delete` latency.
+Doltgres branch after merge and includes `branch_delete` latency. When the
+runner knows the backend Docker container name, the summary rows also include
+`final_memory_bytes`, `final_memory_mb`, `peak_memory_bytes`, and
+`peak_memory_mb` for the database container used by that config.
 The cross-backend `merge_apply` phase includes whatever validation the backend
 requires to commit a branch transaction: Chronos performs row-level merge
 validation inside `merge_apply`, while Doltgres performs its native merge logic.
