@@ -157,6 +157,59 @@ the common case. LLM inference latency gives the system some room, but branch
 management still needs to be lightweight enough that agents can speculate
 broadly and discard failed attempts freely.
 
+## Research Questions
+
+The central research question is not whether Chronos can beat a native
+transaction on a short SQL-only critical path. A native transaction is the right
+upper-bound baseline for that case. The question is whether a branch transaction
+is a better abstraction when the unit of work is a long-running agent attempt
+with private intermediate state, expensive reasoning, and a review step before
+commit.
+
+This leads to several focused questions:
+
+- **What does a private branch buy over 2PL or OCC?** Native transactions provide
+  concurrency control, but a long agent transaction can hold locks, keep old
+  versions alive, or abort after expensive LLM and tool work. A branch
+  transaction moves the expensive work into a private workspace and postpones
+  validation to merge time. The research problem is to quantify when that
+  reduces wasted work, improves concurrency, or avoids MVCC/GC pressure.
+- **Can merge be more useful than abort?** Native OCC has a hard outcome: commit
+  or retry. Branch transactions can expose a diff, run policy checks, apply
+  source-over-target rules, use row or column merge policies, or invoke
+  application/LLM-assisted reconciliation. The key question is whether semantic
+  merge lowers abort/retry cost for agent workloads.
+- **How cheap can the branch primitives be?** A useful branch transaction needs
+  fork, checkout, diff, merge-preview, merge-apply, and delete to be stable as
+  the number of transactions grows. Chronos' interval backend uses fixed-size
+  child intervals for wide transaction streams and `writer_segment_id` to make
+  diff proportional to the number of branch-local edits. The benchmark question
+  is how close this gets to the native transaction upper bound, and where the
+  remaining cost sits.
+- **How should conflict detection be parameterized?** Row-level write-write
+  conflict detection is a starting point, not the whole semantics. Some
+  workflows need column-level merge, predicate validation, invariant checks, or
+  policy-selected subsets of the diff. Chronos should make the validation and
+  reconciliation policy explicit.
+- **How does the API stay usable for agents?** Human users can call
+  `create_branch`, `diff`, and `merge` directly. Autonomous agents should not
+  need to reason about an entire branch graph. A practical system likely needs a
+  higher-level branch-transaction API, database proxy, or MCP tool wrapper that
+  presents "run attempt, show diff, approve/merge, discard" as the natural
+  workflow.
+- **Is relational branching enough to establish the idea?** Relational data is a
+  clean first target because conflict detection, row diffs, schema changes, and
+  native transaction baselines are well-defined. The same model can later extend
+  to filesystems, memory, vector stores, and other state, but the first
+  evaluation can stay relational and still answer the core question.
+
+The evaluation should therefore compare Chronos branch transactions with
+PostgreSQL native transactions and native branching systems such as Doltgres.
+Native transactions show the best possible SQL-only latency. Doltgres shows a
+database-native branch baseline. Chronos should be judged on primitive
+throughput, scalability with many short-lived branches, change-proportional diff
+and merge, and the ability to avoid full retry by offering semantic merge.
+
 ## Required Chronos Primitives
 
 For relational state, Chronos needs:
@@ -203,10 +256,13 @@ intent records or outbox entries, then execute them only after merge approval.
 
 ## Open Design Questions
 
-- How should Chronos expose `detect_conflicts` and `reconcile` policies?
-- How much conflict detection should be row-level, column-level, predicate-level,
-  or application-defined?
+- What is the default merge policy: source-over-target, reject on row conflict,
+  column-level merge, or application-defined?
+- Which validation policies are needed to match common isolation levels, and
+  which policies are intentionally weaker but useful for agent workflows?
 - Should merge apply support policy-selected subsets of a branch diff?
+- What API hides branch graph details from autonomous agents while preserving
+  explicit review and merge control for humans?
 - How should Chronos coordinate atomic merge across relational and filesystem
   stores?
 - Which external effects must be represented as staged intents before merge?
