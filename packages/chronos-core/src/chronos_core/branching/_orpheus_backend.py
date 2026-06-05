@@ -22,9 +22,11 @@ class _OrpheusBackend(_SQLBranchBackend):
         self,
         db: SQLDatabaseAdapter,
         enable_schema_branching: bool = False,
+        enable_diff_merge_tracking: bool = False,
     ):
         super().__init__(db)
         self.enable_schema_branching = bool(enable_schema_branching)
+        self.enable_diff_merge_tracking = bool(enable_diff_merge_tracking)
         self._base_version_rid_limit_cache: dict[tuple[str, str], int] = {}
 
     def ensure(self) -> None:
@@ -87,6 +89,8 @@ class _OrpheusBackend(_SQLBranchBackend):
             ON _chronos_branch_orpheus_workspace (branch_id, table_name)
             """
         )
+        if self.enable_diff_merge_tracking:
+            self._ensure_diff_merge_tracking_tables()
         if self.enable_schema_branching:
             self._ensure_schema_branching_tables()
         if self._version_row(1) is None:
@@ -120,6 +124,41 @@ class _OrpheusBackend(_SQLBranchBackend):
                 (_utc_now(),),
             )
         self.db.commit()
+
+    def _ensure_diff_merge_tracking_tables(self) -> None:
+        self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _chronos_branch_orpheus_version_delta (
+              vid INTEGER NOT NULL,
+              writer_branch_id TEXT NOT NULL,
+              table_name TEXT NOT NULL,
+              key_text TEXT NOT NULL,
+              op TEXT NOT NULL,
+              before_rid INTEGER,
+              after_rid INTEGER,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (vid, table_name, key_text)
+            )
+            """
+        )
+        self.db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS _chronos_idx_orpheus_delta_vid_table
+            ON _chronos_branch_orpheus_version_delta (vid, table_name)
+            """
+        )
+        self.db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS _chronos_idx_orpheus_delta_writer_table
+            ON _chronos_branch_orpheus_version_delta (writer_branch_id, table_name)
+            """
+        )
+        self.db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS _chronos_idx_orpheus_delta_table_key
+            ON _chronos_branch_orpheus_version_delta (table_name, key_text, vid)
+            """
+        )
 
     def register_table(self, table: str, primary_key: list[str]) -> None:
         columns, defs = _table_defs(self.db, table)
@@ -697,8 +736,20 @@ class _OrpheusBackend(_SQLBranchBackend):
                         parent_version,
                         new_version,
                     )
+                    self._record_version_deltas_from_workspace(
+                        other_meta,
+                        ref.branch_id,
+                        parent_version,
+                        new_version,
+                    )
                 else:
                     self._carry_forward_rlist(other_meta, parent_version, new_version)
+            self._record_version_deltas_by_comparing_versions(
+                meta,
+                ref.branch_id,
+                parent_version,
+                new_version,
+            )
             self.db.execute(
                 """
                 UPDATE _chronos_branch_orpheus_branches
@@ -752,6 +803,558 @@ class _OrpheusBackend(_SQLBranchBackend):
     def visible_rows(self, branch_id: str, table: str) -> list[dict[str, Any]]:
         ref = self.prepare_ref(_BranchRef(branch_id, self._current_version_id(branch_id)))
         return self.query(ref, f"SELECT * FROM {_quote_table_name(table)}", {})
+
+    def diff_rows(self, left: str, right: str, table: str) -> list[RowDiff] | None:
+        if not self.enable_diff_merge_tracking:
+            return None
+        meta = self._compatible_meta_for_table(table, left, right)
+        if meta is None:
+            return None
+        left_vid = self._vid(self._current_version_id(left))
+        right_vid = self._vid(self._current_version_id(right))
+        base_vid = self._nearest_common_version(left_vid, right_vid)
+        if base_vid is None:
+            return None
+        candidate_keys = self._candidate_key_texts_between(
+            table,
+            base_vid,
+            left_vid,
+            right_vid,
+            left,
+            right,
+        )
+        if not candidate_keys:
+            return []
+        left_rows = self._rows_by_key_text_for_branch(meta, left, left_vid, candidate_keys)
+        right_rows = self._rows_by_key_text_for_branch(meta, right, right_vid, candidate_keys)
+        return self._classify_key_text_diffs(table, meta, left_rows, right_rows)
+
+    def merge_preview(self, source: str, target: str) -> MergePreview | None:
+        if not self.enable_diff_merge_tracking:
+            return None
+        preview = self._merge_preview_from_tracking(source, target)
+        return MergePreview(
+            source=source,
+            target=target,
+            changes=preview[0],
+            conflicts=preview[1],
+        )
+
+    def merge_apply(
+        self,
+        source: str,
+        target: str,
+        resolution: MergeResolution | None = None,
+    ) -> MergeResult | None:
+        if not self.enable_diff_merge_tracking:
+            return None
+        with self._materialization_lock():
+            self._lock_branch_for_update(source)
+            self._lock_branch_for_update(target)
+            source_vid = self._materialize_workspace(source, "chronos merge source")
+            target_vid = self._materialize_workspace(target, "chronos merge target")
+            changes, conflicts = self._merge_preview_from_tracking(source, target)
+            if conflicts:
+                raise BranchingError("merge has unresolved conflicts")
+            if not changes:
+                return MergeResult(source=source, target=target, applied=0)
+
+            new_version = self._new_version_id()
+            now = _utc_now()
+            self.db.execute(
+                """
+                INSERT INTO _chronos_branch_orpheus_versiontable
+                (vid, author, num_records, parent, children, create_time, commit_time, commit_msg)
+                VALUES (?, 'chronos', 0, ?::integer[], ?::integer[], ?, ?, ?)
+                """,
+                (
+                    new_version,
+                    [target_vid, source_vid],
+                    [],
+                    now,
+                    now,
+                    f"chronos merge {source} into {target}",
+                ),
+            )
+
+            changes_by_table: dict[str, list[RowDiff]] = {}
+            for change in changes:
+                changes_by_table.setdefault(change.table, []).append(change)
+            table_metas = (
+                self._active_metas_for_owner("branch", target).values()
+                if self.enable_schema_branching
+                else self.tables.values()
+            )
+            for meta in table_metas:
+                table_changes = changes_by_table.get(meta.name, [])
+                if not table_changes:
+                    self._carry_forward_rlist(meta, target_vid, new_version)
+                    continue
+                key_texts = [
+                    self._key_text_from_key(meta, change.key)
+                    for change in table_changes
+                ]
+                self._insert_merged_rlist(
+                    meta,
+                    target_vid,
+                    source_vid,
+                    key_texts,
+                    new_version,
+                )
+                self._record_merge_version_deltas(
+                    meta,
+                    target,
+                    target_vid,
+                    source_vid,
+                    new_version,
+                    table_changes,
+                )
+            self.db.execute(
+                """
+                UPDATE _chronos_branch_orpheus_branches
+                   SET current_vid = ?
+                 WHERE branch_id = ?
+                """,
+                (new_version, target),
+            )
+            self._refresh_version_record_count(new_version)
+            return MergeResult(source=source, target=target, applied=len(changes))
+
+    def _lock_branch_for_update(self, branch_id: str) -> None:
+        row = self.db.execute(
+            """
+            SELECT 1
+            FROM _chronos_branch_orpheus_branches
+            WHERE branch_id = ?
+            FOR UPDATE
+            """,
+            (branch_id,),
+        ).fetchone()
+        if row is None:
+            raise BranchNotFoundError(branch_id)
+
+    def _insert_merged_rlist(
+        self,
+        meta: _TableMeta,
+        target_version: int,
+        source_version: int,
+        key_texts: list[str],
+        new_version: int,
+    ) -> None:
+        if not key_texts:
+            self._carry_forward_rlist(meta, target_version, new_version)
+            return
+        values = ", ".join("(?)" for _ in key_texts)
+        self.db.execute(
+            f"""
+            INSERT INTO {_quote(self._index_table(meta))}
+            (vid, rlist)
+            WITH keys(key_text) AS (VALUES {values}),
+            target_rows AS (
+              SELECT d.rid
+              FROM {_quote(meta.physical_name)} AS d
+              JOIN {_quote(self._index_table(meta))} AS i
+                ON i.vid = ?
+               AND d.rid = ANY(i.rlist)
+              WHERE NOT EXISTS (
+                SELECT 1
+                FROM keys
+                WHERE keys.key_text = {self._key_json_sql(meta, alias='d')}
+              )
+            ),
+            source_rows AS (
+              SELECT d.rid
+              FROM keys
+              JOIN {_quote(meta.physical_name)} AS d
+                ON {self._key_json_sql(meta, alias='d')} = keys.key_text
+              JOIN {_quote(self._index_table(meta))} AS i
+                ON i.vid = ?
+               AND d.rid = ANY(i.rlist)
+            ),
+            materialized AS (
+              SELECT rid FROM target_rows
+              UNION ALL
+              SELECT rid FROM source_rows
+            )
+            SELECT ?, COALESCE(array_agg(rid ORDER BY rid), ARRAY[]::integer[])
+            FROM materialized
+            ON CONFLICT (vid)
+            DO UPDATE SET rlist = EXCLUDED.rlist
+            """,
+            [*key_texts, target_version, source_version, new_version],
+        )
+
+    def _record_merge_version_deltas(
+        self,
+        meta: _TableMeta,
+        target_branch: str,
+        target_version: int,
+        source_version: int,
+        new_version: int,
+        changes: list[RowDiff],
+    ) -> None:
+        if not self.enable_diff_merge_tracking or not changes:
+            return
+        key_texts = [self._key_text_from_key(meta, change.key) for change in changes]
+        target_rows = self._rows_by_key_text_for_version(
+            meta, target_version, key_texts, include_rid=True
+        )
+        source_rows = self._rows_by_key_text_for_version(
+            meta, source_version, key_texts, include_rid=True
+        )
+        now = _utc_now()
+        rows = []
+        for change in changes:
+            key_text = self._key_text_from_key(meta, change.key)
+            before = target_rows.get(key_text)
+            after = source_rows.get(key_text)
+            rows.append(
+                (
+                    new_version,
+                    target_branch,
+                    meta.name,
+                    key_text,
+                    change.change,
+                    before.get("rid") if before is not None else None,
+                    after.get("rid") if after is not None else None,
+                    now,
+                )
+            )
+        self.db.executemany(
+            """
+            INSERT INTO _chronos_branch_orpheus_version_delta
+            (vid, writer_branch_id, table_name, key_text, op, before_rid, after_rid, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (vid, table_name, key_text)
+            DO UPDATE SET
+              writer_branch_id = EXCLUDED.writer_branch_id,
+              op = EXCLUDED.op,
+              before_rid = EXCLUDED.before_rid,
+              after_rid = EXCLUDED.after_rid,
+              created_at = EXCLUDED.created_at
+            """,
+            rows,
+        )
+
+    def _merge_preview_from_tracking(
+        self, source: str, target: str
+    ) -> tuple[list[RowDiff], list[RowDiff]]:
+        source_vid = self._vid(self._current_version_id(source))
+        target_vid = self._vid(self._current_version_id(target))
+        base_vid = self._nearest_common_version(source_vid, target_vid)
+        if base_vid is None:
+            raise BranchingError("cannot merge Orpheus branches without a common version")
+
+        changes: list[RowDiff] = []
+        conflicts: list[RowDiff] = []
+        for table in self.diff_tables():
+            meta = self._compatible_meta_for_table(table, source, target, base_vid)
+            if meta is None:
+                raise UnsupportedSQLError(
+                    "Orpheus merge with schema divergence is not supported"
+                )
+            candidate_keys = self._candidate_key_texts_between(
+                table,
+                base_vid,
+                source_vid,
+                target_vid,
+                source,
+                target,
+            )
+            if not candidate_keys:
+                continue
+            base_rows = self._rows_by_key_text_for_version(meta, base_vid, candidate_keys)
+            source_rows = self._rows_by_key_text_for_branch(
+                meta, source, source_vid, candidate_keys
+            )
+            target_rows = self._rows_by_key_text_for_branch(
+                meta, target, target_vid, candidate_keys
+            )
+            for key_text in sorted(candidate_keys):
+                base_row = base_rows.get(key_text)
+                source_row = source_rows.get(key_text)
+                target_row = target_rows.get(key_text)
+                if source_row == target_row:
+                    continue
+                if source_row == base_row:
+                    continue
+                diff = self._row_diff_from_target_to_source_by_key_text(
+                    table,
+                    meta,
+                    key_text,
+                    target_row,
+                    source_row,
+                )
+                if diff is None:
+                    continue
+                if target_row == base_row:
+                    changes.append(diff)
+                else:
+                    conflicts.append(diff)
+        return changes, conflicts
+
+    def _compatible_meta_for_table(
+        self,
+        table: str,
+        left_branch: str,
+        right_branch: str,
+        base_vid: int | None = None,
+    ) -> _TableMeta | None:
+        left_meta = self._meta_for_owner("branch", left_branch, table)
+        right_meta = self._meta_for_owner("branch", right_branch, table)
+        base_meta = (
+            self._active_meta_for_version(base_vid, table)
+            if base_vid is not None and table in self._active_metas_for_version(base_vid)
+            else left_meta or right_meta
+        )
+        if left_meta is None and right_meta is None:
+            return None
+        if left_meta is None or right_meta is None or base_meta is None:
+            return None
+        if (
+            left_meta.physical_name != right_meta.physical_name
+            or left_meta.physical_name != base_meta.physical_name
+            or left_meta.pk_columns != right_meta.pk_columns
+            or left_meta.pk_columns != base_meta.pk_columns
+            or left_meta.columns != right_meta.columns
+            or left_meta.columns != base_meta.columns
+        ):
+            return None
+        return left_meta
+
+    def _nearest_common_version(self, left_vid: int, right_vid: int) -> int | None:
+        row = self.db.execute(
+            """
+            WITH RECURSIVE
+            left_path(vid, depth) AS (
+              VALUES (?::integer, 0::integer)
+              UNION
+              SELECT p.parent_vid, left_path.depth + 1
+              FROM left_path
+              JOIN _chronos_branch_orpheus_versiontable AS v ON v.vid = left_path.vid
+              CROSS JOIN LATERAL unnest(v.parent) AS p(parent_vid)
+              WHERE p.parent_vid > 0
+            ),
+            right_path(vid, depth) AS (
+              VALUES (?::integer, 0::integer)
+              UNION
+              SELECT p.parent_vid, right_path.depth + 1
+              FROM right_path
+              JOIN _chronos_branch_orpheus_versiontable AS v ON v.vid = right_path.vid
+              CROSS JOIN LATERAL unnest(v.parent) AS p(parent_vid)
+              WHERE p.parent_vid > 0
+            )
+            SELECT left_path.vid
+            FROM left_path
+            JOIN right_path USING (vid)
+            ORDER BY left_path.depth + right_path.depth, left_path.depth, right_path.depth
+            LIMIT 1
+            """,
+            (left_vid, right_vid),
+        ).fetchone()
+        return int(row["vid"]) if row is not None else None
+
+    def _version_ids_after_base(self, head_vid: int, base_vid: int) -> list[int]:
+        rows = self.db.execute(
+            """
+            WITH RECURSIVE path(vid) AS (
+              VALUES (?::integer)
+              UNION
+              SELECT p.parent_vid
+              FROM path
+              JOIN _chronos_branch_orpheus_versiontable AS v ON v.vid = path.vid
+              CROSS JOIN LATERAL unnest(v.parent) AS p(parent_vid)
+              WHERE p.parent_vid > 0
+                AND path.vid <> ?
+            )
+            SELECT vid
+            FROM path
+            WHERE vid <> ?
+            """,
+            (head_vid, base_vid, base_vid),
+        ).fetchall()
+        return [int(row["vid"]) for row in rows]
+
+    def _candidate_key_texts_between(
+        self,
+        table: str,
+        base_vid: int,
+        left_vid: int,
+        right_vid: int,
+        left_branch: str,
+        right_branch: str,
+    ) -> list[str]:
+        version_ids = sorted(
+            set(self._version_ids_after_base(left_vid, base_vid))
+            | set(self._version_ids_after_base(right_vid, base_vid))
+        )
+        keys: set[str] = set()
+        if version_ids:
+            placeholders = ", ".join("?" for _ in version_ids)
+            rows = self.db.execute(
+                f"""
+                SELECT DISTINCT key_text
+                FROM _chronos_branch_orpheus_version_delta
+                WHERE table_name = ?
+                  AND vid IN ({placeholders})
+                """,
+                [table, *version_ids],
+            ).fetchall()
+            keys.update(str(row["key_text"]) for row in rows)
+        keys.update(self._workspace_key_texts(left_branch, table))
+        keys.update(self._workspace_key_texts(right_branch, table))
+        return sorted(keys)
+
+    def _workspace_key_texts(self, branch_id: str, table: str) -> list[str]:
+        rows = self.db.execute(
+            """
+            SELECT key_text
+            FROM _chronos_branch_orpheus_workspace
+            WHERE branch_id = ? AND table_name = ?
+            """,
+            (branch_id, table),
+        ).fetchall()
+        return [str(row["key_text"]) for row in rows]
+
+    def _rows_by_key_text_for_version(
+        self,
+        meta: _TableMeta,
+        version_id: int,
+        key_texts: list[str],
+        *,
+        include_rid: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        if not key_texts:
+            return {}
+        values = ", ".join("(?)" for _ in key_texts)
+        rid_col = "d.rid, " if include_rid else ""
+        cols = ", ".join(f"d.{_quote(column)}" for column in meta.columns)
+        rows = self.db.execute(
+            f"""
+            WITH keys(key_text) AS (VALUES {values})
+            SELECT keys.key_text, {rid_col}{cols}
+            FROM keys
+            JOIN {_quote(meta.physical_name)} AS d
+              ON {self._key_json_sql(meta, alias='d')} = keys.key_text
+            JOIN {_quote(self._index_table(meta))} AS i
+              ON i.vid = ?
+             AND d.rid = ANY(i.rlist)
+            """,
+            [*key_texts, version_id],
+        ).fetchall()
+        return {str(row["key_text"]): self._row_from_result(row, meta, include_rid) for row in rows}
+
+    def _rows_by_key_text_for_branch(
+        self,
+        meta: _TableMeta,
+        branch_id: str,
+        version_id: int,
+        key_texts: list[str],
+        *,
+        include_rid: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        if not key_texts:
+            return {}
+        values = ", ".join("(?)" for _ in key_texts)
+        rid_col = "d.rid, " if include_rid else ""
+        cols = ", ".join(f"d.{_quote(column)}" for column in meta.columns)
+        rows = self.db.execute(
+            f"""
+            WITH keys(key_text) AS (VALUES {values}),
+            committed_rows AS (
+              SELECT keys.key_text, {rid_col}{cols}
+              FROM keys
+              JOIN {_quote(meta.physical_name)} AS d
+                ON {self._key_json_sql(meta, alias='d')} = keys.key_text
+              JOIN {_quote(self._index_table(meta))} AS i
+                ON i.vid = ?
+               AND d.rid = ANY(i.rlist)
+              WHERE NOT EXISTS (
+                SELECT 1
+                FROM _chronos_branch_orpheus_workspace AS w
+                WHERE w.branch_id = ?
+                  AND w.table_name = ?
+                  AND w.key_text = keys.key_text
+              )
+            ),
+            workspace_rows AS (
+              SELECT keys.key_text, {rid_col}{cols}
+              FROM keys
+              JOIN _chronos_branch_orpheus_workspace AS w
+                ON w.branch_id = ?
+               AND w.table_name = ?
+               AND w.key_text = keys.key_text
+               AND w.deleted = FALSE
+              JOIN {_quote(meta.physical_name)} AS d ON d.rid = w.rid
+            )
+            SELECT * FROM committed_rows
+            UNION ALL
+            SELECT * FROM workspace_rows
+            """,
+            [*key_texts, version_id, branch_id, meta.name, branch_id, meta.name],
+        ).fetchall()
+        return {str(row["key_text"]): self._row_from_result(row, meta, include_rid) for row in rows}
+
+    def _row_from_result(
+        self, row: Any, meta: _TableMeta, include_rid: bool
+    ) -> dict[str, Any]:
+        result = {column: row[column] for column in meta.columns}
+        if include_rid:
+            result["rid"] = int(row["rid"])
+        return result
+
+    def _classify_key_text_diffs(
+        self,
+        table: str,
+        meta: _TableMeta,
+        left_rows: dict[str, dict[str, Any]],
+        right_rows: dict[str, dict[str, Any]],
+    ) -> list[RowDiff]:
+        diffs: list[RowDiff] = []
+        for key_text in sorted(set(left_rows) | set(right_rows)):
+            diff = self._row_diff_from_target_to_source_by_key_text(
+                table,
+                meta,
+                key_text,
+                left_rows.get(key_text),
+                right_rows.get(key_text),
+            )
+            if diff is not None:
+                diffs.append(diff)
+        return diffs
+
+    def _row_diff_from_target_to_source_by_key_text(
+        self,
+        table: str,
+        meta: _TableMeta,
+        key_text: str,
+        target_row: dict[str, Any] | None,
+        source_row: dict[str, Any] | None,
+    ) -> RowDiff | None:
+        if target_row == source_row:
+            return None
+        key_dict = self._key_dict_from_text(meta, key_text)
+        before = self._strip_internal_row(target_row)
+        after = self._strip_internal_row(source_row)
+        if before is None and after is not None:
+            return RowDiff(table, key_dict, "added", None, after)
+        if before is not None and after is None:
+            return RowDiff(table, key_dict, "deleted", before, None)
+        return RowDiff(table, key_dict, "modified", before, after)
+
+    def _strip_internal_row(
+        self, row: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {key: value for key, value in row.items() if key != "rid"}
+
+    def _key_dict_from_text(self, meta: _TableMeta, key_text: str) -> dict[str, Any]:
+        values = json.loads(key_text)
+        return dict(zip(meta.pk_columns, values))
+
+    def _key_text_from_key(self, meta: _TableMeta, key: dict[str, Any]) -> str:
+        return json.dumps([key[column] for column in meta.pk_columns], default=str)
 
     def upsert_row(self, branch_id: str, table: str, row: dict[str, Any]) -> None:
         self.upsert_rows(branch_id, table, [row])
@@ -874,6 +1477,12 @@ class _OrpheusBackend(_SQLBranchBackend):
                     parent_version,
                     new_version,
                 )
+                self._record_version_deltas_from_workspace(
+                    table_meta,
+                    branch_id,
+                    parent_version,
+                    new_version,
+                )
             self.db.execute(
                 """
                 UPDATE _chronos_branch_orpheus_branches
@@ -970,6 +1579,118 @@ class _OrpheusBackend(_SQLBranchBackend):
                 branch_id,
                 meta.name,
                 new_version,
+            ),
+        )
+
+    def _record_version_deltas_from_workspace(
+        self,
+        meta: _TableMeta,
+        branch_id: str,
+        parent_version: int,
+        new_version: int,
+    ) -> None:
+        if not self.enable_diff_merge_tracking:
+            return
+        self._ensure_diff_merge_tracking_tables()
+        self.db.execute(
+            f"""
+            INSERT INTO _chronos_branch_orpheus_version_delta
+            (vid, writer_branch_id, table_name, key_text, op, before_rid, after_rid, created_at)
+            WITH parent_rows AS (
+              SELECT d.rid, {self._key_json_sql(meta, alias='d')} AS key_text
+              FROM {_quote(meta.physical_name)} AS d
+              JOIN {_quote(self._index_table(meta))} AS i
+                ON i.vid = ?
+               AND d.rid = ANY(i.rlist)
+            )
+            SELECT ?, ?, ?, w.key_text,
+                   CASE
+                     WHEN w.deleted THEN 'deleted'
+                     WHEN p.rid IS NULL THEN 'added'
+                     ELSE 'modified'
+                   END,
+                   p.rid,
+                   CASE WHEN w.deleted THEN NULL ELSE w.rid END,
+                   ?
+            FROM _chronos_branch_orpheus_workspace AS w
+            LEFT JOIN parent_rows AS p ON p.key_text = w.key_text
+            WHERE w.branch_id = ?
+              AND w.table_name = ?
+              AND NOT (w.deleted AND p.rid IS NULL)
+            ON CONFLICT (vid, table_name, key_text)
+            DO UPDATE SET
+              writer_branch_id = EXCLUDED.writer_branch_id,
+              op = EXCLUDED.op,
+              before_rid = EXCLUDED.before_rid,
+              after_rid = EXCLUDED.after_rid,
+              created_at = EXCLUDED.created_at
+            """,
+            (
+                parent_version,
+                new_version,
+                branch_id,
+                meta.name,
+                _utc_now(),
+                branch_id,
+                meta.name,
+            ),
+        )
+
+    def _record_version_deltas_by_comparing_versions(
+        self,
+        meta: _TableMeta,
+        branch_id: str,
+        parent_version: int,
+        new_version: int,
+    ) -> None:
+        if not self.enable_diff_merge_tracking:
+            return
+        self._ensure_diff_merge_tracking_tables()
+        self.db.execute(
+            f"""
+            INSERT INTO _chronos_branch_orpheus_version_delta
+            (vid, writer_branch_id, table_name, key_text, op, before_rid, after_rid, created_at)
+            WITH parent_rows AS (
+              SELECT d.rid, {self._key_json_sql(meta, alias='d')} AS key_text
+              FROM {_quote(meta.physical_name)} AS d
+              JOIN {_quote(self._index_table(meta))} AS i
+                ON i.vid = ?
+               AND d.rid = ANY(i.rlist)
+            ),
+            new_rows AS (
+              SELECT d.rid, {self._key_json_sql(meta, alias='d')} AS key_text
+              FROM {_quote(meta.physical_name)} AS d
+              JOIN {_quote(self._index_table(meta))} AS i
+                ON i.vid = ?
+               AND d.rid = ANY(i.rlist)
+            )
+            SELECT ?, ?, ?, COALESCE(parent_rows.key_text, new_rows.key_text),
+                   CASE
+                     WHEN parent_rows.rid IS NULL THEN 'added'
+                     WHEN new_rows.rid IS NULL THEN 'deleted'
+                     ELSE 'modified'
+                   END,
+                   parent_rows.rid,
+                   new_rows.rid,
+                   ?
+            FROM parent_rows
+            FULL OUTER JOIN new_rows ON new_rows.key_text = parent_rows.key_text
+            WHERE parent_rows.rid IS DISTINCT FROM new_rows.rid
+            ON CONFLICT (vid, table_name, key_text)
+            DO UPDATE SET
+              writer_branch_id = EXCLUDED.writer_branch_id,
+              op = EXCLUDED.op,
+              before_rid = EXCLUDED.before_rid,
+              after_rid = EXCLUDED.after_rid,
+              created_at = EXCLUDED.created_at
+            """,
+            (
+                parent_version,
+                new_version,
+                new_version,
+                branch_id,
+                meta.name,
+                _utc_now(),
             ),
         )
 

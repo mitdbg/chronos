@@ -778,6 +778,14 @@ class _SQLBranchBackend:
     def merge_preview(self, source: str, target: str) -> MergePreview | None:
         return None
 
+    def merge_apply(
+        self,
+        source: str,
+        target: str,
+        resolution: MergeResolution | None = None,
+    ) -> MergeResult | None:
+        return None
+
     def _require_table(self, table: str) -> _TableMeta:
         try:
             return self.tables[table]

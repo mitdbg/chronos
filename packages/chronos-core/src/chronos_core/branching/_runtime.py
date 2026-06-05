@@ -180,6 +180,7 @@ class ChronosBranchContext:
         interval_child_width: int | None = None,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
+        enable_diff_merge_tracking: bool = False,
     ) -> ChronosBranchContext:
         db = connect_sql_database(database_url)
         return cls.from_database_adapter(
@@ -190,6 +191,7 @@ class ChronosBranchContext:
             interval_child_width=interval_child_width,
             ensure_metadata=ensure_metadata,
             enable_schema_branching=enable_schema_branching,
+            enable_diff_merge_tracking=enable_diff_merge_tracking,
         )
 
     @classmethod
@@ -202,6 +204,7 @@ class ChronosBranchContext:
         interval_child_width: int | None = None,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
+        enable_diff_merge_tracking: bool = False,
     ) -> ChronosBranchContext:
         def build_backend() -> _SQLBranchBackend:
             if backend == "interval":
@@ -218,7 +221,11 @@ class ChronosBranchContext:
             if backend == "copy":
                 return _CopyBackend(db, enable_schema_branching=enable_schema_branching)
             if backend == "orpheus":
-                return _OrpheusBackend(db, enable_schema_branching=enable_schema_branching)
+                return _OrpheusBackend(
+                    db,
+                    enable_schema_branching=enable_schema_branching,
+                    enable_diff_merge_tracking=enable_diff_merge_tracking,
+                )
             if backend == "litetree":
                 return _LiteTreeBackend(db)
             raise ValueError(f"unknown branch backend: {backend}")
@@ -454,6 +461,15 @@ class ChronosBranchContext:
         target: str,
         resolution: MergeResolution | None = None,
     ) -> MergeResult:
+        try:
+            backend_result = self._backend.merge_apply(source, target, resolution)
+        except Exception:
+            self._rollback_autocommit()
+            raise
+        if backend_result is not None:
+            self._commit_autocommit()
+            self._metadata_epoch += 1
+            return backend_result
         applied = 0
         target_session = self.checkout(target)
         with target_session.transaction():

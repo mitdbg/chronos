@@ -588,6 +588,24 @@ def _make_products_only_context(
     return ctx
 
 
+def _make_orpheus_tracking_context() -> ChronosBranchContext:
+    _reset_postgres_schema()
+    ctx = ChronosBranchContext.connect(
+        _postgres_dsn(),
+        backend="orpheus",
+        enable_diff_merge_tracking=True,
+    )
+    ctx._test_sql_backend = "postgres"  # type: ignore[attr-defined]
+    ctx.db.execute("CREATE TABLE products (sku TEXT PRIMARY KEY, name TEXT, price INTEGER)")
+    ctx.db.executemany(
+        "INSERT INTO products VALUES (?, ?, ?)",
+        [("abc", "Alpha", 10), ("def", "Delta", 20)],
+    )
+    ctx.db.commit()
+    ctx.register_table("products", ["sku"])
+    return ctx
+
+
 def test_create_branch_storage_behavior_for_user_records(ctx: ChronosBranchContext) -> None:
     before = _physical_change_count(ctx, "products")
     ctx.create_branch("exp", from_branch="main")
@@ -759,6 +777,189 @@ def test_postgres_orpheus_materializes_version_on_checkpoint() -> None:
 
         assert dict(version_count) == {"count": 2, "max_vid": 2}
         assert int(work["current_vid"]) == 2
+    finally:
+        ctx.close()
+
+
+def test_postgres_orpheus_tracking_records_durable_version_deltas() -> None:
+    ctx = _make_orpheus_tracking_context()
+    try:
+        ctx.create_branch("work", from_branch="main")
+        work = ctx.checkout("work")
+        work.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 11, "sku": "abc"},
+        )
+        work.execute("DELETE FROM products WHERE sku = :sku", {"sku": "def"})
+        work.execute(
+            "INSERT INTO products (sku, name, price) VALUES (:sku, :name, :price)",
+            {"sku": "ghi", "name": "Gamma", "price": 33},
+        )
+
+        ctx.create_checkpoint("work-snap", branch="work")
+
+        rows = ctx.db.execute(
+            """
+            SELECT key_text, op, before_rid IS NOT NULL AS has_before,
+                   after_rid IS NOT NULL AS has_after
+            FROM _chronos_branch_orpheus_version_delta
+            WHERE table_name = 'products'
+            ORDER BY key_text
+            """
+        ).fetchall()
+        assert [dict(row) for row in rows] == [
+            {
+                "key_text": '["abc"]',
+                "op": "modified",
+                "has_before": True,
+                "has_after": True,
+            },
+            {
+                "key_text": '["def"]',
+                "op": "deleted",
+                "has_before": True,
+                "has_after": False,
+            },
+            {
+                "key_text": '["ghi"]',
+                "op": "added",
+                "has_before": False,
+                "has_after": True,
+            },
+        ]
+
+        changes = ctx.diff_rows("main", "work", "products")
+        assert [(change.key, change.change) for change in changes] == [
+            ({"sku": "abc"}, "modified"),
+            ({"sku": "def"}, "deleted"),
+            ({"sku": "ghi"}, "added"),
+        ]
+    finally:
+        ctx.close()
+
+
+def test_postgres_orpheus_tracking_merge_applies_source_only_changes() -> None:
+    ctx = _make_orpheus_tracking_context()
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "def", "price": 22},
+        )
+
+        preview = ctx.merge_preview(source="agent", target="main")
+        assert preview.conflicts == []
+        assert [(change.key, change.change, change.after) for change in preview.changes] == [
+            ({"sku": "abc"}, "modified", {"sku": "abc", "name": "Alpha", "price": 11})
+        ]
+
+        result = ctx.merge_apply(source="agent", target="main")
+        assert result.applied == 1
+        assert _product(ctx.checkout("main"), "abc")["price"] == 11
+        assert _product(ctx.checkout("main"), "def")["price"] == 22
+
+        merge = ctx.db.execute(
+            """
+            SELECT current_vid
+            FROM _chronos_branch_orpheus_branches
+            WHERE branch_id = 'main'
+            """
+        ).fetchone()
+        parents = ctx.db.execute(
+            """
+            SELECT parent
+            FROM _chronos_branch_orpheus_versiontable
+            WHERE vid = ?
+            """,
+            (int(merge["current_vid"]),),
+        ).fetchone()
+        assert len(parents["parent"]) == 2
+
+        delta = ctx.db.execute(
+            """
+            SELECT op, before_rid IS NOT NULL AS has_before,
+                   after_rid IS NOT NULL AS has_after
+            FROM _chronos_branch_orpheus_version_delta
+            WHERE vid = ? AND table_name = 'products' AND key_text = '["abc"]'
+            """,
+            (int(merge["current_vid"]),),
+        ).fetchone()
+        assert dict(delta) == {"op": "modified", "has_before": True, "has_after": True}
+    finally:
+        ctx.close()
+
+
+def test_postgres_orpheus_tracking_merge_applies_source_delete() -> None:
+    ctx = _make_orpheus_tracking_context()
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute("DELETE FROM products WHERE sku = :sku", {"sku": "def"})
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+
+        preview = ctx.merge_preview(source="agent", target="main")
+        assert preview.conflicts == []
+        assert [(change.key, change.change) for change in preview.changes] == [
+            ({"sku": "def"}, "deleted")
+        ]
+
+        result = ctx.merge_apply(source="agent", target="main")
+        assert result.applied == 1
+        assert _product(ctx.checkout("main"), "abc")["price"] == 12
+        assert ctx.checkout("main").query("SELECT * FROM products WHERE sku = 'def'") == []
+    finally:
+        ctx.close()
+
+
+def test_postgres_orpheus_tracking_merge_detects_conflicts_without_preview_mutation() -> None:
+    ctx = _make_orpheus_tracking_context()
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+
+        preview = ctx.merge_preview(source="agent", target="main")
+        assert preview.changes == []
+        assert [
+            (conflict.key, conflict.change, conflict.before, conflict.after)
+            for conflict in preview.conflicts
+        ] == [
+            (
+                {"sku": "abc"},
+                "modified",
+                {"sku": "abc", "name": "Alpha", "price": 12},
+                {"sku": "abc", "name": "Alpha", "price": 11},
+            )
+        ]
+        assert ctx.db.execute(
+            "SELECT COUNT(*) AS count FROM _chronos_branch_orpheus_versiontable"
+        ).fetchone()["count"] == 1
+
+        with pytest.raises(BranchingError):
+            ctx.merge_apply(source="agent", target="main")
+
+        assert ctx.db.execute(
+            "SELECT COUNT(*) AS count FROM _chronos_branch_orpheus_versiontable"
+        ).fetchone()["count"] == 1
+        assert _product(ctx.checkout("main"), "abc")["price"] == 12
     finally:
         ctx.close()
 
@@ -2272,6 +2473,92 @@ def test_interval_delete_branch_cascades_to_subbranches(sql_backend: str) -> Non
         for branch in ("parent", "child", "grandchild"):
             with pytest.raises(BranchNotFoundError):
                 ctx.get_branch(branch)
+    finally:
+        ctx.close()
+
+
+def test_interval_delete_branch_cascades_branch_from_checkpoint(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("parent", from_branch="main")
+        ctx.create_checkpoint("snap", branch="parent")
+        ctx.create_branch_from_checkpoint("restored", "snap")
+
+        row = ctx.db.execute(
+            """
+            SELECT parent_branch_id, child_count
+            FROM _chronos_branch_interval_branches
+            WHERE branch_id = 'restored'
+            """
+        ).fetchone()
+        assert row["parent_branch_id"] == "parent"
+        assert row["child_count"] == 0
+
+        parent = ctx.db.execute(
+            """
+            SELECT child_count
+            FROM _chronos_branch_interval_branches
+            WHERE branch_id = 'parent'
+            """
+        ).fetchone()
+        assert parent["child_count"] == 1
+
+        ctx.delete_branch("parent")
+        ctx.wait_for_background_work()
+
+        assert [branch.branch_id for branch in ctx.list_branches()] == ["main"]
+        for branch in ("parent", "restored"):
+            with pytest.raises(BranchNotFoundError):
+                ctx.get_branch(branch)
+    finally:
+        ctx.close()
+
+
+def test_postgres_interval_delete_leaf_branch_from_wide_main_fanout() -> None:
+    _reset_postgres_schema()
+    ctx = ChronosBranchContext.connect(
+        _postgres_dsn(), backend="interval", interval_child_width=2
+    )
+    ctx._test_sql_backend = "postgres"  # type: ignore[attr-defined]
+    try:
+        ctx.db.execute(
+            "CREATE TABLE products (sku TEXT PRIMARY KEY, name TEXT, price INTEGER)"
+        )
+        ctx.db.executemany(
+            "INSERT INTO products VALUES (?, ?, ?)",
+            [("abc", "Alpha", 10), ("def", "Delta", 20)],
+        )
+        ctx.db.commit()
+        ctx.register_table("products", ["sku"])
+
+        for index in range(200):
+            ctx.create_branch(f"txn_{index}", from_branch="main")
+
+        before = ctx.db.execute(
+            """
+            SELECT child_count
+            FROM _chronos_branch_interval_branches
+            WHERE branch_id = 'main'
+            """
+        ).fetchone()
+        assert before["child_count"] == 200
+
+        ctx.delete_branch("txn_100")
+
+        with pytest.raises(BranchNotFoundError):
+            ctx.get_branch("txn_100")
+        assert ctx.get_branch("txn_101").branch_id == "txn_101"
+        after = ctx.db.execute(
+            """
+            SELECT child_count
+            FROM _chronos_branch_interval_branches
+            WHERE branch_id = 'main'
+            """
+        ).fetchone()
+        assert after["child_count"] == 199
+        ctx.wait_for_background_work()
     finally:
         ctx.close()
 

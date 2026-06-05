@@ -373,9 +373,36 @@ class _IntervalBackend(_SQLBranchBackend):
             CREATE TABLE IF NOT EXISTS _chronos_branch_interval_branches (
               branch_id TEXT PRIMARY KEY,
               current_segment_id INTEGER NOT NULL,
+              parent_branch_id TEXT,
+              child_count INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL,
               metadata TEXT NOT NULL
             )
+            """
+        )
+        branch_columns, _branch_defs = self.db.table_defs(
+            "_chronos_branch_interval_branches"
+        )
+        added_parent_branch_id = "parent_branch_id" not in branch_columns
+        added_child_count = "child_count" not in branch_columns
+        if "parent_branch_id" not in branch_columns:
+            self.db.execute(
+                """
+                ALTER TABLE _chronos_branch_interval_branches
+                ADD COLUMN parent_branch_id TEXT
+                """
+            )
+        if "child_count" not in branch_columns:
+            self.db.execute(
+                """
+                ALTER TABLE _chronos_branch_interval_branches
+                ADD COLUMN child_count INTEGER NOT NULL DEFAULT 0
+                """
+            )
+        self.db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS _chronos_idx_interval_branches_parent
+            ON _chronos_branch_interval_branches (parent_branch_id)
             """
         )
         self.db.execute(
@@ -429,11 +456,16 @@ class _IntervalBackend(_SQLBranchBackend):
             self.db.execute(
                 """
                 INSERT INTO _chronos_branch_interval_branches
-                (branch_id, current_segment_id, created_at, metadata)
-                VALUES (?, ?, ?, ?)
+                (branch_id, current_segment_id, parent_branch_id, child_count,
+                 created_at, metadata)
+                VALUES (?, ?, NULL, 0, ?, ?)
                 """,
                 ("main", segment, _utc_now(), "{}"),
             )
+        if added_parent_branch_id:
+            self._backfill_interval_branch_parent_ids()
+        if added_parent_branch_id or added_child_count:
+            self._backfill_interval_branch_child_counts()
         self.db.execute(
             """
             CREATE TABLE IF NOT EXISTS _chronos_branch_interval_checkpoints (
@@ -458,6 +490,72 @@ class _IntervalBackend(_SQLBranchBackend):
         if self.enable_schema_branching:
             self._ensure_schema_branching_tables()
         self.db.commit()
+
+    def _backfill_interval_branch_parent_ids(self) -> None:
+        rows = self.db.execute(
+            """
+            SELECT branch_id, current_segment_id
+            FROM _chronos_branch_interval_branches
+            WHERE branch_id <> 'main'
+              AND parent_branch_id IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            parent = self._infer_parent_branch_id_from_segments(
+                row["branch_id"], int(row["current_segment_id"])
+            )
+            if parent is None:
+                continue
+            self.db.execute(
+                """
+                UPDATE _chronos_branch_interval_branches
+                   SET parent_branch_id = ?
+                 WHERE branch_id = ?
+                   AND parent_branch_id IS NULL
+                """,
+                (parent, row["branch_id"]),
+            )
+
+    def _infer_parent_branch_id_from_segments(
+        self, branch_id: str, segment_id: int
+    ) -> str | None:
+        row = self.db.execute(
+            """
+            WITH RECURSIVE ancestry(
+              segment_id, parent_segment_id, owner_branch_id, depth
+            ) AS (
+              SELECT segment_id, parent_segment_id, owner_branch_id, 0
+              FROM _chronos_branch_interval_segments
+              WHERE segment_id = ?
+            UNION ALL
+              SELECT parent.segment_id, parent.parent_segment_id,
+                     parent.owner_branch_id, ancestry.depth + 1
+              FROM _chronos_branch_interval_segments AS parent
+              JOIN ancestry ON parent.segment_id = ancestry.parent_segment_id
+            )
+            SELECT owner_branch_id
+            FROM ancestry
+            WHERE owner_branch_id IS NOT NULL
+              AND owner_branch_id <> ?
+            ORDER BY depth
+            LIMIT 1
+            """,
+            (segment_id, branch_id),
+        ).fetchone()
+        return str(row["owner_branch_id"]) if row is not None else None
+
+    def _backfill_interval_branch_child_counts(self) -> None:
+        self.db.execute(
+            """
+            UPDATE _chronos_branch_interval_branches
+               SET child_count = (
+                 SELECT COUNT(*)
+                 FROM _chronos_branch_interval_branches AS child
+                 WHERE child.parent_branch_id =
+                       _chronos_branch_interval_branches.branch_id
+               )
+            """
+        )
 
     def _ensure_segment_id_allocator(self) -> None:
         if self.db.dialect == "postgres":
@@ -1048,7 +1146,8 @@ class _IntervalBackend(_SQLBranchBackend):
         self.db.execute(
             """
             UPDATE _chronos_branch_interval_branches
-            SET current_segment_id = ?
+            SET current_segment_id = ?,
+                child_count = child_count + 1
             WHERE branch_id = ?
             """,
             (continuation["segment_id"], from_branch),
@@ -1056,10 +1155,11 @@ class _IntervalBackend(_SQLBranchBackend):
         self.db.execute(
             """
             INSERT INTO _chronos_branch_interval_branches
-            (branch_id, current_segment_id, created_at, metadata)
-            VALUES (?, ?, ?, ?)
+            (branch_id, current_segment_id, parent_branch_id, child_count,
+             created_at, metadata)
+            VALUES (?, ?, ?, 0, ?, ?)
             """,
-            (branch_id, child["segment_id"], now, _json_dumps(metadata)),
+            (branch_id, child["segment_id"], from_branch, now, _json_dumps(metadata)),
         )
 
     def _create_branch_postgres_locked(
@@ -1135,7 +1235,8 @@ class _IntervalBackend(_SQLBranchBackend):
             self.db.execute(
                 """
                 UPDATE _chronos_branch_interval_branches
-                SET current_segment_id = ?
+                SET current_segment_id = ?,
+                    child_count = child_count + 1
                 WHERE branch_id = ?
                   AND current_segment_id = ?
                 """,
@@ -1144,10 +1245,11 @@ class _IntervalBackend(_SQLBranchBackend):
             self.db.execute(
                 """
                 INSERT INTO _chronos_branch_interval_branches
-                (branch_id, current_segment_id, created_at, metadata)
-                VALUES (?, ?, ?, ?)
+                (branch_id, current_segment_id, parent_branch_id, child_count,
+                 created_at, metadata)
+                VALUES (?, ?, ?, 0, ?, ?)
                 """,
-                (branch_id, child["segment_id"], now, _json_dumps(metadata)),
+                (branch_id, child["segment_id"], from_branch, now, _json_dumps(metadata)),
             )
 
     def create_branch_from_checkpoint(self, branch_id: str, checkpoint: str) -> None:
@@ -1198,10 +1300,19 @@ class _IntervalBackend(_SQLBranchBackend):
         self.db.execute(
             """
             INSERT INTO _chronos_branch_interval_branches
-            (branch_id, current_segment_id, created_at, metadata)
-            VALUES (?, ?, ?, ?)
+            (branch_id, current_segment_id, parent_branch_id, child_count,
+             created_at, metadata)
+            VALUES (?, ?, ?, 0, ?, ?)
             """,
-            (branch_id, child["segment_id"], now, "{}"),
+            (branch_id, child["segment_id"], cp["branch_id"], now, "{}"),
+        )
+        self.db.execute(
+            """
+            UPDATE _chronos_branch_interval_branches
+               SET child_count = child_count + 1
+             WHERE branch_id = ?
+            """,
+            (cp["branch_id"],),
         )
 
     def update_branch_metadata(
@@ -1218,9 +1329,27 @@ class _IntervalBackend(_SQLBranchBackend):
     def delete_branch(self, branch_id: str) -> None:
         if branch_id == "main":
             raise BranchingError("main cannot be deleted")
-        branches = self._branches_to_delete_cascade(branch_id)
-        if not branches:
+
+        branch = self._branch_row_for_update(branch_id)
+        if branch is None:
             raise BranchNotFoundError(branch_id)
+
+        parent_branch_id = branch["parent_branch_id"]
+        if int(branch["child_count"]) == 0:
+            cur = self.db.execute(
+                """
+                DELETE FROM _chronos_branch_interval_branches
+                WHERE branch_id = ?
+                """,
+                (branch_id,),
+            )
+            if cur.rowcount == 0:
+                raise BranchNotFoundError(branch_id)
+            self._decrement_interval_branch_child_count(parent_branch_id)
+            self._interval_gc_requested = True
+            return
+
+        branches = self._branches_to_delete_cascade_by_parent(branch_id)
         cur = self.db.execute(
             f"""
             DELETE FROM _chronos_branch_interval_branches
@@ -1230,61 +1359,44 @@ class _IntervalBackend(_SQLBranchBackend):
         )
         if cur.rowcount == 0:
             raise BranchNotFoundError(branch_id)
+        self._decrement_interval_branch_child_count(parent_branch_id)
         self._interval_gc_requested = True
 
-    def _branches_to_delete_cascade(self, branch_id: str) -> list[str]:
-        branch_rows = self.db.execute(
+    def _branches_to_delete_cascade_by_parent(self, branch_id: str) -> list[str]:
+        rows = self.db.execute(
             """
-            SELECT branch_id, current_segment_id
-            FROM _chronos_branch_interval_branches
-            """
-        ).fetchall()
-        if not any(row["branch_id"] == branch_id for row in branch_rows):
-            return []
-        segment_rows = self.db.execute(
-            """
-            SELECT segment_id, parent_segment_id, owner_branch_id
-            FROM _chronos_branch_interval_segments
-            """
-        ).fetchall()
-        segments = {
-            int(row["segment_id"]): (
-                int(row["parent_segment_id"]) if row["parent_segment_id"] is not None else None,
-                row["owner_branch_id"],
+            WITH RECURSIVE subtree(branch_id) AS (
+              SELECT branch_id
+              FROM _chronos_branch_interval_branches
+              WHERE branch_id = ?
+            UNION ALL
+              SELECT child.branch_id
+              FROM _chronos_branch_interval_branches AS child
+              JOIN subtree ON child.parent_branch_id = subtree.branch_id
+              WHERE child.branch_id <> 'main'
             )
-            for row in segment_rows
-        }
+            SELECT branch_id
+            FROM subtree
+            ORDER BY branch_id
+            """,
+            (branch_id,),
+        ).fetchall()
+        return [row["branch_id"] for row in rows]
 
-        to_delete = {branch_id}
-        changed = True
-        while changed:
-            changed = False
-            for row in branch_rows:
-                candidate = row["branch_id"]
-                if candidate == "main" or candidate in to_delete:
-                    continue
-                if self._branch_ancestry_has_owner(
-                    int(row["current_segment_id"]), segments, to_delete
-                ):
-                    to_delete.add(candidate)
-                    changed = True
-        return sorted(to_delete)
-
-    def _branch_ancestry_has_owner(
-        self,
-        segment_id: int,
-        segments: dict[int, tuple[int | None, str | None]],
-        owners: set[str],
-    ) -> bool:
-        seen: set[int] = set()
-        current: int | None = segment_id
-        while current is not None and current not in seen:
-            seen.add(current)
-            parent, owner = segments.get(current, (None, None))
-            if owner in owners:
-                return True
-            current = parent
-        return False
+    def _decrement_interval_branch_child_count(self, branch_id: str | None) -> None:
+        if branch_id is None:
+            return
+        self.db.execute(
+            """
+            UPDATE _chronos_branch_interval_branches
+               SET child_count = CASE
+                   WHEN child_count > 0 THEN child_count - 1
+                   ELSE 0
+               END
+             WHERE branch_id = ?
+            """,
+            (branch_id,),
+        )
 
     def list_branches(self) -> list[BranchInfo]:
         rows = self.db.execute(
