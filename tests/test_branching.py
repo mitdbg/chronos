@@ -179,6 +179,34 @@ def test_interval_batched_upsert_rows_bulk_insert_and_replace(sql_backend: str) 
 
 
 @pytest.mark.parametrize("sql_backend", SQL_BACKENDS)
+def test_interval_batched_delete_keys_records_absent_key_tombstones(sql_backend: str) -> None:
+    if sql_backend == "postgres":
+        _reset_postgres_schema()
+    ctx = ChronosBranchContext.connect(_database_url(sql_backend), backend="interval")
+    try:
+        ctx.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT)")
+        ctx.db.commit()
+        ctx.register_table("docs", ["id"])
+        session = ctx.checkout("main")
+
+        session.delete_keys("docs", [{"id": f"missing:{idx}"} for idx in range(1200)])
+        session.upsert_rows(
+            "docs",
+            [
+                {"id": "missing:0", "title": "recreated"},
+                {"id": "present", "title": "present"},
+            ],
+        )
+
+        assert session.query("SELECT count(*) AS c FROM docs") == [{"c": 2}]
+        assert session.query("SELECT title FROM docs WHERE id = :id", {"id": "missing:0"}) == [
+            {"title": "recreated"}
+        ]
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("sql_backend", SQL_BACKENDS)
 def test_interval_batched_upsert_rows_uses_branch_local_schema(sql_backend: str) -> None:
     if sql_backend == "postgres":
         _reset_postgres_schema()
@@ -345,6 +373,13 @@ def _postgres_dsn() -> str:
 
 
 def _reset_postgres_schema() -> None:
+    from chronos_core.branching._interval_backend import (
+        _wait_for_all_interval_gc_jobs,
+        _wait_for_all_async_schema_index_jobs,
+    )
+
+    _wait_for_all_async_schema_index_jobs()
+    _wait_for_all_interval_gc_jobs()
     db = connect_sql_database(_postgres_dsn())
     try:
         db.execute("DROP SCHEMA IF EXISTS public CASCADE")
@@ -579,7 +614,7 @@ def test_postgres_interval_create_branch_locks_parent_before_split(monkeypatch) 
         ctx.create_branch("exp", from_branch="main")
 
         assert any("FOR UPDATE" in call for call in calls)
-        assert any("current_segment_id = ?" in call for call in calls)
+        assert any("SET current_segment_id" in call for call in calls)
         assert _product(ctx.checkout("exp"), "abc")["price"] == 10
         assert _product(ctx.checkout("main"), "abc")["price"] == 10
     finally:
@@ -850,6 +885,57 @@ def test_interval_split_default_favors_depth_and_can_be_configured_for_width() -
         wide_ctx.close()
 
 
+def test_interval_split_can_use_fixed_child_width_for_serial_transactions() -> None:
+    ctx = ChronosBranchContext.connect(
+        "sqlite:///:memory:",
+        backend="interval",
+        interval_child_width=2,
+    )
+    try:
+        ctx.db.execute(
+            "CREATE TABLE products (sku TEXT PRIMARY KEY, name TEXT, price INTEGER)"
+        )
+        ctx.db.execute("INSERT INTO products VALUES (?, ?, ?)", ("abc", "Alpha", 10))
+        ctx.db.commit()
+        ctx.register_table("products", ["sku"])
+        initial_main = ctx._backend._current_segment("main")  # type: ignore[attr-defined]
+
+        for index in range(10):
+            ctx.create_branch(f"txn_{index}", from_branch="main")
+
+        main_segment = ctx._backend._current_segment("main")  # type: ignore[attr-defined]
+        assert initial_main.live_hi - main_segment.live_hi == 30
+
+        child_rows = ctx.db.execute(
+            """
+            SELECT live_hi - live_lo AS width
+            FROM _chronos_branch_interval_segments
+            WHERE owner_branch_id LIKE 'txn_%'
+              AND segment_kind = 'mutable'
+            ORDER BY owner_branch_id
+            """
+        ).fetchall()
+        assert [int(row["width"]) for row in child_rows] == [2] * 10
+
+        fork_base_rows = ctx.db.execute(
+            """
+            SELECT live_hi - live_lo AS width
+            FROM _chronos_branch_interval_segments
+            WHERE segment_kind = 'fork_base'
+            """
+        ).fetchall()
+        assert [int(row["width"]) for row in fork_base_rows] == [1] * 10
+
+        ctx.checkout("txn_9").execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 99, "sku": "abc"},
+        )
+        assert _product(ctx.checkout("txn_9"), "abc")["price"] == 99
+        assert _product(ctx.checkout("main"), "abc")["price"] == 10
+    finally:
+        ctx.close()
+
+
 def test_interval_split_rejects_invalid_continuation_percent() -> None:
     with pytest.raises(ValueError):
         ChronosBranchContext.connect(
@@ -862,6 +948,15 @@ def test_interval_split_rejects_invalid_continuation_percent() -> None:
             "sqlite:///:memory:",
             backend="interval",
             interval_continuation_percent=100,
+        )
+
+
+def test_interval_split_rejects_invalid_child_width() -> None:
+    with pytest.raises(ValueError):
+        ChronosBranchContext.connect(
+            "sqlite:///:memory:",
+            backend="interval",
+            interval_child_width=1,
         )
 
 
@@ -1861,6 +1956,372 @@ def test_diff_rows_and_merge_apply(ctx: ChronosBranchContext) -> None:
     assert _product(main, "ghi")["price"] == 40
 
 
+def test_interval_branch_creation_records_one_unit_fork_base(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        rows = ctx.db.execute(
+            """
+            SELECT segment_id, parent_segment_id, owner_branch_id, segment_kind,
+                   live_lo, live_hi, branch_point
+            FROM _chronos_branch_interval_segments
+            ORDER BY segment_id
+            """
+        ).fetchall()
+        fork_bases = [row for row in rows if row["segment_kind"] == "fork_base"]
+        assert len(fork_bases) == 1
+        fork_base = fork_bases[0]
+        assert int(fork_base["live_hi"]) - int(fork_base["live_lo"]) == 1
+        assert int(fork_base["branch_point"]) == int(fork_base["live_lo"])
+
+        main_segment = int(ctx.get_branch("main").current_ref)
+        agent_segment = int(ctx.get_branch("agent").current_ref)
+        children = ctx.db.execute(
+            """
+            SELECT segment_id, parent_segment_id, segment_kind
+            FROM _chronos_branch_interval_segments
+            WHERE segment_id IN (?, ?)
+            ORDER BY segment_id
+            """,
+            (main_segment, agent_segment),
+        ).fetchall()
+        assert {int(row["parent_segment_id"]) for row in children} == {
+            int(fork_base["segment_id"])
+        }
+        assert {row["segment_kind"] for row in children} == {"mutable"}
+
+        main = ctx.checkout("main")
+        agent = ctx.checkout("agent")
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 30},
+        )
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 40},
+        )
+
+        base_row = ctx.db.execute(
+            """
+            SELECT price
+            FROM _chronos_b_interval_products
+            WHERE sku = 'abc'
+              AND live_lo <= ?
+              AND ? < live_hi
+              AND deleted = 0
+            """,
+            (fork_base["branch_point"], fork_base["branch_point"]),
+        ).fetchone()
+        assert base_row["price"] == 10
+    finally:
+        ctx.close()
+
+
+def test_interval_three_way_merge_applies_only_source_changes(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "def", "price": 22},
+        )
+
+        preview = ctx.merge_preview(source="agent", target="main")
+        assert preview.conflicts == []
+        assert [(change.key, change.change, change.after) for change in preview.changes] == [
+            ({"sku": "abc"}, "modified", {"sku": "abc", "name": "Alpha", "price": 11})
+        ]
+
+        assert ctx.merge_apply(source="agent", target="main").applied == 1
+        main = ctx.checkout("main")
+        assert _product(main, "abc")["price"] == 11
+        assert _product(main, "def")["price"] == 22
+    finally:
+        ctx.close()
+
+
+def test_interval_direct_sibling_merge_does_not_walk_ancestry(
+    sql_backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "def", "price": 22},
+        )
+
+        def fail_ancestry_walk(segment_id: int) -> list[dict[str, object]]:
+            raise AssertionError(f"unexpected ancestry walk for segment {segment_id}")
+
+        monkeypatch.setattr(
+            ctx._backend,
+            "_segment_ancestry_rows",
+            fail_ancestry_walk,
+        )
+
+        preview = ctx.merge_preview(source="agent", target="main")
+        assert preview.conflicts == []
+        assert [(change.key, change.change) for change in preview.changes] == [
+            ({"sku": "abc"}, "modified")
+        ]
+        assert ctx.merge_apply(source="agent", target="main").applied == 1
+        assert _product(ctx.checkout("main"), "abc")["price"] == 11
+        assert _product(ctx.checkout("main"), "def")["price"] == 22
+    finally:
+        ctx.close()
+
+
+def test_interval_merge_apply_batches_large_clean_changes(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        main = ctx.checkout("main")
+        main.upsert_rows(
+            "products",
+            [
+                {"sku": f"base:{idx}", "name": f"Base {idx}", "price": idx}
+                for idx in range(300)
+            ],
+        )
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        agent.upsert_rows(
+            "products",
+            [
+                {"sku": f"base:{idx}", "name": f"Changed {idx}", "price": idx + 1000}
+                for idx in range(150)
+            ]
+            + [
+                {"sku": f"new:{idx}", "name": f"New {idx}", "price": idx + 2000}
+                for idx in range(150)
+            ],
+        )
+        agent.delete_keys("products", [{"sku": f"base:{idx}"} for idx in range(150, 225)])
+
+        result = ctx.merge_apply(source="agent", target="main")
+
+        assert result.applied == 375
+        rows = main.query(
+            """
+            SELECT
+              SUM(CASE WHEN sku LIKE 'new:%' THEN 1 ELSE 0 END) AS new_count,
+              SUM(CASE WHEN sku LIKE 'base:%' AND price >= 1000 THEN 1 ELSE 0 END) AS changed_count,
+              SUM(CASE WHEN sku LIKE 'base:%' THEN 1 ELSE 0 END) AS base_count
+            FROM products
+            """
+        )[0]
+        assert rows == {"new_count": 150, "changed_count": 150, "base_count": 225}
+        assert main.query("SELECT * FROM products WHERE sku = :sku", {"sku": "base:175"}) == []
+    finally:
+        ctx.close()
+
+
+def test_interval_three_way_merge_detects_conflicts(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+        agent.execute("DELETE FROM products WHERE sku = :sku", {"sku": "def"})
+
+        preview = ctx.merge_preview(source="agent", target="main")
+        assert [(change.key, change.change) for change in preview.changes] == [
+            ({"sku": "def"}, "deleted")
+        ]
+        assert [
+            (conflict.key, conflict.change, conflict.before, conflict.after)
+            for conflict in preview.conflicts
+        ] == [
+            (
+                {"sku": "abc"},
+                "modified",
+                {"sku": "abc", "name": "Alpha", "price": 12},
+                {"sku": "abc", "name": "Alpha", "price": 11},
+            )
+        ]
+        with pytest.raises(BranchingError):
+            ctx.merge_apply(source="agent", target="main")
+        main = ctx.checkout("main")
+        assert _product(main, "abc")["price"] == 12
+        assert _product(main, "def")["price"] == 20
+    finally:
+        ctx.close()
+
+
+def test_interval_merge_apply_conflict_rolls_back_clean_changes(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        agent.execute("DELETE FROM products WHERE sku = :sku", {"sku": "def"})
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+
+        with pytest.raises(BranchingError):
+            ctx.merge_apply(source="agent", target="main")
+
+        assert _product(main, "abc")["price"] == 12
+        assert _product(main, "def")["price"] == 20
+    finally:
+        ctx.close()
+
+
+def test_interval_nested_merge_uses_fork_time_parent_state(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("parent", from_branch="main")
+        parent = ctx.checkout("parent")
+        parent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 15},
+        )
+        ctx.create_branch("child", from_branch="parent")
+        child = ctx.checkout("child")
+        parent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 17},
+        )
+        child.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 16},
+        )
+
+        preview = ctx.merge_preview(source="child", target="parent")
+        assert preview.changes == []
+        assert [
+            (conflict.key, conflict.before, conflict.after)
+            for conflict in preview.conflicts
+        ] == [
+            (
+                {"sku": "abc"},
+                {"sku": "abc", "name": "Alpha", "price": 17},
+                {"sku": "abc", "name": "Alpha", "price": 16},
+            )
+        ]
+    finally:
+        ctx.close()
+
+
+def test_interval_delete_branch_cascades_to_subbranches(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("parent", from_branch="main")
+        ctx.create_branch("child", from_branch="parent")
+        ctx.create_branch("grandchild", from_branch="child")
+
+        ctx.delete_branch("parent")
+        ctx.wait_for_background_work()
+
+        assert [branch.branch_id for branch in ctx.list_branches()] == ["main"]
+        for branch in ("parent", "child", "grandchild"):
+            with pytest.raises(BranchNotFoundError):
+                ctx.get_branch(branch)
+    finally:
+        ctx.close()
+
+
+def test_interval_delete_branch_gc_removes_unreachable_writer_rows_and_segments(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 99},
+        )
+        agent_segment = int(ctx.get_branch("agent").current_ref)
+        assert ctx.db.execute(
+            """
+            SELECT 1
+            FROM _chronos_b_interval_products
+            WHERE writer_segment_id = ?
+            """,
+            (agent_segment,),
+        ).fetchone() is not None
+
+        ctx.delete_branch("agent")
+        ctx.wait_for_background_work()
+
+        assert ctx.db.execute(
+            """
+            SELECT 1
+            FROM _chronos_b_interval_products
+            WHERE writer_segment_id = ?
+            """,
+            (agent_segment,),
+        ).fetchone() is None
+        assert ctx.db.execute(
+            """
+            SELECT 1
+            FROM _chronos_branch_interval_segments
+            WHERE segment_id = ?
+            """,
+            (agent_segment,),
+        ).fetchone() is None
+        assert _product(ctx.checkout("main"), "abc")["price"] == 10
+    finally:
+        ctx.close()
+
+
+def test_interval_delete_branch_gc_keeps_checkpoint_visible_rows(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 99},
+        )
+        writer_segment = int(ctx.get_branch("agent").current_ref)
+        ctx.create_checkpoint("agent-snap", branch="agent")
+
+        ctx.delete_branch("agent")
+        ctx.wait_for_background_work()
+
+        assert _product(ctx.checkout_checkpoint("agent-snap"), "abc")["price"] == 99
+        assert ctx.db.execute(
+            """
+            SELECT 1
+            FROM _chronos_b_interval_products
+            WHERE writer_segment_id = ?
+            """,
+            (writer_segment,),
+        ).fetchone() is not None
+    finally:
+        ctx.close()
+
+
 def test_duplicate_insert_and_duplicate_branch_errors(ctx: ChronosBranchContext) -> None:
     session = ctx.checkout("main")
     with pytest.raises(DuplicateKeyError):
@@ -1987,6 +2448,266 @@ def test_interval_backend_splices_physical_rows_without_copying_whole_table(
     ctx.close()
 
 
+def test_interval_segment_ids_are_integers(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("exp", from_branch="main")
+        rows = ctx.db.execute(
+            """
+            SELECT segment_id, parent_segment_id
+            FROM _chronos_branch_interval_segments
+            ORDER BY segment_id
+            """
+        ).fetchall()
+        assert rows
+        assert all(isinstance(row["segment_id"], int) for row in rows)
+        assert all(
+            row["parent_segment_id"] is None
+            or isinstance(row["parent_segment_id"], int)
+            for row in rows
+        )
+        assert all(-(2**31) <= int(row["segment_id"]) < 2**31 for row in rows)
+    finally:
+        ctx.close()
+
+
+def test_interval_writer_provenance_ignores_sibling_preservation_rows(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("b", from_branch="main")
+        ctx.create_branch("sibling", from_branch="main")
+        ctx.checkout("sibling").execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 31, "sku": "abc"},
+        )
+
+        b_segment_id = int(ctx.get_branch("b").current_ref)
+        b_segment = ctx.db.execute(
+            """
+            SELECT live_lo, live_hi, branch_point
+            FROM _chronos_branch_interval_segments
+            WHERE segment_id = ?
+            """,
+            (b_segment_id,),
+        ).fetchone()
+        preservation = ctx.db.execute(
+            """
+            SELECT price, writer_segment_id
+            FROM _chronos_b_interval_products
+            WHERE sku = 'abc'
+              AND live_lo <= ?
+              AND ? < live_hi
+              AND deleted = 0
+            """,
+            (b_segment["branch_point"], b_segment["branch_point"]),
+        ).fetchone()
+
+        assert preservation is not None
+        assert preservation["price"] == 10
+        assert int(preservation["writer_segment_id"]) != b_segment_id
+        assert ctx.diff_rows("main", "b", "products") == []
+        assert [(c.key, c.change, c.after) for c in ctx.diff_rows("main", "sibling", "products")] == [
+            ({"sku": "abc"}, "modified", {"sku": "abc", "name": "Alpha", "price": 31})
+        ]
+    finally:
+        ctx.close()
+
+
+def test_interval_diff_uses_divergent_writer_segments_for_arbitrary_branches(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("left", from_branch="main")
+        left = ctx.checkout("left")
+        left.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 11, "sku": "abc"},
+        )
+        ctx.create_branch("left_child", from_branch="left")
+        ctx.checkout("left_child").execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 22, "sku": "def"},
+        )
+
+        ctx.create_branch("right", from_branch="main")
+        right = ctx.checkout("right")
+        right.execute("DELETE FROM products WHERE sku = :sku", {"sku": "abc"})
+        right.execute(
+            "INSERT INTO products (sku, name, price) VALUES (:sku, :name, :price)",
+            {"sku": "ghi", "name": "Gamma", "price": 7},
+        )
+
+        changes = ctx.diff_rows("left_child", "right", "products")
+        assert [(c.key, c.change, c.before, c.after) for c in changes] == [
+            (
+                {"sku": "abc"},
+                "deleted",
+                {"sku": "abc", "name": "Alpha", "price": 11},
+                None,
+            ),
+            (
+                {"sku": "def"},
+                "modified",
+                {"sku": "def", "name": "Delta", "price": 22},
+                {"sku": "def", "name": "Delta", "price": 20},
+            ),
+            (
+                {"sku": "ghi"},
+                "added",
+                None,
+                {"sku": "ghi", "name": "Gamma", "price": 7},
+            ),
+        ]
+    finally:
+        ctx.close()
+
+
+def test_interval_diff_suppresses_update_revert_candidates(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("exp", from_branch="main")
+        exp = ctx.checkout("exp")
+        exp.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 15, "sku": "abc"},
+        )
+        exp.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 10, "sku": "abc"},
+        )
+
+        rows = ctx.db.execute(
+            """
+            SELECT DISTINCT writer_segment_id
+            FROM _chronos_b_interval_products
+            WHERE sku = 'abc'
+            """
+        ).fetchall()
+        assert int(ctx.get_branch("exp").current_ref) in {
+            int(row["writer_segment_id"]) for row in rows
+        }
+        assert ctx.diff_rows("main", "exp", "products") == []
+    finally:
+        ctx.close()
+
+
+def test_interval_diff_finds_branch_delete_tombstone(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("exp", from_branch="main")
+        exp = ctx.checkout("exp")
+        exp.execute("DELETE FROM products WHERE sku = :sku", {"sku": "def"})
+
+        exp_segment_id = int(ctx.get_branch("exp").current_ref)
+        tombstone = ctx.db.execute(
+            """
+            SELECT deleted, writer_segment_id
+            FROM _chronos_b_interval_products
+            WHERE sku = 'def'
+              AND writer_segment_id = ?
+            """,
+            (exp_segment_id,),
+        ).fetchone()
+        assert tombstone is not None
+        assert bool(tombstone["deleted"])
+        assert [(c.key, c.change) for c in ctx.diff_rows("main", "exp", "products")] == [
+            ({"sku": "def"}, "deleted")
+        ]
+    finally:
+        ctx.close()
+
+
+def test_postgres_interval_batch_update_assigns_writer_segments_for_diff() -> None:
+    ctx = _make_products_only_context("postgres", "interval")
+    try:
+        ctx.create_branch("exp", from_branch="main")
+        exp = ctx.checkout("exp")
+        assert exp.execute("UPDATE products SET price = price + 5").rowcount == 2
+
+        exp_segment_id = int(ctx.get_branch("exp").current_ref)
+        rows = ctx.db.execute(
+            """
+            SELECT sku, price, writer_segment_id
+            FROM _chronos_b_interval_products
+            WHERE writer_segment_id = ?
+            ORDER BY sku
+            """,
+            (exp_segment_id,),
+        ).fetchall()
+        assert [(row["sku"], row["price"]) for row in rows] == [
+            ("abc", 15),
+            ("def", 25),
+        ]
+        assert [(c.key, c.change, c.after["price"]) for c in ctx.diff_rows("main", "exp", "products")] == [
+            ({"sku": "abc"}, "modified", 15),
+            ({"sku": "def"}, "modified", 25),
+        ]
+    finally:
+        ctx.close()
+
+
+def test_postgres_interval_large_sparse_diff_is_change_proportional() -> None:
+    _reset_postgres_schema()
+    ctx = ChronosBranchContext.connect(_postgres_dsn(), backend="interval")
+    row_count = 50_000
+    changed_ids = [0, 7, 103, 999, 5_001, 9_999, 20_000, 31_337, 42_000, 49_999]
+    try:
+        ctx.db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, payload TEXT, score INTEGER)")
+        ctx.db.executemany(
+            "INSERT INTO docs VALUES (?, ?, ?)",
+            ((idx, f"doc-{idx}", idx % 17) for idx in range(row_count)),
+        )
+        ctx.db.commit()
+        ctx.register_table("docs", ["id"])
+
+        ctx.create_branch("exp", from_branch="main")
+        exp = ctx.checkout("exp")
+        for idx in changed_ids:
+            exp.execute(
+                "UPDATE docs SET score = score + 1000 WHERE id = :id",
+                {"id": idx},
+            )
+
+        backend = ctx._backend  # type: ignore[attr-defined]
+        start = time.perf_counter()
+        fast_changes = ctx.diff_rows("main", "exp", "docs")
+        fast_elapsed = time.perf_counter() - start
+
+        start = time.perf_counter()
+        snapshot_changes = backend._snapshot_diff_rows(  # type: ignore[attr-defined]
+            "main",
+            "exp",
+            "docs",
+            backend.table_meta_for_branch("main", "docs"),
+        )
+        snapshot_elapsed = time.perf_counter() - start
+
+        assert {change.key["id"] for change in fast_changes} == set(changed_ids)
+        assert [
+            (change.key, change.change, change.before, change.after)
+            for change in fast_changes
+        ] == [
+            (change.key, change.change, change.before, change.after)
+            for change in snapshot_changes
+        ]
+        writer_rows = ctx.db.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM _chronos_b_interval_docs
+            WHERE writer_segment_id = ?
+            """,
+            (int(ctx.get_branch("exp").current_ref),),
+        ).fetchone()
+        assert int(writer_rows["count"]) == len(changed_ids)
+        assert fast_elapsed < snapshot_elapsed
+        assert snapshot_elapsed / max(fast_elapsed, 1e-9) >= 3
+    finally:
+        ctx.close()
+
+
 def test_interval_session_reuses_prepared_segment_metadata(sql_backend: str) -> None:
     ctx = _make_products_only_context(sql_backend, "interval")
     ctx.create_branch("exp", from_branch="main")
@@ -2049,6 +2770,42 @@ def test_interval_checkout_uses_current_ref_without_extra_branch_lookup(
     assert metadata_reads == {"branch": 1, "segment": 1}
     assert _product(session, "abc")["price"] == 10
     ctx.close()
+
+
+def test_interval_reuses_sql_parse_cache_across_checkouts(
+    sql_backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("left", from_branch="main")
+        ctx.create_branch("right", from_branch="main")
+
+        from chronos_core.branching import _interval_backend
+
+        original_parse_one = _interval_backend.sqlglot.parse_one
+        parse_count = {"count": 0}
+
+        def counting_parse_one(*args, **kwargs):
+            parse_count["count"] += 1
+            return original_parse_one(*args, **kwargs)
+
+        monkeypatch.setattr(_interval_backend.sqlglot, "parse_one", counting_parse_one)
+        query_sql = "SELECT price FROM products WHERE sku = :sku"
+        update_sql = "UPDATE products SET price = :price WHERE sku = :sku"
+
+        left = ctx.checkout("left")
+        right = ctx.checkout("right")
+        assert left.query(query_sql, {"sku": "abc"}) == [{"price": 10}]
+        assert right.query(query_sql, {"sku": "abc"}) == [{"price": 10}]
+        left.execute(update_sql, {"sku": "abc", "price": 11})
+        right.execute(update_sql, {"sku": "def", "price": 22})
+
+        # One parse for the SELECT, one parse for the visible replacement
+        # subquery, and one parse for the UPDATE plan. The second checkout uses
+        # the backend-level cache instead of paying per-branch sqlglot cost.
+        assert parse_count["count"] == 3
+    finally:
+        ctx.close()
 
 
 def test_interval_stale_session_refreshes_to_latest_segment_after_branching(

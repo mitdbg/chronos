@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+
 from chronos_core.branching._common import *
 from chronos_core.branching._orpheus_implementation import orpheus_dataset_tables
 
@@ -15,6 +17,15 @@ class _OrpheusBackend(_SQLBranchBackend):
     """
 
     name = "orpheus"
+
+    def __init__(
+        self,
+        db: SQLDatabaseAdapter,
+        enable_schema_branching: bool = False,
+    ):
+        super().__init__(db)
+        self.enable_schema_branching = bool(enable_schema_branching)
+        self._base_version_rid_limit_cache: dict[tuple[str, str], int] = {}
 
     def ensure(self) -> None:
         if self.db.dialect != "postgres":
@@ -76,6 +87,8 @@ class _OrpheusBackend(_SQLBranchBackend):
             ON _chronos_branch_orpheus_workspace (branch_id, table_name)
             """
         )
+        if self.enable_schema_branching:
+            self._ensure_schema_branching_tables()
         if self._version_row(1) is None:
             now = _utc_now()
             self.db.execute(
@@ -86,6 +99,17 @@ class _OrpheusBackend(_SQLBranchBackend):
                 """,
                 ([-1], [], now, now),
             )
+        self.db.execute("CREATE SEQUENCE IF NOT EXISTS _chronos_branch_orpheus_vid_seq")
+        self.db.execute(
+            """
+            SELECT setval(
+              '_chronos_branch_orpheus_vid_seq',
+              (SELECT GREATEST(COALESCE(MAX(vid), 1), 1)
+               FROM _chronos_branch_orpheus_versiontable),
+              true
+            )
+            """
+        )
         if self._branch_row("main") is None:
             self.db.execute(
                 """
@@ -105,6 +129,8 @@ class _OrpheusBackend(_SQLBranchBackend):
                 f"primary key columns missing from {table}: {missing}"
             )
         if table in self.tables:
+            if self.enable_schema_branching:
+                self._record_table_binding("branch", "main", self.tables[table], False)
             meta = self.tables[table]
             existing = set(meta.columns)
             additions = [
@@ -135,6 +161,8 @@ class _OrpheusBackend(_SQLBranchBackend):
                 column_defs=defs,
                 backend=meta.backend,
             )
+            if self.enable_schema_branching:
+                self._record_table_binding("branch", "main", self.tables[table], False)
             return
 
         physical = orpheus_dataset_tables(
@@ -196,6 +224,8 @@ class _OrpheusBackend(_SQLBranchBackend):
             backend=self.name,
         )
         self.tables[table] = meta
+        if self.enable_schema_branching:
+            self._record_table_binding("branch", "main", meta, False)
         self._copy_source_rows_to_version(meta, table, 1)
         self._refresh_version_record_count(1)
 
@@ -204,14 +234,28 @@ class _OrpheusBackend(_SQLBranchBackend):
     ) -> IndexInfo:
         meta, index = self._validate_index(table, columns, name)
         if index.name not in self.indexes:
-            self.db.execute(
-                f"""
-                CREATE INDEX {_quote(f'_chronos_idx_orpheus_{index.name}')}
-                ON {_quote(meta.physical_name)}
-                ({", ".join(_quote(column) for column in index.columns)})
-                """
-            )
             self._record_index(index)
+            metas = (
+                [
+                    self._meta_from_binding(row)
+                    for row in self.db.execute(
+                        """
+                        SELECT *
+                        FROM _chronos_branch_orpheus_table_bindings
+                        WHERE table_name = ? AND tombstone = 0
+                        """,
+                        (table,),
+                    ).fetchall()
+                ]
+                if self.enable_schema_branching
+                else [meta]
+            )
+            seen: set[str] = set()
+            for active_meta in metas:
+                if active_meta.physical_name in seen:
+                    continue
+                seen.add(active_meta.physical_name)
+                self._create_physical_index(active_meta, index)
         return IndexInfo(index.name, index.table, index.columns, index.backend)
 
     def create_branch(
@@ -222,7 +266,11 @@ class _OrpheusBackend(_SQLBranchBackend):
         source = self._branch_row(from_branch)
         if source is None:
             raise BranchNotFoundError(from_branch)
-        source_vid = self._materialize_workspace(from_branch, "chronos branch")
+        source_vid = self._current_version_id(from_branch)
+        if self.enable_schema_branching:
+            self._copy_tombstone_bindings("branch", from_branch, "branch", branch_id)
+            for meta in self._active_metas_for_owner("branch", from_branch).values():
+                self._record_table_binding("branch", branch_id, meta, False)
         self.db.execute(
             """
             INSERT INTO _chronos_branch_orpheus_branches
@@ -236,6 +284,7 @@ class _OrpheusBackend(_SQLBranchBackend):
                 _json_dumps(metadata),
             ),
         )
+        self._copy_workspace(from_branch, branch_id)
 
     def update_branch_metadata(
         self, branch_id: str, metadata: dict[str, Any]
@@ -256,6 +305,10 @@ class _OrpheusBackend(_SQLBranchBackend):
         if self._branch_row(branch_id) is not None:
             raise BranchAlreadyExistsError(branch_id)
         cp = self.get_checkpoint(checkpoint)
+        if self.enable_schema_branching:
+            self._copy_tombstone_bindings("checkpoint", checkpoint, "branch", branch_id)
+            for meta in self._active_metas_for_owner("checkpoint", checkpoint).values():
+                self._record_table_binding("branch", branch_id, meta, False)
         self.db.execute(
             """
             INSERT INTO _chronos_branch_orpheus_branches
@@ -274,6 +327,14 @@ class _OrpheusBackend(_SQLBranchBackend):
             "DELETE FROM _chronos_branch_orpheus_branches WHERE branch_id = ?",
             (branch_id,),
         )
+        if self.enable_schema_branching:
+            self.db.execute(
+                """
+                DELETE FROM _chronos_branch_orpheus_table_bindings
+                WHERE owner_kind = 'branch' AND owner_id = ?
+                """,
+                (branch_id,),
+            )
 
     def list_branches(self) -> list[BranchInfo]:
         rows = self.db.execute(
@@ -316,6 +377,10 @@ class _OrpheusBackend(_SQLBranchBackend):
             raise BranchNotFoundError(branch)
         checkpoint_vid = self._materialize_workspace(branch, "chronos checkpoint")
         now = _utc_now()
+        if self.enable_schema_branching:
+            self._copy_tombstone_bindings("branch", branch, "checkpoint", checkpoint)
+            for meta in self._active_metas_for_owner("branch", branch).values():
+                self._record_table_binding("checkpoint", checkpoint, meta, False)
         self.db.execute(
             """
             INSERT INTO _chronos_branch_orpheus_checkpoints
@@ -398,25 +463,33 @@ class _OrpheusBackend(_SQLBranchBackend):
             ref.readonly,
             {
                 "replacements": self._replacements(ref, include_rid=False),
+                "tables": self._active_metas_for_ref(ref) if self.enable_schema_branching else self.tables,
                 "query_rewrite_cache": {},
                 "statement_plan_cache": {},
             },
         )
 
     def refresh_ref_after_execute(self, ref: _PreparedBranchRef) -> _PreparedBranchRef:
+        if self.enable_schema_branching:
+            return self.prepare_ref(_BranchRef(ref.branch_id, self._current_version_id(ref.branch_id), ref.readonly))
         return ref
 
     def prepare_transaction(self, ref: _PreparedBranchRef) -> None:
+        ref.metadata["defer_orpheus_materialize"] = True
         return None
 
     def commit_transaction(self, ref: _PreparedBranchRef) -> _PreparedBranchRef:
+        ref.metadata.pop("defer_orpheus_materialize", None)
         return ref
 
     def rollback_transaction(self, ref: _PreparedBranchRef) -> None:
+        ref.metadata.pop("defer_orpheus_materialize", None)
         return None
 
     def query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         ref = self._fresh_ref(ref)
+        if self.enable_schema_branching:
+            self._validate_query_tables_visible(ref, sql)
         rewrite_cache = ref.metadata.setdefault("query_rewrite_cache", {})
         cache_key = (ref.ref, sql)
         rewritten = rewrite_cache.get(cache_key)
@@ -432,18 +505,30 @@ class _OrpheusBackend(_SQLBranchBackend):
         if ref.readonly:
             raise BranchingError("checkpoint sessions are read-only")
         ref = self._fresh_ref(ref)
+        if self._is_schema_statement(sql):
+            tree = sqlglot.parse_one(sql, read=self.db.dialect)
+            if not self.enable_schema_branching:
+                raise UnsupportedSQLError("branch-local schema changes are disabled")
+            if not isinstance(tree, (exp.Create, exp.Alter, exp.Drop)):
+                raise UnsupportedSQLError("unsupported schema statement")
+            return self._execute_schema_ddl(ref, tree)
+        if self.enable_schema_branching:
+            self._validate_query_tables_visible(ref, sql)
         plan = self._statement_plan(ref, sql)
         if isinstance(plan, _InsertPlan):
             rows = _insert_rows_from_plan(plan, params)
-            full_rows = self._full_rows(plan.table, rows)
+            full_rows = self._full_rows(ref, plan.table, rows)
             self._apply_workspace_delta(ref.branch_id, plan.table, [], full_rows)
             return ExecuteResult(len(full_rows))
         if isinstance(plan, _UpdatePlan):
+            if not (set(column for column, _expr in plan.assignments) & set(self._require_table_for_ref(ref, plan.table).pk_columns)):
+                rowcount = self._apply_update_plan_bulk(ref, plan, params)
+                return ExecuteResult(rowcount)
             current_rows = self._select_matching_rows(
                 ref, plan.table, plan.where_sql, params, plan.direct_filter
             )
             new_rows: list[dict[str, Any]] = []
-            meta = self._require_table(plan.table)
+            meta = self._require_table_for_ref(ref, plan.table)
             for current in current_rows:
                 old_row = {column: current[column] for column in meta.columns}
                 new_row = dict(old_row)
@@ -459,6 +544,211 @@ class _OrpheusBackend(_SQLBranchBackend):
             return ExecuteResult(len(current_rows))
         raise UnsupportedSQLError("only SELECT, INSERT, UPDATE, and DELETE are supported")
 
+    def _apply_update_plan_bulk(
+        self,
+        ref: _PreparedBranchRef,
+        plan: _UpdatePlan,
+        params: dict[str, Any],
+    ) -> int:
+        meta = self._require_table_for_ref(ref, plan.table)
+        assignment_sql = {
+            column: expr.sql(dialect=self.db.dialect)
+            for column, expr in plan.assignments
+        }
+        select_cols = ", ".join(
+            (
+                f"{assignment_sql[column]} AS {_quote(column)}"
+                if column in assignment_sql
+                else _quote(column)
+            )
+            for column in meta.columns
+        )
+        visible = self._branch_visible_subquery(
+            meta,
+            ref.branch_id,
+            self._current_version_id(ref.branch_id),
+            include_rid=False,
+        )
+        source = f"SELECT * FROM ({visible}) AS visible_rows"
+        stripped = plan.where_sql.strip()
+        if not stripped and not ref.metadata.get("defer_orpheus_materialize"):
+            return self._apply_full_update_plan_materialized(
+                ref,
+                plan.table,
+                meta,
+                source,
+                select_cols,
+                params,
+            )
+        if stripped:
+            if not stripped.upper().startswith("WHERE "):
+                raise UnsupportedSQLError("unsupported WHERE clause")
+            source = f"{source} WHERE {stripped[6:]}"
+        cols = ", ".join(_quote(column) for column in meta.columns)
+        pk_returning = ", ".join(_quote(column) for column in meta.pk_columns)
+        row = self.db.execute(
+            f"""
+            WITH source_rows AS (
+              {source}
+            ),
+            inserted AS (
+              INSERT INTO {_quote(meta.physical_name)}
+              ({cols})
+              SELECT {select_cols}
+              FROM source_rows
+              RETURNING rid, {pk_returning}
+            ),
+            upserted AS (
+              INSERT INTO _chronos_branch_orpheus_workspace
+              (branch_id, table_name, key_text, rid, deleted, updated_at)
+              SELECT :__chronos_branch_id, :__chronos_table_name,
+                     {self._key_json_sql(meta, alias='inserted')},
+                     rid, FALSE, :__chronos_updated_at
+              FROM inserted
+              ON CONFLICT (branch_id, table_name, key_text)
+              DO UPDATE SET
+                rid = EXCLUDED.rid,
+                deleted = FALSE,
+                updated_at = EXCLUDED.updated_at
+              RETURNING 1
+            )
+            SELECT COUNT(*) AS count FROM upserted
+            """,
+            {
+                **params,
+                "__chronos_branch_id": ref.branch_id,
+                "__chronos_table_name": meta.name,
+                "__chronos_updated_at": _utc_now(),
+            },
+        ).fetchone()
+        count = int(row["count"]) if row is not None else 0
+        if count > 1000 and not ref.metadata.get("defer_orpheus_materialize"):
+            # Full-table macrobench backfills can touch every visible row. If
+            # those replacements remain in the workspace, every subsequent
+            # read pays an anti-join against one marker per row. Materializing
+            # keeps Orpheus reads on compact committed rlists.
+            self._materialize_workspace(ref.branch_id, "chronos bulk update")
+        return count
+
+    def _apply_full_update_plan_materialized(
+        self,
+        ref: _PreparedBranchRef,
+        table: str,
+        meta: _TableMeta,
+        source: str,
+        select_cols: str,
+        params: dict[str, Any],
+    ) -> int:
+        with self._materialization_lock():
+            parent_version = self._vid(self._current_version_id(ref.branch_id))
+            new_version = self._new_version_id()
+            now = _utc_now()
+            # Chronos only follows the parent pointer when resolving Orpheus
+            # versions. Maintaining the reverse children array would update a
+            # shared parent row from every child materialization and serialize
+            # wide branching workloads on that row.
+            self.db.execute(
+                """
+                INSERT INTO _chronos_branch_orpheus_versiontable
+                (vid, author, num_records, parent, children, create_time, commit_time, commit_msg)
+                VALUES (?, 'chronos', 0, ?::integer[], ?::integer[], ?, ?, ?)
+                """,
+                (
+                    new_version,
+                    [parent_version],
+                    [],
+                    now,
+                    now,
+                    "chronos full update",
+                ),
+            )
+            cols = ", ".join(_quote(column) for column in meta.columns)
+            row = self.db.execute(
+                f"""
+                WITH source_rows AS (
+                  {source}
+                ),
+                inserted AS (
+                  INSERT INTO {_quote(meta.physical_name)}
+                  ({cols})
+                  SELECT {select_cols}
+                  FROM source_rows
+                  RETURNING rid
+                )
+                INSERT INTO {_quote(self._index_table(meta))}
+                (vid, rlist)
+                SELECT :__chronos_new_version,
+                       COALESCE(array_agg(rid ORDER BY rid), ARRAY[]::integer[])
+                FROM inserted
+                RETURNING cardinality(rlist) AS count
+                """,
+                {
+                    **params,
+                    "__chronos_new_version": new_version,
+                },
+            ).fetchone()
+            for other_meta in self._active_metas_for_owner("branch", ref.branch_id).values():
+                if other_meta.name == table:
+                    continue
+                if self._workspace_has_table_changes(ref.branch_id, other_meta.name):
+                    self._insert_materialized_rlist(
+                        other_meta,
+                        ref.branch_id,
+                        parent_version,
+                        new_version,
+                    )
+                else:
+                    self._carry_forward_rlist(other_meta, parent_version, new_version)
+            self.db.execute(
+                """
+                UPDATE _chronos_branch_orpheus_branches
+                   SET current_vid = ?
+                 WHERE branch_id = ?
+                """,
+                (new_version, ref.branch_id),
+            )
+            self._refresh_version_record_count(new_version)
+            self.db.execute(
+                "DELETE FROM _chronos_branch_orpheus_workspace WHERE branch_id = ?",
+                (ref.branch_id,),
+            )
+            return int(row["count"]) if row is not None else 0
+
+    def _workspace_has_table_changes(self, branch_id: str, table: str) -> bool:
+        row = self.db.execute(
+            """
+            SELECT 1
+            FROM _chronos_branch_orpheus_workspace
+            WHERE branch_id = ? AND table_name = ?
+            LIMIT 1
+            """,
+            (branch_id, table),
+        ).fetchone()
+        return row is not None
+
+    @contextlib.contextmanager
+    def _materialization_lock(self) -> Iterator[None]:
+        yield
+
+    def _carry_forward_rlist(
+        self,
+        meta: _TableMeta,
+        parent_version: int,
+        new_version: int,
+    ) -> None:
+        self.db.execute(
+            f"""
+            INSERT INTO {_quote(self._index_table(meta))}
+            (vid, rlist)
+            SELECT ?, COALESCE(rlist, ARRAY[]::integer[])
+            FROM {_quote(self._index_table(meta))}
+            WHERE vid = ?
+            ON CONFLICT (vid)
+            DO UPDATE SET rlist = EXCLUDED.rlist
+            """,
+            (new_version, parent_version),
+        )
+
     def visible_rows(self, branch_id: str, table: str) -> list[dict[str, Any]]:
         ref = self.prepare_ref(_BranchRef(branch_id, self._current_version_id(branch_id)))
         return self.query(ref, f"SELECT * FROM {_quote_table_name(table)}", {})
@@ -471,7 +761,9 @@ class _OrpheusBackend(_SQLBranchBackend):
     ) -> None:
         if not rows:
             return
-        meta = self._require_table(table)
+        meta = self._meta_for_owner("branch", branch_id, table) if self.enable_schema_branching else self._require_table(table)
+        if meta is None:
+            raise TableNotRegisteredError(table)
         version_id = self._current_version_id(branch_id)
         remove_rows: list[dict[str, Any]] = []
         for row in rows:
@@ -487,7 +779,7 @@ class _OrpheusBackend(_SQLBranchBackend):
             branch_id,
             table,
             remove_rows,
-            self._full_rows(table, rows),
+            self._full_rows_for_meta(meta, rows),
         )
 
     def delete_key(self, branch_id: str, table: str, key: dict[str, Any]) -> None:
@@ -518,7 +810,9 @@ class _OrpheusBackend(_SQLBranchBackend):
         remove_rows: list[dict[str, Any]],
         add_rows: list[dict[str, Any]],
     ) -> None:
-        meta = self._require_table(table)
+        meta = self._meta_for_owner("branch", branch_id, table) if self.enable_schema_branching else self._require_table(table)
+        if meta is None:
+            raise TableNotRegisteredError(table)
         version_id = self._current_version_id(branch_id)
         removed_keys: set[tuple[Any, ...]] = set()
         for row in remove_rows:
@@ -544,55 +838,56 @@ class _OrpheusBackend(_SQLBranchBackend):
             self._upsert_workspace_marker(branch_id, meta, row, rid, deleted=False)
 
     def _materialize_workspace(self, branch_id: str, commit_msg: str) -> int:
-        parent_version = self._vid(self._current_version_id(branch_id))
-        if not self._workspace_is_dirty(branch_id):
-            return parent_version
-        new_version = self._new_version_id()
-        now = _utc_now()
-        self.db.execute(
-            """
-            INSERT INTO _chronos_branch_orpheus_versiontable
-            (vid, author, num_records, parent, children, create_time, commit_time, commit_msg)
-            VALUES (?, 'chronos', 0, ?::integer[], ?::integer[], ?, ?, ?)
-            """,
-            (
-                new_version,
-                [parent_version],
-                [],
-                now,
-                now,
-                commit_msg,
-            ),
-        )
-        self.db.execute(
-            """
-            UPDATE _chronos_branch_orpheus_versiontable
-               SET children = array_append(children, ?)
-             WHERE vid = ?
-            """,
-            (new_version, parent_version),
-        )
-        for table_meta in self.tables.values():
-            self._insert_materialized_rlist(
-                table_meta,
-                branch_id,
-                parent_version,
-                new_version,
+        with self._materialization_lock():
+            parent_version = self._vid(self._current_version_id(branch_id))
+            if not self._workspace_is_dirty(branch_id):
+                return parent_version
+            new_version = self._new_version_id()
+            now = _utc_now()
+            # Keep the parent pointer but avoid updating the parent's reverse
+            # children array; concurrent materializations from sibling branches
+            # would otherwise contend on the same versiontable tuple.
+            self.db.execute(
+                """
+                INSERT INTO _chronos_branch_orpheus_versiontable
+                (vid, author, num_records, parent, children, create_time, commit_time, commit_msg)
+                VALUES (?, 'chronos', 0, ?::integer[], ?::integer[], ?, ?, ?)
+                """,
+                (
+                    new_version,
+                    [parent_version],
+                    [],
+                    now,
+                    now,
+                    commit_msg,
+                ),
             )
-        self._refresh_version_record_count(new_version)
-        self.db.execute(
-            """
-            UPDATE _chronos_branch_orpheus_branches
-               SET current_vid = ?
-             WHERE branch_id = ?
-            """,
-            (new_version, branch_id),
-        )
-        self.db.execute(
-            "DELETE FROM _chronos_branch_orpheus_workspace WHERE branch_id = ?",
-            (branch_id,),
-        )
-        return new_version
+            table_metas = (
+                self._active_metas_for_owner("branch", branch_id).values()
+                if self.enable_schema_branching
+                else self.tables.values()
+            )
+            for table_meta in table_metas:
+                self._insert_materialized_rlist(
+                    table_meta,
+                    branch_id,
+                    parent_version,
+                    new_version,
+                )
+            self.db.execute(
+                """
+                UPDATE _chronos_branch_orpheus_branches
+                   SET current_vid = ?
+                 WHERE branch_id = ?
+                """,
+                (new_version, branch_id),
+            )
+            self._refresh_version_record_count(new_version)
+            self.db.execute(
+                "DELETE FROM _chronos_branch_orpheus_workspace WHERE branch_id = ?",
+                (branch_id,),
+            )
+            return new_version
 
     def _workspace_is_dirty(self, branch_id: str) -> bool:
         row = self.db.execute(
@@ -605,6 +900,18 @@ class _OrpheusBackend(_SQLBranchBackend):
             (branch_id,),
         ).fetchone()
         return row is not None
+
+    def _copy_workspace(self, source_branch: str, dest_branch: str) -> None:
+        self.db.execute(
+            """
+            INSERT INTO _chronos_branch_orpheus_workspace
+            (branch_id, table_name, key_text, rid, deleted, updated_at)
+            SELECT ?, table_name, key_text, rid, deleted, ?
+            FROM _chronos_branch_orpheus_workspace
+            WHERE branch_id = ?
+            """,
+            (dest_branch, _utc_now(), source_branch),
+        )
 
     def _insert_materialized_rlist(
         self,
@@ -666,6 +973,659 @@ class _OrpheusBackend(_SQLBranchBackend):
             ),
         )
 
+    def _ensure_schema_branching_tables(self) -> None:
+        self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _chronos_branch_orpheus_table_bindings (
+              owner_kind TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              table_name TEXT NOT NULL,
+              physical_table TEXT,
+              pk_columns TEXT,
+              columns TEXT,
+              column_defs TEXT,
+              tombstone INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              metadata TEXT NOT NULL,
+              PRIMARY KEY (owner_kind, owner_id, table_name)
+            )
+            """
+        )
+
+    def _active_metas_for_ref(self, ref: _BranchRef | _PreparedBranchRef) -> dict[str, _TableMeta]:
+        owner_kind = "checkpoint" if ref.readonly else "branch"
+        owner_id = ref.ref if ref.readonly else ref.branch_id
+        return self._active_metas_for_owner(owner_kind, owner_id)
+
+    def _active_metas_for_owner(self, owner_kind: str, owner_id: str) -> dict[str, _TableMeta]:
+        if not self.enable_schema_branching:
+            return dict(self.tables)
+        self._ensure_schema_branching_tables()
+        rows = self.db.execute(
+            """
+            SELECT *
+            FROM _chronos_branch_orpheus_table_bindings
+            WHERE owner_kind = ? AND owner_id = ?
+            """,
+            (owner_kind, owner_id),
+        ).fetchall()
+        if not rows:
+            return dict(self.tables)
+        metas: dict[str, _TableMeta] = {}
+        for row in rows:
+            if bool(row["tombstone"]):
+                continue
+            metas[row["table_name"]] = self._meta_from_binding(row)
+        return metas
+
+    def _meta_for_owner(
+        self, owner_kind: str, owner_id: str, table: str
+    ) -> _TableMeta | None:
+        if not self.enable_schema_branching:
+            return self.tables.get(table)
+        row = self.db.execute(
+            """
+            SELECT *
+            FROM _chronos_branch_orpheus_table_bindings
+            WHERE owner_kind = ? AND owner_id = ? AND table_name = ?
+            """,
+            (owner_kind, owner_id, table),
+        ).fetchone()
+        if row is None:
+            return self.tables.get(table)
+        if bool(row["tombstone"]):
+            return None
+        return self._meta_from_binding(row)
+
+    def _meta_from_binding(self, row: Any) -> _TableMeta:
+        return _TableMeta(
+            name=row["table_name"],
+            physical_name=row["physical_table"],
+            pk_columns=tuple(json.loads(row["pk_columns"])),
+            columns=tuple(json.loads(row["columns"])),
+            column_defs=tuple(json.loads(row["column_defs"])),
+            backend=self.name,
+        )
+
+    def _record_table_binding(
+        self,
+        owner_kind: str,
+        owner_id: str,
+        meta: _TableMeta,
+        tombstone: bool,
+    ) -> None:
+        self._ensure_schema_branching_tables()
+        self.db.execute(
+            """
+            INSERT INTO _chronos_branch_orpheus_table_bindings
+            (owner_kind, owner_id, table_name, physical_table, pk_columns,
+             columns, column_defs, tombstone, created_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_kind, owner_id, table_name) DO UPDATE SET
+              physical_table = excluded.physical_table,
+              pk_columns = excluded.pk_columns,
+              columns = excluded.columns,
+              column_defs = excluded.column_defs,
+              tombstone = excluded.tombstone,
+              created_at = excluded.created_at,
+              metadata = excluded.metadata
+            """,
+            (
+                owner_kind,
+                owner_id,
+                meta.name,
+                meta.physical_name,
+                json.dumps(meta.pk_columns),
+                json.dumps(meta.columns),
+                json.dumps(meta.column_defs),
+                1 if tombstone else 0,
+                _utc_now(),
+                "{}",
+            ),
+        )
+
+    def _record_tombstone(self, owner_kind: str, owner_id: str, table: str) -> None:
+        self._ensure_schema_branching_tables()
+        self.db.execute(
+            """
+            INSERT INTO _chronos_branch_orpheus_table_bindings
+            (owner_kind, owner_id, table_name, physical_table, pk_columns,
+             columns, column_defs, tombstone, created_at, metadata)
+            VALUES (?, ?, ?, NULL, NULL, NULL, NULL, 1, ?, ?)
+            ON CONFLICT(owner_kind, owner_id, table_name) DO UPDATE SET
+              physical_table = NULL,
+              pk_columns = NULL,
+              columns = NULL,
+              column_defs = NULL,
+              tombstone = 1,
+              created_at = excluded.created_at,
+              metadata = excluded.metadata
+            """,
+            (owner_kind, owner_id, table, _utc_now(), "{}"),
+        )
+
+    def _copy_tombstone_bindings(
+        self,
+        source_kind: str,
+        source_id: str,
+        dest_kind: str,
+        dest_id: str,
+    ) -> None:
+        for row in self.db.execute(
+            """
+            SELECT table_name
+            FROM _chronos_branch_orpheus_table_bindings
+            WHERE owner_kind = ? AND owner_id = ? AND tombstone = 1
+            """,
+            (source_kind, source_id),
+        ).fetchall():
+            self._record_tombstone(dest_kind, dest_id, row["table_name"])
+
+    def _require_table_for_ref(
+        self, ref: _PreparedBranchRef, table: str
+    ) -> _TableMeta:
+        if not self.enable_schema_branching:
+            return self._require_table(table)
+        metas = ref.metadata.get("tables")
+        if not isinstance(metas, dict):
+            metas = self._active_metas_for_ref(ref)
+        meta = metas.get(table)
+        if meta is None:
+            raise TableNotRegisteredError(table)
+        return meta
+
+    def _active_metas_for_version(self, version_id: str | int) -> dict[str, _TableMeta]:
+        if not self.enable_schema_branching:
+            return dict(self.tables)
+        branch = self.db.execute(
+            """
+            SELECT branch_id
+            FROM _chronos_branch_orpheus_branches
+            WHERE current_vid = ?
+            ORDER BY branch_id
+            LIMIT 1
+            """,
+            (self._vid(version_id),),
+        ).fetchone()
+        if branch is not None:
+            return self._active_metas_for_owner("branch", branch["branch_id"])
+        checkpoint = self.db.execute(
+            """
+            SELECT checkpoint_id
+            FROM _chronos_branch_orpheus_checkpoints
+            WHERE vid = ?
+            ORDER BY checkpoint_id
+            LIMIT 1
+            """,
+            (self._vid(version_id),),
+        ).fetchone()
+        if checkpoint is not None:
+            return self._active_metas_for_owner("checkpoint", checkpoint["checkpoint_id"])
+        return dict(self.tables)
+
+    def _active_meta_for_version(self, version_id: str | int, table: str) -> _TableMeta:
+        meta = self._active_metas_for_version(version_id).get(table)
+        if meta is None:
+            raise TableNotRegisteredError(table)
+        return meta
+
+    def _known_tables(self) -> set[str]:
+        known = set(self.tables)
+        if not self.enable_schema_branching:
+            return known
+        for row in self.db.execute(
+            "SELECT DISTINCT table_name FROM _chronos_branch_orpheus_table_bindings"
+        ).fetchall():
+            known.add(row["table_name"])
+        return known
+
+    def _validate_query_tables_visible(self, ref: _PreparedBranchRef, sql: str) -> None:
+        active = set(self._active_metas_for_ref(ref))
+        known = self._known_tables()
+        tree = sqlglot.parse_one(sql, read=self.db.dialect)
+        for table_node in tree.find_all(exp.Table):
+            table = _table_key(table_node)
+            if table in known and table not in active:
+                raise TableNotRegisteredError(table)
+
+    @staticmethod
+    def _is_schema_statement(sql: str) -> bool:
+        head = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+        return head in {"CREATE", "ALTER", "DROP"}
+
+    def _execute_schema_ddl(
+        self,
+        ref: _PreparedBranchRef,
+        tree: exp.Expression,
+    ) -> ExecuteResult:
+        with _chronos_metadata_lock(self.db):
+            if isinstance(tree, exp.Create):
+                return self._execute_create_table_ddl(ref, tree)
+            if isinstance(tree, exp.Alter):
+                return self._execute_alter_table_ddl(ref, tree)
+            if isinstance(tree, exp.Drop):
+                return self._execute_drop_table_ddl(ref, tree)
+        raise UnsupportedSQLError("unsupported schema statement")
+
+    def _execute_create_table_ddl(
+        self,
+        ref: _PreparedBranchRef,
+        tree: exp.Create,
+    ) -> ExecuteResult:
+        if str(tree.args.get("kind", "")).upper() != "TABLE":
+            raise UnsupportedSQLError("only CREATE TABLE is supported")
+        schema = tree.this
+        if not isinstance(schema, exp.Schema) or not isinstance(schema.this, exp.Table):
+            raise UnsupportedSQLError("CREATE TABLE must define columns")
+        table = _table_key(schema.this)
+        if self._meta_for_owner("branch", ref.branch_id, table) is not None:
+            raise BranchAlreadyExistsError(table)
+        columns, defs, pk_columns = self._column_defs_from_schema(schema)
+        if not pk_columns:
+            raise UnsupportedSQLError("CREATE TABLE requires an inline primary key")
+        meta = _TableMeta(
+            name=table,
+            physical_name=self._new_schema_physical_table(table),
+            pk_columns=tuple(pk_columns),
+            columns=tuple(columns),
+            column_defs=tuple(defs),
+            backend=self.name,
+        )
+        self._create_orpheus_physical_table(meta)
+        self._insert_version_rlist(meta, self._current_version_id(ref.branch_id), [])
+        self._record_table_binding("branch", ref.branch_id, meta, False)
+        self._create_indexes_for_table(meta)
+        return ExecuteResult(0)
+
+    def _execute_alter_table_ddl(
+        self,
+        ref: _PreparedBranchRef,
+        tree: exp.Alter,
+    ) -> ExecuteResult:
+        if str(tree.args.get("kind", "")).upper() != "TABLE":
+            raise UnsupportedSQLError("only ALTER TABLE is supported")
+        if not isinstance(tree.this, exp.Table):
+            raise UnsupportedSQLError("ALTER TABLE must target a table")
+        table = _table_key(tree.this)
+        old_meta = self._meta_for_owner("branch", ref.branch_id, table)
+        if old_meta is None:
+            raise TableNotRegisteredError(table)
+        actions = list(tree.args.get("actions") or [])
+        if len(actions) != 1:
+            raise UnsupportedSQLError(
+                "only single-action ALTER TABLE statements are supported"
+            )
+        action = actions[0]
+        if isinstance(action, exp.ColumnDef):
+            return self._execute_alter_table_add_column_ddl(ref, table, old_meta, action)
+        if isinstance(action, exp.Drop):
+            return self._execute_alter_table_drop_column_ddl(ref, table, old_meta, action)
+        if isinstance(action, exp.AlterColumn):
+            return self._execute_alter_table_type_ddl(ref, table, old_meta, action)
+        raise UnsupportedSQLError(
+            "only ALTER TABLE ADD COLUMN, DROP COLUMN, and ALTER COLUMN TYPE are supported"
+        )
+
+    def _execute_alter_table_add_column_ddl(
+        self,
+        ref: _PreparedBranchRef,
+        table: str,
+        old_meta: _TableMeta,
+        action: exp.ColumnDef,
+    ) -> ExecuteResult:
+        column = self._column_def_name(action)
+        if column in old_meta.columns:
+            raise BranchingError(f"column already exists: {column}")
+        new_def = self._column_def_sql(action)
+        meta = _TableMeta(
+            name=table,
+            physical_name=old_meta.physical_name,
+            pk_columns=old_meta.pk_columns,
+            columns=tuple([*old_meta.columns, column]),
+            column_defs=tuple([*old_meta.column_defs, new_def]),
+            backend=self.name,
+        )
+        self._materialize_workspace(ref.branch_id, "chronos schema change")
+        if self._schema_physical_is_private_to_branch(ref.branch_id, old_meta.physical_name):
+            self.db.execute(
+                f"ALTER TABLE {_quote(old_meta.physical_name)} ADD COLUMN {new_def}"
+            )
+            self._record_table_binding("branch", ref.branch_id, meta, False)
+            return ExecuteResult(0)
+        default_sql = self._column_default_sql(action)
+        self._copy_visible_rows_to_new_schema(
+            ref.branch_id,
+            old_meta,
+            meta,
+            select_sql_by_column={column: default_sql or "NULL"},
+        )
+        return ExecuteResult(0)
+
+    def _execute_alter_table_drop_column_ddl(
+        self,
+        ref: _PreparedBranchRef,
+        table: str,
+        old_meta: _TableMeta,
+        action: exp.Drop,
+    ) -> ExecuteResult:
+        if str(action.args.get("kind", "")).upper() != "COLUMN":
+            raise UnsupportedSQLError("only ALTER TABLE DROP COLUMN is supported")
+        column = self._drop_column_name(action)
+        if column not in old_meta.columns:
+            raise TableNotRegisteredError(f"column missing from {table}: {column}")
+        if column in old_meta.pk_columns:
+            raise UnsupportedSQLError("dropping primary key columns is not supported")
+        kept = [
+            (old_column, old_def)
+            for old_column, old_def in zip(old_meta.columns, old_meta.column_defs)
+            if old_column != column
+        ]
+        meta = _TableMeta(
+            name=table,
+            physical_name=old_meta.physical_name,
+            pk_columns=old_meta.pk_columns,
+            columns=tuple(old_column for old_column, _old_def in kept),
+            column_defs=tuple(old_def for _old_column, old_def in kept),
+            backend=self.name,
+        )
+        self._materialize_workspace(ref.branch_id, "chronos schema change")
+        if self._schema_physical_is_private_to_branch(ref.branch_id, old_meta.physical_name):
+            self.db.execute(
+                f"ALTER TABLE {_quote(old_meta.physical_name)} DROP COLUMN {_quote(column)}"
+            )
+            self._record_table_binding("branch", ref.branch_id, meta, False)
+            return ExecuteResult(0)
+        self._copy_visible_rows_to_new_schema(ref.branch_id, old_meta, meta)
+        return ExecuteResult(0)
+
+    def _execute_alter_table_type_ddl(
+        self,
+        ref: _PreparedBranchRef,
+        table: str,
+        old_meta: _TableMeta,
+        action: exp.AlterColumn,
+    ) -> ExecuteResult:
+        column = self._alter_column_name(action)
+        if column not in old_meta.columns:
+            raise TableNotRegisteredError(f"column missing from {table}: {column}")
+        dtype = action.args.get("dtype")
+        if not isinstance(dtype, exp.Expression):
+            raise UnsupportedSQLError("ALTER COLUMN TYPE must specify a type")
+        type_sql = dtype.sql(dialect=self.db.dialect)
+        column_index = old_meta.columns.index(column)
+        defs = list(old_meta.column_defs)
+        defs[column_index] = self._replace_column_type_sql(
+            defs[column_index], column, type_sql
+        )
+        meta = _TableMeta(
+            name=table,
+            physical_name=old_meta.physical_name,
+            pk_columns=old_meta.pk_columns,
+            columns=old_meta.columns,
+            column_defs=tuple(defs),
+            backend=self.name,
+        )
+        using = action.args.get("using")
+        select_sql = (
+            using.sql(dialect=self.db.dialect)
+            if isinstance(using, exp.Expression)
+            else f"CAST({_quote(column)} AS {type_sql})"
+        )
+        self._materialize_workspace(ref.branch_id, "chronos schema change")
+        if self._schema_physical_is_private_to_branch(ref.branch_id, old_meta.physical_name):
+            self.db.execute(
+                f"ALTER TABLE {_quote(old_meta.physical_name)} "
+                f"ALTER COLUMN {_quote(column)} TYPE {type_sql} USING {select_sql}"
+            )
+            self._record_table_binding("branch", ref.branch_id, meta, False)
+            return ExecuteResult(0)
+        self._copy_visible_rows_to_new_schema(
+            ref.branch_id,
+            old_meta,
+            meta,
+            select_sql_by_column={column: select_sql},
+        )
+        return ExecuteResult(0)
+
+    def _execute_drop_table_ddl(
+        self,
+        ref: _PreparedBranchRef,
+        tree: exp.Drop,
+    ) -> ExecuteResult:
+        if str(tree.args.get("kind", "")).upper() != "TABLE":
+            raise UnsupportedSQLError("only DROP TABLE is supported")
+        if not isinstance(tree.this, exp.Table):
+            raise UnsupportedSQLError("DROP TABLE must target a table")
+        table = _table_key(tree.this)
+        if self._meta_for_owner("branch", ref.branch_id, table) is None:
+            raise TableNotRegisteredError(table)
+        self._record_tombstone("branch", ref.branch_id, table)
+        return ExecuteResult(0)
+
+    def _copy_visible_rows_to_new_schema(
+        self,
+        branch_id: str,
+        old_meta: _TableMeta,
+        new_meta: _TableMeta,
+        *,
+        select_sql_by_column: dict[str, str] | None = None,
+    ) -> None:
+        select_sql_by_column = select_sql_by_column or {}
+        new_physical = self._new_schema_physical_table(old_meta.name)
+        materialized_meta = _TableMeta(
+            name=new_meta.name,
+            physical_name=new_physical,
+            pk_columns=new_meta.pk_columns,
+            columns=new_meta.columns,
+            column_defs=new_meta.column_defs,
+            backend=self.name,
+        )
+        self._create_orpheus_physical_table(materialized_meta)
+        old_cols = set(old_meta.columns)
+        insert_cols = ", ".join(_quote(column) for column in materialized_meta.columns)
+        select_cols = ", ".join(
+            (
+                f"{select_sql_by_column[column]} AS {_quote(column)}"
+                if column in select_sql_by_column
+                else f"{_quote(column)}"
+                if column in old_cols
+                else "NULL"
+            )
+            for column in materialized_meta.columns
+        )
+        vid = self._vid(self._current_version_id(branch_id))
+        visible = self._branch_visible_subquery(
+            old_meta,
+            branch_id,
+            str(vid),
+            include_rid=False,
+        )
+        self.db.execute(
+            f"""
+            WITH inserted AS (
+              INSERT INTO {_quote(materialized_meta.physical_name)}
+              ({insert_cols})
+              SELECT {select_cols}
+              FROM ({visible}) AS visible_rows
+              RETURNING rid
+            )
+            INSERT INTO {_quote(self._index_table(materialized_meta))}
+            (vid, rlist)
+            SELECT ?, COALESCE(array_agg(rid ORDER BY rid), ARRAY[]::integer[])
+            FROM inserted
+            ON CONFLICT (vid)
+            DO UPDATE SET rlist = EXCLUDED.rlist
+            """,
+            (vid,),
+        )
+        self._record_table_binding("branch", branch_id, materialized_meta, False)
+        self._create_indexes_for_table(materialized_meta)
+
+    def _schema_physical_is_private_to_branch(self, branch_id: str, physical: str) -> bool:
+        if not self.enable_schema_branching:
+            return False
+        row = self.db.execute(
+            """
+            SELECT COUNT(*) AS owners
+            FROM _chronos_branch_orpheus_table_bindings
+            WHERE physical_table = ?
+              AND tombstone = 0
+              AND NOT (owner_kind = 'branch' AND owner_id = ?)
+            """,
+            (physical, branch_id),
+        ).fetchone()
+        return row is not None and int(row["owners"]) == 0
+
+    def _column_defs_from_schema(
+        self, schema: exp.Schema
+    ) -> tuple[list[str], list[str], list[str]]:
+        columns: list[str] = []
+        defs: list[str] = []
+        pk_columns: list[str] = []
+        for expression in schema.expressions:
+            if not isinstance(expression, exp.ColumnDef):
+                raise UnsupportedSQLError("only column definitions are supported")
+            column = self._column_def_name(expression)
+            columns.append(column)
+            defs.append(self._column_def_sql(expression, allow_primary_key=True))
+            if self._column_def_has_inline_primary_key(expression):
+                pk_columns.append(column)
+        return columns, defs, pk_columns
+
+    def _column_def_name(self, column_def: exp.ColumnDef) -> str:
+        identifier = column_def.this
+        if isinstance(identifier, exp.Identifier):
+            return identifier.name
+        return str(identifier)
+
+    def _alter_column_name(self, action: exp.AlterColumn) -> str:
+        identifier = action.this
+        if isinstance(identifier, exp.Identifier):
+            return identifier.name
+        return str(identifier)
+
+    def _drop_column_name(self, action: exp.Drop) -> str:
+        target = action.this
+        if isinstance(target, exp.Column):
+            identifier = target.this
+            if isinstance(identifier, exp.Identifier):
+                return identifier.name
+            return str(identifier)
+        if isinstance(target, exp.Identifier):
+            return target.name
+        return str(target)
+
+    def _column_def_sql(
+        self, column_def: exp.ColumnDef, *, allow_primary_key: bool = False
+    ) -> str:
+        default_sql = self._column_default_sql(column_def)
+        for constraint in column_def.args.get("constraints") or []:
+            kind = (
+                constraint.args.get("kind")
+                if isinstance(constraint, exp.ColumnConstraint)
+                else None
+            )
+            if allow_primary_key and isinstance(kind, exp.PrimaryKeyColumnConstraint):
+                continue
+            if isinstance(kind, exp.DefaultColumnConstraint):
+                continue
+            raise UnsupportedSQLError(
+                "column constraints other than inline primary key and constant DEFAULT are not supported"
+            )
+        kind = column_def.args.get("kind")
+        type_sql = kind.sql(dialect=self.db.dialect) if isinstance(kind, exp.Expression) else "TEXT"
+        default_clause = f" DEFAULT {default_sql}" if default_sql is not None else ""
+        return f"{_quote(self._column_def_name(column_def))} {type_sql}{default_clause}"
+
+    def _column_default_sql(self, column_def: exp.ColumnDef) -> str | None:
+        default_sql: str | None = None
+        for constraint in column_def.args.get("constraints") or []:
+            kind = (
+                constraint.args.get("kind")
+                if isinstance(constraint, exp.ColumnConstraint)
+                else None
+            )
+            if isinstance(kind, exp.DefaultColumnConstraint):
+                try:
+                    _expr_value(kind.this, {})
+                except UnsupportedSQLError as exc:
+                    raise UnsupportedSQLError("only constant DEFAULT expressions are supported") from exc
+                default_sql = kind.this.sql(dialect=self.db.dialect)
+        return default_sql
+
+    def _replace_column_type_sql(
+        self, definition: str, column: str, type_sql: str
+    ) -> str:
+        _head, marker, default_sql = definition.partition(" DEFAULT ")
+        default_clause = f" DEFAULT {default_sql}" if marker else ""
+        return f"{_quote(column)} {type_sql}{default_clause}"
+
+    def _column_def_has_inline_primary_key(self, column_def: exp.ColumnDef) -> bool:
+        for constraint in column_def.args.get("constraints") or []:
+            kind = constraint.args.get("kind") if isinstance(constraint, exp.ColumnConstraint) else None
+            if isinstance(kind, exp.PrimaryKeyColumnConstraint):
+                return True
+        return False
+
+    def _create_orpheus_physical_table(self, meta: _TableMeta) -> None:
+        self.db.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_quote(meta.physical_name)} (
+              rid SERIAL PRIMARY KEY,
+              {", ".join(meta.column_defs)}
+            )
+            """
+        )
+        self.db.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_quote(self._index_table(meta))} (
+              vid INTEGER PRIMARY KEY,
+              rlist INTEGER[] NOT NULL
+            )
+            """
+        )
+        self.db.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS
+            {_quote(f'_chronos_idx_orpheus_{_identifier_token(meta.physical_name)}_pk')}
+            ON {_quote(meta.physical_name)}
+            ({", ".join(_quote(column) for column in meta.pk_columns)})
+            """
+        )
+        self.db.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS
+            {_quote(f'_chronos_idx_orpheus_{_identifier_token(meta.physical_name)}_rlist')}
+            ON {_quote(self._index_table(meta))} USING GIN (rlist)
+            """
+        )
+
+    def _create_indexes_for_table(self, meta: _TableMeta) -> None:
+        for index in self.indexes.values():
+            if index.table == meta.name:
+                self._create_physical_index(meta, index)
+
+    def _create_physical_index(self, meta: _TableMeta, index: _IndexMeta) -> None:
+        if set(index.columns) - set(meta.columns):
+            return
+        index_name = (
+            f"_chronos_idx_orpheus_{_identifier_token(meta.physical_name)}_{_identifier_token(index.name)}"
+            if self.enable_schema_branching
+            else f"_chronos_idx_orpheus_{index.name}"
+        )
+        self.db.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_quote(index_name)}
+            ON {_quote(meta.physical_name)}
+            ({", ".join(_quote(column) for column in index.columns)})
+            """
+        )
+
+    def _new_schema_physical_table(self, table: str) -> str:
+        return orpheus_dataset_tables(
+            f"_chronos_b_orpheus_{_physical_table_suffix(table)}_{uuid.uuid4().hex[:8]}"
+        ).datatable
+
     def _statement_plan(self, ref: _PreparedBranchRef, sql: str) -> _StatementPlan:
         plan_cache = ref.metadata.setdefault("statement_plan_cache", {})
         plan = plan_cache.get(sql)
@@ -693,6 +1653,7 @@ class _OrpheusBackend(_SQLBranchBackend):
 
     def _replacements(self, ref: _BranchRef, include_rid: bool) -> dict[str, str]:
         version_id = ref.ref if ref.readonly else self._current_version_id(ref.branch_id)
+        metas = self._active_metas_for_ref(ref) if self.enable_schema_branching else self.tables
         return {
             table: (
                 self._committed_visible_subquery(meta, version_id, include_rid)
@@ -704,7 +1665,7 @@ class _OrpheusBackend(_SQLBranchBackend):
                     include_rid,
                 )
             )
-            for table, meta in self.tables.items()
+            for table, meta in metas.items()
         }
 
     def _prepared_replacements(self, ref: _PreparedBranchRef) -> dict[str, str]:
@@ -719,6 +1680,17 @@ class _OrpheusBackend(_SQLBranchBackend):
         cols = [f"d.{_quote(column)}" for column in meta.columns]
         if include_rid:
             cols.insert(0, "d.rid")
+        if self._vid(version_id) == 1:
+            rid_limit = self._base_version_rid_limit(meta, version_id)
+            # Version 1 is loaded before any branch-local rows are appended to
+            # the shared datatable, so its rid set is a stable prefix. Scanning
+            # that prefix lets PostgreSQL push filters into the physical table
+            # instead of expanding the whole rlist array for every read.
+            return (
+                f"SELECT {', '.join(cols)} "
+                f"FROM {_quote(meta.physical_name)} AS d "
+                f"WHERE d.rid <= {rid_limit}"
+            )
         return (
             f"SELECT {', '.join(cols)} "
             f"FROM {_quote(meta.physical_name)} AS d "
@@ -740,13 +1712,23 @@ class _OrpheusBackend(_SQLBranchBackend):
         select_cols = ", ".join(cols)
         branch_literal = self._sql_literal(branch_id)
         table_literal = self._sql_literal(meta.name)
+        if self._vid(version_id) == 1:
+            rid_limit = self._base_version_rid_limit(meta, version_id)
+            base_from = (
+                f"FROM {_quote(meta.physical_name)} AS d "
+                f"WHERE d.rid <= {rid_limit} "
+            )
+        else:
+            base_from = (
+                f"FROM {_quote(meta.physical_name)} AS d "
+                f"JOIN {_quote(self._index_table(meta))} AS i "
+                f"  ON i.vid = {self._vid(version_id)} "
+                f" AND d.rid = ANY(i.rlist) "
+                f"WHERE TRUE "
+            )
         return (
             f"SELECT {select_cols} "
-            f"FROM {_quote(meta.physical_name)} AS d "
-            f"JOIN {_quote(self._index_table(meta))} AS i "
-            f"  ON i.vid = {self._vid(version_id)} "
-            f" AND d.rid = ANY(i.rlist) "
-            f"WHERE TRUE "
+            f"{base_from}"
             f"AND NOT EXISTS ("
             f"  SELECT 1 FROM _chronos_branch_orpheus_workspace AS w "
             f"  WHERE w.branch_id = {branch_literal} "
@@ -762,6 +1744,24 @@ class _OrpheusBackend(_SQLBranchBackend):
             f"  AND w.deleted = FALSE"
         )
 
+    def _base_version_rid_limit(self, meta: _TableMeta, version_id: str) -> int:
+        key = (meta.physical_name, str(self._vid(version_id)))
+        cached = self._base_version_rid_limit_cache.get(key)
+        if cached is not None:
+            return cached
+        row = self.db.execute(
+            f"""
+            SELECT COALESCE(MAX(r.rid), 0) AS rid_limit
+            FROM {_quote(self._index_table(meta))} AS i
+            CROSS JOIN LATERAL unnest(i.rlist) AS r(rid)
+            WHERE i.vid = ?
+            """,
+            (self._vid(version_id),),
+        ).fetchone()
+        rid_limit = int(row["rid_limit"]) if row is not None else 0
+        self._base_version_rid_limit_cache[key] = rid_limit
+        return rid_limit
+
     def _select_matching_rows(
         self,
         ref: _PreparedBranchRef,
@@ -771,7 +1771,7 @@ class _OrpheusBackend(_SQLBranchBackend):
         direct_filter: bool,
     ) -> list[dict[str, Any]]:
         if not direct_filter:
-            meta = self._require_table(table)
+            meta = self._require_table_for_ref(ref, table)
             select_cols = ", ".join(["rid", *[_quote(column) for column in meta.columns]])
             sql = f"SELECT {select_cols} FROM {_quote_table_name(table)}{where}"
             rewritten = _rewrite_tables(
@@ -784,7 +1784,7 @@ class _OrpheusBackend(_SQLBranchBackend):
             )
             rows = self.db.execute(rewritten, params).fetchall()
             return [dict(row) for row in rows]
-        meta = self._require_table(table)
+        meta = self._require_table_for_ref(ref, table)
         visible = (
             self._committed_visible_subquery(meta, ref.ref, include_rid=True)
             if ref.readonly
@@ -804,9 +1804,14 @@ class _OrpheusBackend(_SQLBranchBackend):
         return [dict(row) for row in rows]
 
     def _full_rows(
-        self, table: str, rows: list[dict[str, Any]]
+        self, ref: _PreparedBranchRef, table: str, rows: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        meta = self._require_table(table)
+        meta = self._require_table_for_ref(ref, table)
+        return self._full_rows_for_meta(meta, rows)
+
+    def _full_rows_for_meta(
+        self, meta: _TableMeta, rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         return [{column: row.get(column) for column in meta.columns} for row in rows]
 
     def _key_tuple(self, meta: _TableMeta, row: dict[str, Any]) -> tuple[Any, ...]:
@@ -815,7 +1820,7 @@ class _OrpheusBackend(_SQLBranchBackend):
     def _visible_row_by_key(
         self, version_id: str | int, table: str, key: dict[str, Any]
     ) -> dict[str, Any] | None:
-        meta = self._require_table(table)
+        meta = self._active_meta_for_version(version_id, table)
         cols = ", ".join(f"d.{_quote(column)}" for column in meta.columns)
         row = self.db.execute(
             f"""
@@ -838,7 +1843,9 @@ class _OrpheusBackend(_SQLBranchBackend):
         table: str,
         key: dict[str, Any],
     ) -> dict[str, Any] | None:
-        meta = self._require_table(table)
+        meta = self._meta_for_owner("branch", branch_id, table) if self.enable_schema_branching else self._require_table(table)
+        if meta is None:
+            raise TableNotRegisteredError(table)
         marker = self.db.execute(
             """
             SELECT rid, deleted
@@ -853,7 +1860,7 @@ class _OrpheusBackend(_SQLBranchBackend):
             if marker["deleted"]:
                 return None
             return self._row_by_rid(meta, int(marker["rid"]))
-        return self._visible_row_by_key(version_id, table, key)
+        return self._visible_row_by_key_in_meta(meta, version_id, key)
 
     def _row_by_rid(self, meta: _TableMeta, rid: int) -> dict[str, Any] | None:
         cols = ", ".join(f"d.{_quote(column)}" for column in meta.columns)
@@ -865,6 +1872,27 @@ class _OrpheusBackend(_SQLBranchBackend):
             LIMIT 1
             """,
             (rid,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _visible_row_by_key_in_meta(
+        self,
+        meta: _TableMeta,
+        version_id: str | int,
+        key: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        cols = ", ".join(f"d.{_quote(column)}" for column in meta.columns)
+        row = self.db.execute(
+            f"""
+            SELECT d.rid, {cols}
+            FROM {_quote(meta.physical_name)} AS d
+            JOIN {_quote(self._index_table(meta))} AS i
+              ON i.vid = ?
+             AND d.rid = ANY(i.rlist)
+            WHERE {self._key_where(meta, alias='d')}
+            LIMIT 1
+            """,
+            [self._vid(version_id), *self._key_values(meta, key)],
         ).fetchone()
         return dict(row) if row is not None else None
 
@@ -1031,7 +2059,8 @@ class _OrpheusBackend(_SQLBranchBackend):
             )
             return
         total = 0
-        for meta in self.tables.values():
+        metas = self._active_metas_for_version(version_id).values() if self.enable_schema_branching else self.tables.values()
+        for meta in metas:
             row = self.db.execute(
                 f"""
                 SELECT COALESCE(cardinality(rlist), 0) AS count
@@ -1052,7 +2081,7 @@ class _OrpheusBackend(_SQLBranchBackend):
 
     def _new_version_id(self) -> int:
         row = self.db.execute(
-            "SELECT COALESCE(MAX(vid), 0) + 1 AS vid FROM _chronos_branch_orpheus_versiontable"
+            "SELECT nextval('_chronos_branch_orpheus_vid_seq') AS vid"
         ).fetchone()
         return int(row["vid"])
 

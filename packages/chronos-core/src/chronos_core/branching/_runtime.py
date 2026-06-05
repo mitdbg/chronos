@@ -46,6 +46,8 @@ class BranchSession:
         self, sql: str, params: dict[str, Any] | None = None
     ) -> ExecuteResult:
         self._ensure_fresh()
+        if self._transaction_depth == 0 and self._context._db.in_transaction:
+            self._context._db.commit()
         try:
             result = self._context._backend.execute(self._ref, sql, _ensure_params(params))
             # Some backends mutate the branch head on write. Refresh the prepared
@@ -81,6 +83,7 @@ class BranchSession:
                 if callable(rollback):
                     rollback(self._ref)
                 self._context._db.rollback()
+                self._context._backend.after_rollback()
             raise
         else:
             self._transaction_depth -= 1
@@ -91,11 +94,13 @@ class BranchSession:
                         self._ref = commit(self._ref)
                         self._context._stamp_prepared_ref(self._ref)
                     self._context._db.commit()
+                    self._context._backend.after_commit()
                 except Exception:
                     rollback = getattr(self._context._backend, "rollback_transaction", None)
                     if callable(rollback):
                         rollback(self._ref)
                     self._context._db.rollback()
+                    self._context._backend.after_rollback()
                     raise
 
     def branch_info(self) -> BranchInfo:
@@ -105,6 +110,8 @@ class BranchSession:
         self._ensure_fresh()
         if self._ref.readonly:
             raise BranchingError("checkpoint sessions are read-only")
+        if self._transaction_depth == 0 and self._context._db.in_transaction:
+            self._context._db.commit()
         try:
             self._context._backend.upsert_rows(self.branch_id, table, rows)
             self._ref = self._context._backend.refresh_ref_after_execute(self._ref)
@@ -121,6 +128,8 @@ class BranchSession:
         self._ensure_fresh()
         if self._ref.readonly:
             raise BranchingError("checkpoint sessions are read-only")
+        if self._transaction_depth == 0 and self._context._db.in_transaction:
+            self._context._db.commit()
         try:
             self._context._backend.delete_keys(self.branch_id, table, keys)
             self._ref = self._context._backend.refresh_ref_after_execute(self._ref)
@@ -168,6 +177,7 @@ class ChronosBranchContext:
         backend: BranchBackendName = "interval",
         autocommit: bool = True,
         interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
+        interval_child_width: int | None = None,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
     ) -> ChronosBranchContext:
@@ -177,6 +187,7 @@ class ChronosBranchContext:
             backend=backend,
             autocommit=autocommit,
             interval_continuation_percent=interval_continuation_percent,
+            interval_child_width=interval_child_width,
             ensure_metadata=ensure_metadata,
             enable_schema_branching=enable_schema_branching,
         )
@@ -188,6 +199,7 @@ class ChronosBranchContext:
         backend: BranchBackendName = "interval",
         autocommit: bool = True,
         interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
+        interval_child_width: int | None = None,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
     ) -> ChronosBranchContext:
@@ -196,16 +208,17 @@ class ChronosBranchContext:
                 return _IntervalBackend(
                     db,
                     continuation_percent=interval_continuation_percent,
+                    child_width=interval_child_width,
                     enable_schema_branching=enable_schema_branching,
                 )
-            if enable_schema_branching and backend not in {"copy"}:
-                raise ValueError("schema branching is currently supported only by the interval and copy backends")
+            if enable_schema_branching and backend not in {"copy", "orpheus"}:
+                raise ValueError("schema branching is currently supported only by the interval, copy, and orpheus backends")
             if backend == "log":
                 return _LogBackend(db)
             if backend == "copy":
                 return _CopyBackend(db, enable_schema_branching=enable_schema_branching)
             if backend == "orpheus":
-                return _OrpheusBackend(db)
+                return _OrpheusBackend(db, enable_schema_branching=enable_schema_branching)
             if backend == "litetree":
                 return _LiteTreeBackend(db)
             raise ValueError(f"unknown branch backend: {backend}")
@@ -241,6 +254,16 @@ class ChronosBranchContext:
 
     def close(self) -> None:
         self._db.close()
+
+    def wait_for_background_work(self) -> None:
+        if self._db.in_transaction:
+            self._db.commit()
+        wait = getattr(self._backend, "wait_for_async_schema_indexes", None)
+        if callable(wait):
+            wait()
+        wait_gc = getattr(self._backend, "wait_for_interval_gc", None)
+        if callable(wait_gc):
+            wait_gc()
 
     def register_table(self, table: str, primary_key: list[str]) -> None:
         try:
@@ -321,17 +344,23 @@ class ChronosBranchContext:
         return self._backend.get_branch(branch_id)
 
     def checkout(self, branch_id: str) -> BranchSession:
-        info = self._backend.get_branch(branch_id)
-        return BranchSession(
-            self,
-            self._prepare_ref(_BranchRef(branch_id, info.current_ref)),
-        )
+        try:
+            info = self._backend.get_branch(branch_id)
+            prepared = self._prepare_ref(_BranchRef(branch_id, info.current_ref))
+        except Exception:
+            self._rollback_autocommit()
+            raise
+        self._commit_autocommit()
+        return BranchSession(self, prepared)
 
     def checkout_checkpoint(self, checkpoint: str) -> BranchSession:
-        return BranchSession(
-            self,
-            self._prepare_ref(self._backend.checkout_checkpoint(checkpoint)),
-        )
+        try:
+            prepared = self._prepare_ref(self._backend.checkout_checkpoint(checkpoint))
+        except Exception:
+            self._rollback_autocommit()
+            raise
+        self._commit_autocommit()
+        return BranchSession(self, prepared)
 
     def create_checkpoint(
         self,
@@ -361,10 +390,12 @@ class ChronosBranchContext:
     def _commit_autocommit(self) -> None:
         if self._autocommit:
             self._db.commit()
+            self._backend.after_commit()
 
     def _rollback_autocommit(self) -> None:
         if self._autocommit and self._db.in_transaction:
             self._db.rollback()
+            self._backend.after_rollback()
 
     def _prepare_ref(self, ref: _BranchRef) -> _PreparedBranchRef:
         prepared = self._backend.prepare_ref(ref)
@@ -381,6 +412,9 @@ class ChronosBranchContext:
         return BranchDiff(left=left, right=right, changes=changes)
 
     def diff_rows(self, left: str, right: str, table: str) -> list[RowDiff]:
+        backend_diffs = self._backend.diff_rows(left, right, table)
+        if backend_diffs is not None:
+            return backend_diffs
         try:
             left_meta = self._backend.table_meta_for_branch(left, table)
         except TableNotRegisteredError:
@@ -408,6 +442,9 @@ class ChronosBranchContext:
         return diffs
 
     def merge_preview(self, source: str, target: str) -> MergePreview:
+        backend_preview = self._backend.merge_preview(source, target)
+        if backend_preview is not None:
+            return backend_preview
         changes = self.diff(target, source).changes
         return MergePreview(source=source, target=target, changes=changes, conflicts=[])
 
@@ -417,19 +454,43 @@ class ChronosBranchContext:
         target: str,
         resolution: MergeResolution | None = None,
     ) -> MergeResult:
-        preview = self.merge_preview(source, target)
-        if preview.conflicts and resolution is None:
-            raise BranchingError("merge has unresolved conflicts")
         applied = 0
-        with self.checkout(target).transaction():
-            for change in preview.changes:
-                if change.change == "deleted":
-                    self._backend.delete_key(target, change.table, change.key)
-                else:
-                    assert change.after is not None
-                    self._backend.upsert_row(target, change.table, change.after)
-                applied += 1
+        target_session = self.checkout(target)
+        with target_session.transaction():
+            preview = self.merge_preview(source, target)
+            if preview.conflicts and resolution is None:
+                raise BranchingError("merge has unresolved conflicts")
+            applied = self._apply_merge_changes(target_session, preview.changes)
         return MergeResult(source=source, target=target, applied=applied)
+
+    def _apply_merge_changes(
+        self, target_session: BranchSession, changes: list[RowDiff]
+    ) -> int:
+        pending_deletes: dict[str, list[dict[str, Any]]] = {}
+        pending_upserts: dict[str, list[dict[str, Any]]] = {}
+        table_order: list[str] = []
+        seen_tables: set[str] = set()
+        for change in changes:
+            if change.table not in seen_tables:
+                seen_tables.add(change.table)
+                table_order.append(change.table)
+            if change.change == "deleted":
+                pending_deletes.setdefault(change.table, []).append(change.key)
+            else:
+                assert change.after is not None
+                pending_upserts.setdefault(change.table, []).append(change.after)
+
+        applied = 0
+        for table in table_order:
+            deletes = pending_deletes.get(table, [])
+            if deletes:
+                target_session.delete_keys(table, deletes)
+                applied += len(deletes)
+            upserts = pending_upserts.get(table, [])
+            if upserts:
+                target_session.upsert_rows(table, upserts)
+                applied += len(upserts)
+        return applied
 
     def _rows_by_key(
         self, branch_id: str, table: str, meta: _TableMeta

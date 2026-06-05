@@ -199,13 +199,14 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
     _named_param = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
     _dollar_quote = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
 
-    def __init__(self, conn: psycopg.Connection[Any]):
+    def __init__(self, conn: psycopg.Connection[Any], database_url: str | None = None):
         self._conn = conn
+        self.database_url = database_url
 
     @classmethod
     def connect(cls, database_url: str) -> PostgresDatabaseAdapter:
         conn = psycopg.connect(database_url, row_factory=dict_row)
-        return cls(conn)
+        return cls(conn, database_url)
 
     def execute(
         self, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()

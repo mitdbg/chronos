@@ -7,6 +7,8 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
+import operator
 from typing import Any, Iterator, Literal
 
 import sqlglot
@@ -26,6 +28,7 @@ _INTERVAL_CONTINUATION_PERCENT = 5
 _INTERVAL_PERCENT_DENOMINATOR = 100
 _MIN_SPLIT_WIDTH = 2
 _META_PREFIX = "_chronos_branch_"
+_CURRENT_TIMESTAMP_PARAM = "__chronos_current_timestamp"
 
 
 def _validate_interval_continuation_percent(value: int) -> int:
@@ -33,6 +36,15 @@ def _validate_interval_continuation_percent(value: int) -> int:
     if not 1 <= percent <= 99:
         raise ValueError("interval_continuation_percent must be between 1 and 99")
     return percent
+
+
+def _validate_interval_child_width(value: int | None) -> int | None:
+    if value is None:
+        return None
+    width = int(value)
+    if width < _MIN_SPLIT_WIDTH:
+        raise ValueError(f"interval_child_width must be at least {_MIN_SPLIT_WIDTH}")
+    return width
 
 
 class BranchingError(Exception):
@@ -173,7 +185,7 @@ class _PreparedBranchRef:
 class _IntervalSegment:
     """Numeric visibility range owned by a branch/checkpoint in interval mode."""
 
-    segment_id: str
+    segment_id: int
     live_lo: int
     live_hi: int
     branch_point: int
@@ -184,6 +196,7 @@ class _InsertPlan:
     table: str
     columns: tuple[str, ...]
     value_tuples: tuple[tuple[exp.Expression, ...], ...]
+    ignore_conflicts: bool = False
 
 
 @dataclass(frozen=True)
@@ -264,27 +277,23 @@ def _table_defs(db: SQLDatabaseAdapter, table: str) -> tuple[tuple[str, ...], tu
 
 @contextlib.contextmanager
 def _chronos_metadata_lock(db: SQLDatabaseAdapter) -> Iterator[None]:
-    """Serialize Chronos metadata DDL for PostgreSQL-backed contexts.
+    """Serialize Chronos metadata mutations for PostgreSQL-backed contexts.
 
     PostgreSQL's `CREATE TABLE IF NOT EXISTS` is idempotent for sequential
     callers, but concurrent sessions can still race while creating the
-    associated composite type. A session-level advisory lock keeps independent
-    ChronosBranchContext instances from initializing/registering metadata at
-    the same time.
+    associated composite type. A transaction-level advisory lock also keeps
+    schema-branch privacy checks stable until their metadata changes commit.
     """
 
     if db.dialect != "postgres":
         yield
         return
-    db.execute("SELECT pg_advisory_lock(1720812901, 19840717)")
-    try:
-        yield
-    finally:
-        try:
-            db.execute("SELECT pg_advisory_unlock(1720812901, 19840717)")
-        except Exception:
-            db.rollback()
-            db.execute("SELECT pg_advisory_unlock(1720812901, 19840717)")
+    # This must be transaction-scoped: schema DDL decides whether a schema
+    # version is private, then mutates either metadata or the physical table. A
+    # concurrent fork/checkpoint cannot be allowed to observe the old metadata
+    # and attach to that same schema version before the DDL commits.
+    db.execute("SELECT pg_advisory_xact_lock(1720812901, 19840717)")
+    yield
 
 
 def _parse_table_registry(db: SQLDatabaseAdapter, backend: str) -> dict[str, _TableMeta]:
@@ -376,6 +385,8 @@ def _expr_value(
         return None
     if isinstance(node, exp.Boolean):
         return bool(node.this)
+    if isinstance(node, exp.CurrentTimestamp):
+        return params.setdefault(_CURRENT_TIMESTAMP_PARAM, datetime.now(timezone.utc))
     if isinstance(node, exp.Neg):
         value = _expr_value(node.this, params, row)
         return -value
@@ -384,16 +395,84 @@ def _expr_value(
     if isinstance(node, exp.Cast):
         return _expr_value(node.this, params, row)
     if isinstance(node, exp.Add):
-        return _expr_value(node.this, params, row) + _expr_value(node.expression, params, row)
+        return _numeric_binary_op(node, params, row, operator.add)
     if isinstance(node, exp.Sub):
-        return _expr_value(node.this, params, row) - _expr_value(node.expression, params, row)
+        return _numeric_binary_op(node, params, row, operator.sub)
     if isinstance(node, exp.Mul):
-        return _expr_value(node.this, params, row) * _expr_value(node.expression, params, row)
+        return _numeric_binary_op(node, params, row, operator.mul)
     if isinstance(node, exp.Div):
-        return _expr_value(node.this, params, row) / _expr_value(node.expression, params, row)
+        return _numeric_binary_op(node, params, row, operator.truediv)
     if isinstance(node, exp.Mod):
-        return _expr_value(node.this, params, row) % _expr_value(node.expression, params, row)
+        return _numeric_binary_op(node, params, row, operator.mod)
+    if isinstance(node, exp.Case):
+        base = _expr_value(node.this, params, row) if node.this is not None else None
+        for candidate in node.args.get("ifs") or []:
+            condition = candidate.this
+            if node.this is not None:
+                matches = base == _expr_value(condition, params, row)
+            else:
+                matches = _sql_truthy(_expr_value(condition, params, row))
+            if matches:
+                return _expr_value(candidate.args["true"], params, row)
+        default = node.args.get("default")
+        return _expr_value(default, params, row) if default is not None else None
+    if isinstance(node, exp.And):
+        return _sql_truthy(_expr_value(node.this, params, row)) and _sql_truthy(
+            _expr_value(node.expression, params, row)
+        )
+    if isinstance(node, exp.Or):
+        return _sql_truthy(_expr_value(node.this, params, row)) or _sql_truthy(
+            _expr_value(node.expression, params, row)
+        )
+    if isinstance(node, exp.Not):
+        return not _sql_truthy(_expr_value(node.this, params, row))
+    if isinstance(node, exp.Is):
+        left = _expr_value(node.this, params, row)
+        right_expr = node.expression
+        if isinstance(right_expr, exp.Null):
+            return left is None
+        return left is _expr_value(right_expr, params, row)
+    if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+        left = _expr_value(node.this, params, row)
+        right = _expr_value(node.expression, params, row)
+        if left is None or right is None:
+            return False
+        if isinstance(node, exp.EQ):
+            return left == right
+        if isinstance(node, exp.NEQ):
+            return left != right
+        if isinstance(node, exp.GT):
+            return left > right
+        if isinstance(node, exp.GTE):
+            return left >= right
+        if isinstance(node, exp.LT):
+            return left < right
+        return left <= right
     raise UnsupportedSQLError(f"unsupported write expression: {node.sql()}")
+
+
+def _numeric_binary_op(
+    node: exp.Expression,
+    params: dict[str, Any],
+    row: dict[str, Any] | None,
+    op: Any,
+) -> Any:
+    left = _expr_value(node.this, params, row)
+    right = _expr_value(node.expression, params, row)
+    if isinstance(left, Decimal) or isinstance(right, Decimal):
+        left = _as_decimal(left)
+        right = _as_decimal(right)
+    return op(left, right)
+
+
+def _as_decimal(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def _sql_truthy(value: Any) -> bool:
+    return value is not None and bool(value)
 
 
 def _rewrite_tables(sql: str, replacements: dict[str, str], dialect: str) -> str:
@@ -453,7 +532,15 @@ def _build_insert_plan(tree: exp.Insert) -> _InsertPlan:
         if len(tup.expressions) != len(columns):
             raise UnsupportedSQLError("INSERT column/value count mismatch")
         value_tuples.append(tuple(tup.expressions))
-    return _InsertPlan(table, tuple(columns), tuple(value_tuples))
+    ignore_conflicts = False
+    conflict = tree.args.get("conflict")
+    if conflict is not None:
+        action = str(conflict.args.get("action") or "").upper()
+        if action == "DO NOTHING":
+            ignore_conflicts = True
+        else:
+            raise UnsupportedSQLError("only ON CONFLICT DO NOTHING is supported")
+    return _InsertPlan(table, tuple(columns), tuple(value_tuples), ignore_conflicts)
 
 
 def _insert_rows(tree: exp.Insert, params: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
@@ -622,6 +709,16 @@ class _SQLBranchBackend:
 
         return None
 
+    def after_commit(self) -> None:
+        """Hook for work that must start only after the SQL transaction commits."""
+
+        return None
+
+    def after_rollback(self) -> None:
+        """Hook for dropping transaction-local deferred work after rollback."""
+
+        return None
+
     def query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         raise NotImplementedError
 
@@ -674,6 +771,12 @@ class _SQLBranchBackend:
 
     def table_meta_for_branch(self, branch_id: str, table: str) -> _TableMeta:
         return self._require_table(table)
+
+    def diff_rows(self, left: str, right: str, table: str) -> list[RowDiff] | None:
+        return None
+
+    def merge_preview(self, source: str, target: str) -> MergePreview | None:
+        return None
 
     def _require_table(self, table: str) -> _TableMeta:
         try:
