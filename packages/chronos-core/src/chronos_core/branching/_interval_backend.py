@@ -3852,74 +3852,88 @@ class _IntervalBackend(_SQLBranchBackend):
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         lo = segment.live_lo
         hi = segment.live_hi
-        # A fork base is a one-unit immutable interval [x, x+1). Mutable
-        # descendants still need width >= 2 so they have an interior split point
-        # for future branching/checkpointing.
+        # A fork base is a one-unit immutable interval [x, x+1). Allocate it
+        # from the low end so repeated forks consume interval space forward:
+        # fork_base, child, then source-branch continuation.
+        # Mutable descendants still need width >= 2 so they have an interior
+        # split point for future branching/checkpointing.
         if hi - lo < (_MIN_SPLIT_WIDTH * 2) + 1:
             raise BranchingError("interval space exhausted")
-        mutable_hi = hi - 1
-        width = mutable_hi - lo
+        fork_base_hi = lo + 1
+        width = hi - fork_base_hi
         if self.child_width is None:
-            left_width = (width * self.continuation_percent) // _INTERVAL_PERCENT_DENOMINATOR
+            continuation_width = (
+                width * self.continuation_percent
+            ) // _INTERVAL_PERCENT_DENOMINATOR
+            child_width = width - continuation_width
         else:
             # Branch-transaction workloads repeatedly fork short-lived children
             # from one durable branch. Percentage splits decay geometrically in
             # that shape, so fixed child widths consume interval space linearly:
             # parent loses child_width plus the one-unit immutable fork base.
-            left_width = width - self.child_width
-        left_width = max(_MIN_SPLIT_WIDTH, min(width - _MIN_SPLIT_WIDTH, left_width))
-        split = lo + left_width
-        continuation_segment_id, child_segment_id, fork_base_segment_id = self._allocate_segment_ids(3)
+            child_width = self.child_width
+        child_width = max(_MIN_SPLIT_WIDTH, min(width - _MIN_SPLIT_WIDTH, child_width))
+        child_hi = fork_base_hi + child_width
+        (
+            continuation_segment_id,
+            child_segment_id,
+            fork_base_segment_id,
+        ) = self._allocate_segment_ids(3)
         continuation = {
             "segment_id": continuation_segment_id,
-            "live_lo": lo,
-            "live_hi": split,
-            "branch_point": lo + (split - lo) // 2,
+            "live_lo": child_hi,
+            "live_hi": hi,
+            "branch_point": child_hi + (hi - child_hi) // 2,
         }
         child = {
             "segment_id": child_segment_id,
-            "live_lo": split,
-            "live_hi": mutable_hi,
-            "branch_point": split + (mutable_hi - split) // 2,
+            "live_lo": fork_base_hi,
+            "live_hi": child_hi,
+            "branch_point": fork_base_hi + (child_hi - fork_base_hi) // 2,
         }
         fork_base = {
             "segment_id": fork_base_segment_id,
-            "live_lo": mutable_hi,
-            "live_hi": hi,
-            "branch_point": mutable_hi,
+            "live_lo": lo,
+            "live_hi": fork_base_hi,
+            "branch_point": lo,
         }
         return continuation, child, fork_base
 
     def _split_segment(
         self, segment: _IntervalSegment
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        # Biased splitting gives the new child most of the numeric space. This
-        # keeps deep spine/MCTS-style workloads alive much longer than midpoint
-        # splitting while preserving O(1) branch creation and constant-size read
-        # predicates. The source branch still keeps a small continuation segment
-        # so later writes to the source remain isolated from the child.
+        # Biased splitting gives the new snapshot most of the numeric space.
+        # Allocate the snapshot from the low end so interval consumption moves
+        # forward consistently with branch/fork-base allocation. The source
+        # branch keeps the high-end continuation segment, preserving O(1)
+        # checkpoint creation and constant-size read predicates.
         lo = segment.live_lo
         hi = segment.live_hi
         if hi - lo < 4:
             raise BranchingError("interval space exhausted")
         width = hi - lo
-        left_width = (width * self.continuation_percent) // _INTERVAL_PERCENT_DENOMINATOR
-        left_width = max(_MIN_SPLIT_WIDTH, min(width - _MIN_SPLIT_WIDTH, left_width))
-        split = lo + left_width
-        left_segment_id, right_segment_id = self._allocate_segment_ids(2)
-        left = {
-            "segment_id": left_segment_id,
-            "live_lo": lo,
-            "live_hi": split,
-            "branch_point": lo + (split - lo) // 2,
-        }
-        right = {
-            "segment_id": right_segment_id,
+        continuation_width = (
+            width * self.continuation_percent
+        ) // _INTERVAL_PERCENT_DENOMINATOR
+        snapshot_width = width - continuation_width
+        snapshot_width = max(
+            _MIN_SPLIT_WIDTH, min(width - _MIN_SPLIT_WIDTH, snapshot_width)
+        )
+        split = lo + snapshot_width
+        continuation_segment_id, snapshot_segment_id = self._allocate_segment_ids(2)
+        continuation = {
+            "segment_id": continuation_segment_id,
             "live_lo": split,
             "live_hi": hi,
             "branch_point": split + (hi - split) // 2,
         }
-        return left, right
+        snapshot = {
+            "segment_id": snapshot_segment_id,
+            "live_lo": lo,
+            "live_hi": split,
+            "branch_point": lo + (split - lo) // 2,
+        }
+        return continuation, snapshot
 
     def _segment_for_ref(self, ref: _BranchRef) -> _IntervalSegment:
         return self._segment(ref.ref)

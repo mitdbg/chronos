@@ -904,11 +904,12 @@ def test_interval_split_can_use_fixed_child_width_for_serial_transactions() -> N
             ctx.create_branch(f"txn_{index}", from_branch="main")
 
         main_segment = ctx._backend._current_segment("main")  # type: ignore[attr-defined]
-        assert initial_main.live_hi - main_segment.live_hi == 30
+        assert main_segment.live_lo - initial_main.live_lo == 30
+        assert main_segment.live_hi == initial_main.live_hi
 
         child_rows = ctx.db.execute(
             """
-            SELECT live_hi - live_lo AS width
+            SELECT live_lo, live_hi, live_hi - live_lo AS width
             FROM _chronos_branch_interval_segments
             WHERE owner_branch_id LIKE 'txn_%'
               AND segment_kind = 'mutable'
@@ -916,15 +917,22 @@ def test_interval_split_can_use_fixed_child_width_for_serial_transactions() -> N
             """
         ).fetchall()
         assert [int(row["width"]) for row in child_rows] == [2] * 10
+        assert [int(row["live_lo"]) for row in child_rows] == [
+            initial_main.live_lo + 1 + index * 3 for index in range(10)
+        ]
 
         fork_base_rows = ctx.db.execute(
             """
-            SELECT live_hi - live_lo AS width
+            SELECT live_lo, live_hi, live_hi - live_lo AS width
             FROM _chronos_branch_interval_segments
             WHERE segment_kind = 'fork_base'
+            ORDER BY live_lo
             """
         ).fetchall()
         assert [int(row["width"]) for row in fork_base_rows] == [1] * 10
+        assert [int(row["live_lo"]) for row in fork_base_rows] == [
+            initial_main.live_lo + index * 3 for index in range(10)
+        ]
 
         ctx.checkout("txn_9").execute(
             "UPDATE products SET price = :price WHERE sku = :sku",
@@ -1821,6 +1829,24 @@ def test_checkpoint_is_stable_after_later_branch_writes(ctx: ChronosBranchContex
         )
 
 
+def test_interval_checkpoint_split_allocates_snapshot_forward() -> None:
+    ctx = _make_context("sqlite", "interval")
+    try:
+        ctx.create_branch("exp", from_branch="main")
+        before = ctx._backend._current_segment("exp")  # type: ignore[attr-defined]
+
+        created = ctx.create_checkpoint("snap", branch="exp")
+
+        after = ctx._backend._current_segment("exp")  # type: ignore[attr-defined]
+        snapshot = ctx._backend._segment(int(created.ref))  # type: ignore[attr-defined]
+        assert snapshot.live_lo == before.live_lo
+        assert snapshot.live_hi == after.live_lo
+        assert after.live_hi == before.live_hi
+        assert after.live_lo > before.live_lo
+    finally:
+        ctx.close()
+
+
 def test_create_branch_from_checkpoint(ctx: ChronosBranchContext) -> None:
     ctx.create_branch("exp", from_branch="main")
     exp = ctx.checkout("exp")
@@ -1978,7 +2004,7 @@ def test_interval_branch_creation_records_one_unit_fork_base(sql_backend: str) -
         agent_segment = int(ctx.get_branch("agent").current_ref)
         children = ctx.db.execute(
             """
-            SELECT segment_id, parent_segment_id, segment_kind
+            SELECT segment_id, parent_segment_id, segment_kind, live_lo, live_hi
             FROM _chronos_branch_interval_segments
             WHERE segment_id IN (?, ?)
             ORDER BY segment_id
@@ -1989,6 +2015,9 @@ def test_interval_branch_creation_records_one_unit_fork_base(sql_backend: str) -
             int(fork_base["segment_id"])
         }
         assert {row["segment_kind"] for row in children} == {"mutable"}
+        assert int(fork_base["live_lo"]) <= int(fork_base["live_hi"]) <= min(
+            int(row["live_lo"]) for row in children
+        )
 
         main = ctx.checkout("main")
         agent = ctx.checkout("agent")
