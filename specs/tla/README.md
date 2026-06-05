@@ -19,9 +19,9 @@ visible rows on another branch unless those changes happened before the fork.
 With `tla2tools.jar` installed:
 
 ```bash
-java -cp tla2tools.jar tlc2.TLC CopyBranching.cfg
-java -cp tla2tools.jar tlc2.TLC IntervalBranching.cfg
-java -cp tla2tools.jar tlc2.TLC LogBranching.cfg
+java -cp tla2tools.jar tlc2.TLC -config CopyBranching.cfg CopyBranching.tla
+java -cp tla2tools.jar tlc2.TLC -config IntervalBranching.cfg IntervalBranching.tla
+java -cp tla2tools.jar tlc2.TLC -config LogBranching.cfg LogBranching.tla
 ```
 
 The included configs use tiny model values so TLC can exhaustively explore
@@ -37,7 +37,10 @@ table after branch creation.
 
 - every logical key has at most one visible physical row per branch;
 - physical row intervals for the same key never overlap;
-- read results from interval predicates match a simple reference branch view.
+- read results from interval predicates match a simple reference branch view;
+- every row version records a known writer segment;
+- preservation rows keep their original writer segment;
+- visible row versions were written by a segment on the reader's ancestry path.
 
 `LogBranching` checks that:
 

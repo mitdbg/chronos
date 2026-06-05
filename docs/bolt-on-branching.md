@@ -50,7 +50,8 @@ At a high level:
 
 ```text
 1. Branches own monotonically shrinking interval segments.
-2. Forking a branch splits the parent's current segment into two segments.
+2. Forking a branch splits the parent's current segment into a parent
+   continuation, a child segment, and an immutable fork-base segment.
 3. Rows written by a branch receive that branch's current segment as their
    visibility interval.
 4. Reads use one point inside the branch segment to filter visible rows.
@@ -413,10 +414,12 @@ checks. The segment is the write/inheritance scope; the point is the read
 identity.
 
 When a branch is forked, Chronos recursively partitions the source branch's
-current segment into two new segments:
+current segment into three new segments:
 
 - one continuation segment for the source branch
 - one initial segment for the new child branch
+- one immutable `fork_base` segment that represents the source branch's state
+  at fork time
 
 This is not allocation from a global append-only counter. Each fork splits the
 parent branch's current interval.
@@ -428,16 +431,18 @@ Before:
 
 After `ctx.create_branch("y", from_branch="x")`:
 
-          x_s2   <- x continues here
-        /
-  x_s1           <- stable fork prefix
-        \
-          y_s1   <- y starts here
+            x_s2   <- x continues here
+          /
+  x_s1 -> z_s1     <- immutable fork base
+          \
+            y_s1   <- y starts here
 ```
 
 Future writes to `x` go to `x_s2`. Future writes to `y` go to `y_s1`. The
 segment owned by `x` has shrunk from `x_s1` to `x_s2`. Both branches inherit
-rows whose intervals covered the old `x_s1` segment.
+rows whose intervals covered the old `x_s1` segment. The `z_s1` fork-base
+segment is readable but not writable or branchable, so later writes to either
+branch cannot change the state used as their merge base.
 
 ### Interval Encoding
 
@@ -481,7 +486,7 @@ they override them.
 ```sql
 CREATE TABLE branches (
   branch_id TEXT PRIMARY KEY,
-  current_segment_id TEXT NOT NULL,
+  current_segment_id INTEGER NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
@@ -489,20 +494,41 @@ CREATE TABLE branches (
 
 ```sql
 CREATE TABLE segments (
-  segment_id TEXT PRIMARY KEY,
-  parent_segment_id TEXT NULL,
+  segment_id INTEGER PRIMARY KEY,
+  parent_segment_id INTEGER NULL,
   owner_branch_id TEXT NULL,
+  segment_kind TEXT NOT NULL DEFAULT 'mutable',
   live_lo NUMERIC(78, 0) NOT NULL,
   live_hi NUMERIC(78, 0) NOT NULL,
   branch_point NUMERIC(78, 0) NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-  CHECK (live_lo < branch_point),
+  CHECK (live_lo <= branch_point),
   CHECK (branch_point < live_hi)
 );
 ```
 
-`branches.current_segment_id` points to the branch's mutable segment. `segments.parent_segment_id` supports management, visualization, diff, merge, and interval allocation. It is not on the hot read path.
+`branches.current_segment_id` points to the branch's mutable segment.
+`segments.parent_segment_id` supports management, visualization, diff, merge,
+and interval allocation. It is not on the hot read path.
+
+`segment_kind` distinguishes normal mutable branch segments from immutable
+internal refs:
+
+```text
+mutable    writable segment owned by a branch head
+checkpoint read-only user checkpoint
+fork_base  read-only internal merge base created during branch creation
+```
+
+Only `mutable` segments are writable and branchable. `checkpoint` and
+`fork_base` segments are readable snapshots. A `fork_base` segment is hidden
+from the public branch API; users name source and target branches, and Chronos
+infers the merge base from metadata.
+
+Mutable segments are allocated with enough width to keep an interior branch
+point. Fork-base segments are one-unit intervals `[x, x+1)` and use
+`branch_point = x`.
 
 ## Branched User Tables
 
@@ -516,12 +542,20 @@ The most important rule is how a physical row gets its interval:
 on insert/update in branch b:
   new_row.live_lo = b.current_segment.live_lo
   new_row.live_hi = b.current_segment.live_hi
+  new_row.writer_segment_id = b.current_segment_id
 ```
 
 That write scope is what makes inheritance work. A row written before a fork
 has an interval that covers both resulting branch points after the fork. A row
 written after a fork is restricted to the writer's continuation segment, so
 sibling branches do not see it.
+
+`writer_segment_id` records provenance. It identifies the segment that produced
+the logical user effect. Inserts, updates, and delete tombstones use the current
+segment id of the writing branch. Preservation rows created while splicing an
+old row keep the old row's writer segment id; they are not attributed to the
+branch that caused the splice. This distinction lets Chronos find candidate
+branch changes from row-version provenance without a separate side table.
 
 Logical table:
 
@@ -542,6 +576,7 @@ CREATE TABLE products_b (
   price NUMERIC NULL,
   live_lo NUMERIC(78, 0) NOT NULL,
   live_hi NUMERIC(78, 0) NOT NULL,
+  writer_segment_id INTEGER NOT NULL,
   deleted BOOLEAN NOT NULL DEFAULT false,
   PRIMARY KEY (sku, live_lo),
   CHECK (live_lo < live_hi)
@@ -666,6 +701,7 @@ The copied rows remain interval rows:
 ```text
 new_v2_row.live_lo = exp.current_segment.live_lo
 new_v2_row.live_hi = exp.current_segment.live_hi
+new_v2_row.writer_segment_id = source_row.writer_segment_id
 ```
 
 Future writes in `exp` and future forks from `exp` continue to use interval
@@ -988,17 +1024,24 @@ Then it splices each matched key. Batch execution should lock keys in determinis
 
 1. Lock branch `x`.
 2. Read `x.current_segment_id`, called `S`.
-3. Split `S` into two child intervals:
+3. Split `S` into three child intervals:
+   - one immutable fork-base segment `Z`
    - one continuation segment for `x`
    - one initial segment for `y`
-4. Insert both child segments.
-5. Update `x.current_segment_id` to the continuation segment.
-6. Insert branch `y` pointing to its initial segment.
-7. Commit.
+4. Insert all three segments.
+5. Set the parent of both mutable segments to `Z`.
+6. Set the parent of `Z` to the old segment `S`.
+7. Update `x.current_segment_id` to the continuation segment.
+8. Insert branch `y` pointing to its initial segment.
+9. Record fork metadata linking `(x, y)` to `Z`.
+10. Commit.
 
 No user rows are copied.
 
-Existing live intervals continue to cover both child branch points until one branch writes an override.
+Existing live intervals continue to cover the parent continuation, child, and
+fork-base branch points until one mutable branch writes an override. Writes only
+target the current mutable segment, so the fork-base point remains a stable
+readable snapshot.
 
 ## Correctness Conditions
 
@@ -1007,7 +1050,8 @@ The system is correct when these conditions hold:
 - For each logical key and branch point, at most one non-deleted physical row is visible.
 - Branch creation only writes metadata.
 - User writes target the current mutable segment.
-- Stable fork-prefix segments and checkpoints are immutable.
+- Fork-base segments and checkpoints are immutable.
+- Only mutable segments can be written or used as the source of a new branch.
 - Deletes create tombstone intervals.
 - Splices are atomic database transactions.
 - Concurrent writers to the same key and overlapping interval are serialized.
@@ -1597,7 +1641,8 @@ modified   key is present on both sides but row contents differ
 unchanged  key is present on both sides and row contents match
 ```
 
-The physical table should store a row hash to make diff efficient:
+The physical table stores writer provenance and may store a row hash to make
+final comparison cheap:
 
 ```sql
 CREATE TABLE products_b (
@@ -1606,8 +1651,9 @@ CREATE TABLE products_b (
   price NUMERIC NULL,
   live_lo NUMERIC(78, 0) NOT NULL,
   live_hi NUMERIC(78, 0) NOT NULL,
+  writer_segment_id INTEGER NOT NULL,
   deleted BOOLEAN NOT NULL DEFAULT false,
-  row_hash TEXT NOT NULL,
+  row_hash TEXT NULL,
   PRIMARY KEY (sku, live_lo),
   CHECK (live_lo < live_hi)
 );
@@ -1621,58 +1667,119 @@ hash(name, price)
 
 Tombstones participate in diff as absence. A deleted row is not present in that branch state.
 
-### Table Diff Query
+### Candidate Keys From Writer Segments
 
-For a single table, collect rows visible at either branch point and collapse by logical key:
+For two current branch segments, Chronos first finds their nearest shared
+immutable fork-base segment. Mutable writer segments on the left path after
+that base are left-only writers. Mutable writer segments on the right path
+after that base are right-only writers.
+
+```text
+left_segments  = mutable_ancestors(left.current_segment) after base_segment
+right_segments = mutable_ancestors(right.current_segment) after base_segment
+candidate_writer_segments = left_segments union right_segments
+```
+
+Rows whose writer segment is on only one side are the only rows that can cause
+the two branch states to differ. Shared-prefix writes are inherited by both
+branches unless a later one-sided write overrides them. Preservation rows do not
+create false authorship because they keep the writer segment id of the row they
+preserve.
+
+For a single table, collect candidate keys from writer provenance:
+
+```sql
+SELECT DISTINCT sku
+FROM products_b
+WHERE writer_segment_id = ANY(:candidate_writer_segments);
+```
+
+Then reconstruct only those keys at the two branch points:
+
+```sql
+SELECT sku, row_hash, deleted
+FROM products_b
+WHERE sku = :sku
+  AND live_lo <= :left_point
+  AND :left_point < live_hi;
+```
+
+```sql
+SELECT sku, row_hash, deleted
+FROM products_b
+WHERE sku = :sku
+  AND live_lo <= :right_point
+  AND :right_point < live_hi;
+```
+
+For batch execution, use the candidate key relation instead of one key at a
+time:
+
+```sql
+WITH candidate_keys AS (
+  SELECT DISTINCT sku
+  FROM products_b
+  WHERE writer_segment_id = ANY(:candidate_writer_segments)
+),
+left_visible AS (
+  SELECT p.*
+  FROM products_b p
+  JOIN candidate_keys c USING (sku)
+  WHERE p.live_lo <= :left_point
+    AND :left_point < p.live_hi
+),
+right_visible AS (
+  SELECT p.*
+  FROM products_b p
+  JOIN candidate_keys c USING (sku)
+  WHERE p.live_lo <= :right_point
+    AND :right_point < p.live_hi
+)
+SELECT c.sku,
+       l.deleted AS left_deleted,
+       r.deleted AS right_deleted,
+       l.row_hash AS left_hash,
+       r.row_hash AS right_hash
+FROM candidate_keys c
+LEFT JOIN left_visible l USING (sku)
+LEFT JOIN right_visible r USING (sku);
+```
+
+The non-overlap invariant guarantees that each branch point contributes at most
+one row per key. Tombstones are treated as absence during classification.
+
+Classify each candidate row:
+
+```text
+left absent and right present      -> added
+left present and right absent      -> deleted
+left present and right present
+  and left_hash <> right_hash      -> modified
+otherwise                         -> unchanged
+```
+
+Most callers should suppress unchanged rows. Unchanged candidates are possible:
+a branch may update a row and later restore the same value, or a divergent
+writer may touch a key without changing the final logical state.
+
+### Fallback Snapshot Diff
+
+If writer provenance is unavailable, the backend can fall back to a visible
+snapshot diff. This path collects rows visible at either branch point and
+collapses by logical key:
 
 ```sql
 SELECT
   sku,
-  bool_or(
-    live_lo <= :left_point
-    AND :left_point < live_hi
-    AND deleted = false
-  ) AS present_left,
-  bool_or(
-    live_lo <= :right_point
-    AND :right_point < live_hi
-    AND deleted = false
-  ) AS present_right,
-  max(row_hash) FILTER (
-    WHERE live_lo <= :left_point
-      AND :left_point < live_hi
-      AND deleted = false
-  ) AS left_hash,
-  max(row_hash) FILTER (
-    WHERE live_lo <= :right_point
-      AND :right_point < live_hi
-      AND deleted = false
-  ) AS right_hash
+  bool_or(live_lo <= :left_point AND :left_point < live_hi AND deleted = false) AS present_left,
+  bool_or(live_lo <= :right_point AND :right_point < live_hi AND deleted = false) AS present_right,
+  max(row_hash) FILTER (WHERE live_lo <= :left_point AND :left_point < live_hi AND deleted = false) AS left_hash,
+  max(row_hash) FILTER (WHERE live_lo <= :right_point AND :right_point < live_hi AND deleted = false) AS right_hash
 FROM products_b
-WHERE (
-    live_lo <= :left_point
-    AND :left_point < live_hi
-  )
-  OR (
-    live_lo <= :right_point
-    AND :right_point < live_hi
-  )
+WHERE (live_lo <= :left_point AND :left_point < live_hi)
+   OR (live_lo <= :right_point AND :right_point < live_hi)
 GROUP BY sku;
 ```
-
-The non-overlap invariant guarantees that each branch point contributes at most one non-deleted row per key. The aggregate is therefore selecting a single value, not resolving competing versions.
-
-Classify each grouped row:
-
-```text
-present_left = false and present_right = true   -> added
-present_left = true  and present_right = false  -> deleted
-present_left = true  and present_right = true
-  and left_hash <> right_hash                   -> modified
-otherwise                                      -> unchanged
-```
-
-Most callers should suppress unchanged rows.
 
 ### Diff Output
 
@@ -1712,40 +1819,193 @@ WHERE sku = :sku
 
 ### Diff Efficiency
 
-Diff cost is proportional to rows visible at either branch point for each table:
+With writer provenance, diff cost is proportional to the two segment ancestry
+paths plus the row versions written after divergence:
 
 ```text
-O(visible_rows(left) + visible_rows(right))
+O(depth(left) + depth(right) + W_delta + K_delta * point_lookup)
 ```
 
-Indexes for diff:
+`W_delta` is the number of physical row versions and tombstones whose writer
+segment is on one side of the branch divergence. `K_delta` is the distinct key
+count among those rows. The final point lookup uses the normal visibility
+predicate, so correctness does not depend on a separate diff representation.
+
+Indexes for provenance-based diff:
 
 ```sql
-CREATE INDEX products_b_diff_left_right
-ON products_b (live_lo, live_hi)
-INCLUDE (sku, deleted, row_hash);
+CREATE INDEX products_b_writer_segment
+ON products_b (writer_segment_id, sku);
+
+CREATE INDEX products_b_point_lookup
+ON products_b (sku, live_hi)
+INCLUDE (live_lo, deleted, row_hash);
 ```
 
-For range-aware databases:
+The snapshot fallback can use a range index:
 
 ```sql
 CREATE INDEX products_b_diff_span
 ON products_b USING gist (live_span);
 ```
 
-Large database-wide diffs should stream table-by-table and key-by-key. The system can also maintain per-table change counters or per-segment touched-key summaries to skip tables that cannot differ.
+Large database-wide diffs should stream table-by-table and key-by-key.
 
 ## Merge
 
-Merge uses the nearest common ancestor segment as the base:
+Merge is the promotion of one speculative branch state into another branch. The
+user provides source and target branches; Chronos infers the base:
 
 ```text
-base = nearest common ancestor segment
-left = visible state of target branch
-right = visible state of source branch
+base   = immutable fork-base segment shared by source and target
+target = visible state of target branch
+source = visible state of source branch
 ```
 
-The base design is state-based. It compares current values at branch heads and fork/checkpoint boundaries.
+The base must be a readable state, not merely the id of a mutable common
+ancestor. A mutable branch segment can receive later writes, so using it as the
+base would make merge depend on changes that happened after the source branch
+forked. Chronos therefore creates an immutable fork-base segment during branch
+creation and uses that segment as the merge base.
+
+For the common case:
+
+```text
+main forks agent_attempt
+agent_attempt merges back into main
+```
+
+the fork-base segment created at fork time is the merge base. If branches are
+deeper, Chronos walks segment ancestry and picks the nearest shared immutable
+fork-base segment.
+
+### Merge Classification
+
+Merge compares each candidate logical key in three states:
+
+```text
+B = row visible at base fork-base point
+T = row visible at target branch point
+S = row visible at source branch point
+```
+
+Classification:
+
+```text
+S == B and T != B              keep target
+T == B and S != B              apply source
+S == T                         already converged
+S != B and T != B and S != T   conflict
+source deleted, target same    apply delete
+target deleted, source same    keep target delete
+delete vs update               conflict
+```
+
+The default relational conflict granularity is row-level. Column-level merge can
+be added later as an explicit policy, but the core model should not silently
+combine independently updated columns because application invariants may span
+columns.
+
+### Candidate Keys
+
+Chronos should not scan the whole table for merge preview. It can reuse
+writer-segment provenance:
+
+```text
+source_writer_segments = mutable writer segments on source path after base
+target_writer_segments = mutable writer segments on target path after base
+candidate_writer_segments = source_writer_segments union target_writer_segments
+```
+
+Then:
+
+```sql
+SELECT DISTINCT sku
+FROM products_b
+WHERE writer_segment_id = ANY(:candidate_writer_segments);
+```
+
+For each candidate key, reconstruct the row at the base, source, and target
+branch points using the normal visibility predicate. This gives merge preview
+cost proportional to ancestry plus changed keys:
+
+```text
+O(depth(source) + depth(target) + W_delta + K_delta * point_lookup)
+```
+
+The result is a `MergePreview` containing clean changes, conflicts, and the
+base segment id used for the preview. `merge_apply` must verify that the target
+branch still points to the same segment observed by the preview, or recompute
+the preview before applying.
+
+### Applying a Clean Merge
+
+For clean source-only changes, `merge_apply` writes the source result into the
+target branch using the same interval write path as ordinary DML. It does not
+modify the source branch and does not mutate the fork-base segment.
+
+The merge result can optionally be recorded as metadata:
+
+```text
+merge_source_branch
+merge_target_branch
+merge_base_segment_id
+merge_source_segment_id
+merge_target_segment_id_before_apply
+```
+
+This metadata is useful for audit, visualization, and later garbage collection.
+
+### Schema-Aware Merge
+
+Schema merge runs before row merge. The conservative first policy is:
+
+```text
+source adds table/column, target unchanged from base       apply
+source drops table/column, target unchanged from base      apply if dependencies allow
+both make identical schema change                         clean
+both change schema differently                            conflict
+type change vs target row updates                         conflict
+constraint/index changes differ                           conflict unless identical
+```
+
+If a source branch has a divergent schema version, row merge for that logical
+table can proceed only after Chronos resolves how the target schema should
+change. If source and target physical schema tables differ and no safe schema
+resolution is available, merge preview must report a schema conflict rather
+than falling back to precedence.
+
+### Compatibility With Interval Optimizations
+
+Fork-base segments are internal readers. Every optimization that assumes a
+schema version or physical table is private must treat fork bases the same way
+it treats user checkpoints.
+
+In particular, in-place DDL on a private schema-version table is safe only when
+no other live branch, checkpoint, or fork-base segment can resolve to that
+schema version. Otherwise Chronos must create a new schema-version physical
+table, copy the visible rows, and splice table bindings over the current
+mutable segment.
+
+The same rule applies to row fast paths. An optimization that updates a private
+physical table in place is valid only when no branch, checkpoint, or fork base
+can observe the old state. If a fork base can observe it, the operation must use
+interval splicing so the fork-base point keeps seeing the pre-write value.
+
+### Orpheus-Style Precedence Merge
+
+Chronos may expose a separate precedence merge mode for compatibility with
+OrpheusDB-style dataset versioning:
+
+```text
+materialize source branches in listed order
+first row for a primary key wins
+commit result as a new branch/version with multiple parents
+```
+
+This is not the default agentic merge model. It can silently discard one side's
+change, so it should be explicit and should not be used for promotion of agent
+execution results unless the caller chooses that policy.
 
 ## Garbage Collection
 
