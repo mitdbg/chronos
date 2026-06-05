@@ -993,7 +993,7 @@ def main() -> None:
         help="Comma-separated transaction counts to run separately. Default: 100,1000,10000.",
     )
     parser.add_argument("--changes", type=int, default=1)
-    parser.add_argument("--read-count", type=int, default=1)
+    parser.add_argument("--read-count", type=int, default=3)
     parser.add_argument(
         "--warmup-iterations",
         type=int,

@@ -241,13 +241,13 @@ OUTPUT_DIR="${CHRONOS_BENCH_OUTPUT_DIR:-${ROOT_DIR}/.benchmarks/branching-transa
 ARGS=("$@")
 case "${MODE}" in
   postgres)
-    BACKENDS="chronos,native_txn"
+    BACKENDS="native_txn,chronos"
     ;;
   doltgres)
     BACKENDS="doltgres"
     ;;
   postgres-doltgres)
-    BACKENDS="chronos,doltgres,native_txn"
+    BACKENDS="native_txn,chronos,doltgres"
     ;;
 esac
 
