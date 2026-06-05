@@ -1,10 +1,13 @@
 # chronos-core
 
-Core Transactional Agent Runtime primitives and framework-independent shims.
+Core branch management, merge, checkpoint, and framework-independent state
+isolation primitives.
 
 ## Relational branching
 
-`ChronosBranchContext` provides named SQL branches over SQLite or PostgreSQL:
+`ChronosBranchContext` provides named SQL branches over SQLite or PostgreSQL.
+Applications manage branches through Python APIs and keep using SQL against
+logical table names inside a checked-out branch:
 
 ```python
 from chronos_core.branching import ChronosBranchContext
@@ -27,7 +30,12 @@ with session.transaction():
 
 Supported branch backends are `interval`, `log`, and `copy`.
 
-## PostgreSQL shim
+The interval backend is the default. It supports metadata-only branch creation,
+branch-local writes, checkpoints, diff, merge preview, merge apply, branch
+deletion, and opt-in branch-local schema changes. PostgreSQL has the most
+complete DDL coverage.
+
+## Lower-Level PostgreSQL Shim
 
 `PostgresShim` provides the same MVCC-style transactional table interface as
 `SQLiteShim`, backed by PostgreSQL:

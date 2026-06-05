@@ -359,8 +359,10 @@ existing databases and compatible with ordinary SQL, but it creates trade-offs:
   intervals.
 - Fixed-width interval spaces require careful allocation, relabeling, or depth
   limits.
-- Branch-local schema changes are outside the first relational design;
-  the initial model branches row contents under a shared schema.
+- Branch-local schema changes require a hybrid design: shared interval rows
+  while schemas match, then branch-local physical schema-version tables when a
+  branch diverges. This keeps the common case cheap while preserving correct
+  future forks from the divergent branch.
 - Cross-store consistency depends on TAR coordination and state adapters.
 
 These are different trade-offs from systems that implement branching in the

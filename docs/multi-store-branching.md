@@ -171,7 +171,7 @@ session.
 
 ## Store Driver Interface
 
-Every multi-store participant implements the same lifecycle surface:
+Every multi-store participant implements the same lifecycle contract:
 
 ```python
 class ChronosStore:

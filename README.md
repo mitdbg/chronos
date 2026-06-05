@@ -1,37 +1,47 @@
 # Chronos
 
-Chronos gives state-modifying AI agents isolation over the data they touch.
-Agents can edit files, run commands, update relational state, write memory, use
-vector storage, and explore named database branches without leaking partial
-side effects into the shared state.
+Chronos is a bolt-on branching layer over data stores for stateful applications and agents. It
+lets an application fork, mutate, diff, merge, checkpoint, or discard data store state while
+each underlying store keeps its native access model: SQL for relational data,
+POSIX-style access for filesystems, and store-specific APIs for memory, vectors,
+or other application state.
 
-Chronos is built for agent workflows where "try it and see what happens" is useful
-but unsafe without isolation: code editing, debugging, data repair, structured
-memory updates, RAG indexing, and multi-step tool plans.
+Chronos is built for workflows where "try it and see what happens" is useful but
+unsafe without a branch: code editing, debugging, data repair, structured memory
+updates, RAG indexing, and multi-step tool plans.
 
 ## What Chronos Provides
 
-- **Isolated execution:** tool calls run against transaction-local state.
-- **Atomic commit/abort:** all enrolled backends commit or roll back together.
-- **Savepoints:** agents can checkpoint before risky work and roll back only
-  the failed part.
-- **Snapshot-style reads:** relational and vector shims use MVCC metadata so a
-  transaction sees a stable view plus its own writes.
-- **Long-lived relational branches:** applications can create, check out, query,
-  mutate, diff, and merge named SQL branches.
-- **Zero-copy filesystem branching:** file operations use OverlayFS or
-  `fuse-overlayfs` copy-on-write layers.
-- **Agent-facing tools:** LangChain tools expose file editing, bash, memory,
-  SQLite, vector store, and transaction control.
-- **Framework separation:** the transaction layer is framework-independent;
-  LangChain and LangGraph integrations are adapters on top.
+- **Named branches:** applications can create, check out, query, mutate, diff,
+  merge, and delete branches.
+- **Store-native access:** branch sessions expose SQL for relational stores and
+  filesystem paths for code and artifacts.
+- **Long-lived SQL branches:** relational data can keep branch state across many
+  operations, including opt-in schema changes on branch-local physical tables.
+- **Branch diffs and merges:** Chronos can compare branches and apply approved
+  row-level changes back to a target branch.
+- **Zero-copy filesystem branches:** file operations use OverlayFS or
+  `fuse-overlayfs` copy-on-write layers when available.
+- **Branch transactions:** an agent can run tool calls inside a branch, inspect
+  the final diff, and merge only the approved result.
+- **Framework separation:** the branch layer is framework-independent. Adapter
+  packages can be built on top without changing the core API.
 
 ## Current Scope
 
-Chronos has two related but separate surfaces.
+Chronos has two related APIs. The main API is branch management:
 
-The transaction runtime provides short-lived, transaction-scoped virtual
-branches over stateful tools:
+```text
+create branch -> checkout branch session -> query/write with store-native APIs
+diff/merge -> compare or apply branch changes
+delete branch -> discard speculative state
+```
+
+For relational data, branch management is Python API driven. User data is still
+stored and queried with SQL through a branch-bound session object.
+
+The lower-level transaction runtime provides short-lived, transaction-scoped
+virtual branches over stateful tools:
 
 ```text
 begin transaction -> isolated branch
@@ -41,25 +51,86 @@ commit -> merge into real state
 abort  -> discard branch
 ```
 
-The relational branching API provides named, long-lived SQL branches:
+For long agent runs, a branch transaction is usually the better abstraction:
 
 ```text
-create branch -> checkout branch session -> query/write with SQL
-checkpoint -> read stable historical state
-diff/merge -> compare or apply branch changes
+branch = fork(application_state)
+agent performs tool calls inside branch
+system computes DB/file diff
+policy checker reviews final state
+merge approved changes or discard branch
 ```
 
-Branch management is Python API driven. User data is still stored and queried
-with SQL through a branch-bound session object.
+This avoids holding a database transaction open across LLM calls and avoids
+exposing saga-style intermediate state to other users or agents.
+
+## Quickstart: Branch SQL State
+
+Use `ChronosBranchContext` when you want named, mutable branches over SQL tables.
+The application manages branches with Python APIs, while agents and application
+code continue to issue SQL against logical table names.
+
+```python
+from chronos_core.branching import ChronosBranchContext
+
+ctx = ChronosBranchContext.connect("sqlite:///:memory:", backend="interval")
+conn = ctx.conn
+
+conn.execute(
+    """
+    CREATE TABLE products (
+      sku TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      price INTEGER NOT NULL,
+      stock INTEGER NOT NULL
+    )
+    """
+)
+conn.execute("INSERT INTO products VALUES ('abc', 'Keyboard', 100, 5)")
+conn.commit()
+
+ctx.register_table("products", primary_key=["sku"])
+
+ctx.create_branch("agent_experiment", from_branch="main")
+agent = ctx.checkout("agent_experiment")
+
+with agent.transaction():
+    agent.execute(
+        "UPDATE products SET price = :price WHERE sku = :sku",
+        {"price": 90, "sku": "abc"},
+    )
+    agent.execute(
+        """
+        INSERT INTO products (sku, name, price, stock)
+        VALUES (:sku, :name, :price, :stock)
+        """,
+        {"sku": "def", "name": "Mouse", "price": 25, "stock": 10},
+    )
+
+assert agent.query("SELECT sku, price FROM products ORDER BY sku") == [
+    {"sku": "abc", "price": 90},
+    {"sku": "def", "price": 25},
+]
+assert ctx.checkout("main").query("SELECT sku, price FROM products") == [
+    {"sku": "abc", "price": 100},
+]
+
+diff = ctx.diff("main", "agent_experiment")
+for change in diff.changes:
+    print(change.table, change.key, change.change)
+
+ctx.merge_apply(source="agent_experiment", target="main")
+```
+
+`checkout()` returns a reusable `BranchSession`. Reusing the session is
+important for performance because it caches branch metadata such as interval
+segment bounds or log lineage.
 
 ## Packages
 
 ```text
 packages/
-  chronos-core        Core coordinator, transaction types, and backend shims
-  langchain-chronos  LangChain tools backed by Chronos transactions
-  chronos-langgraph  LangGraph helpers using public LangGraph APIs
-  chronos-code       Transactional coding-agent CLI and MCP server
+  chronos-core        Core branching context, coordinator, and backend shims
 ```
 
 ### `chronos-core`
@@ -77,39 +148,8 @@ Framework-independent runtime components:
 - transaction handles, snapshots, savepoints, branch diffs, change records, and
   vote types
 
-### `langchain-chronos`
-
-LangChain tools for agent use:
-
-- `ChronosContext`
-- `ChronosFileEditor`
-- `ChronosBash`
-- `ChronosMemory`
-- `ChronosSQLite`
-- `ChronosVectorStore`
-- `ChronosTransactionControl`
-
-### `chronos-langgraph`
-
-LangGraph integration helpers:
-
-- transaction-control tools
-- `TransactionalToolWrapper`
-- `create_transactional_agent`
-- branch-aware LangGraph store shim
-
-This package uses public LangGraph package APIs such as `langgraph.prebuilt`,
-`langgraph.types`, and `langgraph.store`.
-
-### `chronos-code`
-
-A coding-agent application built on Chronos:
-
-- `chronos-code` CLI
-- session and transaction manager
-- coding tools for read/write/edit/bash/glob/ripgrep/todos/memory
-- sub-agent and parallel-agent orchestration
-- MCP server and bootstrap helpers
+Adapter packages for agent frameworks live in this repository, but the branch
+API and the examples below use `chronos-core` directly.
 
 ## Installation
 
@@ -123,15 +163,12 @@ For editable installs without `uv`:
 
 ```bash
 python -m pip install -e packages/chronos-core
-python -m pip install -e packages/chronos-langchain
-python -m pip install -e packages/chronos-langgraph
-python -m pip install -e packages/chronos-code
 ```
 
 If you do not install the packages, run commands with:
 
 ```bash
-PYTHONPATH=packages/chronos-core/src:packages/chronos-langchain/src:packages/chronos-langgraph/src:packages/chronos-code/src
+PYTHONPATH=packages/chronos-core/src
 ```
 
 ## System Requirements
@@ -140,10 +177,7 @@ PYTHONPATH=packages/chronos-core/src:packages/chronos-langchain/src:packages/chr
 - Linux for filesystem isolation
 - `fuse-overlayfs` for unprivileged filesystem transactions, or root privileges
   for kernel OverlayFS mounts
-- PostgreSQL only when using `PostgresShim`
-- `rg` for ripgrep-backed Chronos-code tests/tools
-- `mcp[cli]` for MCP server functionality
-- model provider credentials for live Chronos-code agent runs
+- PostgreSQL when using PostgreSQL-backed shims or relational branches
 
 Install `fuse-overlayfs` on Ubuntu/Debian:
 
@@ -151,72 +185,7 @@ Install `fuse-overlayfs` on Ubuntu/Debian:
 sudo apt install fuse-overlayfs
 ```
 
-## Quickstart: App-Controlled Commit
-
-Use this pattern when the application decides whether an agent's work should be
-kept.
-
-```python
-from pathlib import Path
-
-from langchain_chronos import ChronosContext
-
-project = Path("./demo_project").resolve()
-project.mkdir(exist_ok=True)
-
-ctx = ChronosContext(project, enable_sqlite=True, enable_vectorstore=False)
-ctx.begin()
-
-ctx.file_editor.invoke({
-    "command": "create",
-    "path": "README.md",
-    "file_text": "# Demo\n\nCreated inside a Chronos transaction.\n",
-})
-
-ctx.bash.invoke({"command": "ls"})
-
-checks_passed = True
-if checks_passed:
-    ctx.commit()
-else:
-    ctx.abort()
-```
-
-Inside the transaction, tools see the edited project. Outside the transaction,
-the real project is unchanged until `commit()`.
-
-## Quickstart: Savepoint And Rollback
-
-```python
-from langchain_chronos import ChronosContext
-
-ctx = ChronosContext("./demo_project", enable_sqlite=True, enable_vectorstore=False)
-ctx.begin()
-
-ctx.file_editor.invoke({
-    "command": "create",
-    "path": "stable.txt",
-    "file_text": "keep this\n",
-})
-
-ctx.savepoint("before_experiment")
-
-ctx.file_editor.invoke({
-    "command": "create",
-    "path": "experiment.txt",
-    "file_text": "discard this if checks fail\n",
-})
-
-checks_passed = False
-if not checks_passed:
-    ctx.rollback("before_experiment")
-
-ctx.commit()
-```
-
-The final commit keeps `stable.txt` and discards `experiment.txt`.
-
-## Quickstart: SQLite Transactions
+## Lower-Level Runtime: SQLite Transactions
 
 ```python
 from chronos_core.transaction import SQLiteShim, TransactionCoordinator
@@ -248,71 +217,12 @@ SQLite rows are versioned with Chronos metadata columns:
 Reads apply the transaction snapshot visibility predicate. Updates close the
 old version and insert a new version.
 
-## Quickstart: Relational Branching
+## Relational Branching Details
 
-Use `ChronosBranchContext` when you want named, mutable branches over SQL tables.
-The application manages branches with Python APIs, while agents and application
-code continue to issue SQL against logical table names.
-
-```python
-from chronos_core.branching import ChronosBranchContext
-
-ctx = ChronosBranchContext.connect("sqlite:///:memory:", backend="interval")
-conn = ctx.conn
-
-conn.execute(
-    """
-    CREATE TABLE products (
-      sku TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      price INTEGER NOT NULL,
-      stock INTEGER NOT NULL
-    )
-    """
-)
-conn.execute(
-    "INSERT INTO products VALUES ('abc', 'Keyboard', 100, 5)"
-)
-conn.commit()
-
-ctx.register_table("products", primary_key=["sku"])
-ctx.create_index("products", ["sku"], name="products_sku_lookup")
-
-ctx.create_branch("agent_experiment", from_branch="main")
-session = ctx.checkout("agent_experiment")
-
-with session.transaction():
-    session.execute(
-        "UPDATE products SET price = :price WHERE sku = :sku",
-        {"price": 90, "sku": "abc"},
-    )
-    session.execute(
-        """
-        INSERT INTO products (sku, name, price, stock)
-        VALUES (:sku, :name, :price, :stock)
-        """,
-        {"sku": "def", "name": "Mouse", "price": 25, "stock": 10},
-    )
-
-rows = session.query(
-    "SELECT sku, price FROM products ORDER BY sku"
-)
-
-main_rows = ctx.checkout("main").query(
-    "SELECT sku, price FROM products ORDER BY sku"
-)
-
-assert rows == [
-    {"sku": "abc", "price": 90},
-    {"sku": "def", "price": 25},
-]
-assert main_rows == [{"sku": "abc", "price": 100}]
-```
-
-`checkout()` returns a reusable `BranchSession`. Reusing the session is
-important for performance because it caches branch metadata such as interval
-segment bounds or log lineage. Use `session.transaction()` to group several
-writes into one underlying database transaction.
+After a table is registered, SQL continues to use logical table names. Chronos
+rewrites the query for the selected branch and sends it to the underlying
+database. Use `session.transaction()` to group several writes into one
+underlying database transaction.
 
 ### Branching Multiple Tables
 
@@ -414,43 +324,6 @@ coordinator.commit(txn.id)
 The PostgreSQL backend follows the same MVCC protocol as SQLite and uses
 PostgreSQL transactions for durable SQL execution.
 
-## LangGraph Integration
-
-```python
-from langgraph.prebuilt import create_react_agent
-from langchain_chronos import ChronosContext
-from langchain_chronos.context import ChronosTransactionControl
-
-ctx = ChronosContext("./demo_project", enable_sqlite=True, enable_vectorstore=False)
-ctx.begin()
-
-tools = ctx.get_tools() + [ChronosTransactionControl(chronos_context=ctx)]
-
-agent = create_react_agent(
-    model,
-    tools=tools,
-    prompt=(
-        "A Chronos transaction is active. Use savepoints before risky changes. "
-        "Commit only after checks pass."
-    ),
-)
-```
-
-`chronos-langgraph` also provides helpers for constructing transaction-management
-tools and wrapping tool calls with automatic savepoints.
-
-## Chronos-Code CLI
-
-Run a transactional coding-agent session:
-
-```bash
-chronos-code --project /path/to/project
-```
-
-The CLI creates a Chronos-backed session so edits, commands, memory, and SQLite
-state can be committed or aborted together. It also includes MCP server support
-for exposing Chronos tools to external agents.
-
 ## Backend Semantics
 
 Transaction shims participate in `TransactionCoordinator`:
@@ -461,7 +334,6 @@ Transaction shims participate in `TransactionCoordinator`:
 | SQLite | Chronos MVCC columns and visibility predicates | Mark transaction IDs committed |
 | PostgreSQL | Chronos MVCC columns and visibility predicates | PostgreSQL-backed row versioning |
 | Vector store | sqlite-vec style transactional records | Commit visible vector records |
-| LangGraph store | Branch-prefixed namespaces | Flush branch entries into main namespace |
 
 All registered shims participate in the same coordinator commit. If one
 participant votes abort during prepare, the coordinator aborts the transaction.
@@ -479,24 +351,16 @@ the database's normal transaction mechanism through `session.transaction()`.
 
 ## Running Tests
 
-Run fast unit and integration tests that do not require live model calls:
+Run core branching and shim tests:
 
 ```bash
-PYTHONPATH=packages/chronos-core/src:packages/chronos-langchain/src:packages/chronos-langgraph/src:packages/chronos-code/src \
+PYTHONPATH=packages/chronos-core/src \
 pytest -q \
   tests/test_adapter_imports.py \
   tests/test_branching.py \
-  tests/test_postgres_shim.py \
-  tests/chronos_code/unit \
-  tests/chronos_code/integration \
-  --ignore=tests/chronos_code/integration/test_cli_live_e2e.py
-```
-
-Run LangChain Chronos tests:
-
-```bash
-PYTHONPATH=packages/chronos-core/src:packages/chronos-langchain/src:packages/chronos-langgraph/src:packages/chronos-code/src \
-pytest -q -rs tests/langchain_chronos
+  tests/test_branching_schema.py \
+  tests/test_workspace_filesystem.py \
+  tests/test_postgres_shim.py
 ```
 
 Many of these tests require filesystem transaction support. Some filesystem
@@ -510,21 +374,13 @@ docker run --rm -d --name chronos-postgres-test \
   -e POSTGRES_PASSWORD=postgres \
   -e POSTGRES_DB=chronos_test \
   -p 55432:5432 \
-  postgres:16-alpine
+  postgres:18-alpine
 
 CHRONOS_POSTGRES_DSN=postgresql://postgres:postgres@localhost:55432/chronos_test \
-PYTHONPATH=packages/chronos-core/src:packages/chronos-langchain/src:packages/chronos-langgraph/src:packages/chronos-code/src \
+PYTHONPATH=packages/chronos-core/src \
 pytest -q tests/test_postgres_shim.py
 
 docker stop chronos-postgres-test
-```
-
-Run live CLI tests only when model credentials are available:
-
-```bash
-OPENROUTER_API_KEY=... \
-PYTHONPATH=packages/chronos-core/src:packages/chronos-langchain/src:packages/chronos-langgraph/src:packages/chronos-code/src \
-pytest -q tests/chronos_code/integration/test_cli_live_e2e.py
 ```
 
 ## Limitations
@@ -532,13 +388,16 @@ pytest -q tests/chronos_code/integration/test_cli_live_e2e.py
 - The coordinator is currently an in-process coordinator, not a distributed
   transaction manager.
 - Durable transaction metadata is not yet externalized for multi-process use.
-- Branching currently supports shared schema row branching; branch-local schema
-  changes and DDL are not supported.
+- Branch-local schema changes are opt-in with `enable_schema_branching=True`.
+  The strongest coverage is on PostgreSQL. The current DDL support focuses on
+  table-local schema evolution such as adding columns, dropping columns, type
+  changes, and index preservation/copying for branch-local physical tables.
 - `ChronosBranchContext.connect()` currently has SQLite and PostgreSQL database
   adapters. Additional SQL databases need an adapter implementation.
-- Branch write SQL supports a focused subset: `INSERT ... VALUES`, simple
-  `UPDATE` assignments, and `DELETE`. Branch reads can use richer `SELECT`
-  statements because Chronos rewrites table references before execution.
+- Branch write SQL supports a focused DML subset: `INSERT ... VALUES`, simple
+  `UPDATE` assignments and expressions, and `DELETE`. Branch reads can use
+  richer `SELECT` statements because Chronos rewrites table references before
+  execution.
 - The interval backend uses fixed-width integer interval allocation. Very deep
   single-child chains can exhaust interval space without future relabeling or a
   wider numeric representation.
@@ -559,8 +418,6 @@ The design documents in `docs/` describe the broader research direction:
 
 ## Development Guidelines
 
-- Keep `chronos-core` independent of LangChain and LangGraph.
-- Use public LangChain and LangGraph package APIs in adapter packages.
-- Do not depend on internal LangChain or LangGraph module paths.
+- Keep `chronos-core` independent of application frameworks.
 - Keep transaction semantics in shims explicit: begin, prepare, commit, abort,
   savepoint, rollback, and change inspection.

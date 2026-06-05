@@ -66,7 +66,7 @@ update, and insert phases without timing the warmup operation.
 
 By default, `run_branching_experiments.sh` runs PostgreSQL. If
 `CHRONOS_BRANCH_POSTGRES_DSN` or `CHRONOS_BRANCH_DATABASE_URL` is not set, it starts
-a temporary `postgres:16-alpine` Docker container, waits for readiness, runs the
+a temporary `postgres:18-alpine` Docker container, waits for readiness, runs the
 benchmark, and stops the container.
 
 When the runner starts PostgreSQL and Doltgres containers, it uses the same

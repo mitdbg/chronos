@@ -1552,7 +1552,7 @@ The log-table representation should maintain an optional current-state projectio
 
 ```text
 log tables                source of truth, history, time travel
-current-state projection  optimized branch query surface
+current-state projection  optimized branch query path
 ```
 
 Projection options:
