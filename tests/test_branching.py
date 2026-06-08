@@ -3352,6 +3352,81 @@ def test_interval_autocommit_rolls_back_failed_logical_write(
     ctx.close()
 
 
+class UniqueViolation(Exception):
+    pass
+
+
+def _interval_unique_violation() -> UniqueViolation:
+    return UniqueViolation(
+        'duplicate key value violates unique constraint "_chronos_b_interval_products_pkey"'
+    )
+
+
+def test_interval_autocommit_retries_logical_write_on_physical_unique_violation(
+    sql_backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("exp", from_branch="main")
+        session = ctx.checkout("exp")
+        backend = ctx._backend  # type: ignore[attr-defined]
+        original_execute = backend.execute
+        calls = 0
+
+        def flaky_execute(ref, sql, params):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise _interval_unique_violation()
+            return original_execute(ref, sql, params)
+
+        monkeypatch.setattr(backend, "execute", flaky_execute)
+
+        result = session.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 44, "sku": "abc"},
+        )
+
+        assert result.rowcount == 1
+        assert calls == 2
+        assert _product(session, "abc")["price"] == 44
+    finally:
+        ctx.close()
+
+
+def test_interval_explicit_transaction_does_not_retry_physical_unique_violation(
+    sql_backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("exp", from_branch="main")
+        session = ctx.checkout("exp")
+        backend = ctx._backend  # type: ignore[attr-defined]
+        original_execute = backend.execute
+        calls = 0
+
+        def flaky_execute(ref, sql, params):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise _interval_unique_violation()
+            return original_execute(ref, sql, params)
+
+        monkeypatch.setattr(backend, "execute", flaky_execute)
+
+        with pytest.raises(UniqueViolation):
+            with session.transaction():
+                session.execute(
+                    "UPDATE products SET price = :price WHERE sku = :sku",
+                    {"price": 44, "sku": "abc"},
+                )
+
+        assert calls == 1
+        assert _product(session, "abc")["price"] == 10
+    finally:
+        ctx.close()
+
+
 def test_log_backend_branching_shares_log_prefix_and_appends_only_writes(
     sql_backend: str,
 ) -> None:

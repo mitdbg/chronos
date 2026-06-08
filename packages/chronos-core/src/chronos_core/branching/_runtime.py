@@ -7,6 +7,17 @@ from chronos_core.branching._litetree_backend import _LiteTreeBackend
 from chronos_core.branching._log_backend import _LogBackend
 from chronos_core.branching._orpheus_backend import _OrpheusBackend
 
+_INTERVAL_UNIQUE_RETRY_LIMIT = 3
+
+
+def _is_retryable_interval_unique_violation(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "UniqueViolation" in type(exc).__name__
+        or "duplicate key value violates unique constraint" in message
+    ) and "_chronos_b_interval_" in message
+
+
 class BranchSession:
     """Checked-out branch handle used by agents and applications.
 
@@ -48,19 +59,25 @@ class BranchSession:
         self._ensure_fresh()
         if self._transaction_depth == 0 and self._context._db.in_transaction:
             self._context._db.commit()
-        try:
-            result = self._context._backend.execute(self._ref, sql, _ensure_params(params))
-            # Some backends mutate the branch head on write. Refresh the prepared
-            # metadata so later reads in the same session see their own writes.
-            self._ref = self._context._backend.refresh_ref_after_execute(self._ref)
-            self._context._stamp_prepared_ref(self._ref)
-        except Exception:
+        retry_limit = _INTERVAL_UNIQUE_RETRY_LIMIT if self._transaction_depth == 0 else 1
+        for attempt in range(retry_limit):
+            try:
+                result = self._context._backend.execute(self._ref, sql, _ensure_params(params))
+                # Some backends mutate the branch head on write. Refresh the prepared
+                # metadata so later reads in the same session see their own writes.
+                self._ref = self._context._backend.refresh_ref_after_execute(self._ref)
+                self._context._stamp_prepared_ref(self._ref)
+            except Exception as exc:
+                if self._transaction_depth == 0:
+                    self._context._rollback_autocommit()
+                    if attempt + 1 < retry_limit and _is_retryable_interval_unique_violation(exc):
+                        self._ensure_fresh()
+                        continue
+                raise
             if self._transaction_depth == 0:
-                self._context._rollback_autocommit()
-            raise
-        if self._transaction_depth == 0:
-            self._context._commit_autocommit()
-        return result
+                self._context._commit_autocommit()
+            return result
+        raise AssertionError("unreachable")
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[None]:
