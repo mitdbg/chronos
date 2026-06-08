@@ -12,7 +12,12 @@ def _load_branching_transactions_module():
     existing = sys.modules.get(module_name)
     if existing is not None:
         return existing
-    module_path = Path(__file__).resolve().parents[1] / "bench" / "branching_transactions.py"
+    module_path = (
+        Path(__file__).resolve().parents[1]
+        / "bench"
+        / "transactions"
+        / "branching_transactions.py"
+    )
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)

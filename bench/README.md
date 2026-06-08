@@ -6,19 +6,19 @@ the native Doltgres branching baseline.
 Run a quick smoke benchmark:
 
 ```bash
-bench/run_branching_experiments.sh postgres --quick
+bench/branching/run_branching_experiments.sh postgres --quick
 ```
 
 Run the branch-local schema-change benchmark:
 
 ```bash
-bench/run_schema_branching_experiments.sh postgres-doltgres --quick
+bench/schema_branching/run_schema_branching_experiments.sh postgres-doltgres --quick
 ```
 
 Run the single-threaded branching-transaction benchmark:
 
 ```bash
-bench/run_branching_transaction_experiments.sh postgres-doltgres --quick
+bench/transactions/run_branching_transaction_experiments.sh postgres-doltgres --quick
 ```
 
 The branching-transaction benchmark compares three ways to execute one logical
@@ -64,7 +64,7 @@ after the schema change. Before the later steady-state phases, it runs
 default wrapper passes `--warmup-ops 1`, warming point read, range read, count,
 update, and insert phases without timing the warmup operation.
 
-By default, `run_branching_experiments.sh` runs PostgreSQL. If
+By default, `branching/run_branching_experiments.sh` runs PostgreSQL. If
 `CHRONOS_BRANCH_POSTGRES_DSN` or `CHRONOS_BRANCH_DATABASE_URL` is not set, it starts
 a temporary `postgres:18-alpine` Docker container, waits for readiness, runs the
 benchmark, and stops the container.
@@ -75,7 +75,7 @@ resource budget for both:
 ```bash
 CHRONOS_BENCH_DB_MEMORY=10g \
 CHRONOS_BENCH_DB_BUFFER=5g \
-bench/run_branching_experiments.sh all
+bench/branching/run_branching_experiments.sh all
 ```
 
 `CHRONOS_BENCH_DB_MEMORY` is passed as the Docker memory limit for both
@@ -92,31 +92,31 @@ memory cap.
 Run the broader default benchmark:
 
 ```bash
-bench/run_branching_experiments.sh
+bench/branching/run_branching_experiments.sh
 ```
 
 Run SQLite instead:
 
 ```bash
-bench/run_branching_experiments.sh sqlite
+bench/branching/run_branching_experiments.sh sqlite
 ```
 
 Run both SQLite and PostgreSQL:
 
 ```bash
-bench/run_branching_experiments.sh both
+bench/branching/run_branching_experiments.sh both
 ```
 
 Run the native Doltgres baseline:
 
 ```bash
-bench/run_branching_experiments.sh doltgres --backends doltgres
+bench/branching/run_branching_experiments.sh doltgres --backends doltgres
 ```
 
 Run PostgreSQL and Doltgres in one command:
 
 ```bash
-bench/run_branching_experiments.sh postgres-doltgres --backends copy,interval,doltgres
+bench/branching/run_branching_experiments.sh postgres-doltgres --backends copy,interval,doltgres
 ```
 
 `all` is an alias for `postgres-doltgres`. SQLite only runs when you ask for

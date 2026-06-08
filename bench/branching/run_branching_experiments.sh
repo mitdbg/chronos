@@ -6,7 +6,7 @@ usage() {
 Run Chronos branching backend benchmarks for SQLite, PostgreSQL, and/or Doltgres.
 
 Usage:
-  bench/run_branching_experiments.sh [sqlite|postgres|doltgres|postgres-doltgres|both|all] [extra benchmark args...]
+  bench/branching/run_branching_experiments.sh [sqlite|postgres|doltgres|postgres-doltgres|both|all] [extra benchmark args...]
 
 Environment:
   CHRONOS_BRANCH_POSTGRES_DSN     PostgreSQL URL used for the postgres run.
@@ -43,25 +43,35 @@ Defaults:
   branch mutations:   500
 
 Examples:
-  bench/run_branching_experiments.sh
+  bench/branching/run_branching_experiments.sh
 
-  bench/run_branching_experiments.sh sqlite
+  bench/branching/run_branching_experiments.sh sqlite
 
-  bench/run_branching_experiments.sh postgres --backends interval,copy,orpheus
+  bench/branching/run_branching_experiments.sh postgres --backends interval,copy,orpheus
 
-  bench/run_branching_experiments.sh doltgres --backends doltgres
+  bench/branching/run_branching_experiments.sh doltgres --backends doltgres
 
-  bench/run_branching_experiments.sh postgres-doltgres --backends copy,interval,doltgres
+  bench/branching/run_branching_experiments.sh postgres-doltgres --backends copy,interval,doltgres
 
-  bench/run_branching_experiments.sh all
+  bench/branching/run_branching_experiments.sh all
 
-  bench/run_branching_experiments.sh both --backends interval,copy,orpheus,litetree
+  bench/branching/run_branching_experiments.sh both --backends interval,copy,orpheus,litetree
 USAGE
 }
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON:-python3}"
-MODE="${1:-postgres-doltgres}"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+MODE="postgres-doltgres"
+if [[ $# -gt 0 && "${1}" != -* ]]; then
+  MODE="$1"
+  shift
+fi
 POSTGRES_CONTAINER="${CHRONOS_BENCH_POSTGRES_NAME:-chronos-branch-postgres}"
 POSTGRES_IMAGE="${CHRONOS_BENCH_POSTGRES_IMAGE:-postgres:16-alpine}"
 POSTGRES_PORT="${CHRONOS_BENCH_POSTGRES_PORT:-55433}"
@@ -76,11 +86,6 @@ DOLTGRES_IMAGE="${CHRONOS_BENCH_DOLTGRES_IMAGE:-dolthub/doltgresql:latest}"
 DOLTGRES_PORT="${CHRONOS_BENCH_DOLTGRES_PORT:-55437}"
 DOLTGRES_PASSWORD="${CHRONOS_BENCH_DOLTGRES_PASSWORD:-password}"
 DOLTGRES_STARTED_BY_SCRIPT=0
-
-if [[ "${MODE}" == "-h" || "${MODE}" == "--help" ]]; then
-  usage
-  exit 0
-fi
 
 case "${MODE}" in
   sqlite|postgres|doltgres|postgres-doltgres|both|all)
@@ -461,7 +466,7 @@ run_one() {
     cd "${ROOT_DIR}"
     CHRONOS_BRANCH_DATABASE_URL="${database_url}" \
       PYTHONPATH="${PYTHONPATH_VALUE}" \
-      "${PYTHON_BIN}" bench/branching_backends.py \
+      "${PYTHON_BIN}" bench/branching/branching_backends.py \
         "${DEFAULT_ARGS[@]}" \
         --backends "${backend_csv}" \
         --output-dir "${output_dir}" \
@@ -494,7 +499,7 @@ merge_results() {
   (
     cd "${ROOT_DIR}"
     PYTHONPATH="${PYTHONPATH_VALUE}" \
-      "${PYTHON_BIN}" bench/branching_backends.py \
+      "${PYTHON_BIN}" bench/branching/branching_backends.py \
         --summarize-existing \
         --output-dir "${output_dir}"
   )

@@ -6,7 +6,7 @@ usage() {
 Run single-threaded branching-transaction benchmarks.
 
 Usage:
-  bench/run_branching_transaction_experiments.sh [postgres|doltgres|postgres-doltgres] [extra args...]
+  bench/transactions/run_branching_transaction_experiments.sh [postgres|doltgres|postgres-doltgres] [extra args...]
 
 Backends:
   postgres            chronos,native_txn
@@ -43,24 +43,28 @@ Defaults:
   Chronos interval_child_width: 2
 
 Examples:
-  bench/run_branching_transaction_experiments.sh postgres-doltgres
-  bench/run_branching_transaction_experiments.sh postgres --quick
-  bench/run_branching_transaction_experiments.sh postgres-doltgres --dataset-sizes 100000,1000000 --iterations 10
+  bench/transactions/run_branching_transaction_experiments.sh postgres-doltgres
+  bench/transactions/run_branching_transaction_experiments.sh postgres --quick
+  bench/transactions/run_branching_transaction_experiments.sh postgres-doltgres --dataset-sizes 100000,1000000 --iterations 10
 USAGE
 }
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON:-python3}"
-MODE="${1:-postgres-doltgres}"
 
-if [[ "${MODE}" == "-h" || "${MODE}" == "--help" ]]; then
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
 fi
 
+MODE="postgres-doltgres"
+if [[ $# -gt 0 && "${1}" != -* ]]; then
+  MODE="$1"
+  shift
+fi
+
 case "${MODE}" in
   postgres|doltgres|postgres-doltgres)
-    shift || true
     ;;
   *)
     echo "unknown mode: ${MODE}" >&2
@@ -267,7 +271,7 @@ fi
 
 export PYTHONPATH="${ROOT_DIR}/packages/chronos-core/src${PYTHONPATH:+:${PYTHONPATH}}"
 
-"${PYTHON_BIN}" "${ROOT_DIR}/bench/branching_transactions.py" \
+"${PYTHON_BIN}" "${ROOT_DIR}/bench/transactions/branching_transactions.py" \
   --backends "${BACKENDS}" \
   --output-dir "${OUTPUT_DIR}" \
   --postgres-container "${POSTGRES_CONTAINER}" \

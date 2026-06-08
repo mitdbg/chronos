@@ -6,7 +6,7 @@ usage() {
 Run schema-branching benchmarks for Chronos PostgreSQL backends and/or Doltgres.
 
 Usage:
-  bench/run_schema_branching_experiments.sh [postgres|doltgres|postgres-doltgres] [extra benchmark args...]
+  bench/schema_branching/run_schema_branching_experiments.sh [postgres|doltgres|postgres-doltgres] [extra benchmark args...]
 
 Environment:
   CHRONOS_BRANCH_POSTGRES_DSN     PostgreSQL URL used for the Chronos run.
@@ -40,16 +40,26 @@ Defaults:
   warmup ops:    1 before each steady-state post-DDL phase
 
 Examples:
-  bench/run_schema_branching_experiments.sh
-  bench/run_schema_branching_experiments.sh postgres --quick
-  bench/run_schema_branching_experiments.sh postgres-doltgres --dataset-sizes 100000,5000000
-  bench/run_schema_branching_experiments.sh doltgres --ddl-variants default
+  bench/schema_branching/run_schema_branching_experiments.sh
+  bench/schema_branching/run_schema_branching_experiments.sh postgres --quick
+  bench/schema_branching/run_schema_branching_experiments.sh postgres-doltgres --dataset-sizes 100000,5000000
+  bench/schema_branching/run_schema_branching_experiments.sh doltgres --ddl-variants default
 USAGE
 }
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON:-python3}"
-MODE="${1:-postgres-doltgres}"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+MODE="postgres-doltgres"
+if [[ $# -gt 0 && "${1}" != -* ]]; then
+  MODE="$1"
+  shift
+fi
 POSTGRES_CONTAINER="${CHRONOS_BENCH_POSTGRES_NAME:-chronos-schema-postgres}"
 POSTGRES_IMAGE="${CHRONOS_BENCH_POSTGRES_IMAGE:-postgres:16-alpine}"
 POSTGRES_PORT="${CHRONOS_BENCH_POSTGRES_PORT:-55438}"
@@ -65,14 +75,8 @@ DOLTGRES_PORT="${CHRONOS_BENCH_DOLTGRES_PORT:-55439}"
 DOLTGRES_PASSWORD="${CHRONOS_BENCH_DOLTGRES_PASSWORD:-password}"
 DOLTGRES_STARTED_BY_SCRIPT=0
 
-if [[ "${MODE}" == "-h" || "${MODE}" == "--help" ]]; then
-  usage
-  exit 0
-fi
-
 case "${MODE}" in
   postgres|doltgres|postgres-doltgres)
-    shift || true
     ;;
   *)
     echo "unknown mode: ${MODE}" >&2
@@ -269,7 +273,7 @@ run_one() {
     cd "${ROOT_DIR}"
     CHRONOS_BRANCH_DATABASE_URL="${database_url}" \
       PYTHONPATH="${PYTHONPATH_VALUE}" \
-      "${PYTHON_BIN}" bench/schema_branching_backends.py \
+      "${PYTHON_BIN}" bench/schema_branching/schema_branching_backends.py \
         "${DEFAULT_ARGS[@]}" \
         --backends "${backend_csv}" \
         --output-dir "${output_dir}" \
@@ -298,7 +302,7 @@ merge_results() {
   (
     cd "${ROOT_DIR}"
     PYTHONPATH="${PYTHONPATH_VALUE}" \
-      "${PYTHON_BIN}" bench/schema_branching_backends.py \
+      "${PYTHON_BIN}" bench/schema_branching/schema_branching_backends.py \
         --summarize-existing \
         --output-dir "${output_dir}"
   )
