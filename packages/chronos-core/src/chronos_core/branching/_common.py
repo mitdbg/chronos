@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 import operator
-from typing import Any, Iterator, Literal
+from typing import Any, Iterator, Literal, Protocol
 
 import sqlglot
 from sqlglot import exp
@@ -17,6 +17,7 @@ from sqlglot import exp
 from chronos_core.branching.sql_adapters import SQLDatabaseAdapter, connect_sql_database
 
 BranchBackendName = Literal["interval", "log", "copy", "orpheus", "litetree"]
+IntervalAllocationStrategy = Literal["adaptive", "percentage"]
 
 # Interval backends assign branches/subtrees numeric visibility ranges. SQLite
 # is limited to signed 64-bit integers. PostgreSQL can use exact NUMERIC
@@ -27,6 +28,8 @@ _POSTGRES_MAX_INTERVAL = 10**31
 _INTERVAL_CONTINUATION_PERCENT = 5
 _INTERVAL_PERCENT_DENOMINATOR = 100
 _MIN_SPLIT_WIDTH = 2
+_INTERVAL_ADAPTIVE_SQRT_THRESHOLD = 2**32
+_INTERVAL_TERMINAL_CHILD_WIDTH = 2
 _META_PREFIX = "_chronos_branch_"
 _CURRENT_TIMESTAMP_PARAM = "__chronos_current_timestamp"
 
@@ -45,6 +48,12 @@ def _validate_interval_child_width(value: int | None) -> int | None:
     if width < _MIN_SPLIT_WIDTH:
         raise ValueError(f"interval_child_width must be at least {_MIN_SPLIT_WIDTH}")
     return width
+
+
+def _validate_interval_allocation_strategy(value: str) -> IntervalAllocationStrategy:
+    if value not in {"adaptive", "percentage"}:
+        raise ValueError("interval_allocation_strategy must be 'adaptive' or 'percentage'")
+    return value  # type: ignore[return-value]
 
 
 class BranchingError(Exception):
@@ -101,6 +110,7 @@ class RowDiff:
     change: Literal["added", "deleted", "modified"]
     before: dict[str, Any] | None
     after: dict[str, Any] | None
+    conflict_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +139,62 @@ class MergeResult:
     source: str
     target: str
     applied: int
+
+
+@dataclass(frozen=True)
+class MergeContext:
+    source: str
+    target: str
+    backend: str
+    phase: Literal["preview", "apply"]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MergeValidationResult:
+    accepted: bool
+    message: str = ""
+
+    @classmethod
+    def accept(cls) -> "MergeValidationResult":
+        return cls(True)
+
+    @classmethod
+    def reject(cls, message: str) -> "MergeValidationResult":
+        return cls(False, message)
+
+
+class MergeValidator(Protocol):
+    def validate(
+        self, context: MergeContext, preview: MergePreview
+    ) -> MergeValidationResult:
+        ...
+
+
+class MergeResolver(Protocol):
+    def resolve(self, context: MergeContext, preview: MergePreview) -> MergeResolution:
+        ...
+
+
+MergePolicyMode = Literal[
+    "abort_on_conflict",
+    "snapshot_isolation",
+    "source_wins",
+    "target_wins",
+    "manual_review",
+    "custom",
+]
+
+
+@dataclass(frozen=True)
+class MergePolicy:
+    name: str = "abort_on_conflict"
+    mode: MergePolicyMode = "abort_on_conflict"
+    validators: tuple[MergeValidator, ...] = ()
+    resolver: MergeResolver | None = None
+
+
+MergePolicyInput = MergePolicy | MergePolicyMode | str | None
 
 
 @dataclass(frozen=True)
@@ -229,6 +295,157 @@ def _json_loads(value: str | None) -> dict[str, Any]:
     if not value:
         return {}
     return json.loads(value)
+
+
+def _json_stable(value: Any) -> str:
+    return json.dumps(value, default=str, sort_keys=True, separators=(",", ":"))
+
+
+def _merge_conflict_id(diff: RowDiff) -> str:
+    payload = {
+        "table": diff.table,
+        "key": diff.key,
+        "change": diff.change,
+        "before": diff.before,
+        "after": diff.after,
+    }
+    return hashlib.sha1(_json_stable(payload).encode("utf-8")).hexdigest()
+
+
+def _with_merge_conflict_ids(preview: MergePreview) -> MergePreview:
+    conflicts = [
+        diff if diff.conflict_id else RowDiff(
+            diff.table,
+            diff.key,
+            diff.change,
+            diff.before,
+            diff.after,
+            _merge_conflict_id(diff),
+        )
+        for diff in preview.conflicts
+    ]
+    return MergePreview(
+        source=preview.source,
+        target=preview.target,
+        changes=preview.changes,
+        conflicts=conflicts,
+        resolution=preview.resolution,
+    )
+
+
+def _normalize_merge_policy(policy: MergePolicyInput) -> MergePolicy:
+    if policy is None:
+        return MergePolicy()
+    if isinstance(policy, MergePolicy):
+        return policy
+    modes = {
+        "abort_on_conflict",
+        "snapshot_isolation",
+        "source_wins",
+        "target_wins",
+        "manual_review",
+        "custom",
+    }
+    if policy not in modes:
+        raise BranchingError(f"unknown merge policy: {policy}")
+    return MergePolicy(name=str(policy), mode=policy)  # type: ignore[arg-type]
+
+
+def _default_resolution_for_policy(
+    policy: MergePolicy, preview: MergePreview
+) -> MergeResolution:
+    if policy.mode == "source_wins":
+        return MergeResolution(
+            {
+                conflict.conflict_id: "source"
+                for conflict in preview.conflicts
+                if conflict.conflict_id is not None
+            }
+        )
+    if policy.mode == "target_wins":
+        return MergeResolution(
+            {
+                conflict.conflict_id: "target"
+                for conflict in preview.conflicts
+                if conflict.conflict_id is not None
+            }
+        )
+    return MergeResolution()
+
+
+def _preview_with_merge_policy(
+    preview: MergePreview,
+    policy: MergePolicyInput = None,
+    *,
+    backend: str,
+) -> MergePreview:
+    normalized = _normalize_merge_policy(policy)
+    preview = _with_merge_conflict_ids(preview)
+    context = MergeContext(preview.source, preview.target, backend, "preview")
+    resolution = _default_resolution_for_policy(normalized, preview)
+    if normalized.mode == "custom" and normalized.resolver is not None:
+        resolution = normalized.resolver.resolve(context, preview)
+    return MergePreview(
+        source=preview.source,
+        target=preview.target,
+        changes=preview.changes,
+        conflicts=preview.conflicts,
+        resolution=resolution,
+    )
+
+
+def _resolve_merge_changes(
+    preview: MergePreview,
+    policy: MergePolicyInput,
+    resolution: MergeResolution | None,
+    *,
+    backend: str,
+) -> list[RowDiff]:
+    normalized = _normalize_merge_policy(policy)
+    preview = _with_merge_conflict_ids(preview)
+    context = MergeContext(preview.source, preview.target, backend, "apply")
+    for validator in normalized.validators:
+        result = validator.validate(context, preview)
+        if not result.accepted:
+            message = result.message or "merge validation failed"
+            raise BranchingError(message)
+
+    active_resolution = resolution
+    if active_resolution is None:
+        active_resolution = _default_resolution_for_policy(normalized, preview)
+    if active_resolution is None:
+        active_resolution = MergeResolution()
+
+    current_conflicts = {
+        conflict.conflict_id: conflict
+        for conflict in preview.conflicts
+        if conflict.conflict_id is not None
+    }
+    stale_ids = set(active_resolution.conflict_choices) - set(current_conflicts)
+    if stale_ids:
+        raise BranchingError(
+            "merge resolution is stale for conflicts: "
+            + ", ".join(sorted(stale_ids))
+        )
+
+    if normalized.mode in {"abort_on_conflict", "snapshot_isolation"} and preview.conflicts:
+        raise BranchingError("merge has unresolved conflicts")
+    if normalized.mode == "manual_review" and preview.conflicts and resolution is None:
+        raise BranchingError("merge requires an explicit resolution")
+
+    resolved = list(preview.changes)
+    for conflict in preview.conflicts:
+        assert conflict.conflict_id is not None
+        choice = active_resolution.conflict_choices.get(conflict.conflict_id)
+        if choice is None:
+            raise BranchingError(f"merge conflict is unresolved: {conflict.conflict_id}")
+        if choice in {"target", "ours", "skip"}:
+            continue
+        if choice in {"source", "theirs"}:
+            resolved.append(conflict)
+            continue
+        raise BranchingError(f"unsupported merge conflict choice: {choice}")
+    return resolved
 
 
 def _quote(identifier: str) -> str:
@@ -657,7 +874,12 @@ class _SQLBranchBackend:
         raise NotImplementedError
 
     def create_branch(
-        self, branch_id: str, from_branch: str, metadata: dict[str, Any] | None = None
+        self,
+        branch_id: str,
+        from_branch: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        terminal: bool = False,
     ) -> None:
         raise NotImplementedError
 

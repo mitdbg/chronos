@@ -195,6 +195,7 @@ class ChronosBranchContext:
         autocommit: bool = True,
         interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         interval_child_width: int | None = None,
+        interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
         enable_diff_merge_tracking: bool = False,
@@ -206,6 +207,7 @@ class ChronosBranchContext:
             autocommit=autocommit,
             interval_continuation_percent=interval_continuation_percent,
             interval_child_width=interval_child_width,
+            interval_allocation_strategy=interval_allocation_strategy,
             ensure_metadata=ensure_metadata,
             enable_schema_branching=enable_schema_branching,
             enable_diff_merge_tracking=enable_diff_merge_tracking,
@@ -219,6 +221,7 @@ class ChronosBranchContext:
         autocommit: bool = True,
         interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         interval_child_width: int | None = None,
+        interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
         enable_diff_merge_tracking: bool = False,
@@ -229,6 +232,7 @@ class ChronosBranchContext:
                     db,
                     continuation_percent=interval_continuation_percent,
                     child_width=interval_child_width,
+                    allocation_strategy=interval_allocation_strategy,
                     enable_schema_branching=enable_schema_branching,
                 )
             if enable_schema_branching and backend not in {"copy", "orpheus"}:
@@ -322,9 +326,13 @@ class ChronosBranchContext:
         branch_id: str,
         from_branch: str = "main",
         metadata: dict[str, Any] | None = None,
+        *,
+        terminal: bool = False,
     ) -> None:
         try:
-            self._backend.create_branch(branch_id, from_branch, metadata)
+            self._backend.create_branch(
+                branch_id, from_branch, metadata, terminal=terminal
+            )
         except Exception:
             self._rollback_autocommit()
             raise
@@ -465,19 +473,37 @@ class ChronosBranchContext:
                 diffs.append(RowDiff(table, key_dict, "modified", before, after))
         return diffs
 
-    def merge_preview(self, source: str, target: str) -> MergePreview:
+    def merge_preview(
+        self, source: str, target: str, *, policy: MergePolicyInput = None
+    ) -> MergePreview:
         backend_preview = self._backend.merge_preview(source, target)
         if backend_preview is not None:
-            return backend_preview
+            return _preview_with_merge_policy(
+                backend_preview, policy, backend=self._backend.name
+            )
         changes = self.diff(target, source).changes
-        return MergePreview(source=source, target=target, changes=changes, conflicts=[])
+        return _preview_with_merge_policy(
+            MergePreview(source=source, target=target, changes=changes, conflicts=[]),
+            policy,
+            backend=self._backend.name,
+        )
 
     def merge_apply(
         self,
         source: str,
         target: str,
         resolution: MergeResolution | None = None,
+        *,
+        policy: MergePolicyInput = None,
     ) -> MergeResult:
+        normalized_policy = _normalize_merge_policy(policy)
+        if self._backend.name == "orpheus" and (
+            normalized_policy.mode != "abort_on_conflict"
+            or (resolution is not None and resolution.conflict_choices)
+        ):
+            raise BranchingError(
+                "custom merge policies are not yet supported by the Orpheus backend"
+            )
         try:
             backend_result = self._backend.merge_apply(source, target, resolution)
         except Exception:
@@ -491,9 +517,10 @@ class ChronosBranchContext:
         target_session = self.checkout(target)
         with target_session.transaction():
             preview = self.merge_preview(source, target)
-            if preview.conflicts and resolution is None:
-                raise BranchingError("merge has unresolved conflicts")
-            applied = self._apply_merge_changes(target_session, preview.changes)
+            changes = _resolve_merge_changes(
+                preview, normalized_policy, resolution, backend=self._backend.name
+            )
+            applied = self._apply_merge_changes(target_session, changes)
         return MergeResult(source=source, target=target, applied=applied)
 
     def _apply_merge_changes(

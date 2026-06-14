@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import glob
+import math
 import os
 import subprocess
 import tempfile
@@ -15,6 +16,9 @@ from chronos_core.branching import (
     BranchNotFoundError,
     BranchingError,
     DuplicateKeyError,
+    MergePolicy,
+    MergeResolution,
+    MergeValidationResult,
     TableNotRegisteredError,
     ChronosBranchContext,
 )
@@ -1048,17 +1052,25 @@ def test_postgres_interval_concurrent_wide_branch_creation_serializes_parent() -
         ctx.close()
 
 
-def test_interval_split_default_favors_depth_and_can_be_configured_for_width() -> None:
+def test_interval_split_default_uses_adaptive_sqrt_before_percentage() -> None:
     default_ctx = _make_products_only_context("sqlite", "interval")
     try:
         default_backend = default_ctx._backend  # type: ignore[attr-defined]
         assert default_backend.continuation_percent == 5
+        assert default_backend.allocation_strategy == "adaptive"
+        initial_main = default_backend._current_segment("main")
+        default_ctx.create_branch("wide_child", from_branch="main")
+        child = default_backend._current_segment("wide_child")
+        assert child.live_hi - child.live_lo == math.isqrt(
+            initial_main.live_hi - initial_main.live_lo - 1
+        )
     finally:
         default_ctx.close()
 
     wide_ctx = ChronosBranchContext.connect(
         "sqlite:///:memory:",
         backend="interval",
+        interval_allocation_strategy="percentage",
         interval_continuation_percent=98,
     )
     try:
@@ -1070,6 +1082,7 @@ def test_interval_split_default_favors_depth_and_can_be_configured_for_width() -
         wide_ctx.register_table("products", ["sku"])
         wide_backend = wide_ctx._backend  # type: ignore[attr-defined]
         assert wide_backend.continuation_percent == 98
+        assert wide_backend.allocation_strategy == "percentage"
 
         for index in range(30):
             wide_ctx.create_branch(f"trial_{index}", from_branch="main")
@@ -1084,6 +1097,57 @@ def test_interval_split_default_favors_depth_and_can_be_configured_for_width() -
         assert _product(wide_ctx.checkout("main"), "abc")["price"] == 10
     finally:
         wide_ctx.close()
+
+
+def test_interval_terminal_branch_uses_minimal_width_and_cannot_branch() -> None:
+    ctx = ChronosBranchContext.connect("sqlite:///:memory:", backend="interval")
+    try:
+        ctx.db.execute(
+            "CREATE TABLE products (sku TEXT PRIMARY KEY, name TEXT, price INTEGER)"
+        )
+        ctx.db.execute("INSERT INTO products VALUES (?, ?, ?)", ("abc", "Alpha", 10))
+        ctx.db.commit()
+        ctx.register_table("products", ["sku"])
+        initial_main = ctx._backend._current_segment("main")  # type: ignore[attr-defined]
+
+        for index in range(10):
+            ctx.create_branch(f"txn_{index}", from_branch="main", terminal=True)
+
+        main_segment = ctx._backend._current_segment("main")  # type: ignore[attr-defined]
+        assert main_segment.live_lo - initial_main.live_lo == 30
+        assert main_segment.live_hi == initial_main.live_hi
+
+        child_rows = ctx.db.execute(
+            """
+            SELECT b.branch_id, b.branch_kind, s.live_lo, s.live_hi,
+                   s.live_hi - s.live_lo AS width
+            FROM _chronos_branch_interval_branches AS b
+            JOIN _chronos_branch_interval_segments AS s
+              ON s.segment_id = b.current_segment_id
+            WHERE b.branch_id LIKE 'txn_%'
+            ORDER BY b.branch_id
+            """
+        ).fetchall()
+        assert [row["branch_kind"] for row in child_rows] == ["terminal"] * 10
+        assert [int(row["width"]) for row in child_rows] == [2] * 10
+        assert [int(row["live_lo"]) for row in child_rows] == [
+            initial_main.live_lo + 1 + index * 3 for index in range(10)
+        ]
+
+        terminal = ctx.checkout("txn_9")
+        terminal.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 99, "sku": "abc"},
+        )
+        assert _product(terminal, "abc")["price"] == 99
+        assert _product(ctx.checkout("main"), "abc")["price"] == 10
+
+        with pytest.raises(BranchingError, match="terminal branch is not branchable"):
+            ctx.create_branch("bad_child", from_branch="txn_9")
+        with pytest.raises(BranchingError, match="terminal branch cannot be checkpointed"):
+            ctx.create_checkpoint("bad_checkpoint", branch="txn_9")
+    finally:
+        ctx.close()
 
 
 def test_interval_split_can_use_fixed_child_width_for_serial_transactions() -> None:
@@ -1166,6 +1230,15 @@ def test_interval_split_rejects_invalid_child_width() -> None:
             "sqlite:///:memory:",
             backend="interval",
             interval_child_width=1,
+        )
+
+
+def test_interval_split_rejects_invalid_allocation_strategy() -> None:
+    with pytest.raises(ValueError):
+        ChronosBranchContext.connect(
+            "sqlite:///:memory:",
+            backend="interval",
+            interval_allocation_strategy="unknown",  # type: ignore[arg-type]
         )
 
 
@@ -2419,6 +2492,303 @@ def test_interval_merge_apply_conflict_rolls_back_clean_changes(sql_backend: str
 
         assert _product(main, "abc")["price"] == 12
         assert _product(main, "def")["price"] == 20
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_price", "expected_applied"),
+    [
+        ("source_wins", 11, 1),
+        ("target_wins", 12, 0),
+    ],
+)
+def test_interval_merge_builtin_conflict_policies(
+    sql_backend: str, policy: str, expected_price: int, expected_applied: int
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+
+        preview = ctx.merge_preview(source="agent", target="main", policy=policy)
+        assert len(preview.conflicts) == 1
+        assert preview.conflicts[0].conflict_id
+
+        result = ctx.merge_apply(source="agent", target="main", policy=policy)
+
+        assert result.applied == expected_applied
+        assert _product(ctx.checkout("main"), "abc")["price"] == expected_price
+    finally:
+        ctx.close()
+
+
+def test_interval_merge_snapshot_isolation_rejects_write_write_conflict(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+
+        with pytest.raises(BranchingError):
+            ctx.merge_apply(source="agent", target="main", policy="snapshot_isolation")
+
+        assert _product(main, "abc")["price"] == 12
+    finally:
+        ctx.close()
+
+
+def test_interval_manual_review_resolution_is_revalidated(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+
+        preview = ctx.merge_preview(source="agent", target="main", policy="manual_review")
+        conflict_id = preview.conflicts[0].conflict_id
+        assert conflict_id is not None
+        resolution = MergeResolution({conflict_id: "source"})
+
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 13},
+        )
+        with pytest.raises(BranchingError, match="stale"):
+            ctx.merge_apply(
+                source="agent",
+                target="main",
+                policy="manual_review",
+                resolution=resolution,
+            )
+
+        assert _product(main, "abc")["price"] == 13
+    finally:
+        ctx.close()
+
+
+def test_interval_manual_review_resolution_applies_source_choice(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+
+        preview = ctx.merge_preview(source="agent", target="main", policy="manual_review")
+        conflict_id = preview.conflicts[0].conflict_id
+        assert conflict_id is not None
+        result = ctx.merge_apply(
+            source="agent",
+            target="main",
+            policy="manual_review",
+            resolution=MergeResolution({conflict_id: "source"}),
+        )
+
+        assert result.applied == 1
+        assert _product(main, "abc")["price"] == 11
+    finally:
+        ctx.close()
+
+
+def test_interval_custom_validator_rejects_and_rolls_back(
+    sql_backend: str,
+) -> None:
+    class RejectExpensiveMerge:
+        def validate(self, context, preview):
+            assert context.backend == "interval"
+            assert context.phase == "apply"
+            for change in preview.changes:
+                if change.after is not None and change.after["price"] > 100:
+                    return MergeValidationResult.reject("price too high")
+            return MergeValidationResult.accept()
+
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 101},
+        )
+        agent.execute("DELETE FROM products WHERE sku = :sku", {"sku": "def"})
+        policy = MergePolicy(
+            name="reject_expensive",
+            mode="custom",
+            validators=(RejectExpensiveMerge(),),
+        )
+
+        with pytest.raises(BranchingError, match="price too high"):
+            ctx.merge_apply(source="agent", target="main", policy=policy)
+
+        main = ctx.checkout("main")
+        assert _product(main, "abc")["price"] == 10
+        assert _product(main, "def")["price"] == 20
+    finally:
+        ctx.close()
+
+
+def test_interval_custom_resolver_source_wins(
+    sql_backend: str,
+) -> None:
+    class SourceResolver:
+        def resolve(self, context, preview):
+            assert context.backend == "interval"
+            return MergeResolution(
+                {
+                    conflict.conflict_id: "source"
+                    for conflict in preview.conflicts
+                    if conflict.conflict_id is not None
+                }
+            )
+
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+        policy = MergePolicy(name="source_resolver", mode="custom", resolver=SourceResolver())
+        preview = ctx.merge_preview(source="agent", target="main", policy=policy)
+
+        result = ctx.merge_apply(
+            source="agent",
+            target="main",
+            policy=policy,
+            resolution=preview.resolution,
+        )
+
+        assert result.applied == 1
+        assert _product(main, "abc")["price"] == 11
+    finally:
+        ctx.close()
+
+
+def test_interval_custom_resolver_is_not_called_inside_apply(
+    sql_backend: str,
+) -> None:
+    class FailingResolver:
+        def resolve(self, context, preview):
+            raise AssertionError("resolver must run during preview, not atomic apply")
+
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+        policy = MergePolicy(name="failing_resolver", mode="custom", resolver=FailingResolver())
+
+        with pytest.raises(BranchingError, match="unresolved"):
+            ctx.merge_apply(source="agent", target="main", policy=policy)
+
+        assert _product(main, "abc")["price"] == 12
+    finally:
+        ctx.close()
+
+
+def test_interval_snapshot_isolation_many_branch_transactions(
+    sql_backend: str,
+) -> None:
+    if sql_backend == "postgres":
+        _reset_postgres_schema()
+    ctx = ChronosBranchContext.connect(
+        _database_url(sql_backend, "interval"),
+        backend="interval",
+        interval_child_width=2,
+    )
+    try:
+        ctx.db.execute("CREATE TABLE items (id TEXT PRIMARY KEY, quantity INTEGER)")
+        ctx.db.executemany(
+            "INSERT INTO items VALUES (?, ?)",
+            [(f"item:{idx}", idx) for idx in range(100)],
+        )
+        ctx.db.commit()
+        ctx.register_table("items", ["id"])
+
+        for iteration in range(200):
+            branch_id = f"txn_{iteration}"
+            key = f"item:{iteration % 100}"
+            ctx.create_branch(branch_id, from_branch="main")
+            branch = ctx.checkout(branch_id)
+            with branch.transaction():
+                assert branch.query(
+                    "SELECT quantity FROM items WHERE id = :id",
+                    {"id": key},
+                )
+                branch.execute(
+                    """
+                    UPDATE items
+                    SET quantity = quantity + 1
+                    WHERE id = :id
+                    """,
+                    {"id": key},
+                )
+            result = ctx.merge_apply(
+                source=branch_id,
+                target="main",
+                policy="snapshot_isolation",
+            )
+            assert result.applied == 1
+            ctx.delete_branch(branch_id)
+        ctx.wait_for_background_work()
+
+        rows = ctx.checkout("main").query(
+            "SELECT SUM(quantity) AS total FROM items"
+        )
+        assert rows == [{"total": 5150}]
     finally:
         ctx.close()
 

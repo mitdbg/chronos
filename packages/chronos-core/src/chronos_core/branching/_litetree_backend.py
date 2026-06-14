@@ -88,8 +88,15 @@ class _LiteTreeBackend(_SQLBranchBackend):
         return IndexInfo(index.name, index.table, index.columns, index.backend)
 
     def create_branch(
-        self, branch_id: str, from_branch: str, metadata: dict[str, Any] | None = None
+        self,
+        branch_id: str,
+        from_branch: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        terminal: bool = False,
     ) -> None:
+        if terminal:
+            raise BranchingError("terminal branches are supported only by the interval backend")
         self._validate_branch_name(branch_id)
         if branch_id in self._native_branches():
             raise BranchAlreadyExistsError(branch_id)

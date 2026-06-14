@@ -143,8 +143,15 @@ class _CopyBackend(_SQLBranchBackend):
         return IndexInfo(index.name, index.table, index.columns, index.backend)
 
     def create_branch(
-        self, branch_id: str, from_branch: str, metadata: dict[str, Any] | None = None
+        self,
+        branch_id: str,
+        from_branch: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        terminal: bool = False,
     ) -> None:
+        if terminal:
+            raise BranchingError("terminal branches are supported only by the interval backend")
         if self._branch_row(branch_id) is not None:
             raise BranchAlreadyExistsError(branch_id)
         if self._branch_row(from_branch) is None:

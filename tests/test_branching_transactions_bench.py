@@ -27,7 +27,7 @@ def _load_branching_transactions_module():
     return module
 
 
-def _small_case(backend: str):
+def _small_case(backend: str, *, delete_branches: bool = True):
     bench = _load_branching_transactions_module()
     return bench.TxnCase(
         backend=backend,
@@ -36,7 +36,7 @@ def _small_case(backend: str):
         changes=2,
         read_count=3,
         warmup_iterations=3,
-        delete_branches=True,
+        delete_branches=delete_branches,
         interval_child_width=2,
     )
 
@@ -51,17 +51,18 @@ def test_branching_transaction_defaults_do_not_include_orpheus() -> None:
 def test_chronos_interval_branching_transactions_match_native() -> None:
     bench = _load_branching_transactions_module()
     dsn = _postgres_dsn()
-    native_case = _small_case("native_txn")
-    chronos_case = _small_case("chronos")
+    for delete_branches in (False, True):
+        native_case = _small_case("native_txn", delete_branches=delete_branches)
+        chronos_case = _small_case("chronos", delete_branches=delete_branches)
 
-    reference = bench.run_native_txn_final_state(dsn, native_case)
-    actual = bench.run_chronos_final_state(dsn, chronos_case)
+        reference = bench.run_native_txn_final_state(dsn, native_case)
+        actual = bench.run_chronos_final_state(dsn, chronos_case)
 
-    assert bench.verification_message(reference, actual) == "ok"
-    row = bench.verification_row(chronos_case, reference, actual)
-    assert row["matched"] is True
-    assert row["reference_row_count"] == row["backend_row_count"] == 1_000
-    assert row["reference_changed_rows"] == row["backend_changed_rows"] == 10
+        assert bench.verification_message(reference, actual) == "ok"
+        row = bench.verification_row(chronos_case, reference, actual)
+        assert row["matched"] is True
+        assert row["reference_row_count"] == row["backend_row_count"] == 1_000
+        assert row["reference_changed_rows"] == row["backend_changed_rows"] == 10
 
 
 def test_orpheus_branching_transactions_match_native() -> None:

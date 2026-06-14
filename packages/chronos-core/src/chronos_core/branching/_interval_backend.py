@@ -3,6 +3,7 @@ from __future__ import annotations
 from chronos_core.branching._common import *
 
 import concurrent.futures
+import math
 import os
 import threading
 
@@ -284,6 +285,7 @@ class _IntervalBackend(_SQLBranchBackend):
         db: SQLDatabaseAdapter,
         continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         child_width: int | None = None,
+        allocation_strategy: IntervalAllocationStrategy = "adaptive",
         enable_schema_branching: bool = False,
     ):
         super().__init__(db)
@@ -291,6 +293,9 @@ class _IntervalBackend(_SQLBranchBackend):
             continuation_percent
         )
         self.child_width = _validate_interval_child_width(child_width)
+        self.allocation_strategy = _validate_interval_allocation_strategy(
+            allocation_strategy
+        )
         self.enable_schema_branching = bool(enable_schema_branching)
         self.async_schema_indexes = (
             self.db.dialect == "postgres" and _async_schema_index_enabled_by_env()
@@ -375,6 +380,7 @@ class _IntervalBackend(_SQLBranchBackend):
               current_segment_id INTEGER NOT NULL,
               parent_branch_id TEXT,
               child_count INTEGER NOT NULL DEFAULT 0,
+              branch_kind TEXT NOT NULL DEFAULT 'mutable',
               created_at TEXT NOT NULL,
               metadata TEXT NOT NULL
             )
@@ -385,6 +391,7 @@ class _IntervalBackend(_SQLBranchBackend):
         )
         added_parent_branch_id = "parent_branch_id" not in branch_columns
         added_child_count = "child_count" not in branch_columns
+        added_branch_kind = "branch_kind" not in branch_columns
         if "parent_branch_id" not in branch_columns:
             self.db.execute(
                 """
@@ -397,6 +404,13 @@ class _IntervalBackend(_SQLBranchBackend):
                 """
                 ALTER TABLE _chronos_branch_interval_branches
                 ADD COLUMN child_count INTEGER NOT NULL DEFAULT 0
+                """
+            )
+        if "branch_kind" not in branch_columns:
+            self.db.execute(
+                """
+                ALTER TABLE _chronos_branch_interval_branches
+                ADD COLUMN branch_kind TEXT NOT NULL DEFAULT 'mutable'
                 """
             )
         self.db.execute(
@@ -455,10 +469,10 @@ class _IntervalBackend(_SQLBranchBackend):
             )
             self.db.execute(
                 """
-                INSERT INTO _chronos_branch_interval_branches
-                (branch_id, current_segment_id, parent_branch_id, child_count,
+            INSERT INTO _chronos_branch_interval_branches
+                (branch_id, current_segment_id, parent_branch_id, child_count, branch_kind,
                  created_at, metadata)
-                VALUES (?, ?, NULL, 0, ?, ?)
+                VALUES (?, ?, NULL, 0, 'mutable', ?, ?)
                 """,
                 ("main", segment, _utc_now(), "{}"),
             )
@@ -1118,27 +1132,43 @@ class _IntervalBackend(_SQLBranchBackend):
             self.db.execute(sql)
 
     def create_branch(
-        self, branch_id: str, from_branch: str, metadata: dict[str, Any] | None = None
+        self,
+        branch_id: str,
+        from_branch: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        terminal: bool = False,
     ) -> None:
-        self._create_branch_unlocked(branch_id, from_branch, metadata)
+        self._create_branch_unlocked(branch_id, from_branch, metadata, terminal=terminal)
 
     def _create_branch_unlocked(
-        self, branch_id: str, from_branch: str, metadata: dict[str, Any] | None = None
+        self,
+        branch_id: str,
+        from_branch: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        terminal: bool = False,
     ) -> None:
         if self.db.dialect == "postgres":
-            self._create_branch_postgres_locked(branch_id, from_branch, metadata)
+            self._create_branch_postgres_locked(
+                branch_id, from_branch, metadata, terminal=terminal
+            )
             return
         if self._branch_row(branch_id) is not None:
             raise BranchAlreadyExistsError(branch_id)
         source = self._branch_row(from_branch)
         if source is None:
             raise BranchNotFoundError(from_branch)
+        if source["branch_kind"] == "terminal":
+            raise BranchingError(f"terminal branch is not branchable: {from_branch}")
         source_segment = self._segment(source["current_segment_id"])
         # Branching splits the source segment into two mutable descendants plus
         # a one-point immutable fork base. The fork base is the stable merge base
         # for the two mutable branches; it is readable but never writable or
         # branchable.
-        continuation, child, fork_base = self._split_segment_with_fork_base(source_segment)
+        continuation, child, fork_base = self._split_segment_with_fork_base(
+            source_segment, terminal=terminal
+        )
         now = _utc_now()
         self._insert_segment(fork_base, source_segment.segment_id, None, "fork_base", now)
         self._insert_segment(continuation, fork_base["segment_id"], from_branch, "mutable", now)
@@ -1155,15 +1185,27 @@ class _IntervalBackend(_SQLBranchBackend):
         self.db.execute(
             """
             INSERT INTO _chronos_branch_interval_branches
-            (branch_id, current_segment_id, parent_branch_id, child_count,
+            (branch_id, current_segment_id, parent_branch_id, child_count, branch_kind,
              created_at, metadata)
-            VALUES (?, ?, ?, 0, ?, ?)
+            VALUES (?, ?, ?, 0, ?, ?, ?)
             """,
-            (branch_id, child["segment_id"], from_branch, now, _json_dumps(metadata)),
+            (
+                branch_id,
+                child["segment_id"],
+                from_branch,
+                "terminal" if terminal else "mutable",
+                now,
+                _json_dumps(metadata),
+            ),
         )
 
     def _create_branch_postgres_locked(
-        self, branch_id: str, from_branch: str, metadata: dict[str, Any] | None = None
+        self,
+        branch_id: str,
+        from_branch: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        terminal: bool = False,
     ) -> None:
         """Create a branch while serializing concurrent forks of one parent.
 
@@ -1185,8 +1227,12 @@ class _IntervalBackend(_SQLBranchBackend):
         ).fetchone()
         if source is None:
             raise BranchNotFoundError(from_branch)
+        if source["branch_kind"] == "terminal":
+            raise BranchingError(f"terminal branch is not branchable: {from_branch}")
         source_segment = self._segment(source["current_segment_id"])
-        continuation, child, fork_base = self._split_segment_with_fork_base(source_segment)
+        continuation, child, fork_base = self._split_segment_with_fork_base(
+            source_segment, terminal=terminal
+        )
         now = _utc_now()
         raw = self.db.raw_connection
         if not hasattr(raw, "pipeline"):
@@ -1245,11 +1291,18 @@ class _IntervalBackend(_SQLBranchBackend):
             self.db.execute(
                 """
                 INSERT INTO _chronos_branch_interval_branches
-                (branch_id, current_segment_id, parent_branch_id, child_count,
+                (branch_id, current_segment_id, parent_branch_id, child_count, branch_kind,
                  created_at, metadata)
-                VALUES (?, ?, ?, 0, ?, ?)
+                VALUES (?, ?, ?, 0, ?, ?, ?)
                 """,
-                (branch_id, child["segment_id"], from_branch, now, _json_dumps(metadata)),
+                (
+                    branch_id,
+                    child["segment_id"],
+                    from_branch,
+                    "terminal" if terminal else "mutable",
+                    now,
+                    _json_dumps(metadata),
+                ),
             )
 
     def create_branch_from_checkpoint(self, branch_id: str, checkpoint: str) -> None:
@@ -1300,9 +1353,9 @@ class _IntervalBackend(_SQLBranchBackend):
         self.db.execute(
             """
             INSERT INTO _chronos_branch_interval_branches
-            (branch_id, current_segment_id, parent_branch_id, child_count,
+            (branch_id, current_segment_id, parent_branch_id, child_count, branch_kind,
              created_at, metadata)
-            VALUES (?, ?, ?, 0, ?, ?)
+            VALUES (?, ?, ?, 0, 'mutable', ?, ?)
             """,
             (branch_id, child["segment_id"], cp["branch_id"], now, "{}"),
         )
@@ -1448,6 +1501,8 @@ class _IntervalBackend(_SQLBranchBackend):
         source = self._branch_row_for_update(branch)
         if source is None:
             raise BranchNotFoundError(branch)
+        if source["branch_kind"] == "terminal":
+            raise BranchingError(f"terminal branch cannot be checkpointed: {branch}")
         source_segment = self._segment(source["current_segment_id"])
         # A checkpoint is a read-only segment cut from the current branch. The
         # mutable branch keeps the continuation segment, so later branch writes
@@ -3960,7 +4015,7 @@ class _IntervalBackend(_SQLBranchBackend):
         )
 
     def _split_segment_with_fork_base(
-        self, segment: _IntervalSegment
+        self, segment: _IntervalSegment, *, terminal: bool = False
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         lo = segment.live_lo
         hi = segment.live_hi
@@ -3973,17 +4028,33 @@ class _IntervalBackend(_SQLBranchBackend):
             raise BranchingError("interval space exhausted")
         fork_base_hi = lo + 1
         width = hi - fork_base_hi
-        if self.child_width is None:
+        if terminal:
+            # Terminal branches are private workspaces that can be written,
+            # merged, and deleted, but never forked. Width 2 is the minimum
+            # mutable segment, so flat branch-transaction/simulation workloads
+            # maximize root fanout without affecting read predicates.
+            child_width = _INTERVAL_TERMINAL_CHILD_WIDTH
+        elif self.child_width is not None:
+            # Compatibility path for existing benchmark harnesses. Public
+            # branch creation should use terminal=True instead of numeric widths.
+            child_width = self.child_width
+        elif (
+            self.allocation_strategy == "adaptive"
+            and width > _INTERVAL_ADAPTIVE_SQRT_THRESHOLD
+        ):
+            # Adaptive allocation optimizes for shallow, wide trees near the
+            # root without requiring users to choose a maximum depth. A child
+            # gets sqrt(width), so the parent can create about sqrt(width)
+            # siblings while each child receives comparable future capacity.
+            child_width = math.isqrt(width)
+        else:
+            # Once a segment is below the sqrt threshold, switch back to the
+            # existing depth-biased split. This gives long descendant chains
+            # without asking users to provide a max-depth budget.
             continuation_width = (
                 width * self.continuation_percent
             ) // _INTERVAL_PERCENT_DENOMINATOR
             child_width = width - continuation_width
-        else:
-            # Branch-transaction workloads repeatedly fork short-lived children
-            # from one durable branch. Percentage splits decay geometrically in
-            # that shape, so fixed child widths consume interval space linearly:
-            # parent loses child_width plus the one-unit immutable fork base.
-            child_width = self.child_width
         child_width = max(_MIN_SPLIT_WIDTH, min(width - _MIN_SPLIT_WIDTH, child_width))
         child_hi = fork_base_hi + child_width
         (

@@ -627,7 +627,11 @@ def run_chronos_case(
             branch_id = f"{prefix}_{case.dataset_size}_{iteration}"
             total = Timer()
             phase = Timer()
-            ctx.create_branch(branch_id, from_branch="main")
+            ctx.create_branch(
+                branch_id,
+                from_branch="main",
+                terminal=branch_backend == "interval",
+            )
             branch_create_ms = phase.lap_ms()
             if measured:
                 record(detail_rows, case, iteration, "branch_create", branch_create_ms)
@@ -640,7 +644,10 @@ def run_chronos_case(
             if measured:
                 record(detail_rows, case, iteration, "branch_workload", branch_workload_ms, rows_read=rows_read)
 
-            result = ctx.merge_apply(source=branch_id, target="main")
+            merge_kwargs = (
+                {"policy": "snapshot_isolation"} if branch_backend == "interval" else {}
+            )
+            result = ctx.merge_apply(source=branch_id, target="main", **merge_kwargs)
             merge_apply_ms = phase.lap_ms()
             if measured:
                 record(
@@ -781,11 +788,18 @@ def run_chronos_final_state(
 
         def run_one(iteration: int, *, prefix: str) -> None:
             branch_id = f"{prefix}_{case.dataset_size}_{iteration}"
-            ctx.create_branch(branch_id, from_branch="main")
+            ctx.create_branch(
+                branch_id,
+                from_branch="main",
+                terminal=branch_backend == "interval",
+            )
             session = ctx.checkout(branch_id)
             with session.transaction():
                 execute_workload_sql(session, case, iteration)
-            ctx.merge_apply(source=branch_id, target="main")
+            merge_kwargs = (
+                {"policy": "snapshot_isolation"} if branch_backend == "interval" else {}
+            )
+            ctx.merge_apply(source=branch_id, target="main", **merge_kwargs)
             if case.delete_branches:
                 ctx.delete_branch(branch_id)
 
