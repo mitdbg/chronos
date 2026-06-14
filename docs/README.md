@@ -116,6 +116,8 @@ layers.
 
 See `multi-store-branching.md` for the multi-store design and
 `bolt-on-branching.md` for the relational interval backend.
+See `related-work.md` for a research log of papers and systems related to
+Chronos branching.
 
 ## Branch Transactions Versus Database Transactions
 
