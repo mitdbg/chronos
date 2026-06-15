@@ -1113,13 +1113,100 @@ Databases without exclusion constraints can enforce the invariant with serializa
 
 ## Interval Allocation
 
-The initial interval space should be much larger than 64 bits:
+Chronos needs an allocation rule that works for the two common branch-tree
+shapes:
+
+- shallow and very wide trees, such as branch transactions and agent
+  speculation from `main`
+- deeper trees, such as iterative exploration from a promising branch
+
+The default strategy is **adaptive interval allocation**. It keeps the read
+predicate unchanged: every branch still reads through one integer point and
+every row still stores one `[live_lo, live_hi)` interval. The allocation policy
+only decides how much numeric space each new segment receives.
+
+The root interval is intentionally large:
 
 ```text
-root: [0, 10^78)
+PostgreSQL: [0, 10^31)
+SQLite:     [0, 9e18)
 ```
 
-Children are created by splitting the parent segment into sub-intervals.
+PostgreSQL uses exact `NUMERIC` integer intervals so the root has enough space
+for wide branching without requiring a user-supplied depth budget.
+
+### Branch Split
+
+When creating a normal child branch from a mutable parent segment `S = [lo, hi)`,
+Chronos first reserves a one-unit immutable fork-base segment:
+
+```text
+fork_base = [lo, lo + 1)
+remaining = [lo + 1, hi)
+```
+
+The fork base is the stable merge base for the parent and child. It is readable
+but not writable or branchable.
+
+The remaining space is split into:
+
+- the child segment
+- the parent continuation segment
+
+For a large segment, Chronos allocates the child about `sqrt(width)` units:
+
+```text
+width = hi - (lo + 1)
+child_width = floor(sqrt(width))
+```
+
+This gives a node with interval width `N` about `sqrt(N)` immediate children,
+while each child also receives about `sqrt(N)` future capacity. This is a good
+fit near the root, where branch trees are often wide.
+
+Once the remaining segment becomes smaller than the adaptive threshold,
+Chronos switches to the existing percentage split:
+
+```text
+continuation_width = width * continuation_percent / 100
+child_width = width - continuation_width
+```
+
+The percentage split is depth-oriented. It lets a branch keep making progress
+down a chain after the tree is no longer near the root-wide regime.
+
+### Checkpoint Split
+
+Checkpoints are immutable but branchable snapshots. They use the same adaptive
+idea without a fork-base segment:
+
+- for large segments, the checkpoint receives `sqrt(width)` units
+- the source branch keeps the remaining continuation
+- for smaller segments, Chronos falls back to the percentage split
+
+This matters for systems such as OKG that publish many checkpoints from the
+same branch. Checkpoint creation should not depend on a separate interval
+budget preflight; the allocation strategy itself should preserve enough
+capacity for many future checkpoints.
+
+### Terminal Branches
+
+Some workloads create branches that will be written, merged, and deleted but
+never forked again. Branch transactions are the main example. These branches can
+be marked `terminal=True`.
+
+A terminal branch gets the minimum mutable width:
+
+```text
+terminal child width = 2
+```
+
+That width is enough to choose an interior read point and perform branch-local
+writes, but it does not reserve space for descendants. Terminal branches cannot
+be forked or checkpointed. This maximizes fanout from `main` for flat
+transaction/speculation workloads while preserving the same read predicate.
+
+### Why Not Fixed Width Everywhere?
 
 Fixed-width intervals have a depth/fanout tradeoff:
 
@@ -1138,14 +1225,14 @@ NUMERIC(78):  ~259 bits
 
 The implementation should not rely on 64-bit intervals for correctness.
 
-Recommended first implementation:
+Adaptive allocation avoids exposing a fixed `interval_child_width` parameter to
+normal users. It also avoids requiring a declared maximum depth. The tradeoff is
+that no finite integer interval can support adversarially unbounded width and
+depth at the same time. Chronos should still reject branch creation when a local
+interval lacks the minimum space for the requested operation.
 
-- use `NUMERIC(78,0)` or 256-bit integer intervals
-- allocate sparsely
-- reject branch creation when a local interval lacks space
-- include a subtree relabeling maintenance path
-
-For arbitrary adversarial depth, use variable-length lexicographic intervals:
+For arbitrary adversarial depth, a future implementation can use
+variable-length lexicographic intervals:
 
 ```text
 main_s1 label: 80
