@@ -2557,6 +2557,152 @@ def test_interval_merge_snapshot_isolation_rejects_write_write_conflict(
         ctx.close()
 
 
+def test_interval_merge_snapshot_isolation_first_committer_wins(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("txn_a", from_branch="main")
+        ctx.create_branch("txn_b", from_branch="main")
+        txn_a = ctx.checkout("txn_a")
+        txn_b = ctx.checkout("txn_b")
+        main = ctx.checkout("main")
+        txn_a.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        txn_b.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+
+        first = ctx.merge_apply(source="txn_a", target="main", policy="snapshot_isolation")
+        assert first.applied == 1
+        assert _product(main, "abc")["price"] == 11
+
+        preview = ctx.merge_preview(source="txn_b", target="main", policy="snapshot_isolation")
+        assert len(preview.conflicts) == 1
+        assert preview.conflicts[0].before == {
+            "sku": "abc",
+            "name": "Alpha",
+            "price": 11,
+        }
+        assert preview.conflicts[0].after == {
+            "sku": "abc",
+            "name": "Alpha",
+            "price": 12,
+        }
+        with pytest.raises(BranchingError, match="write-write"):
+            ctx.merge_apply(source="txn_b", target="main", policy="snapshot_isolation")
+
+        assert _product(main, "abc")["price"] == 11
+    finally:
+        ctx.close()
+
+
+def test_interval_merge_snapshot_isolation_same_value_write_conflicts(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("txn_a", from_branch="main")
+        ctx.create_branch("txn_b", from_branch="main")
+        txn_a = ctx.checkout("txn_a")
+        txn_b = ctx.checkout("txn_b")
+        main = ctx.checkout("main")
+        txn_a.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        txn_b.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+
+        assert ctx.merge_apply(source="txn_a", target="main", policy="snapshot_isolation").applied == 1
+        preview = ctx.merge_preview(source="txn_b", target="main", policy="snapshot_isolation")
+        assert len(preview.conflicts) == 1
+        assert preview.conflicts[0].before == preview.conflicts[0].after
+
+        with pytest.raises(BranchingError, match="write-write"):
+            ctx.merge_apply(source="txn_b", target="main", policy="snapshot_isolation")
+
+        assert _product(main, "abc")["price"] == 11
+    finally:
+        ctx.close()
+
+
+def test_interval_merge_weak_snapshot_isolation_does_not_check_write_write_conflicts(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        main = ctx.checkout("main")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        main.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+
+        preview = ctx.merge_preview(
+            source="agent",
+            target="main",
+            policy="weak_snapshot_isolation",
+        )
+        assert len(preview.conflicts) == 1
+        assert preview.resolution.conflict_choices == {
+            preview.conflicts[0].conflict_id: "source"
+        }
+
+        result = ctx.merge_apply(
+            source="agent",
+            target="main",
+            policy="weak_snapshot_isolation",
+        )
+
+        assert result.applied == 1
+        assert _product(main, "abc")["price"] == 11
+    finally:
+        ctx.close()
+
+
+def test_interval_merge_weak_snapshot_isolation_later_committer_overwrites(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("txn_a", from_branch="main")
+        ctx.create_branch("txn_b", from_branch="main")
+        txn_a = ctx.checkout("txn_a")
+        txn_b = ctx.checkout("txn_b")
+        main = ctx.checkout("main")
+        txn_a.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        txn_b.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 12},
+        )
+
+        assert ctx.merge_apply(source="txn_a", target="main", policy="snapshot_isolation").applied == 1
+        result = ctx.merge_apply(
+            source="txn_b",
+            target="main",
+            policy="weak_snapshot_isolation",
+        )
+
+        assert result.applied == 1
+        assert _product(main, "abc")["price"] == 12
+    finally:
+        ctx.close()
+
+
 def test_interval_manual_review_resolution_is_revalidated(
     sql_backend: str,
 ) -> None:

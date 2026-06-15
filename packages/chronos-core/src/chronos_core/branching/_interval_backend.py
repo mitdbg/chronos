@@ -1997,6 +1997,15 @@ class _IntervalBackend(_SQLBranchBackend):
             source_row = source_rows.get(key)
             target_row = target_rows.get(key)
             if source_row == target_row:
+                if source_row != base_row:
+                    # Both sides wrote the row after the fork but converged on
+                    # the same image. Treat this as a write-write conflict so
+                    # snapshot isolation remains first-committer-wins rather
+                    # than value-equivalence-wins.
+                    key_dict = dict(zip(source_meta.pk_columns, key))
+                    conflicts.append(
+                        RowDiff(table, key_dict, "modified", target_row, source_row)
+                    )
                 continue
             if source_row == base_row:
                 continue
@@ -3941,6 +3950,16 @@ class _IntervalBackend(_SQLBranchBackend):
             """,
             (branch_id,),
         ).fetchone()
+
+    def lock_branches_for_merge(self, source: str, target: str) -> None:
+        if self.db.dialect != "postgres":
+            return
+        # Merge preview and apply must observe a stable pair of branch heads.
+        # Lock in deterministic order so concurrent merges into the same target
+        # serialize and snapshot isolation becomes true first-committer-wins.
+        for branch_id in sorted({source, target}):
+            if self._branch_row_for_update(branch_id) is None:
+                raise BranchNotFoundError(branch_id)
 
     def _lock_branch_for_schema_change(self, ref: _PreparedBranchRef) -> None:
         # Branch-local DDL may ALTER a private physical schema table in place.

@@ -179,6 +179,7 @@ class MergeResolver(Protocol):
 MergePolicyMode = Literal[
     "abort_on_conflict",
     "snapshot_isolation",
+    "weak_snapshot_isolation",
     "source_wins",
     "target_wins",
     "manual_review",
@@ -341,6 +342,7 @@ def _normalize_merge_policy(policy: MergePolicyInput) -> MergePolicy:
     modes = {
         "abort_on_conflict",
         "snapshot_isolation",
+        "weak_snapshot_isolation",
         "source_wins",
         "target_wins",
         "manual_review",
@@ -354,7 +356,7 @@ def _normalize_merge_policy(policy: MergePolicyInput) -> MergePolicy:
 def _default_resolution_for_policy(
     policy: MergePolicy, preview: MergePreview
 ) -> MergeResolution:
-    if policy.mode == "source_wins":
+    if policy.mode in {"source_wins", "weak_snapshot_isolation"}:
         return MergeResolution(
             {
                 conflict.conflict_id: "source"
@@ -428,8 +430,12 @@ def _resolve_merge_changes(
             + ", ".join(sorted(stale_ids))
         )
 
-    if normalized.mode in {"abort_on_conflict", "snapshot_isolation"} and preview.conflicts:
+    if normalized.mode == "abort_on_conflict" and preview.conflicts:
         raise BranchingError("merge has unresolved conflicts")
+    if normalized.mode == "snapshot_isolation" and preview.conflicts:
+        # Snapshot isolation uses first-committer-wins: once the target has a
+        # post-fork write to the same row, a later source branch cannot commit.
+        raise BranchingError("snapshot isolation merge has write-write conflicts")
     if normalized.mode == "manual_review" and preview.conflicts and resolution is None:
         raise BranchingError("merge requires an explicit resolution")
 
@@ -442,6 +448,8 @@ def _resolve_merge_changes(
         if choice in {"target", "ours", "skip"}:
             continue
         if choice in {"source", "theirs"}:
+            if conflict.before == conflict.after:
+                continue
             resolved.append(conflict)
             continue
         raise BranchingError(f"unsupported merge conflict choice: {choice}")
@@ -1006,6 +1014,9 @@ class _SQLBranchBackend:
         target: str,
         resolution: MergeResolution | None = None,
     ) -> MergeResult | None:
+        return None
+
+    def lock_branches_for_merge(self, source: str, target: str) -> None:
         return None
 
     def _require_table(self, table: str) -> _TableMeta:

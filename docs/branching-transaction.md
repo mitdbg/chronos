@@ -136,12 +136,16 @@ apply candidate changes and resolution atomically
 ```
 
 This framing is important because the validation policy defines the isolation
-semantics. A Git-like policy that only checks write-write conflicts gives
-snapshot-style behavior but can still allow read-write anomalies such as write
-skew. Serializable behavior requires stronger validation, such as read-set,
-scan-set, predicate, or application-specific invariant checks. Chronos should
-therefore expose merge validation as a configurable policy rather than treating
-row-level conflict detection as the only possible rule.
+semantics. Chronos' `snapshot_isolation` policy is first-committer-wins: a merge
+commits only if the target has not changed the same rows since the branch forked.
+Chronos also exposes `weak_snapshot_isolation`, which keeps branch-local snapshot
+reads but skips write-write validation and applies the source branch over the
+target at merge time. These policies give snapshot-style behavior but can still
+allow read-write anomalies such as write skew. Serializable behavior requires
+stronger validation, such as read-set, scan-set, predicate, or
+application-specific invariant checks. Chronos should therefore expose merge
+validation as a configurable policy rather than treating row-level conflict
+detection as the only possible rule.
 
 ## Why This Helps
 

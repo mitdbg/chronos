@@ -516,6 +516,7 @@ class ChronosBranchContext:
         applied = 0
         target_session = self.checkout(target)
         with target_session.transaction():
+            self._backend.lock_branches_for_merge(source, target)
             preview = self.merge_preview(source, target)
             changes = _resolve_merge_changes(
                 preview, normalized_policy, resolution, backend=self._backend.name
