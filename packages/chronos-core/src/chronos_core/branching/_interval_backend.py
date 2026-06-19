@@ -2397,6 +2397,8 @@ class _IntervalBackend(_SQLBranchBackend):
         for row in rows:
             keyed[self._key_tuple(meta, self._row_key(meta, row))] = row
         deduped = list(keyed.values())
+        if self._try_native_interval_bulk_upsert(deduped, segment, meta):
+            return
         keys = [self._row_key(meta, row) for row in deduped]
         chunk_size = self._upsert_batch_chunk_size(meta)
 
@@ -2439,6 +2441,34 @@ class _IntervalBackend(_SQLBranchBackend):
                 False,
                 segment.segment_id,
             )
+
+    def _try_native_interval_bulk_upsert(
+        self,
+        rows: list[dict[str, Any]],
+        segment: _IntervalSegment,
+        meta: _TableMeta,
+    ) -> bool:
+        if not rows:
+            return True
+        from chronos_core import _native_interval
+
+        if not _native_interval.supports_connection_dialect(self.db.dialect):
+            return False
+        if not self.db.in_transaction:
+            self.db.begin()
+        _native_interval.interval_bulk_upsert_connection(
+            self.db.dialect,
+            self.db.raw_connection,
+            meta.physical_name,
+            list(meta.columns),
+            list(meta.pk_columns),
+            rows,
+            segment.live_lo,
+            segment.live_hi,
+            segment.segment_id,
+            False,
+        )
+        return True
 
     def _upsert_batch_chunk_size(self, meta: _TableMeta) -> int:
         max_keys = (

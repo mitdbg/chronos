@@ -7,7 +7,10 @@ find_package(pybind11 CONFIG REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(PostgreSQL REQUIRED)
 
-pybind11_add_module(_native_interval src/chronos_core/native/interval_module.cpp)
+pybind11_add_module(_native_interval
+  src/chronos_core/native/interval_module.cpp
+  src/chronos_core/native/interval_data_plane.cpp
+)
 target_compile_features(_native_interval PRIVATE cxx_std_17)
 target_link_libraries(_native_interval PRIVATE SQLite::SQLite3 PostgreSQL::PostgreSQL)
 
