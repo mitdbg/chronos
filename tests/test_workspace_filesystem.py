@@ -259,14 +259,14 @@ def test_filesystem_merge_apply_writes_source_changes_to_target(
     assert not (main.path / "c.txt").exists()
 
 
-def test_workspace_context_composes_relational_and_filesystem(
+def test_workspace_context_composes_sql_store_and_filesystem(
     tmp_path: Path,
     base_tree: Path,
 ) -> None:
     _require_fuse_overlayfs()
     sql = ChronosBranchContext.connect("sqlite:///:memory:")
     fs = ChronosFilesystemStore(base_tree, state_dir=tmp_path / "workspace-state")
-    workspace = ChronosWorkspaceContext(relational=sql, filesystem=fs)
+    workspace = ChronosWorkspaceContext(sqlite=sql, filesystem=fs)
     try:
         sql.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, body TEXT)")
         sql.db.execute("INSERT INTO docs VALUES (?, ?)", ("d1", "main"))
@@ -275,10 +275,10 @@ def test_workspace_context_composes_relational_and_filesystem(
 
         workspace.create_branch("agent", from_branch="main")
         agent = workspace.checkout("agent")
-        assert agent.sql is not None
+        assert agent.sqlite is not None
         assert agent.fs is not None
 
-        agent.sql.execute(
+        agent.sqlite.execute(
             "UPDATE docs SET body = :body WHERE id = :id",
             {"id": "d1", "body": "agent"},
         )
@@ -287,14 +287,14 @@ def test_workspace_context_composes_relational_and_filesystem(
         assert sql.checkout("main").query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
             {"body": "main"}
         ]
-        assert agent.sql.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
+        assert agent.sqlite.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
             {"body": "agent"}
         ]
         assert not (base_tree / "report.md").exists()
         assert (agent.fs.path / "report.md").read_text() == "# Agent report\n"
 
         diff = workspace.diff("main", "agent")
-        assert diff["relational"].changes
+        assert diff["sqlite"].changes
         fs_changes = diff["filesystem"].changes
         assert any(change.path == "report.md" and change.change == "added" for change in fs_changes)
     finally:
@@ -308,7 +308,7 @@ def test_workspace_wide_branches_isolate_sql_and_filesystem_state(
     _require_fuse_overlayfs()
     sql = ChronosBranchContext.connect("sqlite:///:memory:")
     fs = ChronosFilesystemStore(base_tree, state_dir=tmp_path / "multi-state")
-    workspace = ChronosWorkspaceContext(relational=sql, filesystem=fs)
+    workspace = ChronosWorkspaceContext(sqlite=sql, filesystem=fs)
     try:
         sql.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, body TEXT)")
         sql.db.execute("INSERT INTO docs VALUES (?, ?)", ("d1", "main"))
@@ -319,9 +319,9 @@ def test_workspace_wide_branches_isolate_sql_and_filesystem_state(
             branch_id = f"agent_{idx}"
             workspace.create_branch(branch_id, from_branch="main")
             branch = workspace.checkout(branch_id)
-            assert branch.sql is not None
+            assert branch.sqlite is not None
             assert branch.fs is not None
-            branch.sql.execute(
+            branch.sqlite.execute(
                 "UPDATE docs SET body = :body WHERE id = :id",
                 {"id": "d1", "body": branch_id},
             )
@@ -329,9 +329,9 @@ def test_workspace_wide_branches_isolate_sql_and_filesystem_state(
             (branch.fs.path / f"{branch_id}.txt").write_text("private\n")
 
         main = workspace.checkout("main")
-        assert main.sql is not None
+        assert main.sqlite is not None
         assert main.fs is not None
-        assert main.sql.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
+        assert main.sqlite.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
             {"body": "main"}
         ]
         assert not (main.fs.path / "branch.txt").exists()
@@ -339,9 +339,9 @@ def test_workspace_wide_branches_isolate_sql_and_filesystem_state(
         for idx in range(6):
             branch_id = f"agent_{idx}"
             branch = workspace.checkout(branch_id)
-            assert branch.sql is not None
+            assert branch.sqlite is not None
             assert branch.fs is not None
-            assert branch.sql.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
+            assert branch.sqlite.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
                 {"body": branch_id}
             ]
             assert (branch.fs.path / "branch.txt").read_text() == f"{branch_id}\n"
@@ -360,7 +360,7 @@ def test_workspace_checkpoint_restore_covers_sql_and_filesystem(
     _require_fuse_overlayfs()
     sql = ChronosBranchContext.connect("sqlite:///:memory:")
     fs = ChronosFilesystemStore(base_tree, state_dir=tmp_path / "checkpoint-state")
-    workspace = ChronosWorkspaceContext(relational=sql, filesystem=fs)
+    workspace = ChronosWorkspaceContext(sqlite=sql, filesystem=fs)
     try:
         sql.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, body TEXT)")
         sql.db.execute("INSERT INTO docs VALUES (?, ?)", ("d1", "main"))
@@ -369,16 +369,16 @@ def test_workspace_checkpoint_restore_covers_sql_and_filesystem(
 
         workspace.create_branch("work", from_branch="main")
         work = workspace.checkout("work")
-        assert work.sql is not None
+        assert work.sqlite is not None
         assert work.fs is not None
-        work.sql.execute(
+        work.sqlite.execute(
             "UPDATE docs SET body = :body WHERE id = :id",
             {"id": "d1", "body": "checkpoint"},
         )
         (work.fs.path / "checkpoint.txt").write_text("checkpoint\n")
         workspace.create_checkpoint("workspace-snap", branch="work")
 
-        work.sql.execute(
+        work.sqlite.execute(
             "UPDATE docs SET body = :body WHERE id = :id",
             {"id": "d1", "body": "later"},
         )
@@ -387,18 +387,18 @@ def test_workspace_checkpoint_restore_covers_sql_and_filesystem(
 
         workspace.create_branch_from_checkpoint("restored", "workspace-snap")
         restored = workspace.checkout("restored")
-        assert restored.sql is not None
+        assert restored.sqlite is not None
         assert restored.fs is not None
-        assert restored.sql.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
+        assert restored.sqlite.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
             {"body": "checkpoint"}
         ]
         assert (restored.fs.path / "checkpoint.txt").read_text() == "checkpoint\n"
         assert not (restored.fs.path / "later.txt").exists()
 
         work = workspace.checkout("work")
-        assert work.sql is not None
+        assert work.sqlite is not None
         assert work.fs is not None
-        assert work.sql.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
+        assert work.sqlite.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
             {"body": "later"}
         ]
         assert not (work.fs.path / "checkpoint.txt").exists()

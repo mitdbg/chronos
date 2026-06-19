@@ -21,6 +21,18 @@ Run the single-threaded branching-transaction benchmark:
 bench/transactions/run_branching_transaction_experiments.sh postgres-doltgres --quick
 ```
 
+Run the filesystem branching benchmark:
+
+```bash
+bench/fs/run_fs_experiments.sh --quick
+```
+
+Run the filesystem benchmark with the Redis compile workload:
+
+```bash
+bench/fs/run_fs_experiments.sh --run-compile --redis-source /path/to/redis
+```
+
 The branching-transaction benchmark compares three ways to execute one logical
 agent transaction:
 
@@ -49,6 +61,24 @@ runner knows the backend Docker container name, the summary rows also include
 The cross-backend `merge_apply` phase includes whatever validation the backend
 requires to commit a branch transaction: Chronos performs row-level merge
 validation inside `merge_apply`, while Doltgres performs its native merge logic.
+
+The filesystem benchmark compares SQLite-backed ChronosFS with the basic
+`fuse-overlayfs` branch store baseline. It records branch creation/deletion,
+POSIX read/write micro-operations, and a large-file copy-on-write workload. The
+large-file COW workload branches from a parent containing one large file, then
+overwrites varied byte ranges and records both latency and backend storage
+growth. This is intended to make record/block-level COW visible against
+file-level overlay copy-up behavior. The optional compile workload imports a
+Redis source tree, creates a branch, and runs `make` inside the branch.
+
+Example COW-focused run:
+
+```bash
+bench/fs/run_fs_experiments.sh \
+  --backends chronosfs,overlayfs \
+  --cow-file-size 64M \
+  --cow-write-sizes 512,4K,64K,1M,4M
+```
 
 The schema benchmark compares Chronos interval, Chronos copy, and native
 Doltgres branches for `ALTER TABLE products ADD COLUMN ...` on a child branch.
