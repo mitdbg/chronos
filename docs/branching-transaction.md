@@ -132,8 +132,37 @@ existing state stores. The merge phase is Chronos' commit-validation phase:
 candidate changes = diff(branch, target)
 conflicts = detect_conflicts(candidate changes, target changes)
 resolution = reconcile(conflicts, policy)
-apply candidate changes and resolution atomically
+stage candidate changes in an unpublished target successor
+publish the successor atomically
 ```
+
+Atomic publish is the critical implementation detail. Chronos must not write
+merge results directly into the target branch's currently published interval
+segment, because those writes would become visible before every participant in a
+multi-store merge has finished. Instead, merge creates a new successor segment
+for the target branch, writes the resolved merge changes into that successor
+using the same branch-local write path as ordinary DML, and then publishes the
+successor with one metadata update:
+
+```text
+target before merge: main -> S10
+
+stage:
+  create S11 as an unpublished successor of S10
+  write resolved merge rows into S11
+
+publish:
+  UPDATE branches
+     SET current_segment_id = S11
+   WHERE branch_id = 'main'
+     AND current_segment_id = S10;
+```
+
+Readers obtain their branch read point from branch metadata. A reader that
+resolved `main -> S10` before publish keeps seeing S10. A reader that resolves
+`main -> S11` after publish sees the merged state. The old segment is therefore
+sealed by reachability: it remains historical state but is no longer the branch
+head. The new segment is ordinary mutable target state after publication.
 
 This framing is important because the validation policy defines the isolation
 semantics. Chronos' `snapshot_isolation` policy is first-committer-wins: a merge
@@ -225,7 +254,8 @@ For relational state, Chronos needs:
 - change-proportional diff from branch to target
 - merge preview with configurable conflict detection
 - optional reconciliation for automatically resolvable conflicts
-- atomic merge apply for approved changes
+- staged merge apply for approved changes
+- atomic target-head publish after staged changes are durable
 - cheap branch deletion after failure or rejection
 
 For multi-store state, Chronos needs equivalent lifecycle operations for each
@@ -233,6 +263,14 @@ store plus a coordinator that treats the branch as one unit. A filesystem branch
 must expose normal POSIX APIs to agent tools. A relational branch must expose
 SQL and schema evolution. The application should not have to reason separately
 about each store's native snapshot mechanism.
+
+For multi-store branch transactions, staged publish is also how Chronos avoids
+needing two-phase commit in the common Epoxy-style case. Each store first writes
+durable but unpublished versions for the same logical target successor. The
+single commit decision is the metadata transaction that publishes the successor
+as the target branch head. If the metadata publish never commits, staged
+versions are unreachable and can be ignored or garbage-collected. If it commits,
+all stores resolve the target branch through the new head.
 
 ## Semantics
 
@@ -248,6 +286,9 @@ A branch transaction should provide:
   exposing it.
 - **Conflict-aware commit.** Merge can reject, reconcile, or require manual
   resolution if the target changed incompatibly after the branch forked.
+- **Atomic visibility by publish.** Approved changes become visible by a branch
+  metadata head flip, not by mutating the previously published target segment in
+  place.
 
 The exact isolation level depends on merge validation. Write-write validation is
 enough for many speculative workflows, but serializable semantics require
@@ -267,8 +308,8 @@ intent records or outbox entries, then execute them only after merge approval.
 - Should merge apply support policy-selected subsets of a branch diff?
 - What API hides branch graph details from autonomous agents while preserving
   explicit review and merge control for humans?
-- How should Chronos coordinate atomic merge across relational and filesystem
-  stores?
+- How should Chronos represent staged successors for non-interval stores such
+  as filesystem, vector, document, or search indexes?
 - Which external effects must be represented as staged intents before merge?
 - What retention policy keeps enough fork-base state for merge without growing
   metadata indefinitely?

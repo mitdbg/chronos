@@ -302,7 +302,10 @@ preview = ctx.merge_preview(source="exp_pricing", target="main")
 ctx.merge_apply(source="exp_pricing", target="main", resolution=preview.resolution)
 ```
 
-`merge_preview` reports additions, deletions, modifications, and conflicts. `merge_apply` runs in a normal database transaction and updates the target branch if conflicts are resolved.
+`merge_preview` reports additions, deletions, modifications, and conflicts.
+`merge_apply` runs in a normal database transaction, stages resolved changes in
+a new target successor segment, and publishes that successor if conflicts are
+resolved.
 
 ## System Model
 
@@ -1206,6 +1209,26 @@ writes, but it does not reserve space for descendants. Terminal branches cannot
 be forked or checkpointed. This maximizes fanout from `main` for flat
 transaction/speculation workloads while preserving the same read predicate.
 
+For branch-transaction workloads, a terminal fork and staged merge consume only
+a small prefix of the target interval. With a toy root interval `[0, 100)`:
+
+```text
+main before fork:
+  S1 [0,100) point=50
+
+create_branch("txn_1", from_branch="main", terminal=True):
+  fork_base S4 [0,1) point=0
+  txn_1     S3 [1,3) point=2
+  main      S2 [3,100) point=3
+
+merge_apply("txn_1", "main") stages and publishes:
+  main successor S5 [4,100) point=4
+```
+
+The target continuation point is kept at the low edge so repeated terminal
+forks and staged publishes advance mostly linearly through the interval space
+instead of repeatedly halving it.
+
 ### Why Not Fixed Width Everywhere?
 
 Fixed-width intervals have a depth/fanout tradeoff:
@@ -2027,9 +2050,30 @@ the preview before applying.
 
 ### Applying a Clean Merge
 
-For clean source-only changes, `merge_apply` writes the source result into the
-target branch using the same interval write path as ordinary DML. It does not
-modify the source branch and does not mutate the fork-base segment.
+`merge_apply` must not write source results directly into the target branch's
+currently published segment. Direct writes would be visible immediately at the
+target branch point and would make multi-store merge partially visible if a
+later store failed. Instead, Chronos uses staged publish:
+
+```text
+1. Lock the target branch row.
+2. Verify or recompute the merge preview against the current target head.
+3. Allocate a new mutable successor segment whose read point does not overlap
+   the old target read point.
+4. Apply resolved merge changes into that successor using the same interval
+   write path as ordinary DML.
+5. Publish by updating branches.current_segment_id from the old target segment
+   to the successor segment.
+```
+
+The old target segment becomes sealed by reachability: readers that already
+resolved the target branch to that segment keep seeing the old state, but new
+checkouts resolve the target branch to the successor. The old segment currently
+keeps `segment_kind = 'mutable'` for compatibility; "sealed" is a structural
+property because it is no longer the branch head.
+
+For clean source-only changes, the successor receives the source result. The
+source branch is not modified and the fork-base segment remains immutable.
 
 The merge result can optionally be recorded as metadata:
 
@@ -2039,6 +2083,7 @@ merge_target_branch
 merge_base_segment_id
 merge_source_segment_id
 merge_target_segment_id_before_apply
+merge_target_segment_id_after_apply
 ```
 
 This metadata is useful for audit, visualization, and later garbage collection.

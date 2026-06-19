@@ -111,10 +111,11 @@ assert session.query("SELECT severity FROM tickets WHERE id = :id", {"id": "t1"}
 
 Filesystem branches expose normal paths. Code and command-line tools read and
 write the branch directory directly; they do not need a Chronos-specific file
-API. On Linux, Chronos can use OverlayFS or `fuse-overlayfs` copy-on-write
-layers.
+API. The current design stores filesystem state in Chronos interval-managed SQL
+tables, with fixed-size file blocks versioned by the interval backend.
 
-See `multi-store-branching.md` for the multi-store design and
+See `filesystem-on-chronos.md` for the SQL-backed filesystem design,
+`multi-store-branching.md` for the broader multi-store design, and
 `bolt-on-branching.md` for the relational interval backend.
 See `related-work.md` for a research log of papers and systems related to
 Chronos branching.
