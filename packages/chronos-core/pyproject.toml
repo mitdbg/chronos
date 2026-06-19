@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "chronos-core"
@@ -28,5 +28,6 @@ fuse = [
   "trio>=0.21",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/chronos_core"]
+[tool.scikit-build]
+wheel.packages = ["src/chronos_core"]
+cmake.source-dir = "."

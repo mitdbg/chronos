@@ -4,7 +4,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from test_branching import _postgres_dsn
+from tests.test_branching import _postgres_dsn
 
 
 def _load_branching_transactions_module():

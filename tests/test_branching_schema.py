@@ -15,8 +15,8 @@ from chronos_core.branching import (
 )
 from chronos_core.workspace import ChronosFilesystemStore, ChronosWorkspaceContext
 
-from test_branching import _postgres_dsn, _reset_postgres_schema
-from test_workspace_filesystem import _require_fuse_overlayfs
+from tests.test_branching import _postgres_dsn, _reset_postgres_schema
+from tests.test_workspace_filesystem import _require_fuse_overlayfs
 
 
 SQL_BACKENDS = ("sqlite", "postgres")

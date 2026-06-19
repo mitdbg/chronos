@@ -174,7 +174,7 @@ def test_duckdb_split_interval_store_with_local_metadata_adapter() -> None:
 
 
 def test_duckdb_split_interval_store_uses_postgres_metadata() -> None:
-    from test_branching import _postgres_dsn, _reset_postgres_schema
+    from tests.test_branching import _postgres_dsn, _reset_postgres_schema
 
     _reset_postgres_schema()
     ctx = ChronosBranchContext.connect_split(

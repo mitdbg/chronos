@@ -562,7 +562,7 @@ def _open_store(db_path: Path) -> ChronosFSStore:
 
 def _reset_and_get_postgres_dsn() -> str:
     pytest.importorskip("psycopg")
-    from test_branching import _postgres_dsn, _reset_postgres_schema
+    from tests.test_branching import _postgres_dsn, _reset_postgres_schema
 
     _reset_postgres_schema()
     return _postgres_dsn()
