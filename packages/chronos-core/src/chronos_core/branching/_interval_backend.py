@@ -6,6 +6,7 @@ import concurrent.futures
 import math
 import os
 import threading
+from typing import Mapping, Sequence
 
 import psycopg
 
@@ -306,6 +307,32 @@ class _IntervalBackend(_SQLBranchBackend):
         self._interval_gc_futures: list[concurrent.futures.Future[None]] = []
         self._query_rewrite_cache: dict[tuple[str, str, tuple[tuple[str, str], ...]], str] = {}
         self._statement_plan_cache: dict[tuple[str, str], _StatementPlan] = {}
+        self._native_backend = self._create_native_backend()
+
+    def _create_native_backend(self) -> Any | None:
+        try:
+            from chronos_core import _native_interval
+
+            if not _native_interval.supports_connection_dialect(self.db.dialect):
+                return None
+            return _native_interval.NativeIntervalBackend(
+                self.db.dialect,
+                self.db.raw_connection,
+            )
+        except Exception:
+            return None
+
+    def _native_query_rows(
+        self,
+        sql: str,
+        params: Sequence[Any] | Mapping[str, Any] = (),
+    ) -> list[dict[str, Any]] | None:
+        if self._native_backend is None:
+            return None
+        try:
+            return self._native_backend.query(sql, params)
+        except Exception:
+            return None
 
     def _metadata_dialect(self) -> str:
         metadata_db = getattr(self.db, "metadata_db", self.db)
@@ -1643,6 +1670,17 @@ class _IntervalBackend(_SQLBranchBackend):
             replacements = {name: self._visible_subquery(meta) for name, meta in tables.items()}
         if self.enable_schema_branching:
             self._validate_query_tables_visible(ref, sql)
+        if self._native_backend is not None:
+            try:
+                rows = self._native_backend.query_visible(
+                    sql,
+                    params,
+                    replacements,
+                    segment.branch_point,
+                )
+                return rows
+            except Exception:
+                pass
         rewrite_key = (
             self.db.dialect,
             sql,
@@ -2450,15 +2488,11 @@ class _IntervalBackend(_SQLBranchBackend):
     ) -> bool:
         if not rows:
             return True
-        from chronos_core import _native_interval
-
-        if not _native_interval.supports_connection_dialect(self.db.dialect):
+        if self._native_backend is None:
             return False
         if not self.db.in_transaction:
             self.db.begin()
-        _native_interval.interval_bulk_upsert_connection(
-            self.db.dialect,
-            self.db.raw_connection,
+        self._native_backend.bulk_upsert(
             meta.physical_name,
             list(meta.columns),
             list(meta.pk_columns),
@@ -2466,6 +2500,37 @@ class _IntervalBackend(_SQLBranchBackend):
             segment.live_lo,
             segment.live_hi,
             segment.segment_id,
+            False,
+            False,
+        )
+        return True
+
+    def _try_native_interval_splice(
+        self,
+        key: dict[str, Any],
+        row: dict[str, Any] | None,
+        deleted: bool,
+        segment: _IntervalSegment,
+        meta: _TableMeta,
+    ) -> bool:
+        if self._native_backend is None:
+            return False
+        if row is None and deleted:
+            replacement = {column: None for column in meta.columns}
+            replacement.update(key)
+        else:
+            replacement = {column: row.get(column) for column in meta.columns}  # type: ignore[union-attr]
+        if not self.db.in_transaction:
+            self.db.begin()
+        self._native_backend.bulk_upsert(
+            meta.physical_name,
+            list(meta.columns),
+            list(meta.pk_columns),
+            [replacement],
+            segment.live_lo,
+            segment.live_hi,
+            segment.segment_id,
+            deleted,
             False,
         )
         return True
@@ -3399,17 +3464,18 @@ class _IntervalBackend(_SQLBranchBackend):
         point = segment.branch_point
         cols = ", ".join(_quote(c) for c in meta.columns)
         where = self._key_where(meta)
-        row = self.db.execute(
-            f"""
+        sql = f"""
             SELECT {cols}
             FROM {_quote(meta.physical_name)}
             WHERE {where}
               AND live_lo <= ?
               AND ? < live_hi
               AND deleted = FALSE
-            """,
-            [*self._key_values(meta, key), point, point],
-        ).fetchone()
+            """
+        rows = self._native_query_rows(sql, [*self._key_values(meta, key), point, point])
+        if rows is not None:
+            return rows[0] if rows else None
+        row = self.db.execute(sql, [*self._key_values(meta, key), point, point]).fetchone()
         return dict(row) if row is not None else None
 
     def _select_matching_rows(
@@ -3428,14 +3494,15 @@ class _IntervalBackend(_SQLBranchBackend):
         visible_where = self._visible_where_for_user_filter(where)
         bound = dict(params)
         bound["_chronos_branch_point"] = segment.branch_point
-        rows = self.db.execute(
-            f"""
+        sql = f"""
             SELECT {select_cols}
             FROM {_quote(meta.physical_name)}
             WHERE {visible_where}
-            """,
-            bound,
-        ).fetchall()
+            """
+        rows = self._native_query_rows(sql, bound)
+        if rows is not None:
+            return rows
+        rows = self.db.execute(sql, bound).fetchall()
         return [dict(row) for row in rows]
 
     def _try_update_full_table_with_batch_splice(
@@ -3887,8 +3954,31 @@ class _IntervalBackend(_SQLBranchBackend):
         if not keys:
             return []
         meta = meta or self._meta_for_segment(segment, table)
+        native_rows = self._visible_rows_for_keys_native(keys, segment, meta)
+        if native_rows is not None:
+            return native_rows
         rows = self._visible_rows_for_keys_cursor(keys, segment, meta).fetchall()
         return [dict(row) for row in rows]
+
+    def _visible_rows_for_keys_native(
+        self,
+        keys: list[dict[str, Any]],
+        segment: _IntervalSegment,
+        meta: _TableMeta,
+    ) -> list[dict[str, Any]] | None:
+        predicate, values = self._keys_predicate(meta, keys)
+        cols = ", ".join(_quote(c) for c in meta.columns)
+        return self._native_query_rows(
+            f"""
+            SELECT {cols}
+            FROM {_quote(meta.physical_name)}
+            WHERE ({predicate})
+              AND live_lo <= ?
+              AND ? < live_hi
+              AND deleted = FALSE
+            """,
+            [*values, segment.branch_point, segment.branch_point],
+        )
 
     def _visible_rows_for_keys_cursor(
         self,
@@ -3920,10 +4010,32 @@ class _IntervalBackend(_SQLBranchBackend):
         if not keys:
             return set()
         meta = meta or self._meta_for_segment(segment, table)
+        native_rows = self._physical_row_key_tuples_for_keys_native(keys, segment, meta)
+        if native_rows is not None:
+            return self._physical_row_key_tuples_from_rows(meta, native_rows)
         rows = self._physical_row_key_tuples_for_keys_cursor(
             keys, segment, meta
         ).fetchall()
         return self._physical_row_key_tuples_from_rows(meta, rows)
+
+    def _physical_row_key_tuples_for_keys_native(
+        self,
+        keys: list[dict[str, Any]],
+        segment: _IntervalSegment,
+        meta: _TableMeta,
+    ) -> list[dict[str, Any]] | None:
+        predicate, values = self._keys_predicate(meta, keys)
+        pk_cols = ", ".join(_quote(c) for c in meta.pk_columns)
+        return self._native_query_rows(
+            f"""
+            SELECT DISTINCT {pk_cols}
+            FROM {_quote(meta.physical_name)}
+            WHERE ({predicate})
+              AND live_lo < ?
+              AND ? < live_hi
+            """,
+            [*values, segment.live_hi, segment.live_lo],
+        )
 
     def _physical_row_key_tuples_for_keys_cursor(
         self,
@@ -3977,6 +4089,8 @@ class _IntervalBackend(_SQLBranchBackend):
     ) -> None:
         segment = segment or self._current_segment(branch_id)
         meta = meta or self._meta_for_segment(segment, table)
+        if self._try_native_interval_splice(key, row, deleted, segment, meta):
+            return
         u_lo = segment.live_lo
         u_hi = segment.live_hi
         where = self._key_where(meta)

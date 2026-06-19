@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -26,6 +28,16 @@ namespace {
 using Blob = std::vector<unsigned char>;
 using Value = std::variant<std::monostate, std::int64_t, double, std::string, Blob>;
 using NativeRows = std::vector<std::vector<Value>>;
+
+struct BoundSql {
+    std::string sql;
+    std::vector<Value> positional_params;
+};
+
+struct SqlBindPlan {
+    std::string sql;
+    std::vector<std::string> param_names;
+};
 
 struct BulkUpsertStats {
     std::int64_t selected = 0;
@@ -87,7 +99,10 @@ Value py_to_value(const py::handle &obj) {
         std::string bytes = obj.cast<std::string>();
         return Blob(bytes.begin(), bytes.end());
     }
-    return obj.cast<std::string>();
+    if (py::isinstance<py::str>(obj)) {
+        return obj.cast<std::string>();
+    }
+    return py::str(obj).cast<std::string>();
 }
 
 std::size_t hash_combine(std::size_t seed, std::size_t value) {
@@ -170,6 +185,186 @@ std::vector<Value> list_to_values(const py::list &items) {
         values.push_back(py_to_value(item));
     }
     return values;
+}
+
+bool is_identifier_start(char ch) {
+    return std::isalpha(static_cast<unsigned char>(ch)) || ch == '_';
+}
+
+bool is_identifier_part(char ch) {
+    return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+}
+
+SqlBindPlan plan_named_sql(const std::string &sql) {
+    SqlBindPlan plan;
+    plan.sql.reserve(sql.size());
+    bool single_quote = false;
+    bool double_quote = false;
+    for (std::size_t i = 0; i < sql.size(); ++i) {
+        const char ch = sql[i];
+        if (ch == '\'' && !double_quote) {
+            single_quote = !single_quote;
+            plan.sql.push_back(ch);
+            continue;
+        }
+        if (ch == '"' && !single_quote) {
+            double_quote = !double_quote;
+            plan.sql.push_back(ch);
+            continue;
+        }
+        if (!single_quote && !double_quote && ch == ':' && i + 1 < sql.size() && is_identifier_start(sql[i + 1])) {
+            std::size_t j = i + 2;
+            while (j < sql.size() && is_identifier_part(sql[j])) {
+                ++j;
+            }
+            std::string name = sql.substr(i + 1, j - i - 1);
+            plan.sql.push_back('?');
+            plan.param_names.push_back(std::move(name));
+            i = j - 1;
+            continue;
+        }
+        plan.sql.push_back(ch);
+    }
+    return plan;
+}
+
+BoundSql bind_named_sql_plan(const SqlBindPlan &plan, const py::dict &params) {
+    BoundSql bound;
+    bound.sql = plan.sql;
+    bound.positional_params.reserve(plan.param_names.size());
+    for (const auto &name : plan.param_names) {
+        py::str key(name);
+        if (!params.contains(key)) {
+            throw std::invalid_argument("missing SQL parameter: " + name);
+        }
+        bound.positional_params.push_back(py_to_value(params[key]));
+    }
+    return bound;
+}
+
+BoundSql bind_sql_params(const std::string &sql, const py::object &params) {
+    if (py::isinstance<py::dict>(params)) {
+        return bind_named_sql_plan(plan_named_sql(sql), params.cast<py::dict>());
+    }
+    BoundSql bound;
+    bound.sql = sql;
+    if (params.is_none()) {
+        return bound;
+    }
+    py::sequence seq = params.cast<py::sequence>();
+    bound.positional_params.reserve(static_cast<std::size_t>(py::len(seq)));
+    for (const auto item : seq) {
+        bound.positional_params.push_back(py_to_value(item));
+    }
+    return bound;
+}
+
+std::optional<std::string> lookup_replacement(const py::dict &replacements, const std::string &name) {
+    py::str key(name);
+    if (replacements.contains(key)) {
+        return replacements[key].cast<std::string>();
+    }
+    return std::nullopt;
+}
+
+std::string rewrite_visible_tables(const std::string &sql, const py::dict &replacements) {
+    std::string out;
+    out.reserve(sql.size() * 2);
+    bool single_quote = false;
+    bool double_quote = false;
+    bool expect_table = false;
+    for (std::size_t i = 0; i < sql.size();) {
+        const char ch = sql[i];
+        if (ch == '\'' && !double_quote) {
+            single_quote = !single_quote;
+            out.push_back(ch);
+            ++i;
+            continue;
+        }
+        if (ch == '"' && !single_quote) {
+            std::size_t j = i + 1;
+            std::string ident;
+            while (j < sql.size()) {
+                if (sql[j] == '"') {
+                    if (j + 1 < sql.size() && sql[j + 1] == '"') {
+                        ident.push_back('"');
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                ident.push_back(sql[j]);
+                ++j;
+            }
+            if (expect_table && j < sql.size()) {
+                if (auto replacement = lookup_replacement(replacements, ident)) {
+                    std::string ltrimmed = *replacement;
+                    ltrimmed.erase(0, ltrimmed.find_first_not_of(" \n\r\t"));
+                    std::string head = ltrimmed.substr(0, std::min<std::size_t>(6, ltrimmed.size()));
+                    std::transform(head.begin(), head.end(), head.begin(), [](unsigned char c) {
+                        return static_cast<char>(std::toupper(c));
+                    });
+                    if (head == "SELECT" || head.rfind("WITH", 0) == 0) {
+                        out += "(" + *replacement + ")";
+                    } else {
+                        out += quote_ident(*replacement);
+                    }
+                } else {
+                    out.append(sql, i, j - i + 1);
+                }
+                expect_table = false;
+                i = j + 1;
+            } else {
+                out.append(sql, i, j < sql.size() ? j - i + 1 : j - i);
+                i = j < sql.size() ? j + 1 : j;
+            }
+            continue;
+        }
+        if (single_quote || double_quote || !is_identifier_start(ch)) {
+            out.push_back(ch);
+            ++i;
+            continue;
+        }
+
+        std::size_t j = i + 1;
+        while (j < sql.size() && is_identifier_part(sql[j])) {
+            ++j;
+        }
+        std::string ident = sql.substr(i, j - i);
+        std::string upper = ident;
+        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
+            return static_cast<char>(std::toupper(c));
+        });
+
+        if (expect_table) {
+            if (auto replacement = lookup_replacement(replacements, ident)) {
+                const std::string trimmed = replacement->substr(0, replacement->find_last_not_of(" \n\r\t") + 1);
+                std::string ltrimmed = trimmed;
+                ltrimmed.erase(0, ltrimmed.find_first_not_of(" \n\r\t"));
+                std::string head = ltrimmed.substr(0, std::min<std::size_t>(6, ltrimmed.size()));
+                std::transform(head.begin(), head.end(), head.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::toupper(c));
+                });
+                if (head == "SELECT" || head.rfind("WITH", 0) == 0) {
+                    out += "(" + *replacement + ")";
+                } else {
+                    out += quote_ident(*replacement);
+                }
+            } else {
+                out += ident;
+            }
+            expect_table = false;
+            i = j;
+            continue;
+        }
+
+        out += ident;
+        if (upper == "FROM" || upper == "JOIN" || upper == "INTO" || upper == "UPDATE") {
+            expect_table = true;
+        }
+        i = j;
+    }
+    return out;
 }
 
 std::size_t column_index(const std::vector<std::string> &columns, const std::string &column) {
@@ -332,6 +527,19 @@ Value column_value(sqlite3_stmt *stmt, int index) {
         return std::string(data, size);
     }
     }
+}
+
+py::list rows_from_statement(SqliteStatement &stmt) {
+    py::list rows;
+    const int column_count = sqlite3_column_count(stmt.get());
+    while (stmt.step_row()) {
+        py::dict row;
+        for (int i = 0; i < column_count; ++i) {
+            row[sqlite3_column_name(stmt.get(), i)] = value_to_py(column_value(stmt.get(), i));
+        }
+        rows.append(row);
+    }
+    return rows;
 }
 
 class SQLiteConnector {
@@ -530,6 +738,7 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
     std::int64_t live_lo,
     std::int64_t live_hi,
     std::int64_t writer_segment_id,
+    bool replacement_deleted,
     bool manage_transaction
 ) {
     if (columns.empty()) {
@@ -546,7 +755,12 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
     // by primary key in native memory avoids running the interval splice more
     // than once for the same key and keeps the Python caller from owning any
     // part of the physical CoW algorithm.
-    const NativeRows deduped = dedupe_rows_by_pk(rows, pk_indices);
+    NativeRows deduped_storage;
+    const NativeRows *splice_rows = &rows;
+    if (rows.size() > 1) {
+        deduped_storage = dedupe_rows_by_pk(rows, pk_indices);
+        splice_rows = &deduped_storage;
+    }
 
     std::string key_where;
     for (std::size_t i = 0; i < pk_columns.size(); ++i) {
@@ -609,7 +823,7 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
         SqliteStatement delete_stmt(db, delete_sql);
         SqliteStatement insert_stmt(db, insert_sql);
 
-        for (const auto &row : deduped) {
+        for (const auto &row : *splice_rows) {
             // Physical rows overlap the branch-local write interval when:
             //   old.live_lo < branch.live_hi AND branch.live_lo < old.live_hi
             // They may be inherited parent rows, rows written by sibling
@@ -644,7 +858,7 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
                 // No existing interval covers this key.  Insert one row for the
                 // whole mutable segment interval; future checkpoints/children
                 // select it by their branch point.
-                bind_insert(insert_stmt, row, live_lo, live_hi, writer_segment_id, 0);
+                bind_insert(insert_stmt, row, live_lo, live_hi, writer_segment_id, replacement_deleted ? 1 : 0);
                 continue;
             }
 
@@ -676,7 +890,14 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
                         physical.deleted
                     );
                 }
-                bind_insert(insert_stmt, row, overlap_lo, overlap_hi, writer_segment_id, 0);
+                bind_insert(
+                    insert_stmt,
+                    replacement_deleted ? physical.values : row,
+                    overlap_lo,
+                    overlap_hi,
+                    writer_segment_id,
+                    replacement_deleted ? 1 : 0
+                );
                 if (overlap_hi < physical.live_hi) {
                     bind_insert(
                         insert_stmt,
@@ -718,6 +939,10 @@ class IntervalConnectionAdapter {
   public:
     virtual ~IntervalConnectionAdapter() = default;
 
+    virtual py::list query(const std::string &sql, const py::object &params) = 0;
+
+    virtual int execute(const std::string &sql, const py::object &params) = 0;
+
     virtual BulkUpsertStats bulk_upsert(
         const std::string &physical_name,
         const std::vector<std::string> &columns,
@@ -726,6 +951,7 @@ class IntervalConnectionAdapter {
         std::int64_t live_lo,
         std::int64_t live_hi,
         std::int64_t writer_segment_id,
+        bool replacement_deleted,
         bool manage_transaction
     ) = 0;
 };
@@ -735,6 +961,28 @@ class SQLiteIntervalConnectionAdapter final : public IntervalConnectionAdapter {
     explicit SQLiteIntervalConnectionAdapter(const py::object &connection)
         : db_(sqlite_db_from_python_connection(connection)) {}
 
+    py::list query(const std::string &sql, const py::object &params) override {
+        BoundSql bound = bind_sql_params_cached(sql, params);
+        SqliteStatement &stmt = statement_for(bound.sql);
+        stmt.reset();
+        int bind_index = 1;
+        for (const auto &value : bound.positional_params) {
+            stmt.bind(bind_index++, value);
+        }
+        return rows_from_statement(stmt);
+    }
+
+    int execute(const std::string &sql, const py::object &params) override {
+        BoundSql bound = bind_sql_params_cached(sql, params);
+        SqliteStatement stmt(db_, bound.sql);
+        int bind_index = 1;
+        for (const auto &value : bound.positional_params) {
+            stmt.bind(bind_index++, value);
+        }
+        stmt.step_done();
+        return sqlite3_changes(db_);
+    }
+
     BulkUpsertStats bulk_upsert(
         const std::string &physical_name,
         const std::vector<std::string> &columns,
@@ -743,6 +991,7 @@ class SQLiteIntervalConnectionAdapter final : public IntervalConnectionAdapter {
         std::int64_t live_lo,
         std::int64_t live_hi,
         std::int64_t writer_segment_id,
+        bool replacement_deleted,
         bool manage_transaction
     ) override {
         return sqlite_adapter_bulk_upsert(
@@ -754,12 +1003,41 @@ class SQLiteIntervalConnectionAdapter final : public IntervalConnectionAdapter {
             live_lo,
             live_hi,
             writer_segment_id,
+            replacement_deleted,
             manage_transaction
         );
     }
 
   private:
+    BoundSql bind_sql_params_cached(const std::string &sql, const py::object &params) {
+        if (py::isinstance<py::dict>(params)) {
+            auto found = bind_plan_cache_.find(sql);
+            if (found == bind_plan_cache_.end()) {
+                if (bind_plan_cache_.size() > 512) {
+                    bind_plan_cache_.clear();
+                }
+                found = bind_plan_cache_.emplace(sql, plan_named_sql(sql)).first;
+            }
+            return bind_named_sql_plan(found->second, params.cast<py::dict>());
+        }
+        return bind_sql_params(sql, params);
+    }
+
+    SqliteStatement &statement_for(const std::string &sql) {
+        auto found = statement_cache_.find(sql);
+        if (found != statement_cache_.end()) {
+            return *found->second;
+        }
+        if (statement_cache_.size() > 256) {
+            statement_cache_.clear();
+        }
+        auto inserted = statement_cache_.emplace(sql, std::make_unique<SqliteStatement>(db_, sql));
+        return *inserted.first->second;
+    }
+
     sqlite3 *db_;
+    std::unordered_map<std::string, SqlBindPlan> bind_plan_cache_;
+    std::unordered_map<std::string, std::unique_ptr<SqliteStatement>> statement_cache_;
 };
 
 bool supports_connection_dialect(const std::string &dialect) {
@@ -801,11 +1079,116 @@ py::dict interval_bulk_upsert_connection(
             live_lo,
             live_hi,
             writer_segment_id,
+            false,
             manage_transaction
         );
     }
     return stats_to_py_dict(stats, native_rows.size(), "native_interval_bulk_upsert");
 }
+
+class NativeIntervalBackend {
+  public:
+    NativeIntervalBackend(const std::string &dialect, const py::object &connection)
+        : dialect_(dialect),
+          connection_(connection),
+          adapter_(make_interval_connection_adapter(dialect_, connection_)) {}
+
+    py::list query(const std::string &sql, const py::object &params) {
+        return adapter_->query(sql, params);
+    }
+
+    py::list query_visible(
+        const std::string &sql,
+        const py::dict &params,
+        const py::dict &replacements,
+        std::int64_t branch_point
+    ) {
+        py::dict bound;
+        for (const auto item : params) {
+            bound[item.first] = item.second;
+        }
+        bound["_chronos_branch_point"] = branch_point;
+        return adapter_->query(rewrite_visible_tables_cached(sql, replacements), bound);
+    }
+
+    int execute(const std::string &sql, const py::object &params) {
+        return adapter_->execute(sql, params);
+    }
+
+    py::dict bulk_upsert(
+        const std::string &physical_name,
+        const std::vector<std::string> &columns,
+        const std::vector<std::string> &pk_columns,
+        const py::list &rows,
+        std::int64_t live_lo,
+        std::int64_t live_hi,
+        std::int64_t writer_segment_id,
+        bool replacement_deleted,
+        bool manage_transaction
+    ) {
+        NativeRows native_rows = rows_to_native_values(rows, columns);
+        BulkUpsertStats stats;
+        {
+            py::gil_scoped_release release;
+            stats = adapter_->bulk_upsert(
+                physical_name,
+                columns,
+                pk_columns,
+                native_rows,
+                live_lo,
+                live_hi,
+                writer_segment_id,
+                replacement_deleted,
+                manage_transaction
+            );
+        }
+        return stats_to_py_dict(stats, native_rows.size(), "native_interval_bulk_upsert");
+    }
+
+  private:
+    std::string rewrite_cache_key(const std::string &sql, const py::dict &replacements) {
+        std::vector<std::pair<std::string, std::string>> items;
+        items.reserve(static_cast<std::size_t>(py::len(replacements)));
+        for (const auto item : replacements) {
+            items.emplace_back(py::str(item.first).cast<std::string>(), py::str(item.second).cast<std::string>());
+        }
+        std::sort(items.begin(), items.end());
+        std::string key;
+        key.reserve(sql.size() + 64 * items.size());
+        key += std::to_string(sql.size());
+        key.push_back(':');
+        key += sql;
+        for (const auto &[name, replacement] : items) {
+            key.push_back('\x1f');
+            key += std::to_string(name.size());
+            key.push_back(':');
+            key += name;
+            key.push_back('=');
+            key += std::to_string(replacement.size());
+            key.push_back(':');
+            key += replacement;
+        }
+        return key;
+    }
+
+    const std::string &rewrite_visible_tables_cached(const std::string &sql, const py::dict &replacements) {
+        const std::string key = rewrite_cache_key(sql, replacements);
+        auto found = rewrite_cache_.find(key);
+        if (found != rewrite_cache_.end()) {
+            return found->second;
+        }
+        if (rewrite_cache_.size() > 512) {
+            rewrite_cache_.clear();
+        }
+        auto inserted = rewrite_cache_.emplace(key, rewrite_visible_tables(sql, replacements));
+        return inserted.first->second;
+    }
+
+    std::string dialect_;
+    py::object connection_;
+    std::unique_ptr<IntervalConnectionAdapter> adapter_;
+    std::unordered_map<std::string, std::string> rewrite_cache_;
+};
 
 py::dict recommended_sql_parser() {
     py::dict result;
@@ -829,6 +1212,13 @@ void bind_interval_data_plane(py::module_ &m) {
           py::arg("dialect"), py::arg("connection"), py::arg("physical_name"),
           py::arg("columns"), py::arg("pk_columns"), py::arg("rows"), py::arg("live_lo"),
           py::arg("live_hi"), py::arg("writer_segment_id"), py::arg("manage_transaction"));
+
+    py::class_<NativeIntervalBackend>(m, "NativeIntervalBackend")
+        .def(py::init<const std::string &, const py::object &>())
+        .def("query", &NativeIntervalBackend::query)
+        .def("query_visible", &NativeIntervalBackend::query_visible)
+        .def("execute", &NativeIntervalBackend::execute)
+        .def("bulk_upsert", &NativeIntervalBackend::bulk_upsert);
 
     py::class_<SQLiteConnector>(m, "SQLiteConnector")
         .def(py::init<const std::string &>())

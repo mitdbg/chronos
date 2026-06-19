@@ -3838,10 +3838,11 @@ def test_interval_reuses_sql_parse_cache_across_checkouts(
         left.execute(update_sql, {"sku": "abc", "price": 11})
         right.execute(update_sql, {"sku": "def", "price": 22})
 
-        # One parse for the SELECT, one parse for the visible replacement
-        # subquery, and one parse for the UPDATE plan. The second checkout uses
-        # the backend-level cache instead of paying per-branch sqlglot cost.
-        assert parse_count["count"] == 3
+        # SQLite routes branch-visible SELECT rewriting/execution through the
+        # native interval backend, so only the UPDATE plan is parsed in Python.
+        # Other engines still parse the SELECT, visible replacement subquery,
+        # and shared UPDATE plan.
+        assert parse_count["count"] == (1 if sql_backend == "sqlite" else 3)
     finally:
         ctx.close()
 
@@ -4049,17 +4050,26 @@ def test_interval_autocommit_rolls_back_failed_logical_write(
     ctx.create_branch("exp", from_branch="main")
     session = ctx.checkout("exp")
     backend = ctx._backend  # type: ignore[attr-defined]
-    original_insert_physical_row = backend._insert_physical_row
-    insert_calls = 0
+    if sql_backend == "sqlite":
+        original_native_splice = backend._try_native_interval_splice
 
-    def failing_insert_physical_row(*args, **kwargs):
-        nonlocal insert_calls
-        insert_calls += 1
-        if insert_calls > 1:
-            raise RuntimeError("injected failure after partial interval splice")
-        return original_insert_physical_row(*args, **kwargs)
+        def failing_native_splice(*args, **kwargs):
+            original_native_splice(*args, **kwargs)
+            raise RuntimeError("injected failure after native interval splice")
 
-    monkeypatch.setattr(backend, "_insert_physical_row", failing_insert_physical_row)
+        monkeypatch.setattr(backend, "_try_native_interval_splice", failing_native_splice)
+    else:
+        original_insert_physical_row = backend._insert_physical_row
+        insert_calls = 0
+
+        def failing_insert_physical_row(*args, **kwargs):
+            nonlocal insert_calls
+            insert_calls += 1
+            if insert_calls > 1:
+                raise RuntimeError("injected failure after partial interval splice")
+            return original_insert_physical_row(*args, **kwargs)
+
+        monkeypatch.setattr(backend, "_insert_physical_row", failing_insert_physical_row)
 
     with pytest.raises(RuntimeError):
         session.execute(
