@@ -24,6 +24,10 @@ from chronos_core.branching._runtime import (
     TableNotRegisteredError,
     UnsupportedSQLError,
 )
+from chronos_core.branching.interval_protocols import (
+    IntervalDataPlane,
+    IntervalMetadataPlane,
+)
 
 __all__ = [
     "BranchAlreadyExistsError",
@@ -36,6 +40,8 @@ __all__ = [
     "DuplicateKeyError",
     "ExecuteResult",
     "IndexInfo",
+    "IntervalDataPlane",
+    "IntervalMetadataPlane",
     "MergePreview",
     "MergePolicy",
     "MergeResolution",

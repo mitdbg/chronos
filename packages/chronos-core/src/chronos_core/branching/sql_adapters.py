@@ -4,7 +4,7 @@ import sqlite3
 from abc import ABC, abstractmethod
 from pathlib import Path
 import re
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
 import psycopg
@@ -139,6 +139,9 @@ class SQLiteDatabaseAdapter(SQLDatabaseAdapter):
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=OFF")
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA fullfsync=ON")
+        conn.execute("PRAGMA checkpoint_fullfsync=ON")
         database_path = parsed.path if parsed.scheme == "file" else path
         return cls(conn, database_path)
 
@@ -520,10 +523,275 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
         return params if adapted_sequence is None else adapted_sequence
 
 
+class DuckDBCursorAdapter:
+    """Small row-mapping wrapper around DuckDB's DB-API cursor."""
+
+    def __init__(self, cursor: Any):
+        self._cursor = cursor
+        self.description = getattr(cursor, "description", None)
+        self.rowcount = getattr(cursor, "rowcount", -1)
+
+    def fetchone(self) -> dict[str, Any] | None:
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        return self._row_to_dict(row)
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        return [self._row_to_dict(row) for row in self._cursor.fetchall()]
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        for row in self._cursor.fetchall():
+            yield self._row_to_dict(row)
+
+    def _row_to_dict(self, row: Sequence[Any]) -> dict[str, Any]:
+        description = self.description or ()
+        return {
+            str(description[index][0]): value
+            for index, value in enumerate(row)
+        }
+
+
+class DuckDBDatabaseAdapter(SQLDatabaseAdapter):
+    dialect = "duckdb"
+
+    _named_param = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
+
+    def __init__(self, conn: Any, database_path: str, database_url: str | None = None):
+        self._conn = conn
+        self.database_path = database_path
+        self.database_url = database_url
+        self._in_transaction = False
+
+    @classmethod
+    def connect(cls, database_url: str) -> DuckDBDatabaseAdapter:
+        try:
+            import duckdb
+        except ModuleNotFoundError as exc:
+            raise ValueError(
+                "DuckDB support requires installing chronos-core[duckdb]"
+            ) from exc
+
+        parsed = urlparse(database_url)
+        if parsed.scheme != "duckdb":
+            raise ValueError(f"not a DuckDB URL: {database_url}")
+        if database_url == "duckdb:///:memory:":
+            path = ":memory:"
+        else:
+            path = unquote(parsed.path)
+            if path.startswith("/") and database_url.startswith("duckdb:///"):
+                pass
+            elif path:
+                path = path.lstrip("/")
+            if not path:
+                raise ValueError(f"DuckDB URL is missing a path: {database_url}")
+        if path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        conn = duckdb.connect(path)
+        return cls(conn, path, database_url)
+
+    def execute(
+        self, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()
+    ) -> DuckDBCursorAdapter:
+        self._begin_implicit_transaction(sql)
+        translated_sql, translated_params = self._translate_params(sql, params)
+        if translated_params:
+            return DuckDBCursorAdapter(self._conn.execute(translated_sql, translated_params))
+        return DuckDBCursorAdapter(self._conn.execute(translated_sql))
+
+    def executemany(self, sql: str, params: Iterable[Sequence[Any]]) -> DuckDBCursorAdapter:
+        self._begin_implicit_transaction(sql)
+        cursor = self._conn.executemany(sql, params)
+        return DuckDBCursorAdapter(cursor)
+
+    def commit(self) -> None:
+        if self._in_transaction:
+            self._conn.commit()
+            self._in_transaction = False
+
+    def rollback(self) -> None:
+        if self._in_transaction:
+            self._conn.rollback()
+            self._in_transaction = False
+
+    def begin(self) -> None:
+        if not self._in_transaction:
+            self._conn.begin()
+            self._in_transaction = True
+
+    def close(self) -> None:
+        self._conn.close()
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._in_transaction
+
+    @property
+    def raw_connection(self) -> Any:
+        return self._conn
+
+    @property
+    def auto_increment_primary_key(self) -> str:
+        return "BIGINT PRIMARY KEY"
+
+    def table_defs(self, table: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        rows = self.execute(
+            f"PRAGMA table_info({self.quote_identifier(table)})"
+        ).fetchall()
+        if not rows:
+            return (), ()
+        columns: list[str] = []
+        defs: list[str] = []
+        for row in rows:
+            name = row["name"]
+            col_type = row["type"] or "VARCHAR"
+            columns.append(name)
+            defs.append(f"{self.quote_identifier(name)} {col_type}")
+        return tuple(columns), tuple(defs)
+
+    def last_insert_id(self) -> int:
+        raise SQLAdapterError("DuckDB does not expose a portable last insert id")
+
+    def _translate_params(
+        self, sql: str, params: Sequence[Any] | Mapping[str, Any]
+    ) -> tuple[str, Sequence[Any]]:
+        if not isinstance(params, Mapping):
+            return sql, params
+        ordered: list[Any] = []
+
+        def replace(segment: str, index: int) -> tuple[str, int] | None:
+            marker = segment[index]
+            if marker not in {":", "$"}:
+                return None
+            if index > 0 and segment[index - 1] == ":":
+                return None
+            if index + 1 >= len(segment):
+                return None
+            if marker == "$" and segment[index + 1] == "$":
+                return None
+            first = segment[index + 1]
+            if not (first.isalpha() or first == "_"):
+                return None
+            end = index + 2
+            while end < len(segment):
+                char = segment[end]
+                if not (char.isalnum() or char == "_"):
+                    break
+                end += 1
+            name = segment[index + 1:end]
+            ordered.append(params[name])
+            return "?", end
+
+        translated = PostgresDatabaseAdapter._rewrite_outside_sql_literals(sql, replace)
+        return translated, ordered
+
+    def _begin_implicit_transaction(self, sql: str) -> None:
+        head = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+        if head in {
+            "ALTER",
+            "CREATE",
+            "DELETE",
+            "DROP",
+            "INSERT",
+            "UPDATE",
+        }:
+            self.begin()
+
+
+class RoutedIntervalDatabaseAdapter(SQLDatabaseAdapter):
+    """Route interval metadata to one adapter and data-plane SQL to another."""
+
+    _metadata_markers = (
+        "_chronos_branch_tables",
+        "_chronos_branch_indexes",
+        "_chronos_branch_interval_",
+        "_chronos_branch_table_schema_versions",
+        "_chronos_branch_table_bindings",
+        "pg_advisory_",
+    )
+
+    def __init__(self, data_db: SQLDatabaseAdapter, metadata_db: SQLDatabaseAdapter):
+        self.data_db = data_db
+        self.metadata_db = metadata_db
+        self.dialect = data_db.dialect
+        self.database_url = getattr(data_db, "database_url", None)
+
+    def execute(
+        self, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()
+    ) -> Any:
+        return self._adapter_for_sql(sql).execute(sql, params)
+
+    def executemany(self, sql: str, params: Iterable[Sequence[Any]]) -> Any:
+        return self._adapter_for_sql(sql).executemany(sql, params)
+
+    def commit(self) -> None:
+        self.data_db.commit()
+        if self.metadata_db is not self.data_db:
+            self.metadata_db.commit()
+
+    def rollback(self) -> None:
+        data_error: Exception | None = None
+        try:
+            self.data_db.rollback()
+        except Exception as exc:
+            data_error = exc
+        if self.metadata_db is not self.data_db:
+            self.metadata_db.rollback()
+        if data_error is not None:
+            raise data_error
+
+    def begin(self) -> None:
+        self.data_db.begin()
+        if self.metadata_db is not self.data_db:
+            self.metadata_db.begin()
+
+    def close(self) -> None:
+        self.data_db.close()
+        if self.metadata_db is not self.data_db:
+            self.metadata_db.close()
+
+    @property
+    def in_transaction(self) -> bool:
+        return self.data_db.in_transaction or self.metadata_db.in_transaction
+
+    @property
+    def raw_connection(self) -> Any:
+        return self.data_db.raw_connection
+
+    @property
+    def auto_increment_primary_key(self) -> str:
+        return self.data_db.auto_increment_primary_key
+
+    def create_temp_table(self, name: str, column_defs: Sequence[str]) -> None:
+        self.data_db.create_temp_table(name, column_defs)
+
+    def drop_table(self, name: str) -> None:
+        self._adapter_for_table(name).drop_table(name)
+
+    def table_defs(self, table: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        return self._adapter_for_table(table).table_defs(table)
+
+    def last_insert_id(self) -> int:
+        return self.data_db.last_insert_id()
+
+    def _adapter_for_table(self, table: str) -> SQLDatabaseAdapter:
+        return self.metadata_db if self._is_metadata_text(table) else self.data_db
+
+    def _adapter_for_sql(self, sql: str) -> SQLDatabaseAdapter:
+        return self.metadata_db if self._is_metadata_text(sql) else self.data_db
+
+    @classmethod
+    def _is_metadata_text(cls, text: str) -> bool:
+        lowered = text.lower()
+        return any(marker in lowered for marker in cls._metadata_markers)
+
+
 def connect_sql_database(database_url: str) -> SQLDatabaseAdapter:
     parsed = urlparse(database_url)
     if parsed.scheme in ("", "sqlite", "file"):
         return SQLiteDatabaseAdapter.connect(database_url)
+    if parsed.scheme == "duckdb":
+        return DuckDBDatabaseAdapter.connect(database_url)
     if parsed.scheme in ("postgres", "postgresql"):
         return PostgresDatabaseAdapter.connect(database_url)
     raise ValueError(f"unsupported SQL database URL for Chronos branching: {database_url}")

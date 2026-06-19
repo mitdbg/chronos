@@ -23,6 +23,8 @@ from chronos_core.branching.api import (
     ChronosBranchContext,
     TableNotRegisteredError,
     UnsupportedSQLError,
+    IntervalDataPlane,
+    IntervalMetadataPlane,
 )
 
 __all__ = [
@@ -36,6 +38,8 @@ __all__ = [
     "DuplicateKeyError",
     "ExecuteResult",
     "IndexInfo",
+    "IntervalDataPlane",
+    "IntervalMetadataPlane",
     "MergePreview",
     "MergePolicy",
     "MergeResolution",

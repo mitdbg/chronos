@@ -92,6 +92,35 @@ def test_postgres_percent_escaping_preserves_placeholders() -> None:
     assert "LIKE %s" in escaped
 
 
+def test_sqlite_branch_query_does_not_commit_without_open_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = ChronosBranchContext.connect("sqlite:///:memory:", backend="interval")
+    try:
+        ctx.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, body TEXT)")
+        ctx.db.execute("INSERT INTO docs VALUES (?, ?)", ("d1", "main"))
+        ctx.db.commit()
+        ctx.register_table("docs", ["id"])
+        session = ctx.checkout("main")
+
+        commits = 0
+        original_commit = ctx.db.commit
+
+        def counted_commit() -> None:
+            nonlocal commits
+            commits += 1
+            original_commit()
+
+        monkeypatch.setattr(ctx.db, "commit", counted_commit)
+
+        assert session.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
+            {"body": "main"}
+        ]
+        assert commits == 0
+    finally:
+        ctx.close()
+
+
 @pytest.mark.parametrize("sql_backend", SQL_BACKENDS)
 def test_interval_register_table_adds_new_source_columns(sql_backend: str) -> None:
     if sql_backend == "postgres":
@@ -2492,6 +2521,183 @@ def test_interval_merge_apply_conflict_rolls_back_clean_changes(sql_backend: str
 
         assert _product(main, "abc")["price"] == 12
         assert _product(main, "def")["price"] == 20
+    finally:
+        ctx.close()
+
+
+def test_interval_merge_apply_writes_to_new_target_segment(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+
+        old_target = ctx._backend._current_segment("main")
+        result = ctx.merge_apply(source="agent", target="main")
+        new_target = ctx._backend._current_segment("main")
+
+        assert result.applied == 1
+        assert new_target.segment_id != old_target.segment_id
+        assert _product(ctx.checkout("main"), "abc")["price"] == 11
+        new_row = ctx.db.execute(
+            """
+            SELECT price, writer_segment_id
+            FROM _chronos_b_interval_products
+            WHERE sku = ?
+              AND live_lo <= ?
+              AND ? < live_hi
+              AND deleted = FALSE
+            """,
+            ("abc", new_target.branch_point, new_target.branch_point),
+        ).fetchone()
+        assert new_row is not None
+        assert new_row["price"] == 11
+        assert int(new_row["writer_segment_id"]) == new_target.segment_id
+        old_row = ctx.db.execute(
+            """
+            SELECT price
+            FROM _chronos_b_interval_products
+            WHERE sku = ?
+              AND live_lo <= ?
+              AND ? < live_hi
+              AND deleted = FALSE
+            """,
+            ("abc", old_target.branch_point, old_target.branch_point),
+        ).fetchone()
+        assert old_row is not None
+        assert old_row["price"] == 10
+    finally:
+        ctx.close()
+
+
+def test_interval_merge_apply_rolls_back_unpublished_successor(
+    sql_backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+
+        old_target = ctx._backend._current_segment("main")
+        staged_segment_ids: list[int] = []
+        original_upsert = ctx._backend._upsert_rows_in_segment
+
+        def fail_after_staged_upsert(branch_id, table, rows, segment, meta):
+            original_upsert(branch_id, table, rows, segment, meta)
+            staged_segment_ids.append(segment.segment_id)
+            raise RuntimeError("boom after staged merge write")
+
+        monkeypatch.setattr(
+            ctx._backend, "_upsert_rows_in_segment", fail_after_staged_upsert
+        )
+
+        with pytest.raises(RuntimeError, match="boom after staged merge write"):
+            ctx.merge_apply(source="agent", target="main")
+
+        current_target = ctx._backend._current_segment("main")
+        assert current_target.segment_id == old_target.segment_id
+        assert _product(ctx.checkout("main"), "abc")["price"] == 10
+        assert staged_segment_ids
+
+        staged_segment = ctx.db.execute(
+            """
+            SELECT 1
+            FROM _chronos_branch_interval_segments
+            WHERE segment_id = ?
+            """,
+            (staged_segment_ids[0],),
+        ).fetchone()
+        assert staged_segment is None
+
+        staged_row = ctx.db.execute(
+            """
+            SELECT 1
+            FROM _chronos_b_interval_products
+            WHERE writer_segment_id = ?
+            """,
+            (staged_segment_ids[0],),
+        ).fetchone()
+        assert staged_row is None
+    finally:
+        ctx.close()
+
+
+def test_interval_merge_apply_successive_terminal_merges_advance_successors(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("txn_a", from_branch="main", terminal=True)
+        txn_a = ctx.checkout("txn_a")
+        txn_a.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+
+        before_first = ctx._backend._current_segment("main")
+        first = ctx.merge_apply(
+            source="txn_a", target="main", policy="snapshot_isolation"
+        )
+        after_first = ctx._backend._current_segment("main")
+
+        assert first.applied == 1
+        assert after_first.segment_id != before_first.segment_id
+        assert after_first.branch_point == before_first.branch_point + 1
+        assert _product(ctx.checkout("main"), "abc")["price"] == 11
+        assert _product(ctx.checkout("main"), "def")["price"] == 20
+
+        first_metadata = ctx.db.execute(
+            """
+            SELECT parent_segment_id, owner_branch_id, segment_kind
+            FROM _chronos_branch_interval_segments
+            WHERE segment_id = ?
+            """,
+            (after_first.segment_id,),
+        ).fetchone()
+        assert first_metadata is not None
+        assert int(first_metadata["parent_segment_id"]) == before_first.segment_id
+        assert first_metadata["owner_branch_id"] == "main"
+        assert first_metadata["segment_kind"] == "mutable"
+
+        ctx.create_branch("txn_b", from_branch="main", terminal=True)
+        txn_b = ctx.checkout("txn_b")
+        txn_b.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "def", "price": 21},
+        )
+
+        before_second = ctx._backend._current_segment("main")
+        second = ctx.merge_apply(
+            source="txn_b", target="main", policy="snapshot_isolation"
+        )
+        after_second = ctx._backend._current_segment("main")
+
+        assert second.applied == 1
+        assert before_second.segment_id != after_first.segment_id
+        assert after_second.segment_id != after_first.segment_id
+        assert after_second.branch_point == before_second.branch_point + 1
+        assert _product(ctx.checkout("main"), "abc")["price"] == 11
+        assert _product(ctx.checkout("main"), "def")["price"] == 21
+
+        second_metadata = ctx.db.execute(
+            """
+            SELECT parent_segment_id, owner_branch_id, segment_kind
+            FROM _chronos_branch_interval_segments
+            WHERE segment_id = ?
+            """,
+            (after_second.segment_id,),
+        ).fetchone()
+        assert second_metadata is not None
+        assert int(second_metadata["parent_segment_id"]) == before_second.segment_id
+        assert second_metadata["owner_branch_id"] == "main"
+        assert second_metadata["segment_kind"] == "mutable"
     finally:
         ctx.close()
 

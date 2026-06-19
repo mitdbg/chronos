@@ -510,31 +510,57 @@ def _chronos_metadata_lock(db: SQLDatabaseAdapter) -> Iterator[None]:
     schema-branch privacy checks stable until their metadata changes commit.
     """
 
-    if db.dialect != "postgres":
+    lock_db = getattr(db, "metadata_db", db)
+    if lock_db.dialect != "postgres":
         yield
         return
     # This must be transaction-scoped: schema DDL decides whether a schema
     # version is private, then mutates either metadata or the physical table. A
     # concurrent fork/checkpoint cannot be allowed to observe the old metadata
     # and attach to that same schema version before the DDL commits.
-    db.execute("SELECT pg_advisory_xact_lock(1720812901, 19840717)")
+    lock_db.execute("SELECT pg_advisory_xact_lock(1720812901, 19840717)")
     yield
 
 
-def _parse_table_registry(db: SQLDatabaseAdapter, backend: str) -> dict[str, _TableMeta]:
-    with _chronos_metadata_lock(db):
-        db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS _chronos_branch_tables (
-              table_name TEXT PRIMARY KEY,
-              physical_table TEXT NOT NULL,
-              pk_columns TEXT NOT NULL,
-              columns TEXT NOT NULL,
-              column_defs TEXT NOT NULL,
-              backend TEXT NOT NULL
-            )
-            """
+def _relation_exists(db: SQLDatabaseAdapter, name: str) -> bool:
+    """Dialect-safe relation probe used before metadata bootstrap DDL."""
+
+    probe_db = getattr(db, "metadata_db", db)
+    if getattr(probe_db, "dialect", None) == "postgres":
+        rows = probe_db.execute("SELECT to_regclass(?) AS reg", (name,))
+    else:
+        rows = probe_db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+            (name,),
         )
+    for row in rows:
+        try:
+            value = row["reg"]
+        except Exception:
+            try:
+                value = row["name"]
+            except Exception:
+                value = row[0]
+        return value is not None
+    return False
+
+
+def _parse_table_registry(db: SQLDatabaseAdapter, backend: str) -> dict[str, _TableMeta]:
+    if not _relation_exists(db, "_chronos_branch_tables"):
+        with _chronos_metadata_lock(db):
+            if not _relation_exists(db, "_chronos_branch_tables"):
+                db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS _chronos_branch_tables (
+                      table_name TEXT PRIMARY KEY,
+                      physical_table TEXT NOT NULL,
+                      pk_columns TEXT NOT NULL,
+                      columns TEXT NOT NULL,
+                      column_defs TEXT NOT NULL,
+                      backend TEXT NOT NULL
+                    )
+                    """
+                )
     tables: dict[str, _TableMeta] = {}
     for row in db.execute(
         "SELECT * FROM _chronos_branch_tables WHERE backend = ?", (backend,)
@@ -551,18 +577,20 @@ def _parse_table_registry(db: SQLDatabaseAdapter, backend: str) -> dict[str, _Ta
 
 
 def _ensure_index_registry(db: SQLDatabaseAdapter) -> None:
-    with _chronos_metadata_lock(db):
-        db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS _chronos_branch_indexes (
-              backend TEXT NOT NULL,
-              index_name TEXT NOT NULL,
-              table_name TEXT NOT NULL,
-              columns TEXT NOT NULL,
-              PRIMARY KEY (backend, index_name)
-            )
-            """
-        )
+    if not _relation_exists(db, "_chronos_branch_indexes"):
+        with _chronos_metadata_lock(db):
+            if not _relation_exists(db, "_chronos_branch_indexes"):
+                db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS _chronos_branch_indexes (
+                      backend TEXT NOT NULL,
+                      index_name TEXT NOT NULL,
+                      table_name TEXT NOT NULL,
+                      columns TEXT NOT NULL,
+                      PRIMARY KEY (backend, index_name)
+                    )
+                    """
+                )
 
 
 def _parse_index_registry(db: SQLDatabaseAdapter, backend: str) -> dict[str, _IndexMeta]:
@@ -1014,6 +1042,14 @@ class _SQLBranchBackend:
         target: str,
         resolution: MergeResolution | None = None,
     ) -> MergeResult | None:
+        return None
+
+    def apply_merge_changes(
+        self,
+        source: str,
+        target: str,
+        changes: list[RowDiff],
+    ) -> int | None:
         return None
 
     def lock_branches_for_merge(self, source: str, target: str) -> None:

@@ -1668,26 +1668,28 @@ def test_multi_store_branch_can_change_schema_and_filesystem(tmp_path: Path, sql
     (repo / "README.md").write_text("# main\n")
     sql = _ctx(sql_backend, enable_schema_branching=True)
     fs = ChronosFilesystemStore(repo, state_dir=tmp_path / "state")
-    workspace = ChronosWorkspaceContext(relational=sql, filesystem=fs)
+    store_name = "postgresql" if sql_backend == "postgres" else "sqlite"
+    workspace = ChronosWorkspaceContext(filesystem=fs, **{store_name: sql})
     try:
         workspace.create_branch("agent", from_branch="main")
         agent = workspace.checkout("agent")
-        assert agent.sql is not None
+        sql_session = getattr(agent, store_name)
+        assert sql_session is not None
         assert agent.fs is not None
 
-        agent.sql.execute("ALTER TABLE products ADD COLUMN score INTEGER")
-        agent.sql.execute(
+        sql_session.execute("ALTER TABLE products ADD COLUMN score INTEGER")
+        sql_session.execute(
             "UPDATE products SET score = :score WHERE sku = :sku",
             {"sku": "abc", "score": 42},
         )
         (agent.fs.path / "report.md").write_text("score: 42\n")
 
-        assert agent.sql.query("SELECT score FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+        assert sql_session.query("SELECT score FROM products WHERE sku = :sku", {"sku": "abc"}) == [
             {"score": 42}
         ]
         assert (agent.fs.path / "report.md").read_text() == "score: 42\n"
         with pytest.raises(Exception):
-            workspace.checkout("main").sql.query("SELECT score FROM products")  # type: ignore[union-attr]
+            getattr(workspace.checkout("main"), store_name).query("SELECT score FROM products")
         assert not (repo / "report.md").exists()
     finally:
         workspace.close()

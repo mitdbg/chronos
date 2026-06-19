@@ -307,6 +307,14 @@ class _IntervalBackend(_SQLBranchBackend):
         self._query_rewrite_cache: dict[tuple[str, str, tuple[tuple[str, str], ...]], str] = {}
         self._statement_plan_cache: dict[tuple[str, str], _StatementPlan] = {}
 
+    def _metadata_dialect(self) -> str:
+        metadata_db = getattr(self.db, "metadata_db", self.db)
+        return metadata_db.dialect
+
+    def _metadata_raw_connection(self) -> Any:
+        metadata_db = getattr(self.db, "metadata_db", self.db)
+        return metadata_db.raw_connection
+
     def after_commit(self) -> None:
         self._start_pending_interval_gc()
         if not self._pending_async_schema_index_sqls:
@@ -572,7 +580,7 @@ class _IntervalBackend(_SQLBranchBackend):
         )
 
     def _ensure_segment_id_allocator(self) -> None:
-        if self.db.dialect == "postgres":
+        if self._metadata_dialect() == "postgres":
             exists = self.db.execute(
                 "SELECT to_regclass('public._chronos_branch_interval_segment_id_seq') AS seq"
             ).fetchone()
@@ -608,20 +616,18 @@ class _IntervalBackend(_SQLBranchBackend):
         )
         self.db.execute(
             """
-            INSERT INTO _chronos_branch_interval_segment_id_alloc
+            INSERT OR IGNORE INTO _chronos_branch_interval_segment_id_alloc
             (singleton, next_segment_id)
-            SELECT 1, COALESCE(MAX(segment_id) + 1, 2)
-            FROM _chronos_branch_interval_segments
-            WHERE NOT EXISTS (
-              SELECT 1 FROM _chronos_branch_interval_segment_id_alloc
-            )
+            SELECT
+              1,
+              COALESCE((SELECT MAX(segment_id) + 1 FROM _chronos_branch_interval_segments), 2)
             """
         )
 
     def _allocate_segment_ids(self, count: int) -> list[int]:
         if count <= 0:
             return []
-        if self.db.dialect == "postgres":
+        if self._metadata_dialect() == "postgres":
             rows = self.db.execute(
                 """
                 SELECT nextval('_chronos_branch_interval_segment_id_seq')::integer AS segment_id
@@ -1149,7 +1155,7 @@ class _IntervalBackend(_SQLBranchBackend):
         *,
         terminal: bool = False,
     ) -> None:
-        if self.db.dialect == "postgres":
+        if self._metadata_dialect() == "postgres":
             self._create_branch_postgres_locked(
                 branch_id, from_branch, metadata, terminal=terminal
             )
@@ -1234,7 +1240,7 @@ class _IntervalBackend(_SQLBranchBackend):
             source_segment, terminal=terminal
         )
         now = _utc_now()
-        raw = self.db.raw_connection
+        raw = self._metadata_raw_connection()
         if not hasattr(raw, "pipeline"):
             raise BranchingError("PostgreSQL adapter does not expose pipeline mode")
         with raw.pipeline():
@@ -1871,7 +1877,7 @@ class _IntervalBackend(_SQLBranchBackend):
         if self.db.dialect != "postgres" or not hasattr(self.db.raw_connection, "pipeline"):
             return self._current_segment(source), self._current_segment(target)
 
-        raw = self.db.raw_connection
+        raw = self._metadata_raw_connection()
         with raw.pipeline():
             source_cur = self.db.execute(
                 """
@@ -2068,6 +2074,79 @@ class _IntervalBackend(_SQLBranchBackend):
             self._rows_by_key_from_rows(source_meta, source_cur.fetchall()),
             self._rows_by_key_from_rows(target_meta, target_cur.fetchall()),
         )
+
+    def apply_merge_changes(
+        self,
+        source: str,
+        target: str,
+        changes: list[RowDiff],
+    ) -> int | None:
+        _source_segment, current_segment = self._current_segments_for_merge(source, target)
+        successor = self._merge_successor_segment(current_segment)
+        now = _utc_now()
+        self._insert_segment(
+            successor,
+            current_segment.segment_id,
+            target,
+            "mutable",
+            now,
+        )
+        successor_segment = _IntervalSegment(
+            segment_id=int(successor["segment_id"]),
+            live_lo=int(successor["live_lo"]),
+            live_hi=int(successor["live_hi"]),
+            branch_point=int(successor["branch_point"]),
+        )
+
+        pending_deletes: dict[str, list[dict[str, Any]]] = {}
+        pending_upserts: dict[str, list[dict[str, Any]]] = {}
+        table_order: list[str] = []
+        seen_tables: set[str] = set()
+        for change in changes:
+            if change.table not in seen_tables:
+                seen_tables.add(change.table)
+                table_order.append(change.table)
+            if change.change == "deleted":
+                pending_deletes.setdefault(change.table, []).append(change.key)
+            else:
+                if change.after is None:
+                    raise BranchingError("merge change is missing source row")
+                pending_upserts.setdefault(change.table, []).append(change.after)
+
+        applied = 0
+        for table in table_order:
+            meta = self._meta_for_segment(successor_segment, table)
+            deletes = pending_deletes.get(table, [])
+            if deletes:
+                self._delete_keys_in_segment(
+                    target,
+                    table,
+                    deletes,
+                    successor_segment,
+                    meta,
+                )
+                applied += len(deletes)
+            upserts = pending_upserts.get(table, [])
+            if upserts:
+                self._upsert_rows_in_segment(
+                    target,
+                    table,
+                    upserts,
+                    successor_segment,
+                    meta,
+                )
+                applied += len(upserts)
+
+        self.db.execute(
+            """
+            UPDATE _chronos_branch_interval_branches
+               SET current_segment_id = ?
+             WHERE branch_id = ?
+               AND current_segment_id = ?
+            """,
+            (successor_segment.segment_id, target, current_segment.segment_id),
+        )
+        return applied
 
     def _snapshot_diff_rows(
         self,
@@ -2304,7 +2383,16 @@ class _IntervalBackend(_SQLBranchBackend):
             return
         segment = self._current_segment(branch_id)
         meta = self._meta_for_segment(segment, table)
+        self._upsert_rows_in_segment(branch_id, table, rows, segment, meta)
 
+    def _upsert_rows_in_segment(
+        self,
+        branch_id: str,
+        table: str,
+        rows: list[dict[str, Any]],
+        segment: _IntervalSegment,
+        meta: _TableMeta,
+    ) -> None:
         keyed: dict[tuple[Any, ...], dict[str, Any]] = {}
         for row in rows:
             keyed[self._key_tuple(meta, self._row_key(meta, row))] = row
@@ -2313,13 +2401,26 @@ class _IntervalBackend(_SQLBranchBackend):
         chunk_size = self._upsert_batch_chunk_size(meta)
 
         physical_keys: set[tuple[Any, ...]] = set()
-        for start in range(0, len(keys), chunk_size):
-            physical_keys |= self._physical_row_key_tuples_for_keys(
-                table,
-                keys[start : start + chunk_size],
-                segment,
-                meta=meta,
-            )
+        key_chunks = [keys[start : start + chunk_size] for start in range(0, len(keys), chunk_size)]
+        if self.db.dialect == "postgres" and hasattr(self.db.raw_connection, "pipeline"):
+            raw = self.db.raw_connection
+            with raw.pipeline():
+                cursors = [
+                    self._physical_row_key_tuples_for_keys_cursor(chunk, segment, meta)
+                    for chunk in key_chunks
+                ]
+            for cursor in cursors:
+                physical_keys |= self._physical_row_key_tuples_from_rows(
+                    meta, cursor.fetchall()
+                )
+        else:
+            for chunk in key_chunks:
+                physical_keys |= self._physical_row_key_tuples_for_keys(
+                    table,
+                    chunk,
+                    segment,
+                    meta=meta,
+                )
 
         direct_rows: list[dict[str, Any]] = []
         for row in deduped:
@@ -2365,7 +2466,16 @@ class _IntervalBackend(_SQLBranchBackend):
             return
         segment = self._current_segment(branch_id)
         meta = self._meta_for_segment(segment, table)
+        self._delete_keys_in_segment(branch_id, table, keys, segment, meta)
 
+    def _delete_keys_in_segment(
+        self,
+        branch_id: str,
+        table: str,
+        keys: list[dict[str, Any]],
+        segment: _IntervalSegment,
+        meta: _TableMeta,
+    ) -> None:
         keyed: dict[tuple[Any, ...], dict[str, Any]] = {}
         for key in keys:
             keyed[self._key_tuple(meta, key)] = key
@@ -3209,14 +3319,27 @@ class _IntervalBackend(_SQLBranchBackend):
             if key_tuple in seen_keys:
                 raise DuplicateKeyError(f"duplicate key on branch {branch_id}: {key}")
             seen_keys.add(key_tuple)
-        visible = self._visible_rows_for_keys(table, [key for key, _ in keyed_rows], segment, meta=meta)
+        keys = [key for key, _ in keyed_rows]
+        if self.db.dialect == "postgres" and hasattr(self.db.raw_connection, "pipeline"):
+            raw = self.db.raw_connection
+            with raw.pipeline():
+                visible_cur = self._visible_rows_for_keys_cursor(keys, segment, meta)
+                physical_cur = self._physical_row_key_tuples_for_keys_cursor(
+                    keys, segment, meta
+                )
+            visible = [dict(row) for row in visible_cur.fetchall()]
+            physical_row_keys = self._physical_row_key_tuples_from_rows(
+                meta, physical_cur.fetchall()
+            )
+        else:
+            visible = self._visible_rows_for_keys(table, keys, segment, meta=meta)
+            physical_row_keys = self._physical_row_key_tuples_for_keys(
+                table, keys, segment, meta=meta
+            )
         if visible:
             duplicate = self._row_key(meta, visible[0])
             raise DuplicateKeyError(f"duplicate key on branch {branch_id}: {duplicate}")
 
-        physical_row_keys = self._physical_row_key_tuples_for_keys(
-            table, [key for key, _ in keyed_rows], segment, meta=meta
-        )
         direct_rows: list[dict[str, Any]] = []
         for key, row in keyed_rows:
             if self._key_tuple(meta, key) in physical_row_keys:
@@ -3767,9 +3890,20 @@ class _IntervalBackend(_SQLBranchBackend):
         if not keys:
             return set()
         meta = meta or self._meta_for_segment(segment, table)
+        rows = self._physical_row_key_tuples_for_keys_cursor(
+            keys, segment, meta
+        ).fetchall()
+        return self._physical_row_key_tuples_from_rows(meta, rows)
+
+    def _physical_row_key_tuples_for_keys_cursor(
+        self,
+        keys: list[dict[str, Any]],
+        segment: _IntervalSegment,
+        meta: _TableMeta,
+    ) -> Any:
         predicate, values = self._keys_predicate(meta, keys)
         pk_cols = ", ".join(_quote(c) for c in meta.pk_columns)
-        rows = self.db.execute(
+        return self.db.execute(
             f"""
             SELECT DISTINCT {pk_cols}
             FROM {_quote(meta.physical_name)}
@@ -3778,7 +3912,11 @@ class _IntervalBackend(_SQLBranchBackend):
               AND ? < live_hi
             """,
             [*values, segment.live_hi, segment.live_lo],
-        ).fetchall()
+        )
+
+    def _physical_row_key_tuples_from_rows(
+        self, meta: _TableMeta, rows: list[Any]
+    ) -> set[tuple[Any, ...]]:
         return {
             tuple(row[column] for column in meta.pk_columns)
             for row in rows
@@ -3939,7 +4077,7 @@ class _IntervalBackend(_SQLBranchBackend):
         ).fetchone()
 
     def _branch_row_for_update(self, branch_id: str) -> Any | None:
-        if self.db.dialect != "postgres":
+        if self._metadata_dialect() != "postgres":
             return self._branch_row(branch_id)
         return self.db.execute(
             """
@@ -3952,13 +4090,33 @@ class _IntervalBackend(_SQLBranchBackend):
         ).fetchone()
 
     def lock_branches_for_merge(self, source: str, target: str) -> None:
-        if self.db.dialect != "postgres":
+        if self._metadata_dialect() != "postgres":
             return
         # Merge preview and apply must observe a stable pair of branch heads.
         # Lock in deterministic order so concurrent merges into the same target
         # serialize and snapshot isolation becomes true first-committer-wins.
-        for branch_id in sorted({source, target}):
-            if self._branch_row_for_update(branch_id) is None:
+        branch_ids = sorted({source, target})
+        raw = self._metadata_raw_connection()
+        if not hasattr(raw, "pipeline"):
+            for branch_id in branch_ids:
+                if self._branch_row_for_update(branch_id) is None:
+                    raise BranchNotFoundError(branch_id)
+            return
+        with raw.pipeline():
+            cursors = [
+                self.db.execute(
+                    """
+                    SELECT *
+                    FROM _chronos_branch_interval_branches
+                    WHERE branch_id = ?
+                    FOR UPDATE
+                    """,
+                    (branch_id,),
+                )
+                for branch_id in branch_ids
+            ]
+        for branch_id, cursor in zip(branch_ids, cursors):
+            if cursor.fetchone() is None:
                 raise BranchNotFoundError(branch_id)
 
     def _lock_branch_for_schema_change(self, ref: _PreparedBranchRef) -> None:
@@ -3967,13 +4125,13 @@ class _IntervalBackend(_SQLBranchBackend):
         # from attaching to the old schema version between the privacy check and
         # the metadata/physical-table mutation. Unrelated branches can still run
         # schema changes and branch creation concurrently.
-        if self.db.dialect != "postgres":
+        if self._metadata_dialect() != "postgres":
             return
         if self._branch_row_for_update(ref.branch_id) is None:
             raise BranchNotFoundError(ref.branch_id)
 
     def _lock_schema_binding_table(self, table: str) -> None:
-        if self.db.dialect != "postgres":
+        if self._metadata_dialect() != "postgres":
             return
         digest = hashlib.blake2s(table.encode("utf-8"), digest_size=4).digest()
         key = int.from_bytes(digest, "big", signed=True)
@@ -4085,7 +4243,7 @@ class _IntervalBackend(_SQLBranchBackend):
             "segment_id": continuation_segment_id,
             "live_lo": child_hi,
             "live_hi": hi,
-            "branch_point": child_hi + (hi - child_hi) // 2,
+            "branch_point": child_hi,
         }
         child = {
             "segment_id": child_segment_id,
@@ -4136,6 +4294,33 @@ class _IntervalBackend(_SQLBranchBackend):
             "branch_point": lo + (split - lo) // 2,
         }
         return continuation, snapshot
+
+    def _merge_successor_segment(self, segment: _IntervalSegment) -> dict[str, Any]:
+        # Staged merge rows must not contain the old branch point; otherwise
+        # readers already holding the old target segment could observe them
+        # before the metadata publish step. Prefer the high side and place the
+        # successor point at its low edge so repeated publishes consume one
+        # point at a time after the initial split.
+        min_width = (_MIN_SPLIT_WIDTH * 2) + 1
+        right_lo = segment.branch_point + 1
+        if segment.live_hi - right_lo >= min_width:
+            successor_id = self._allocate_segment_ids(1)[0]
+            return {
+                "segment_id": successor_id,
+                "live_lo": right_lo,
+                "live_hi": segment.live_hi,
+                "branch_point": right_lo,
+            }
+        left_hi = segment.branch_point
+        if left_hi - segment.live_lo >= min_width:
+            successor_id = self._allocate_segment_ids(1)[0]
+            return {
+                "segment_id": successor_id,
+                "live_lo": segment.live_lo,
+                "live_hi": left_hi,
+                "branch_point": left_hi - 1,
+            }
+        raise BranchingError("interval space exhausted")
 
     def _segment_for_ref(self, ref: _BranchRef) -> _IntervalSegment:
         return self._segment(ref.ref)

@@ -49,7 +49,7 @@ class BranchSession:
             if self._transaction_depth == 0:
                 self._context._rollback_autocommit()
             raise
-        if self._transaction_depth == 0:
+        if self._transaction_depth == 0 and self._context._db.in_transaction:
             self._context._commit_autocommit()
         return rows
 
@@ -179,8 +179,10 @@ class ChronosBranchContext:
         db: SQLDatabaseAdapter,
         backend: _SQLBranchBackend,
         autocommit: bool = True,
+        metadata_db: SQLDatabaseAdapter | None = None,
     ):
         self._db = db
+        self._metadata_db = metadata_db or db
         self._backend = backend
         self._autocommit = autocommit
         # Incremented whenever branch/table metadata changes. Checked-out
@@ -219,6 +221,7 @@ class ChronosBranchContext:
         db: SQLDatabaseAdapter,
         backend: BranchBackendName = "interval",
         autocommit: bool = True,
+        metadata_db: SQLDatabaseAdapter | None = None,
         interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         interval_child_width: int | None = None,
         interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
@@ -226,6 +229,15 @@ class ChronosBranchContext:
         enable_schema_branching: bool = False,
         enable_diff_merge_tracking: bool = False,
     ) -> ChronosBranchContext:
+        if metadata_db is not None:
+            if backend != "interval":
+                raise ValueError("split metadata/data stores are supported only by the interval backend")
+            if enable_schema_branching:
+                raise ValueError("schema branching is not supported for split metadata/data interval stores")
+            from chronos_core.branching.sql_adapters import RoutedIntervalDatabaseAdapter
+
+            db = RoutedIntervalDatabaseAdapter(db, metadata_db)
+
         def build_backend() -> _SQLBranchBackend:
             if backend == "interval":
                 return _IntervalBackend(
@@ -252,12 +264,41 @@ class ChronosBranchContext:
             raise ValueError(f"unknown branch backend: {backend}")
 
         if ensure_metadata:
-            with _chronos_metadata_lock(db):
+            with _chronos_metadata_lock(metadata_db or db):
                 impl = build_backend()
                 impl.ensure()
         else:
             impl = build_backend()
-        return cls(db, impl, autocommit=autocommit)
+        return cls(db, impl, autocommit=autocommit, metadata_db=metadata_db)
+
+    @classmethod
+    def connect_split(
+        cls,
+        data_url: str,
+        metadata_url: str,
+        backend: BranchBackendName = "interval",
+        autocommit: bool = True,
+        interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
+        interval_child_width: int | None = None,
+        interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
+        ensure_metadata: bool = True,
+        enable_schema_branching: bool = False,
+    ) -> ChronosBranchContext:
+        data_db = connect_sql_database(data_url)
+        metadata_db = connect_sql_database(metadata_url)
+        if metadata_db.dialect != "postgres":
+            raise ValueError("split interval metadata store must be PostgreSQL")
+        return cls.from_database_adapter(
+            data_db,
+            backend=backend,
+            autocommit=autocommit,
+            metadata_db=metadata_db,
+            interval_continuation_percent=interval_continuation_percent,
+            interval_child_width=interval_child_width,
+            interval_allocation_strategy=interval_allocation_strategy,
+            ensure_metadata=ensure_metadata,
+            enable_schema_branching=enable_schema_branching,
+        )
 
     @property
     def autocommit(self) -> bool:
@@ -276,9 +317,18 @@ class ChronosBranchContext:
         return self._db
 
     @property
+    def metadata_db(self) -> SQLDatabaseAdapter:
+        return self._metadata_db
+
+    @property
     def conn(self) -> Any:
         """Return the underlying driver connection for low-level tests/tools."""
         return self._db.raw_connection
+
+    @property
+    def metadata_conn(self) -> Any:
+        """Return the underlying metadata connection for split-store tools."""
+        return self._metadata_db.raw_connection
 
     def close(self) -> None:
         self._db.close()
@@ -382,7 +432,8 @@ class ChronosBranchContext:
         except Exception:
             self._rollback_autocommit()
             raise
-        self._commit_autocommit()
+        if self._db.in_transaction:
+            self._commit_autocommit()
         return BranchSession(self, prepared)
 
     def checkout_checkpoint(self, checkpoint: str) -> BranchSession:
@@ -391,7 +442,8 @@ class ChronosBranchContext:
         except Exception:
             self._rollback_autocommit()
             raise
-        self._commit_autocommit()
+        if self._db.in_transaction:
+            self._commit_autocommit()
         return BranchSession(self, prepared)
 
     def create_checkpoint(
@@ -521,7 +573,12 @@ class ChronosBranchContext:
             changes = _resolve_merge_changes(
                 preview, normalized_policy, resolution, backend=self._backend.name
             )
-            applied = self._apply_merge_changes(target_session, changes)
+            backend_applied = self._backend.apply_merge_changes(source, target, changes)
+            if backend_applied is None:
+                applied = self._apply_merge_changes(target_session, changes)
+            else:
+                applied = backend_applied
+        self._metadata_epoch += 1
         return MergeResult(source=source, target=target, applied=applied)
 
     def _apply_merge_changes(

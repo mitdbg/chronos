@@ -15,9 +15,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+duckdb = [
+  "duckdb>=1.0",
+]
 test = [
+  "duckdb>=1.0",
   "pytest>=7.0",
   "pytest-asyncio>=0.21",
+]
+fuse = [
+  "pyfuse3>=3.4",
+  "trio>=0.21",
 ]
 
 [tool.hatch.build.targets.wheel]
