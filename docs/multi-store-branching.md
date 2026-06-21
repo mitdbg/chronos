@@ -237,7 +237,7 @@ postgresql = ChronosPostgresStore(
 )
 ```
 
-DuckDB is the OLAP path with Postgres metadata:
+DuckDB is the OLAP path with transactional row-store metadata:
 
 ```python
 duckdb = ChronosDuckDBStore(
@@ -249,6 +249,9 @@ duckdb = ChronosDuckDBStore(
 Both use interval branching for fixed-schema data operations. PostgreSQL also
 supports opt-in branch-local schema branching through the existing interval
 backend configuration.
+DuckDB stores only physical user tables with interval visibility columns; branch
+lifecycle, segment allocation, checkpoints, and registries live in the
+PostgreSQL or SQLite metadata store.
 
 ## ChronosFS Store
 
@@ -415,7 +418,25 @@ All effects remain branch-local until a workspace merge publishes them.
 ## Transactions and Atomicity
 
 Multi-store branch operations use a staged-publish pattern. The guiding rule is:
-write new store state first, then publish branch refs.
+write new store state first, then publish one transactional branch reference.
+
+Chronos assumes that a polystore workspace has one transactional row store
+owning the branch metadata plane. That store is usually PostgreSQL, but SQLite
+is also valid for local deployments. Additional stores such as DuckDB,
+ChronosFS, vector indexes, or search indexes store only physical user data with
+Chronos visibility columns. They do not own branch lifecycle state. The
+metadata store owns:
+
+- branch heads
+- interval segments
+- checkpoints
+- table and index registries
+- staged publish records
+
+This keeps the commit decision in one transactional database. Chronos does not
+need two-phase commit across stores because additional stores never independently
+publish branch visibility. They only write durable rows that remain unreachable
+until the metadata store advances the target branch head.
 
 For `create_branch`:
 
@@ -431,20 +452,161 @@ For `create_checkpoint`:
 
 For `merge_apply`:
 
-1. Compute or validate store diffs.
-2. Ask each store to apply the source branch changes to the target branch.
-3. Return a grouped merge result keyed by store name.
+1. Resolve a target validation token from the metadata store.
+2. Compute diffs with a three-way comparison over source, target, and fork base.
+3. Run deterministic conflict checks and optional application/LLM-assisted
+   resolution outside the metadata publish transaction.
+4. Reserve exactly one successor segment for the target branch in a short
+   metadata transaction. This revalidates the target token, verifies that no
+   active staged successor already exists for the target, allocates a fresh
+   successor interval, and inserts the staged-publish row.
+5. Run the policy-specific post-reservation validation. If the target changed
+   during preview, the configured policy decides whether to abort, retry,
+   rebase, apply source-over-target, or re-run LLM reconciliation against the
+   new target state.
+6. Write the resolved merge output into the successor segment in every
+   participating store. Stores use the ordinary branch write path with the
+   explicit successor segment as the destination. If a store supports
+   transactions, staged writes for that store should run inside a physical store
+   transaction to minimize cleanup after failures.
+7. Open the final metadata publish transaction, lock the target branch row,
+   revalidate the target token and staged successor row, atomically update the
+   target head to `successor_segment_id`, delete the staged-publish row, and
+   commit.
+8. Return a grouped merge result keyed by store name.
 
-The Chronos interval backend can make an individual store merge atomic by
-sealing the target branch's current segment and writing merge changes into a
-new segment inside one store-local transaction. Old readers that acquired their
-branch read point before publish continue to see the old segment. New readers
-see the post-merge segment.
+The successor segment does not need a special segment kind. It is an ordinary
+`mutable` segment that is unpublished until a branch head points at it. Publish
+state is derived only from metadata reachability:
 
-Cross-store workspace merges are best-effort in v1. Chronos does not require a
-global two-phase commit protocol across independent stores. The design relies
-on branch isolation, per-store atomic publish, and retryable cleanup for failed
-or orphaned prepared state.
+- Unpublished: staged row exists and target branch still points at the old
+  segment.
+- Published: target branch points at the successor segment and the staged row
+  was deleted by the publish transaction.
+- Abandoned: target branch moved somewhere else before publish; the staged row
+  and successor rows are garbage-collection candidates.
+
+The staged-publish table is intentionally small:
+
+```sql
+CREATE TABLE _chronos_branch_staged_publish (
+  successor_segment_id INTEGER PRIMARY KEY,
+  target_branch_id TEXT NOT NULL UNIQUE,
+  old_target_segment_id INTEGER NOT NULL,
+  old_target_revision INTEGER NOT NULL,
+  source_branch_id TEXT,
+  participant_stores TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+```
+
+There is no separate `staging_id`, heartbeat, or status column. The successor
+segment id identifies the attempt. The row is either present because an
+unpublished attempt may need cleanup, or absent because publish completed.
+
+Only one staged successor may exist for a target branch at a time. The
+`UNIQUE(target_branch_id)` constraint makes the staged row a target-branch
+publish lock. Concurrent preview, diff, and LLM reconciliation can still run
+outside the lock, but only one merge enters the staged apply/publish pipeline
+for a given target. This preserves the fast interval visibility predicate: a
+reader does not need a reachability join to filter out multiple sibling staged
+segments for the same target.
+
+`old_target_revision` is required if the target branch can accept in-place
+writes to its current segment. Every Chronos-mediated write that can change the
+target branch's visible contents must advance this revision in the metadata
+store. If an implementation instead makes every visible branch update publish a
+new immutable segment head, then `old_target_segment_id` alone is a sufficient
+validation token. Chronos' general polystore protocol should use the pair
+`(old_target_segment_id, old_target_revision)` so it is correct for both modes.
+
+The publish transaction is the only visibility commit:
+
+```sql
+BEGIN;
+
+SELECT current_segment_id, content_revision
+  FROM _chronos_branch_interval_branches
+ WHERE branch_id = :target_branch_id
+ FOR UPDATE;
+
+UPDATE _chronos_branch_interval_branches
+   SET current_segment_id = :successor_segment_id,
+       content_revision = content_revision + 1
+ WHERE branch_id = :target_branch_id
+   AND current_segment_id = :old_target_segment_id
+   AND content_revision = :old_target_revision;
+
+DELETE FROM _chronos_branch_staged_publish
+ WHERE successor_segment_id = :successor_segment_id;
+
+COMMIT;
+```
+
+SQLite uses the same logical protocol inside a write transaction instead of
+`FOR UPDATE`. If the conditional update affects zero rows, the target moved or
+its current segment was modified. The merge attempt is then handled according
+to the configured merge policy: strict snapshot isolation rejects it, while
+weaker or semantic policies may retry, rebase, or re-run reconciliation against
+the new head.
+
+The row-count check is mandatory. A publish implementation must never do
+`SELECT current_segment_id`, observe that it changed, and then unconditionally
+overwrite the branch head with the staged successor. It also must not ignore a
+revision change on the same head segment. The conditional update is the
+commit-validation step. A successful publish requires exactly one updated branch
+row. Any other result means the merge candidate was validated against a stale
+target and cannot be exposed.
+
+Old readers that acquired their branch read point before publish continue to
+see the old segment. New readers resolve the branch after publish and see the
+successor segment. This gives all participating stores atomic visibility as
+long as their staged writes are durable before the metadata publish commits.
+If a store-local staged write transaction fails before publish, the successor
+remains invisible and GC can later remove any rows that escaped rollback.
+
+### Concurrent Merge Control
+
+Diff, policy checks, and LLM-assisted reconciliation must be decoupled from the
+publish transaction. Holding the target branch row lock while waiting for an LLM
+or external tool would recreate the long transaction problem Chronos is trying
+to avoid.
+
+Chronos instead uses optimistic concurrency control for preview and a serialized
+reservation for staged apply/publish:
+
+1. Merge preview reads `(source, target, fork_base)` at a stable target head.
+2. Conflict detection and optional LLM reconciliation produce a resolved merge
+   candidate for that specific target token:
+   `(old_target_segment_id, old_target_revision)`.
+3. A short reservation transaction locks the target branch row, checks that the
+   target token still matches, checks that no staged successor exists for the
+   target, allocates a successor interval, and inserts the staged row.
+4. After reservation, Chronos runs any policy-required validation against the
+   current target state. Under `snapshot_isolation`, a changed target usually
+   means abort/retry. Under weaker or semantic policies, Chronos may rebase,
+   apply source-over-target, or re-run the application/LLM resolver to minimize
+   wasted work.
+5. While the staged row exists, all target-visible writes for that branch must
+   wait, fail, or participate in the same reserved successor protocol. The
+   reservation is the publish lock for the target branch.
+6. The final publish transaction revalidates the target token and staged row,
+   then flips the branch head.
+
+This handles the race where two concurrent previews both pass diff validation
+against the same target head. The first merge that reserves the successor slot
+enters the commit pipeline. The second merge cannot reserve while the staged
+row exists. After the first merge publishes or aborts, the second merge must
+consult its configured policy against the current target state before it can
+reserve a new successor.
+
+The same validation handles concurrent ordinary writes to the target branch.
+Those writes may not allocate a new segment, but they must advance the target
+branch content revision or be blocked by an active staged row. A merge staged
+against an old revision then fails validation instead of silently overwriting
+data that appeared after diff validation. Direct writes that bypass Chronos and
+do not update the metadata revision are outside the protocol.
 
 ## Workspace Transactions
 
@@ -559,11 +721,19 @@ GC roots:
 - Workspace branches.
 - Workspace checkpoints.
 - Active checkouts and mounted branches.
-- In-progress merge publishes.
+- Staged publish rows in `_chronos_branch_staged_publish`.
 
 ChronosFS GC should remove unreachable inode, dirent, and block row versions
 only after no branch/checkpoint/read point can see them. Relational GC can use
 the same interval reachability logic.
+
+For staged publish cleanup, GC must preserve any successor segment referenced by
+a staged-publish row until the system decides the attempt is abandoned. A
+staged row whose target branch still matches
+`(old_target_segment_id, old_target_revision)` can be retried or explicitly
+aborted. A staged row whose target branch points somewhere else, or whose
+content revision has advanced, is stale and can be collected after the retention
+policy allows it.
 
 ## Failure Modes
 
@@ -583,12 +753,30 @@ fails. Agent runtimes that require POSIX filesystem access should fail closed.
 Deletion should mark the branch deleted and defer mount shutdown or row GC until
 active checkout references are released or a timeout expires.
 
-### Merge partially applies stores, then one store fails
+### Staged writes succeed, metadata publish fails
 
-Per-store atomic merge prevents partial visibility inside that store. A
-cross-store failure may still leave some stores merged and others unmerged in
-v1. Higher-level orchestration should record intent, retry failed stores, or
-run a compensating branch merge.
+The target branch still points at the old segment, so staged rows are invisible.
+The staged-publish row remains as a cleanup root. The merge can either retry the
+same publish if the target head is unchanged, or abort and let GC remove the
+successor later.
+
+### Target branch moves before publish
+
+The publish transaction validates `current_segment_id = old_target_segment_id`.
+With Chronos-managed writes, the active staged row should prevent another merge
+or ordinary write from advancing the target during staged apply. If the target
+still moves because of recovery, timeout, manual intervention, or a write path
+outside the reservation protocol, validation fails and the transaction rolls
+back. The stale successor must not be published. The next action is selected by
+the merge policy: strict snapshot isolation rejects or retries, while semantic
+policies may rebase or re-run conflict resolution against the new target head.
+
+### Metadata publish succeeds, process crashes before returning
+
+The branch head already points at the successor and the staged-publish row was
+deleted in the same transaction. Recovery treats the merge as committed. A
+client that did not receive the response can safely inspect the branch head or
+use an idempotency key in higher-level orchestration.
 
 ## Open Questions
 
@@ -601,8 +789,8 @@ run a compensating branch merge.
   filesystem store into a source-control system?
 - Should workspace `merge_apply()` be allowed when one store has conflicts and
   another does not, or should all store conflicts block the entire merge?
-- How should remote block sharing and local write-back caching interact with
-  Postgres-backed branch metadata?
+- What retention policy should decide when abandoned staged successors are
+  cleaned?
 
 ## Proposed Incremental Plan
 
@@ -614,7 +802,8 @@ run a compensating branch merge.
    rows in Chronos interval tables.
 4. Use `mount_chronosfs(...)` for POSIX execution inside a branch.
 5. Add workspace diff that groups relational and ChronosFS changes.
-6. Keep per-store `merge_apply` atomic through staged interval publish.
+6. Publish multi-store `merge_apply` through the transactional metadata-store
+   branch-head swap.
 7. Add richer ChronosFS merge preview and conflict reporting.
 8. Add schema-branching support behind the PostgreSQL relational store.
 9. Add GC and compaction for ChronosFS row versions and old relational versions.

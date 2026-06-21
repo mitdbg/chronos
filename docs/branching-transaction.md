@@ -272,6 +272,109 @@ as the target branch head. If the metadata publish never commits, staged
 versions are unreachable and can be ignored or garbage-collected. If it commits,
 all stores resolve the target branch through the new head.
 
+This relies on one transactional metadata store for the polystore workspace.
+PostgreSQL or SQLite owns branch heads, segment allocation, checkpoints, table
+registries, and staged publish records. Additional stores such as DuckDB,
+ChronosFS, vector stores, or search indexes store only physical branchable data.
+They do not independently decide branch visibility.
+
+The staged publish record is keyed by the successor segment id:
+
+```sql
+CREATE TABLE _chronos_branch_staged_publish (
+  successor_segment_id INTEGER PRIMARY KEY,
+  target_branch_id TEXT NOT NULL UNIQUE,
+  old_target_segment_id INTEGER NOT NULL,
+  old_target_revision INTEGER NOT NULL,
+  source_branch_id TEXT,
+  participant_stores TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+```
+
+The `UNIQUE(target_branch_id)` constraint makes the staged row a
+target-branch publish lock. Chronos allows concurrent diff, validation, and
+LLM-assisted resolution, but only one merge at a time can reserve a successor
+segment and enter the staged apply/publish pipeline for a target branch. This
+keeps the interval read path fast: abandoned successors are not competing
+sibling intervals for the same target read point.
+
+The successor is a normal `mutable` segment. It does not need a `merge_staging`
+or `merge_published` segment kind. Visibility is determined by the target
+branch head:
+
+```text
+main -> S10        published old state
+S11 exists         durable staged successor, not visible
+main -> S11        committed merge
+```
+
+The publish transaction is intentionally short and contains no model calls,
+human review, filesystem execution, or expensive diff computation:
+
+```text
+BEGIN
+  lock target branch row
+  verify the staged row still names this successor
+  conditionally set current_segment_id = successor_segment_id
+    only if the target token still matches
+  verify exactly one branch row was updated
+  delete staged publish row
+COMMIT
+```
+
+All conflict detection, policy checks, and optional LLM-assisted reconciliation
+run before this transaction using a stable `(source, target, fork_base)` read
+point. The publish transaction only revalidates that the target branch is still
+the one that was reviewed.
+
+The full commit pipeline is:
+
+```text
+preview:
+  diff source/target/base
+  run policy checks and optional LLM/manual reconciliation
+  produce merge plan for target_token
+
+reserve:
+  short metadata transaction
+  lock target branch row
+  check target_token is still current
+  check no staged successor exists for target
+  allocate one successor segment
+  insert staged publish row
+  commit
+
+staged apply:
+  write merge output into the successor segment in each store
+  use store-local transactions where available
+
+publish:
+  short metadata transaction
+  lock target branch row
+  check target_token and staged row still match
+  flip target branch head to successor
+  delete staged row
+  commit
+```
+
+If two concurrent merge attempts both compute clean diffs against the same
+target head, the first one that reserves the staged row enters the commit
+pipeline. The second cannot allocate another successor for the same target
+while that row exists. After the first merge publishes or aborts, the second
+must handle the now-current target according to the configured policy. Under
+`snapshot_isolation`, that often means abort or retry. Under
+`weak_snapshot_isolation`, source-over-target, application merge, or LLM-based
+policies, Chronos may rebase or rerun reconciliation to reduce wasted work.
+The target branch row and unique staged row are the serialization points, while
+expensive reconciliation work stays outside the lock.
+
+This works only if publish treats the branch-head update as a compare-and-swap.
+An implementation that reuses an earlier diff result and unconditionally writes
+the target head would be incorrect: two serial metadata transactions could both
+commit physically while the second one logically overwrites the first merge.
+
 ## Semantics
 
 A branch transaction should provide:
