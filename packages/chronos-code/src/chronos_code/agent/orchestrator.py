@@ -161,6 +161,22 @@ class Orchestrator:
             return value
         return value[: max_chars - 3] + "..."
 
+    @staticmethod
+    def _looks_like_unhelpful_refusal(summary: str) -> bool:
+        """Detect generic worker refusals that should not become final output."""
+        lowered = (summary or "").strip().lower()
+        if not lowered:
+            return True
+        refusal_markers = (
+            "cannot be completed",
+            "can't be completed",
+            "unable to complete",
+            "cannot complete",
+            "with the current constraints",
+            "available tools",
+        )
+        return sum(marker in lowered for marker in refusal_markers) >= 2
+
     def _resolve_txn_working_dir(
         self,
         txn: TxnContext | None = None,
@@ -1969,8 +1985,9 @@ class Orchestrator:
             picked = results_by_node.get(plan.response_node_id)
             if picked is not None and picked.success and (picked.summary or "").strip():
                 summary = picked.summary
-                await self._persist_final_summary(summary, session)
-                return summary
+                if not self._looks_like_unhelpful_refusal(summary):
+                    await self._persist_final_summary(summary, session)
+                    return summary
 
         terminal_ids = self._terminal_node_ids(plan.nodes_by_id)
         terminal_success = [
@@ -1980,8 +1997,9 @@ class Orchestrator:
         ]
         if len(terminal_success) == 1 and (terminal_success[0].summary or "").strip():
             summary = terminal_success[0].summary
-            await self._persist_final_summary(summary, session)
-            return summary
+            if not self._looks_like_unhelpful_refusal(summary):
+                await self._persist_final_summary(summary, session)
+                return summary
 
         aggregator = Aggregator(
             session=session,

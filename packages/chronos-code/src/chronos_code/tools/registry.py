@@ -41,6 +41,7 @@ def build_tools(
     task_launcher: Any = None,
     todo_listener: Callable | None = None,
     expose_txn_control: bool = False,
+    expose_ask_user: bool = True,
 ) -> dict[str, Any]:
     """Create all tool instances for Chronos-Code.
 
@@ -55,6 +56,8 @@ def build_tools(
         expose_txn_control: When True, expose ``chronos_txn`` tool for manual
             transaction control (primarily debug/testing). Defaults to False
             so the orchestrator remains the single owner of txn boundaries.
+        expose_ask_user: When False, omit the blocking ask-user tool. CLI
+            subprocess/non-TTY runs use this so EOF cannot derail a turn.
 
     Returns:
         Dictionary of tool_name → tool instance.
@@ -114,7 +117,8 @@ def build_tools(
         todo.add_listener(todo_listener)
     _register_tool("todo_write", todo)
 
-    _register_tool("ask_user", AskUserTool(prompt_fn=prompt_fn))
+    if expose_ask_user:
+        _register_tool("ask_user", AskUserTool(prompt_fn=prompt_fn))
     task_tool = TaskTool(launcher=task_launcher)
     _register_tool("launch_task", task_tool, "task")
 

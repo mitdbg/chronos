@@ -425,12 +425,14 @@ async def _repl_loop(
         ui.print_info(f"LLM JSONL log: {resolved_log_path}")
 
     # Build initial tools (rooted at project until a txn begins)
+    expose_ask_user = sys.stdin.isatty()
     initial_tools = build_tools(
         working_dir=working_dir,
         config=config,
         chronos_context=chronos_ctx,
         prompt_fn=prompt_fn,
         todo_listener=todo_display.on_todos_changed,
+        expose_ask_user=expose_ask_user,
     )
     initial_schemas = build_tool_schemas(initial_tools)
 
@@ -444,6 +446,7 @@ async def _repl_loop(
             prompt_fn=prompt_fn,
             task_launcher=orchestrator.launch_task,
             todo_listener=todo_display.on_todos_changed,
+            expose_ask_user=expose_ask_user,
         )
         return tools, build_tool_schemas(tools)
 
@@ -455,6 +458,7 @@ async def _repl_loop(
             prompt_fn=prompt_fn,
             task_launcher=orchestrator.launch_task,
             todo_listener=todo_display.on_todos_changed,
+            expose_ask_user=expose_ask_user,
         )
         return tools, build_tool_schemas(tools)
 

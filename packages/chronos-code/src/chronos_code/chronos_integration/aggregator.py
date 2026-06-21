@@ -174,10 +174,10 @@ class Aggregator:
             if self._on_llm_usage is not None and isinstance(response, dict):
                 self._on_llm_usage(response.get("usage"))
             content = str(response.get("content", "")).strip()
-            if content:
+            if content and not self._looks_like_unhelpful_refusal(content):
                 return content
             logger.warning(
-                "Aggregator LLM returned empty content; falling back to deterministic merge."
+                "Aggregator LLM returned empty or unhelpful content; falling back to deterministic merge."
             )
         except Exception as e:
             logger.warning(
@@ -206,3 +206,18 @@ class Aggregator:
                 parts.append(f"- {r.task.description}: {r.error}")
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _looks_like_unhelpful_refusal(summary: str) -> bool:
+        lowered = (summary or "").strip().lower()
+        if not lowered:
+            return True
+        refusal_markers = (
+            "cannot be completed",
+            "can't be completed",
+            "unable to complete",
+            "cannot complete",
+            "with the current constraints",
+            "available tools",
+        )
+        return sum(marker in lowered for marker in refusal_markers) >= 2
