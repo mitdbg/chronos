@@ -1,0 +1,37 @@
+flowchart TB
+  API["Python public API<br/>ChronosBranchContext / BranchSession / Workspace"]
+  Glue["Python glue layer<br/>_interval_backend.py<br/>API compatibility + error mapping"]
+  Native["Native C++ backend<br/>NativeBranchStore / NativeBranchSession"]
+
+  API --> Glue --> Native
+
+  subgraph Metadata["Transactional Metadata Plane: SQLite or PostgreSQL"]
+    Branches["_chronos_branch_interval_branches"]
+    Segments["_chronos_branch_interval_segments"]
+    Checkpoints["_chronos_branch_interval_checkpoints"]
+    Tables["_chronos_branch_tables"]
+    Indexes["_chronos_branch_indexes"]
+    Schema["_chronos_branch_table_schema_versions<br/>_chronos_branch_table_bindings"]
+  end
+
+  subgraph Data["Interval Data Planes"]
+    PGData["PostgreSQL data tables<br/>OLTP row store"]
+    SQLiteData["SQLite data tables"]
+    DuckData["DuckDB data tables<br/>OLAP"]
+    FSData["ChronosFS interval tables<br/>inodes / dirents / file_blocks"]
+  end
+
+  Native --> Metadata
+  Native --> PGData
+  Native --> SQLiteData
+  Native --> DuckData
+  Native --> FSData
+
+  Metadata -. "branch read point<br/>segment + branch_point" .-> Native
+  Native -. "visible predicate" .-> Data
+
+  DataNote["Physical row shape:<br/>user columns + live_lo + live_hi<br/>+ writer_segment_id + deleted"]
+  PGData --> DataNote
+  SQLiteData --> DataNote
+  DuckData --> DataNote
+  FSData --> DataNote

@@ -1,0 +1,19 @@
+flowchart LR
+  SQL["User SQL DML<br/>INSERT / UPDATE / DELETE"]
+  Parse["Native SQL parser/planner<br/>statement classification<br/>table + columns + predicates"]
+  MetaLookup["Native metadata lookup<br/>logical table -> physical table<br/>PK columns + schema"]
+  Plan["Interval write plan"]
+  Probe["Probe visible/overlapping rows<br/>using PK/filter/indexes"]
+  Splice["Interval splice<br/>delete overlap<br/>preserve remainders<br/>insert replacement"]
+  Result["ExecuteResult"]
+
+  SQL --> Parse --> MetaLookup --> Plan --> Probe --> Splice --> Result
+
+  subgraph Stores["Store-specific SQL drivers"]
+    SQLite["SQLite driver"]
+    Postgres["PostgreSQL driver"]
+    DuckDB["DuckDB driver"]
+  end
+
+  Probe --> Stores
+  Splice --> Stores

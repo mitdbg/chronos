@@ -16,11 +16,12 @@ workspace execution, RAG index updates, debugging, and multi-step tool plans.
 - **Store-native access:** branch sessions expose normal SQL for relational
   stores and filesystem operations for workspace state.
 - **Shared interval branching:** PostgreSQL, SQLite, and DuckDB-backed SQL data
-  can use the same interval backend for branch visibility, writes, diffs, and
-  merges.
-- **Postgres metadata plane:** branch metadata, segment allocation, checkpoints,
-  and registries stay in PostgreSQL when using split stores such as
-  DuckDB-data plus Postgres-metadata.
+  can use the same interval data-plane algorithm for branch visibility, writes,
+  diffs, and merges.
+- **Transactional metadata plane:** branch metadata, segment allocation,
+  checkpoints, and registries stay in a transactional row store
+  (PostgreSQL or SQLite). Additional stores such as DuckDB keep only physical
+  user tables plus interval visibility columns.
 - **Multi-store workspaces:** coordinate the same branch names across named
   stores such as `postgresql`, `duckdb`, and `filesystem`.
 - **Branch transactions:** run work in a branch, inspect the resulting diff, and
@@ -165,10 +166,10 @@ PostgreSQL can also be used as both data and metadata through
 `ChronosBranchContext.connect(...)`; this remains compatible with existing
 call sites.
 
-## DuckDB Store With Postgres Metadata
+## DuckDB Store With Row-Store Metadata
 
 Use `ChronosDuckDBStore` for OLAP-oriented relational data while keeping
-branching metadata in PostgreSQL.
+branching metadata in PostgreSQL or SQLite.
 
 ```python
 from chronos_core.workspace import ChronosDuckDBStore
@@ -198,9 +199,12 @@ assert experiment.query("SELECT region, sum(value) AS total FROM metrics GROUP B
 ]
 ```
 
-DuckDB v1 uses the shared interval backend for fixed-schema data operations.
-Branch-local schema branching is intentionally disabled for DuckDB; use
-PostgreSQL interval branches for schema-branching workloads.
+DuckDB v1 uses the shared interval data-plane algorithm for fixed-schema data
+operations. Branch lifecycle and segment metadata are tracked in the
+transactional row store; DuckDB stores only the physical user tables with
+`live_lo`, `live_hi`, `writer_segment_id`, and `deleted` columns. Branch-local
+schema branching is intentionally disabled for DuckDB; use PostgreSQL interval
+branches for schema-branching workloads.
 
 ## Multi-Store Workspace
 
@@ -309,7 +313,7 @@ branch backends:
 
 | Backend | How it stores branch state | Read behavior | Write behavior | Good for |
 | --- | --- | --- | --- | --- |
-| `interval` | Physical rows plus interval visibility and delete metadata | Rewrites SQL through a prepared branch point | Splits overlapping row intervals and writes into the active segment | Default; SQL-heavy reads; Postgres, SQLite, DuckDB data planes |
+| `interval` | Physical rows plus interval visibility and delete metadata | Rewrites SQL through a prepared branch point | Splits overlapping row intervals and writes into the active segment | Default; SQL-heavy reads; Postgres/SQLite metadata, DuckDB data plane |
 | `log` | Append-only per-table operation log with branch lineage metadata | Reconstructs latest visible row per key from log prefixes | Appends insert/update/delete records | Studying log-based designs |
 | `copy` | Full physical table copy per branch/checkpoint | Direct SQL against branch-private tables | Direct writes to private branch tables | Correctness baseline and small datasets |
 
@@ -384,8 +388,9 @@ docker stop chronos-postgres-test
 
 - Cross-store workspace operations are best-effort in v1; there is no global
   distributed commit protocol across independent stores.
-- DuckDB supports fixed-schema interval data operations in v1. Branch-local
-  schema branching is disabled for DuckDB.
+- DuckDB supports fixed-schema interval data operations in v1. Branch metadata
+  must live in PostgreSQL or SQLite, and branch-local schema branching is
+  disabled for DuckDB.
 - Branch-local schema changes are opt-in with `enable_schema_branching=True`.
   PostgreSQL has the strongest schema-branching coverage.
 - Branch write SQL supports a focused DML subset: `INSERT ... VALUES`, simple

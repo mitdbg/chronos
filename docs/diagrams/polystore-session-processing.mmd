@@ -1,0 +1,24 @@
+sequenceDiagram
+  participant User
+  participant WS as WorkspaceBranchSession
+  participant PG as session.postgresql
+  participant Duck as session.duckdb
+  participant FS as session.filesystem
+  participant Meta as Shared Metadata Store
+
+  User->>WS: checkout("experiment")
+  WS->>PG: checkout("experiment")
+  WS->>Duck: checkout("experiment")
+  WS->>FS: checkout("experiment")
+
+  User->>PG: execute OLTP SQL
+  PG->>Meta: read branch segment/table metadata
+  PG->>PG: interval DML over PostgreSQL data
+
+  User->>Duck: query OLAP SQL
+  Duck->>Meta: read same branch segment/table metadata
+  Duck->>Duck: visible aggregate over DuckDB data
+
+  User->>FS: write files
+  FS->>Meta: read same branch segment metadata
+  FS->>FS: block-level interval CoW

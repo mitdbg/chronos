@@ -1,0 +1,20 @@
+sequenceDiagram
+  participant User
+  participant Py as Python BranchSession
+  participant Native as NativeBranchSession
+  participant Meta as Metadata Store
+  participant Data as Data Store
+
+  User->>Py: execute("UPDATE/INSERT/DELETE ...")
+  Py->>Native: execute(sql, params)
+  Native->>Native: parse DML with native planner
+  Native->>Meta: get/cached table metadata + current segment
+  Meta-->>Native: live_lo/live_hi/branch_point/table schema
+  Native->>Data: find overlapping physical rows by PK/index + interval
+  Data-->>Native: old physical intervals
+  Native->>Data: delete overlapping physical intervals
+  Native->>Data: insert left remainder if needed
+  Native->>Data: insert replacement/tombstone interval
+  Native->>Data: insert right remainder if needed
+  Native-->>Py: affected row count
+  Py-->>User: ExecuteResult

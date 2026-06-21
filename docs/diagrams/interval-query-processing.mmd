@@ -1,0 +1,16 @@
+sequenceDiagram
+  participant User
+  participant Py as Python BranchSession
+  participant Native as NativeBranchSession
+  participant Meta as Metadata Store<br/>SQLite/PostgreSQL
+  participant Data as Data Store<br/>PG/SQLite/DuckDB
+
+  User->>Py: session.query("SELECT ...")
+  Py->>Native: query(sql, params)
+  Native->>Meta: prepare/read cached branch segment + table registry
+  Meta-->>Native: segment_id, branch_point, physical table map
+  Native->>Native: parse/rewrite SELECT
+  Native->>Data: SELECT ... FROM physical_table<br/>WHERE live_lo <= branch_point<br/>AND branch_point < live_hi<br/>AND deleted = false
+  Data-->>Native: visible rows
+  Native-->>Py: rows
+  Py-->>User: rows
