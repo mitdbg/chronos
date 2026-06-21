@@ -1209,8 +1209,9 @@ writes, but it does not reserve space for descendants. Terminal branches cannot
 be forked or checkpointed. This maximizes fanout from `main` for flat
 transaction/speculation workloads while preserving the same read predicate.
 
-For branch-transaction workloads, a terminal fork and staged merge consume only
-a small prefix of the target interval. With a toy root interval `[0, 100)`:
+For branch-transaction workloads, a terminal fork and branch transaction commit
+consume only a small prefix of the target interval. With a toy root interval
+`[0, 100)`:
 
 ```text
 main before fork:
@@ -1221,13 +1222,13 @@ create_branch("txn_1", from_branch="main", terminal=True):
   txn_1     S3 [1,3) point=2
   main      S2 [3,100) point=3
 
-merge_apply("txn_1", "main") stages and publishes:
+merge_apply("txn_1", "main") commits through a reserved successor:
   main successor S5 [4,100) point=4
 ```
 
 The target continuation point is kept at the low edge so repeated terminal
-forks and staged publishes advance mostly linearly through the interval space
-instead of repeatedly halving it.
+forks and branch transaction commits advance mostly linearly through the
+interval space instead of repeatedly halving it.
 
 ### Why Not Fixed Width Everywhere?
 
@@ -2053,17 +2054,20 @@ the preview before applying.
 `merge_apply` must not write source results directly into the target branch's
 currently published segment. Direct writes would be visible immediately at the
 target branch point and would make multi-store merge partially visible if a
-later store failed. Instead, Chronos uses staged publish:
+later store failed. Instead, Chronos uses the branch transaction commit
+protocol:
 
 ```text
-1. Lock the target branch row.
-2. Verify or recompute the merge preview against the current target head.
-3. Allocate a new mutable successor segment whose read point does not overlap
+1. Compute diff and resolve conflicts against a target validation token.
+2. Lock the target branch row in a short reservation transaction.
+3. Verify or recompute the merge preview against the current target head.
+4. Allocate one mutable successor segment whose read point does not overlap
    the old target read point.
-4. Apply resolved merge changes into that successor using the same interval
+5. Record the active branch transaction commit for the target branch.
+6. Apply resolved merge changes into that successor using the same interval
    write path as ordinary DML.
-5. Publish by updating branches.current_segment_id from the old target segment
-   to the successor segment.
+7. Commit by updating branches.current_segment_id from the old target segment
+   to the successor segment and deleting the commit record.
 ```
 
 The old target segment becomes sealed by reachability: readers that already
