@@ -24,8 +24,6 @@ test = [
   "pytest-asyncio>=0.21",
 ]
 fuse = [
-  "pyfuse3>=3.4",
-  "trio>=0.21",
 ]
 
 [tool.scikit-build]

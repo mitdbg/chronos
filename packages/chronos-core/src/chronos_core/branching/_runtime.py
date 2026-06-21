@@ -59,6 +59,9 @@ class BranchSession:
         self._ensure_fresh()
         if self._transaction_depth == 0 and self._context._db.in_transaction:
             self._context._db.commit()
+            self._context._backend.after_commit()
+        if self._transaction_depth == 0 and not self._context._autocommit:
+            self._context._db.begin()
         retry_limit = _INTERVAL_UNIQUE_RETRY_LIMIT if self._transaction_depth == 0 else 1
         for attempt in range(retry_limit):
             try:
@@ -84,12 +87,22 @@ class BranchSession:
         """Group several session writes in one underlying SQL transaction."""
 
         root = self._transaction_depth == 0
+        use_adapter_transaction = True
         if root:
             self._ensure_fresh()
             if self._context._db.in_transaction:
                 self._context._db.commit()
+                self._context._backend.after_commit()
+            required = getattr(
+                self._context._backend,
+                "adapter_transaction_required",
+                None,
+            )
+            if callable(required):
+                use_adapter_transaction = bool(required(self._ref))
             self._context._backend.prepare_transaction(self._ref)
-            self._context._db.begin()
+            if use_adapter_transaction:
+                self._context._db.begin()
         self._transaction_depth += 1
         try:
             yield
@@ -99,7 +112,8 @@ class BranchSession:
                 rollback = getattr(self._context._backend, "rollback_transaction", None)
                 if callable(rollback):
                     rollback(self._ref)
-                self._context._db.rollback()
+                if use_adapter_transaction:
+                    self._context._db.rollback()
                 self._context._backend.after_rollback()
             raise
         else:
@@ -110,13 +124,15 @@ class BranchSession:
                     if callable(commit):
                         self._ref = commit(self._ref)
                         self._context._stamp_prepared_ref(self._ref)
-                    self._context._db.commit()
+                    if use_adapter_transaction:
+                        self._context._db.commit()
                     self._context._backend.after_commit()
                 except Exception:
                     rollback = getattr(self._context._backend, "rollback_transaction", None)
                     if callable(rollback):
                         rollback(self._ref)
-                    self._context._db.rollback()
+                    if use_adapter_transaction:
+                        self._context._db.rollback()
                     self._context._backend.after_rollback()
                     raise
 
@@ -129,6 +145,7 @@ class BranchSession:
             raise BranchingError("checkpoint sessions are read-only")
         if self._transaction_depth == 0 and self._context._db.in_transaction:
             self._context._db.commit()
+            self._context._backend.after_commit()
         try:
             self._context._backend.upsert_rows(self.branch_id, table, rows)
             self._ref = self._context._backend.refresh_ref_after_execute(self._ref)
@@ -147,6 +164,7 @@ class BranchSession:
             raise BranchingError("checkpoint sessions are read-only")
         if self._transaction_depth == 0 and self._context._db.in_transaction:
             self._context._db.commit()
+            self._context._backend.after_commit()
         try:
             self._context._backend.delete_keys(self.branch_id, table, keys)
             self._ref = self._context._backend.refresh_ref_after_execute(self._ref)
@@ -229,6 +247,12 @@ class ChronosBranchContext:
         enable_schema_branching: bool = False,
         enable_diff_merge_tracking: bool = False,
     ) -> ChronosBranchContext:
+        if backend == "interval" and db.dialect == "duckdb" and metadata_db is None:
+            raise ValueError(
+                "DuckDB interval stores require a transactional metadata_db; "
+                "use ChronosBranchContext.connect_split(data_url, metadata_url) "
+                "or ChronosDuckDBStore(data_url, metadata_url)."
+            )
         if metadata_db is not None:
             if backend != "interval":
                 raise ValueError("split metadata/data stores are supported only by the interval backend")
@@ -269,6 +293,9 @@ class ChronosBranchContext:
                 impl.ensure()
         else:
             impl = build_backend()
+            initialize_native = getattr(impl, "_initialize_native_branch_store", None)
+            if callable(initialize_native):
+                initialize_native()
         return cls(db, impl, autocommit=autocommit, metadata_db=metadata_db)
 
     @classmethod
@@ -286,8 +313,8 @@ class ChronosBranchContext:
     ) -> ChronosBranchContext:
         data_db = connect_sql_database(data_url)
         metadata_db = connect_sql_database(metadata_url)
-        if metadata_db.dialect != "postgres":
-            raise ValueError("split interval metadata store must be PostgreSQL")
+        if metadata_db.dialect not in {"postgres", "sqlite"}:
+            raise ValueError("split interval metadata store must be PostgreSQL or SQLite")
         return cls.from_database_adapter(
             data_db,
             backend=backend,
@@ -331,6 +358,9 @@ class ChronosBranchContext:
         return self._metadata_db.raw_connection
 
     def close(self) -> None:
+        close_backend = getattr(self._backend, "close", None)
+        if callable(close_backend):
+            close_backend()
         self._db.close()
 
     def wait_for_background_work(self) -> None:
@@ -556,15 +586,22 @@ class ChronosBranchContext:
             raise BranchingError(
                 "custom merge policies are not yet supported by the Orpheus backend"
             )
-        try:
-            backend_result = self._backend.merge_apply(source, target, resolution)
-        except Exception:
-            self._rollback_autocommit()
-            raise
-        if backend_result is not None:
-            self._commit_autocommit()
-            self._metadata_epoch += 1
-            return backend_result
+        can_use_backend_direct_apply = (
+            normalized_policy.mode in {"abort_on_conflict", "snapshot_isolation"}
+            and not normalized_policy.validators
+            and normalized_policy.resolver is None
+            and resolution is None
+        )
+        if can_use_backend_direct_apply:
+            try:
+                backend_result = self._backend.merge_apply(source, target, resolution)
+            except Exception:
+                self._rollback_autocommit()
+                raise
+            if backend_result is not None:
+                self._commit_autocommit()
+                self._metadata_epoch += 1
+                return backend_result
         applied = 0
         target_session = self.checkout(target)
         with target_session.transaction():

@@ -97,7 +97,7 @@ class ChronosPostgresStore:
 
 @dataclass
 class ChronosDuckDBStore:
-    """Workspace store for DuckDB interval data with Postgres metadata."""
+    """Workspace store for DuckDB interval data with row-store metadata."""
 
     data_url: str
     metadata_url: str
@@ -167,4 +167,3 @@ class ChronosDuckDBStore:
 
     def close(self) -> None:
         self.context.close()
-

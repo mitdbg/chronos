@@ -137,6 +137,7 @@ class SQLiteDatabaseAdapter(SQLDatabaseAdapter):
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path, check_same_thread=False, uri=uri)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=OFF")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
@@ -205,6 +206,8 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
     def __init__(self, conn: psycopg.Connection[Any], database_url: str | None = None):
         self._conn = conn
         self.database_url = database_url
+        self._chronos_after_commit = None
+        self._chronos_after_rollback = None
 
     @classmethod
     def connect(cls, database_url: str) -> PostgresDatabaseAdapter:
@@ -246,9 +249,15 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
 
     def commit(self) -> None:
         self._conn.commit()
+        hook = getattr(self, "_chronos_after_commit", None)
+        if callable(hook):
+            hook()
 
     def rollback(self) -> None:
         self._conn.rollback()
+        hook = getattr(self, "_chronos_after_rollback", None)
+        if callable(hook):
+            hook()
 
     def begin(self) -> None:
         self._conn.execute("BEGIN")
@@ -524,54 +533,46 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
 
 
 class DuckDBCursorAdapter:
-    """Small row-mapping wrapper around DuckDB's DB-API cursor."""
+    """Small row-mapping wrapper for native DuckDB query results."""
 
-    def __init__(self, cursor: Any):
-        self._cursor = cursor
-        self.description = getattr(cursor, "description", None)
-        self.rowcount = getattr(cursor, "rowcount", -1)
+    def __init__(self, rows: Sequence[Mapping[str, Any]] = (), rowcount: int = -1):
+        self._rows = [dict(row) for row in rows]
+        self.rowcount = rowcount
 
     def fetchone(self) -> dict[str, Any] | None:
-        row = self._cursor.fetchone()
-        if row is None:
+        if not self._rows:
             return None
-        return self._row_to_dict(row)
+        return self._rows.pop(0)
 
     def fetchall(self) -> list[dict[str, Any]]:
-        return [self._row_to_dict(row) for row in self._cursor.fetchall()]
+        rows = self._rows
+        self._rows = []
+        return rows
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
-        for row in self._cursor.fetchall():
-            yield self._row_to_dict(row)
-
-    def _row_to_dict(self, row: Sequence[Any]) -> dict[str, Any]:
-        description = self.description or ()
-        return {
-            str(description[index][0]): value
-            for index, value in enumerate(row)
-        }
+        while self._rows:
+            yield self._rows.pop(0)
 
 
 class DuckDBDatabaseAdapter(SQLDatabaseAdapter):
+    """DuckDB adapter backed by the native SQL data-plane driver.
+
+    DuckDB is an OLAP data store in Chronos polystore mode. Branch/segment
+    metadata must live in a transactional row store; this adapter only executes
+    DuckDB physical-table SQL through the native driver.
+    """
+
     dialect = "duckdb"
 
     _named_param = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
 
-    def __init__(self, conn: Any, database_path: str, database_url: str | None = None):
-        self._conn = conn
+    def __init__(self, store: Any, database_path: str, database_url: str | None = None):
+        self._store = store
         self.database_path = database_path
         self.database_url = database_url
-        self._in_transaction = False
 
     @classmethod
     def connect(cls, database_url: str) -> DuckDBDatabaseAdapter:
-        try:
-            import duckdb
-        except ModuleNotFoundError as exc:
-            raise ValueError(
-                "DuckDB support requires installing chronos-core[duckdb]"
-            ) from exc
-
         parsed = urlparse(database_url)
         if parsed.scheme != "duckdb":
             raise ValueError(f"not a DuckDB URL: {database_url}")
@@ -580,55 +581,65 @@ class DuckDBDatabaseAdapter(SQLDatabaseAdapter):
         else:
             path = unquote(parsed.path)
             if path.startswith("/") and database_url.startswith("duckdb:///"):
-                pass
+                path = "/" + path.lstrip("/")
             elif path:
                 path = path.lstrip("/")
             if not path:
                 raise ValueError(f"DuckDB URL is missing a path: {database_url}")
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        conn = duckdb.connect(path)
-        return cls(conn, path, database_url)
+        from chronos_core import _native_interval
+
+        return cls(_native_interval.NativeSqlConnection(database_url), path, database_url)
 
     def execute(
         self, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()
     ) -> DuckDBCursorAdapter:
+        self.refresh_connection()
         self._begin_implicit_transaction(sql)
         translated_sql, translated_params = self._translate_params(sql, params)
-        if translated_params:
-            return DuckDBCursorAdapter(self._conn.execute(translated_sql, translated_params))
-        return DuckDBCursorAdapter(self._conn.execute(translated_sql))
+        if self._is_query(translated_sql):
+            rows = self._store.query_sql_dict(translated_sql, translated_params)
+            return DuckDBCursorAdapter(rows)
+        self._store.execute_sql(translated_sql, translated_params)
+        return DuckDBCursorAdapter(rowcount=-1)
 
     def executemany(self, sql: str, params: Iterable[Sequence[Any]]) -> DuckDBCursorAdapter:
+        self.refresh_connection()
         self._begin_implicit_transaction(sql)
-        cursor = self._conn.executemany(sql, params)
-        return DuckDBCursorAdapter(cursor)
+        count = 0
+        for row in params:
+            self._store.execute_sql(sql, row)
+            count += 1
+        return DuckDBCursorAdapter(rowcount=count)
 
     def commit(self) -> None:
-        if self._in_transaction:
-            self._conn.commit()
-            self._in_transaction = False
+        self._store.commit()
 
     def rollback(self) -> None:
-        if self._in_transaction:
-            self._conn.rollback()
-            self._in_transaction = False
+        self._store.rollback()
 
     def begin(self) -> None:
-        if not self._in_transaction:
-            self._conn.begin()
-            self._in_transaction = True
+        if not self._store.in_transaction():
+            self._store.execute_sql("BEGIN")
 
     def close(self) -> None:
-        self._conn.close()
+        self._store = None
+
+    def refresh_connection(self) -> None:
+        if self._store is not None:
+            refresh = getattr(self._store, "refresh_catalog", None)
+            if callable(refresh):
+                refresh()
+        return None
 
     @property
     def in_transaction(self) -> bool:
-        return self._in_transaction
+        return bool(self._store is not None and self._store.in_transaction())
 
     @property
     def raw_connection(self) -> Any:
-        return self._conn
+        return self._store
 
     @property
     def auto_increment_primary_key(self) -> str:
@@ -696,6 +707,10 @@ class DuckDBDatabaseAdapter(SQLDatabaseAdapter):
             "UPDATE",
         }:
             self.begin()
+
+    def _is_query(self, sql: str) -> bool:
+        head = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+        return head in {"SELECT", "WITH", "PRAGMA", "SHOW", "DESCRIBE", "EXPLAIN"}
 
 
 class RoutedIntervalDatabaseAdapter(SQLDatabaseAdapter):
@@ -783,6 +798,8 @@ class RoutedIntervalDatabaseAdapter(SQLDatabaseAdapter):
     @classmethod
     def _is_metadata_text(cls, text: str) -> bool:
         lowered = text.lower()
+        if "information_schema." in lowered:
+            return False
         return any(marker in lowered for marker in cls._metadata_markers)
 
 

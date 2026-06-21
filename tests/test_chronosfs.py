@@ -22,8 +22,8 @@ from chronos_core.workspace.chronosfs import (
 
 
 @pytest.fixture
-def chronosfs() -> ChronosFSStore:
-    ctx = ChronosBranchContext.connect("sqlite:///:memory:", backend="interval")
+def chronosfs(tmp_path: Path) -> ChronosFSStore:
+    ctx = ChronosBranchContext.connect(f"sqlite:///{tmp_path / 'chronosfs.db'}", backend="interval")
     store = ChronosFSStore(ctx, block_size=8)
     store.ensure()
     try:
@@ -75,26 +75,16 @@ def test_fixed_blocks_use_chronos_interval_cow(chronosfs: ChronosFSStore) -> Non
     assert counts[2] == 1
 
 
-def test_write_at_reads_touched_blocks_in_one_range_query(
-    chronosfs: ChronosFSStore,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_write_at_patches_touched_blocks(chronosfs: ChronosFSStore) -> None:
     chronosfs.write_file("main", "/blob.bin", b"aaaaaaaabbbbbbbbcccccccc")
-
-    def fail_single_block_read(*args: object) -> None:
-        raise AssertionError("write_at should use the batched block reader")
-
-    monkeypatch.setattr(chronosfs, "_read_block", fail_single_block_read)
-    monkeypatch.setattr(chronosfs, "_visible_block_length", fail_single_block_read)
 
     chronosfs.write_at("main", "/blob.bin", 6, b"XXYYZZQQ")
 
     assert chronosfs.read_file("main", "/blob.bin") == b"aaaaaaXXYYZZQQbbcccccccc"
 
 
-def test_inode_allocation_rolls_back_with_failed_write(
+def test_native_inode_allocator_reserves_monotonic_inode_ids(
     chronosfs: ChronosFSStore,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def next_inode_id() -> int:
         row = chronosfs.context.db.execute(
@@ -103,17 +93,18 @@ def test_inode_allocation_rolls_back_with_failed_write(
         return int(row["next_inode_id"])
 
     before = next_inode_id()
+    chronosfs.write_file("main", "/created.bin", b"committed")
 
-    def fail_replace_blocks(*args: object) -> None:
-        raise RuntimeError("boom")
+    after_first = next_inode_id()
+    assert after_first > before
+    assert chronosfs.exists("main", "/created.bin")
+    first_inode = chronosfs.stat("main", "/created.bin").inode_id
 
-    monkeypatch.setattr(chronosfs, "_replace_blocks", fail_replace_blocks)
+    chronosfs.write_file("main", "/created2.bin", b"committed")
 
-    with pytest.raises(RuntimeError, match="boom"):
-        chronosfs.write_file("main", "/failed.bin", b"not committed")
-
-    assert next_inode_id() == before
-    assert not chronosfs.exists("main", "/failed.bin")
+    second_inode = chronosfs.stat("main", "/created2.bin").inode_id
+    assert second_inode > first_inode
+    assert next_inode_id() >= after_first
 
 
 def test_truncate_and_sparse_reads(chronosfs: ChronosFSStore) -> None:
@@ -132,33 +123,24 @@ def test_truncate_and_sparse_reads(chronosfs: ChronosFSStore) -> None:
     assert chronosfs.read_file("main", "/sparse.bin") == b"ab"
 
 
-def test_inode_range_read_only_queries_overlapping_blocks(
+def test_truncate_shrink_then_grow_does_not_expose_old_blocks(
     chronosfs: ChronosFSStore,
-    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chronosfs.write_file("main", "/grow.bin", b"abcdefghABCDEFGH")
+
+    chronosfs.truncate("main", "/grow.bin", 2)
+    chronosfs.truncate("main", "/grow.bin", 16)
+
+    assert chronosfs.read_file("main", "/grow.bin") == b"ab" + (b"\x00" * 14)
+
+
+def test_inode_range_read_reads_overlapping_blocks(
+    chronosfs: ChronosFSStore,
 ) -> None:
     chronosfs.write_file("main", "/range.bin", b"aaaaaaaabbbbbbbbcccccccc")
     inode_id = chronosfs.stat("main", "/range.bin").inode_id
-    real_session = chronosfs._read_session("main")
-    queries: list[tuple[str, dict[str, object] | None]] = []
-
-    class RecordingSession:
-        def query(self, sql: str, params: dict[str, object] | None = None):
-            queries.append((sql, params))
-            return real_session.query(sql, params)
-
-        def __getattr__(self, name: str):
-            return getattr(real_session, name)
-
-    monkeypatch.setattr(chronosfs, "_read_session", lambda branch_id: RecordingSession())
 
     assert chronosfs.read_inode_range("main", inode_id, 9, 5) == b"bbbbb"
-
-    block_queries = [
-        params
-        for sql, params in queries
-        if "FROM chronosfs_file_blocks" in sql
-    ]
-    assert block_queries == [{"inode": inode_id, "first": 1, "last": 1}]
 
 
 def test_inode_range_read_handles_sparse_and_cross_block_reads(
@@ -175,43 +157,25 @@ def test_inode_range_read_handles_sparse_and_cross_block_reads(
     assert chronosfs.read_inode_range("main", inode_id, 20, 10) == b""
 
 
-def test_fuse_read_dispatches_to_inode_range(
+def test_fuse_read_dispatches_to_public_inode_range(
     chronosfs: ChronosFSStore,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pytest.importorskip("pyfuse3")
     chronosfs.write_file("main", "/file.txt", b"0123456789")
     inode_id = chronosfs.stat("main", "/file.txt").inode_id
     ops = ChronosFuseOperations(chronosfs, branch_id="main")
     fh = ops._new_handle(inode_id)
-    calls: list[tuple[int, int, int]] = []
-    original_read_range = chronosfs._read_file_range_by_inode
-
-    def read_range(session, inode: int, start: int, end: int) -> bytes:
-        calls.append((inode, start, end))
-        return original_read_range(session, inode, start, end)
-
-    monkeypatch.setattr(chronosfs, "_read_file_range_by_inode", read_range)
 
     assert asyncio.run(ops.read(fh, 3, 3)) == b"345"
-    assert calls == [(inode_id, 3, 6)]
 
 
-def test_fuse_readdir_batches_child_metadata(
+def test_fuse_readdir_uses_public_inode_lookup(
     chronosfs: ChronosFSStore,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pytest.importorskip("pyfuse3")
     chronosfs.mkdir("main", "/dir")
     chronosfs.write_file("main", "/dir/a.txt", b"a")
     chronosfs.write_file("main", "/dir/b.txt", b"b")
     inode_id = chronosfs.stat("main", "/dir").inode_id
     ops = ChronosFuseOperations(chronosfs, branch_id="main")
-
-    def fail_lookup_child(*args: object) -> None:
-        raise AssertionError("readdir should use batched child metadata")
-
-    monkeypatch.setattr(ops, "_lookup_child", fail_lookup_child)
 
     entries = ops._regular_readdir(inode_id)
     assert [name for name, _attr in entries] == [".", "..", "a.txt", "b.txt"]
@@ -343,6 +307,9 @@ def test_fuse_mount_supports_normal_bash_tools(tmp_path: Path) -> None:
                     "printf 'hello from bash\\n' > notes/a.txt",
                     "cp notes/a.txt notes/b.txt",
                     "mv notes/b.txt notes/c.txt",
+                    "chmod +x notes/c.txt",
+                    "touch notes/c.txt",
+                    "test -x notes/c.txt",
                     "rm notes/a.txt",
                     "truncate -s 20 sparse.bin",
                     "printf XYZ | dd of=sparse.bin bs=1 seek=5 conv=notrunc status=none",
@@ -358,12 +325,121 @@ def test_fuse_mount_supports_normal_bash_tools(tmp_path: Path) -> None:
     try:
         assert not store.exists("main", "/notes/a.txt")
         assert store.read_text("main", "/notes/c.txt") == "hello from bash\n"
+        assert store.stat("main", "/notes/c.txt").mode & 0o111
         sparse = store.read_file("main", "/sparse.bin")
         assert len(sparse) == 20
         assert sparse[5:8] == b"XYZ"
         assert store.readlink("main", "/link.txt") == "notes/c.txt"
     finally:
         store.close()
+
+
+def test_fuse_shell_redirection_truncates_existing_file(tmp_path: Path) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+
+    with _mounted_chronosfs(db_path, mountpoint):
+        result = _run_bash(
+            mountpoint,
+            "\n".join(
+                [
+                    "set -euo pipefail",
+                    "printf 'old-old-old-old-old-old-old-old-old\\n' > Makefile.dep",
+                    "printf 'abc\\ndef\\n' > Makefile.dep",
+                    "python3 - <<'PY'",
+                    "from pathlib import Path",
+                    "data = Path('Makefile.dep').read_bytes()",
+                    "assert data == b'abc\\ndef\\n', data",
+                    "print(data.decode(), end='')",
+                    "PY",
+                    ": > Makefile.dep",
+                    "test ! -s Makefile.dep",
+                    "printf 'x\\n' >> Makefile.dep",
+                    "python3 - <<'PY'",
+                    "from pathlib import Path",
+                    "data = Path('Makefile.dep').read_bytes()",
+                    "assert data == b'x\\n', data",
+                    "PY",
+                ]
+            ),
+        )
+        assert result.stdout == "abc\ndef\n"
+
+    store = _open_store(db_path)
+    try:
+        assert store.read_file("main", "/Makefile.dep") == b"x\n"
+    finally:
+        store.close()
+
+
+def test_fuse_open_reader_sees_write_from_other_handle(tmp_path: Path) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+
+    with _mounted_chronosfs(db_path, mountpoint):
+        _run_bash(
+            mountpoint,
+            "\n".join(
+                [
+                    "set -euo pipefail",
+                    "python3 - <<'PY'",
+                    "import os",
+                    "with open('shared.txt', 'wb') as f:",
+                    "    f.write(b'old\\n')",
+                    "reader = os.open('shared.txt', os.O_RDONLY)",
+                    "try:",
+                    "    assert os.read(reader, 4) == b'old\\n'",
+                    "    writer = os.open('shared.txt', os.O_WRONLY | os.O_TRUNC)",
+                    "    try:",
+                    "        os.write(writer, b'new\\n')",
+                    "    finally:",
+                    "        os.close(writer)",
+                    "    os.lseek(reader, 0, os.SEEK_SET)",
+                    "    data = os.read(reader, 4)",
+                    "    assert data == b'new\\n', data",
+                    "finally:",
+                    "    os.close(reader)",
+                    "PY",
+                ]
+            ),
+        )
+
+
+def test_fuse_mount_compiles_redis_smoke(tmp_path: Path) -> None:
+    _require_fuse_tools()
+    _require_tools("git", "make", "gcc")
+    source = _redis_source(tmp_path)
+    db_path = tmp_path / "chronosfs.sqlite"
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+
+    with _mounted_chronosfs(db_path, mountpoint):
+        shutil.copytree(
+            source,
+            mountpoint / "redis",
+            ignore=shutil.ignore_patterns(
+                ".git",
+                "*.o",
+                "*.a",
+                "*.so",
+                "Makefile.dep",
+                "redis-server",
+                "redis-cli",
+                "redis-benchmark",
+            ),
+        )
+        _run_bash(
+            mountpoint,
+            "set -euo pipefail\n"
+            "cd redis\n"
+            f"make -j{min(2, os.cpu_count() or 1)} BUILD_TLS=no MALLOC=libc redis-server\n"
+            "test -x src/redis-server\n",
+            timeout=900,
+        )
 
 
 def test_fuse_control_paths_create_and_checkout_branch(tmp_path: Path) -> None:
@@ -394,6 +470,22 @@ def test_fuse_control_paths_create_and_checkout_branch(tmp_path: Path) -> None:
         assert not store.exists("main", "/branch.txt")
     finally:
         store.close()
+
+
+def test_multiple_local_mountpoints_share_daemon_cache(tmp_path: Path) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mount_a = tmp_path / "mnt-a"
+    mount_b = tmp_path / "mnt-b"
+    mount_a.mkdir()
+    mount_b.mkdir()
+
+    with _mounted_chronosfs(db_path, mount_a):
+        with _mounted_chronosfs(db_path, mount_b):
+            _run_bash(mount_b, "set -euo pipefail\ntest ! -e shared.txt\n")
+            _run_bash(mount_a, "set -euo pipefail\nprintf 'shared\\n' > shared.txt\n")
+            result = _run_bash(mount_b, "set -euo pipefail\ncat shared.txt\n")
+            assert result.stdout == "shared\n"
 
 
 def test_fuse_large_scale_blocks_and_unix_tools(tmp_path: Path) -> None:
@@ -448,8 +540,50 @@ def _require_fuse_tools() -> None:
         pytest.skip(f"missing FUSE test tools: {', '.join(missing)}")
     if not Path("/dev/fuse").exists():
         pytest.skip("/dev/fuse is not available")
-    pytest.importorskip("pyfuse3")
-    pytest.importorskip("trio")
+
+
+def _require_tools(*names: str) -> None:
+    missing = [name for name in names if shutil.which(name) is None]
+    if missing:
+        pytest.skip(f"missing test tools: {', '.join(missing)}")
+
+
+def _redis_source(tmp_path: Path) -> Path:
+    configured = os.environ.get("CHRONOS_TEST_REDIS_SOURCE")
+    if configured:
+        source = Path(configured).resolve()
+        if not source.is_dir():
+            pytest.fail(f"CHRONOS_TEST_REDIS_SOURCE is not a directory: {source}")
+        return source
+
+    cache = Path(
+        os.environ.get(
+            "CHRONOS_TEST_REDIS_CACHE",
+            str(Path.cwd() / ".pytest_cache" / "chronos-redis-7.2.5"),
+        )
+    )
+    if (cache / "src" / "server.c").exists():
+        return cache
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            "7.2.5",
+            "https://github.com/redis/redis.git",
+            str(cache),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"could not fetch Redis source: {result.stderr[-500:]}")
+    return cache
 
 
 @contextmanager

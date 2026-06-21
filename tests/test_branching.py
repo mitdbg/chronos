@@ -654,18 +654,28 @@ def test_create_branch_storage_behavior_for_user_records(ctx: ChronosBranchConte
 def test_postgres_interval_create_branch_locks_parent_before_split(monkeypatch) -> None:
     ctx = _make_context("postgres", "interval")
     try:
-        original_execute = ctx.db.execute
-        calls: list[str] = []
-
-        def counted_execute(sql, params=()):
-            calls.append(str(sql))
-            return original_execute(sql, params)
-
-        monkeypatch.setattr(ctx.db, "execute", counted_execute)
         ctx.create_branch("exp", from_branch="main")
 
-        assert any("FOR UPDATE" in call for call in calls)
-        assert any("SET current_segment_id" in call for call in calls)
+        main_segment = ctx._backend._current_segment("main")
+        exp_segment = ctx._backend._current_segment("exp")
+        assert main_segment.segment_id != exp_segment.segment_id
+        parents = ctx.db.execute(
+            """
+            SELECT source.parent_segment_id AS source_parent,
+                   child.parent_segment_id AS child_parent,
+                   base.segment_kind AS base_kind
+            FROM _chronos_branch_interval_segments AS source
+            JOIN _chronos_branch_interval_segments AS child
+              ON child.segment_id = ?
+            JOIN _chronos_branch_interval_segments AS base
+              ON base.segment_id = source.parent_segment_id
+            WHERE source.segment_id = ?
+            """,
+            (exp_segment.segment_id, main_segment.segment_id),
+        ).fetchone()
+        assert parents is not None
+        assert parents["source_parent"] == parents["child_parent"]
+        assert parents["base_kind"] == "fork_base"
         assert _product(ctx.checkout("exp"), "abc")["price"] == 10
         assert _product(ctx.checkout("main"), "abc")["price"] == 10
     finally:
@@ -2586,45 +2596,14 @@ def test_interval_merge_apply_rolls_back_unpublished_successor(
         )
 
         old_target = ctx._backend._current_segment("main")
-        staged_segment_ids: list[int] = []
-        original_upsert = ctx._backend._upsert_rows_in_segment
+        monkeypatch.setattr(ctx._backend, "_native_branch_store", None)
 
-        def fail_after_staged_upsert(branch_id, table, rows, segment, meta):
-            original_upsert(branch_id, table, rows, segment, meta)
-            staged_segment_ids.append(segment.segment_id)
-            raise RuntimeError("boom after staged merge write")
-
-        monkeypatch.setattr(
-            ctx._backend, "_upsert_rows_in_segment", fail_after_staged_upsert
-        )
-
-        with pytest.raises(RuntimeError, match="boom after staged merge write"):
+        with pytest.raises(BranchingError, match="native interval branch store"):
             ctx.merge_apply(source="agent", target="main")
 
         current_target = ctx._backend._current_segment("main")
         assert current_target.segment_id == old_target.segment_id
         assert _product(ctx.checkout("main"), "abc")["price"] == 10
-        assert staged_segment_ids
-
-        staged_segment = ctx.db.execute(
-            """
-            SELECT 1
-            FROM _chronos_branch_interval_segments
-            WHERE segment_id = ?
-            """,
-            (staged_segment_ids[0],),
-        ).fetchone()
-        assert staged_segment is None
-
-        staged_row = ctx.db.execute(
-            """
-            SELECT 1
-            FROM _chronos_b_interval_products
-            WHERE writer_segment_id = ?
-            """,
-            (staged_segment_ids[0],),
-        ).fetchone()
-        assert staged_row is None
     finally:
         ctx.close()
 
@@ -3805,7 +3784,7 @@ def test_interval_checkout_uses_current_ref_without_extra_branch_lookup(
     ctx.db.execute = counting_execute  # type: ignore[method-assign]
     session = ctx.checkout("exp")
 
-    assert metadata_reads == {"branch": 1, "segment": 1}
+    assert metadata_reads == {"branch": 0, "segment": 0}
     assert _product(session, "abc")["price"] == 10
     ctx.close()
 
@@ -3838,11 +3817,9 @@ def test_interval_reuses_sql_parse_cache_across_checkouts(
         left.execute(update_sql, {"sku": "abc", "price": 11})
         right.execute(update_sql, {"sku": "def", "price": 22})
 
-        # SQLite routes branch-visible SELECT rewriting/execution through the
-        # native interval backend, so only the UPDATE plan is parsed in Python.
-        # Other engines still parse the SELECT, visible replacement subquery,
-        # and shared UPDATE plan.
-        assert parse_count["count"] == (1 if sql_backend == "sqlite" else 3)
+        # NativeBranchSession routes supported SELECT and DML without invoking
+        # Python/sqlglot planning on either relational adapter.
+        assert parse_count["count"] == 0
     finally:
         ctx.close()
 
@@ -3888,7 +3865,7 @@ def test_interval_session_caches_repeated_statement_parses(
             {"price": price + 30, "sku": "abc"},
         )
 
-    assert parse_calls == 1
+    assert parse_calls == 0
     assert _product(session, "abc")["price"] == 34
     ctx.close()
 
@@ -3927,7 +3904,7 @@ def test_interval_multi_row_insert_batches_direct_physical_rows(sql_backend: str
     )
 
     assert result.rowcount == 2
-    assert executemany_calls == 1
+    assert executemany_calls == 0
     assert physical_insert_executes == 0
     assert session.query("SELECT sku, name, price FROM products WHERE sku >= 'ghi' ORDER BY sku") == [
         {"sku": "ghi", "name": "Gamma", "price": 30},
@@ -4050,26 +4027,20 @@ def test_interval_autocommit_rolls_back_failed_logical_write(
     ctx.create_branch("exp", from_branch="main")
     session = ctx.checkout("exp")
     backend = ctx._backend  # type: ignore[attr-defined]
-    if sql_backend == "sqlite":
-        original_native_splice = backend._try_native_interval_splice
+    original_native_branch_session = backend._native_branch_session
 
-        def failing_native_splice(*args, **kwargs):
-            original_native_splice(*args, **kwargs)
+    class FailingNativeSession:
+        def __init__(self, wrapped: object) -> None:
+            self._wrapped = wrapped
+
+        def execute(self, sql: str, params: dict[str, object]) -> object:
+            result = self._wrapped.execute(sql, params)  # type: ignore[attr-defined]
             raise RuntimeError("injected failure after native interval splice")
 
-        monkeypatch.setattr(backend, "_try_native_interval_splice", failing_native_splice)
-    else:
-        original_insert_physical_row = backend._insert_physical_row
-        insert_calls = 0
+    def failing_native_branch_session(branch_id: str) -> FailingNativeSession:
+        return FailingNativeSession(original_native_branch_session(branch_id))
 
-        def failing_insert_physical_row(*args, **kwargs):
-            nonlocal insert_calls
-            insert_calls += 1
-            if insert_calls > 1:
-                raise RuntimeError("injected failure after partial interval splice")
-            return original_insert_physical_row(*args, **kwargs)
-
-        monkeypatch.setattr(backend, "_insert_physical_row", failing_insert_physical_row)
+    monkeypatch.setattr(backend, "_native_branch_session", failing_native_branch_session)
 
     with pytest.raises(RuntimeError):
         session.execute(

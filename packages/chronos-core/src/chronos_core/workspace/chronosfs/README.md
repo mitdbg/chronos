@@ -38,24 +38,30 @@ table, extent tree, refcount table, or filesystem-level block allocator.
 
 ## FUSE Path
 
-`mount_chronosfs(store, mountpoint, branch_id="main")` starts a blocking
-`pyfuse3` mount. The current adapter supports:
+`mount_chronosfs(store, mountpoint, branch_id="main")` starts a blocking native
+libfuse mount. By default, same-machine mounts for the same
+`(database_url, branch_id, block_size, options)` are routed through one local
+ChronosFS daemon process. The daemon hosts multiple FUSE sessions in the same
+process, and the native layer shares one backend/cache object across those
+sessions. This avoids same-machine stale metadata caches when multiple mount
+points target the same PostgreSQL-backed filesystem data.
+
+The current adapter supports:
 
 - `lookup`, `getattr`, `readdir`
-- `open`, `create`, `mknod`, `read`, `write`, `flush`, `fsync`, `release`
+- `open`, `create`, `read`, `write`, `release`
 - `mkdir`, `unlink`, `rmdir`, `rename`
-- `setattr` for truncate and chmod
+- `setattr` for truncate, chmod, and utimens
 - `symlink`, `readlink`
-- `access`, `statfs`
 
 Regular file reads are range reads: the FUSE `read()` handler computes the
 overlapping logical block indexes for the requested byte range and fetches only
 those block rows. Regular file writes are synchronous at the FUSE write-handler
 boundary: `write()` patches the affected logical blocks and upserts them through
-the current Chronos branch. `flush()` and `fsync()` are therefore mostly
-durability barriers for the underlying SQL transaction path today. The only
-buffered writes are `.chronos` control-file writes, because those need complete
-command text.
+the current Chronos branch. ChronosFS does not buffer regular file data in the
+FUSE layer. The mount wrapper also sets FUSE `entry_timeout=0`,
+`attr_timeout=0`, and `negative_timeout=0` unless callers override them, so
+kernel dentry/attribute caches do not hide updates between local mount points.
 
 ## Hard Parts
 
@@ -160,5 +166,9 @@ Important direct store operations:
   merge preview remains future work.
 - The FUSE adapter currently shares one branch id across a mount, so branch
   checkout should be treated as a mount-level operation.
+- Same-machine mount points share a daemon by default. Separate machines, or
+  callers that pass `shared_daemon=False`, still need cross-daemon/cache
+  invalidation before concurrent same-branch writes can be treated as a fully
+  coherent distributed filesystem.
 - The test suite covers both SQLite and PostgreSQL-backed stores, including a
   PostgreSQL-backed FUSE mount exercised through normal shell tools.

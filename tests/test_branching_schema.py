@@ -721,7 +721,6 @@ def test_drop_then_recreate_table_on_branch(sql_backend: str) -> None:
 @pytest.mark.parametrize(
     "ddl",
     [
-        "CREATE INDEX idx_products_price ON products (price)",
         "ALTER TABLE products RENAME COLUMN price TO amount",
         "ALTER TABLE products RENAME TO renamed_products",
     ],
@@ -732,6 +731,26 @@ def test_unsupported_ddl_forms_are_rejected(sql_backend: str, ddl: str) -> None:
         ctx.create_branch("exp", from_branch="main")
         with pytest.raises(UnsupportedSQLError):
             ctx.checkout("exp").execute(ddl)
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("sql_backend", SQL_BACKENDS)
+def test_create_and_drop_index_schema_ddl_is_supported(sql_backend: str) -> None:
+    ctx = _ctx(sql_backend, enable_schema_branching=True)
+    try:
+        ctx.create_branch("exp", from_branch="main")
+        exp = ctx.checkout("exp")
+        exp.execute("CREATE INDEX idx_products_price ON products (price)")
+        assert exp.query("SELECT sku FROM products WHERE price >= 10 ORDER BY sku") == [
+            {"sku": "abc"},
+            {"sku": "def"},
+        ]
+        exp.execute("DROP INDEX idx_products_price")
+        assert exp.query("SELECT sku FROM products WHERE price >= 10 ORDER BY sku") == [
+            {"sku": "abc"},
+            {"sku": "def"},
+        ]
     finally:
         ctx.close()
 
@@ -1245,7 +1264,6 @@ def test_postgres_interval_alter_column_type_using_expression() -> None:
         "ALTER TABLE products RENAME COLUMN price TO amount",
         "ALTER TABLE products RENAME TO renamed_products",
         "DROP VIEW product_names",
-        "DROP INDEX idx_products_price",
         "DROP SEQUENCE product_seq",
         "TRUNCATE TABLE products",
     ],
