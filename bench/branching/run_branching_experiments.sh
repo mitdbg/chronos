@@ -89,7 +89,6 @@ DOLTGRES_STARTED_BY_SCRIPT=0
 
 case "${MODE}" in
   sqlite|postgres|doltgres|postgres-doltgres|both|all)
-    shift || true
     ;;
   *)
     echo "unknown mode: ${MODE}" >&2

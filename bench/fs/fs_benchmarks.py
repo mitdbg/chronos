@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from chronos_core.workspace.chronosfs import ChronosFSStore
 
 BACKENDS = ("chronosfs", "overlayfs")
 SQLITE_SYNCHRONOUS_MODES = {"OFF", "NORMAL", "FULL", "EXTRA"}
+PARTIAL_OVERWRITE_ALIGNMENT = 4096
 MICRO_PHASES = (
     "branch_create",
     "branch_delete",
@@ -142,7 +144,7 @@ class FsBackend:
 class ChronosFSBenchBackend(FsBackend):
     name = "chronosfs"
 
-    def __init__(self, block_size: int = 4096, sqlite_synchronous: str = "NORMAL"):
+    def __init__(self, block_size: int = 4096, sqlite_synchronous: str = "OFF"):
         self.block_size = block_size
         self.sqlite_synchronous = sqlite_synchronous
         self.context: ChronosBranchContext | None = None
@@ -157,6 +159,9 @@ class ChronosFSBenchBackend(FsBackend):
             backend="interval",
         )
         configure_benchmark_sqlite(self.context.db, self.sqlite_synchronous)
+        os.environ["CHRONOS_NATIVE_SQLITE_SYNCHRONOUS"] = normalize_sqlite_synchronous(
+            self.sqlite_synchronous
+        )
         self.store = ChronosFSStore(self.context, block_size=self.block_size)
         self.store.ensure()
         seed_chronosfs(self.store, "main", file_count=file_count, file_size=file_size)
@@ -590,16 +595,17 @@ def run_partial_overwrite(
 ) -> dict[str, Any]:
     payload = seed_bytes(cfg.overwrite_size, 123_456 + repeat)
     ops = cfg.file_count * cfg.file_ops_per_file
-    offset = max(0, cfg.file_size // 2 - cfg.overwrite_size // 2)
+    max_offset = max(0, cfg.file_size - cfg.overwrite_size)
+    offsets = list(range(0, max_offset + 1, PARTIAL_OVERWRITE_ALIGNMENT)) or [0]
+    rng = random.Random(123_456 + repeat)
     start = time.perf_counter_ns()
     with ExitStack() as stack:
         handles = [stack.enter_context(path.open("r+b")) for path in data_file_paths(root, cfg.file_count)]
         for op_index in range(ops):
             handle = handles[op_index % len(handles)]
+            offset = offsets[rng.randrange(len(offsets))]
             handle.seek(offset)
             handle.write(payload)
-        for handle in handles:
-            handle.flush()
     elapsed_ms = elapsed_since_ms(start)
     return ok_row(
         workload="micro",
@@ -609,7 +615,11 @@ def run_partial_overwrite(
         elapsed_ms=elapsed_ms,
         ops=ops,
         byte_count=ops * cfg.overwrite_size,
-        details=working_set_details(cfg) | {"offset": offset},
+        details=working_set_details(cfg)
+        | {
+            "offset_alignment": PARTIAL_OVERWRITE_ALIGNMENT,
+            "offset_count": len(offsets),
+        },
     )
 
 
@@ -787,9 +797,15 @@ def import_tree_to_chronosfs(store: ChronosFSStore, branch_id: str, source: Path
         if path.is_symlink():
             store.symlink(branch_id, os.readlink(path), target, parents=True)
         elif path.is_dir():
-            store.mkdir(branch_id, target, parents=True)
+            store.mkdir(branch_id, target, mode=path.stat().st_mode & 0o7777, parents=True)
         elif path.is_file():
-            store.write_file(branch_id, target, path.read_bytes(), parents=True)
+            store.write_file(
+                branch_id,
+                target,
+                path.read_bytes(),
+                mode=path.stat().st_mode & 0o7777,
+                parents=True,
+            )
 
 
 def ignore_benchmark_paths(directory: str, names: list[str]) -> set[str]:
@@ -813,12 +829,8 @@ def mounted_chronosfs(
     branch_id: str,
     *,
     database_url: str,
-    sqlite_synchronous: str = "NORMAL",
+    sqlite_synchronous: str = "OFF",
 ) -> Iterator[Path]:
-    import chronos_core.workspace.chronosfs.fuse as fuse_module
-
-    if fuse_module.pyfuse3 is None:
-        raise UnsupportedBackend("pyfuse3/trio are required for ChronosFS FUSE")
     mountpoint = Path(tempfile.mkdtemp(prefix=f"chronosfs-{branch_id}-"))
     code = (
         "from chronos_core.workspace.chronosfs import ChronosFSStore, mount_chronosfs\n"
@@ -832,6 +844,9 @@ def mounted_chronosfs(
         f"mount_chronosfs(store, {str(mountpoint)!r}, branch_id={branch_id!r})\n"
     )
     env = os.environ.copy()
+    env["CHRONOS_NATIVE_SQLITE_SYNCHRONOUS"] = normalize_sqlite_synchronous(
+        sqlite_synchronous
+    )
     src = str(Path(__file__).resolve().parents[2] / "packages" / "chronos-core" / "src")
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = src + (os.pathsep + existing if existing else "")
@@ -1347,15 +1362,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backends", default="chronosfs,overlayfs")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--branch-iterations", type=int, default=50)
-    parser.add_argument("--file-count", type=int, default=200)
+    parser.add_argument("--file-count", type=int, default=64)
     parser.add_argument(
         "--file-ops-per-file",
         type=int,
         default=8,
         help="Number of read/write operations to issue per open file in the POSIX IO working set.",
     )
-    parser.add_argument("--file-size", type=int, default=4096)
-    parser.add_argument("--overwrite-size", type=int, default=512)
+    parser.add_argument("--file-size", type=int, default=32 * 1024)
+    parser.add_argument(
+        "--overwrite-size",
+        type=int,
+        default=4096,
+        help="Bytes written by partial_overwrite.",
+    )
     parser.add_argument("--cow-file-size", type=parse_size, default=parse_size("64M"))
     parser.add_argument(
         "--cow-write-sizes",
@@ -1363,7 +1383,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=parse_size_list("512,4K,64K,1M,4M"),
         help="Comma-separated overwrite sizes for the large-file COW workload.",
     )
-    parser.add_argument("--run-compile", action="store_true")
+    parser.add_argument(
+        "--run-compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include the Redis compile benchmark. Enabled by default.",
+    )
     parser.add_argument("--compile-repeats", type=int, default=1)
     parser.add_argument("--compile-jobs", type=int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("--redis-repo-url", default="https://github.com/redis/redis.git")
@@ -1373,8 +1398,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--chronosfs-sqlite-synchronous",
         type=normalize_sqlite_synchronous,
-        default="NORMAL",
-        help="SQLite PRAGMA synchronous for ChronosFS benchmark connections. Defaults to NORMAL.",
+        default="OFF",
+        help="SQLite PRAGMA synchronous for ChronosFS benchmark connections. Defaults to OFF.",
     )
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--output-dir", type=Path)
@@ -1387,7 +1412,11 @@ def main() -> None:
     unknown = sorted(set(backends) - set(BACKENDS))
     if unknown:
         raise SystemExit(f"unknown backend(s): {', '.join(unknown)}")
-    repeats = min(args.repeats, 1) if args.quick else args.repeats
+    # Quick mode reduces dataset sizes and operation counts, but it should not
+    # collapse the repeat count.  The performance-acceptance gate compares
+    # medians, and single-sample COW writes are too noisy to distinguish real
+    # regressions from filesystem scheduling variance.
+    repeats = args.repeats
     branch_iterations = min(args.branch_iterations, 3) if args.quick else args.branch_iterations
     file_count = max(1, min(args.file_count, 8) if args.quick else args.file_count)
     file_ops_per_file = min(args.file_ops_per_file, 2) if args.quick else args.file_ops_per_file

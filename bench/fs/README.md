@@ -6,7 +6,7 @@ This directory benchmarks SQLite-backed ChronosFS against the basic
 Run a smoke benchmark:
 
 ```bash
-bench/fs/run_fs_experiments.sh --quick
+bench/fs/run_fs_experiments.sh --quick --no-run-compile
 ```
 
 Run only ChronosFS:
@@ -15,10 +15,17 @@ Run only ChronosFS:
 bench/fs/run_fs_experiments.sh --backends chronosfs
 ```
 
+By default the benchmark runs microbenchmarks, large-file COW cases, and the
+Redis compile workload. Add `--no-run-compile` to skip compilation.
+
 The POSIX IO microbenchmarks use `--file-count` as the open-file working set
 size and issue `--file-ops-per-file` read/write operations per open file. This
 keeps a group of files open and cycles operations across that set instead of
 opening each file for a single read or write.
+
+By default this uses 64 open files, 32 KiB file payloads, and 4 KiB overwrites
+at deterministic random 4 KiB-aligned offsets for the `partial_overwrite`
+phase.
 
 Run the large-file copy-on-write granularity benchmark with explicit sizes:
 
@@ -29,15 +36,14 @@ bench/fs/run_fs_experiments.sh \
 ```
 
 ChronosFS benchmark connections use `PRAGMA journal_mode=WAL` and
-`PRAGMA synchronous=NORMAL` by default. Use
+`PRAGMA synchronous=OFF` by default. Use
 `--chronosfs-sqlite-synchronous FULL` when measuring durable SQLite commit
-behavior, or `OFF` for a no-fsync comparison.
+behavior, or `NORMAL` for a weaker but still checkpoint-aware SQLite setting.
 
-Run the Redis compile workload after branching:
+Run the Redis compile workload with an existing Redis checkout:
 
 ```bash
 bench/fs/run_fs_experiments.sh \
-  --run-compile \
   --redis-source /path/to/redis
 ```
 
