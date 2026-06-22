@@ -1,0 +1,34 @@
+sequenceDiagram
+  participant Agent as Agent / Unix Tool
+  participant Mount as ChronosFS FUSE Mount
+  participant FS as NativeChronosFS
+  participant Store as NativeBranchStore
+  participant Meta as Metadata Store
+  participant Data as ChronosFS Interval Tables
+
+  Agent->>Mount: mkdir .chronos/branches/agent
+  Mount->>FS: create_branch("agent", current_branch)
+  FS->>Store: create_branch("agent", current_branch)
+  Store->>Meta: allocate branch metadata
+
+  Agent->>Mount: write .chronos/current = "agent"
+  Mount->>FS: checkout mount to agent
+  FS->>Store: checkout("agent")
+
+  Agent->>Mount: POSIX write /src/solution.py
+  Mount->>FS: write_inode_at(inode, offset, bytes)
+  FS->>Store: upsert chronosfs_file_blocks
+  Store->>Data: interval splice block rows
+
+  Agent->>Mount: cat .chronos/merge-preview/agent..main.json
+  Mount->>FS: merge_preview_json(agent, main)
+  FS->>Store: merge_preview(agent, main)
+  Store->>Data: compare base/source/target rows
+  FS-->>Agent: JSON conflicts by path + byte_range
+
+  Agent->>Mount: write .chronos/merge-apply/agent..main JSON
+  Mount->>FS: apply policy/resolution
+  FS->>Store: apply_merge_changes(agent, main)
+  Store->>Meta: reserve merge + continuation
+  Store->>Data: write accepted rows into merge segment
+  Store->>Meta: publish continuation as main head

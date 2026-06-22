@@ -68,17 +68,26 @@ class NativeBranchSessionImpl {
         const NativeRows &rows,
         bool deleted
     ) {
-        store_.driver().interval_upsert(
-            physical_table_for(logical_table),
-            columns,
-            pk_columns,
-            rows,
-            segment_.live_lo,
-            segment_.live_hi,
-            segment_.segment_id,
-            deleted,
-            !store_.driver().in_transaction()
-        );
+        if (rows.empty()) return;
+        const bool started_data_tx = !store_.driver().in_transaction();
+        if (started_data_tx) store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+        try {
+            store_.driver().interval_upsert(
+                physical_table_for(logical_table),
+                columns,
+                pk_columns,
+                rows,
+                segment_.live_lo,
+                segment_.live_hi,
+                segment_.segment_id,
+                deleted,
+                false
+            );
+            commit_if_started(started_data_tx);
+        } catch (...) {
+            rollback_if_started(started_data_tx);
+            throw;
+        }
     }
 
     void begin() {
@@ -90,7 +99,9 @@ class NativeBranchSessionImpl {
         in_transaction_ = true;
     }
     void commit() {
-        store_.driver().execute("COMMIT");
+        if (store_.driver().in_transaction()) {
+            store_.driver().execute("COMMIT");
+        }
         in_transaction_ = false;
     }
     void rollback() {

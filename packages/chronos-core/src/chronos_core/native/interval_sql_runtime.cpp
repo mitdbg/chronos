@@ -2025,11 +2025,29 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
             const char *error = duckdb_result_error(result.get());
             throw NativeDuckDBError(error ? error : "DuckDB statement failed");
         }
+        const std::string keyword = leading_keyword(sql);
         update_transaction_state(sql);
         if (is_schema_mutation(sql)) {
             clear_statements();
         }
+        if (keyword == "COMMIT" && path_ != ":memory:") {
+            // DuckDB permits multiple connections in one process, but separate
+            // database handles do not necessarily observe another handle's
+            // committed writes immediately.  Chronos branch commits require
+            // visibility once merge_apply returns, so file-backed DuckDB
+            // commits force a checkpoint before another workspace can read.
+            checkpoint_after_commit();
+        }
         return static_cast<std::int64_t>(duckdb_rows_changed(result.get()));
+    }
+
+    void checkpoint_after_commit() {
+        clear_statements();
+        DuckDBResult checkpoint_result;
+        if (duckdb_query(conn_, "CHECKPOINT", checkpoint_result.get()) == DuckDBError) {
+            const char *error = duckdb_result_error(checkpoint_result.get());
+            throw NativeDuckDBError(error ? error : "DuckDB checkpoint failed after commit");
+        }
     }
 
     static std::string leading_keyword(const std::string &sql) {
@@ -2460,6 +2478,7 @@ struct NativeBranchSegment {
     std::string live_lo;
     std::string live_hi;
     std::string branch_point;
+    std::string branch_kind;
 };
 
 struct NativeTableMeta {

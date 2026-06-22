@@ -11,6 +11,7 @@ from chronos_core.workspace.filesystem import (
 )
 from chronos_core.workspace.chronosfs import (
     CHRONOSFS_BLOCK_SIZE,
+    ChronosFSBranchSession,
     ChronosFSDiff,
     ChronosFSError,
     ChronosFSMountError,
@@ -40,6 +41,7 @@ __all__ = [
     "ChronosFilesystemStore",
     "FilesystemStoreError",
     "CHRONOSFS_BLOCK_SIZE",
+    "ChronosFSBranchSession",
     "ChronosFSDiff",
     "ChronosFSError",
     "ChronosFSMountError",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ from typing import Iterator
 
 import pytest
 
-from chronos_core.branching import ChronosBranchContext
+from chronos_core.branching import ChronosBranchContext, MergeResolution
 from chronos_core.workspace.chronosfs import (
     ChronosFSError,
     ChronosFSStore,
@@ -219,6 +220,83 @@ def test_rename_symlink_and_merge_apply(chronosfs: ChronosFSStore) -> None:
     assert chronosfs.read_text("main", "/renamed.txt") == "main target\n"
     assert chronosfs.readlink("main", "/link.txt") == "dir/nested.txt"
     assert chronosfs.read_text("main", "/link.txt") == "changed\n"
+
+
+def test_policy_merge_resolves_chronosfs_content_at_block_granularity(
+    chronosfs: ChronosFSStore,
+) -> None:
+    chronosfs.write_file("main", "/data.bin", b"aaaaaaaabbbbbbbb")
+    chronosfs.create_branch("agent", from_branch="main")
+
+    chronosfs.write_at("main", "/data.bin", 0, b"MAIN")
+    chronosfs.write_at("agent", "/data.bin", 8, b"AGNT")
+
+    preview = chronosfs.merge_preview("agent", "main", policy="snapshot_isolation")
+    assert preview.conflicts == []
+
+    result = chronosfs.merge_apply("agent", "main", policy="snapshot_isolation")
+
+    assert result.applied >= 1
+    assert chronosfs.read_file("main", "/data.bin") == b"MAINaaaaAGNTbbbb"
+
+
+def test_weak_snapshot_chronosfs_same_block_conflict_source_wins(
+    chronosfs: ChronosFSStore,
+) -> None:
+    chronosfs.write_file("main", "/data.bin", b"aaaaaaaabbbbbbbb")
+    chronosfs.create_branch("agent", from_branch="main")
+
+    chronosfs.write_at("main", "/data.bin", 8, b"MAIN")
+    chronosfs.write_at("agent", "/data.bin", 8, b"AGNT")
+
+    preview = chronosfs.merge_preview("agent", "main", policy="manual_review")
+    block_conflicts = [
+        conflict
+        for conflict in preview.conflicts
+        if conflict.table == "chronosfs_file_range"
+    ]
+    assert len(block_conflicts) == 1
+    assert block_conflicts[0].key == {
+        "path": "/data.bin",
+        "byte_range": {"start": 8, "end": 16},
+    }
+    assert block_conflicts[0].after is not None
+    assert "unified_diff" in block_conflicts[0].after
+    assert "block_index" not in repr(block_conflicts[0])
+
+    result = chronosfs.merge_apply("agent", "main", policy="weak_snapshot_isolation")
+
+    assert result.applied >= 1
+    assert chronosfs.read_file("main", "/data.bin") == b"aaaaaaaaAGNTbbbb"
+
+
+def test_manual_review_chronosfs_file_range_resolution_uses_public_conflict_id(
+    chronosfs: ChronosFSStore,
+) -> None:
+    chronosfs.write_file("main", "/data.txt", b"aaaaaaaa\nbbbbbbbb\n")
+    chronosfs.create_branch("agent", from_branch="main")
+
+    chronosfs.write_at("main", "/data.txt", 9, b"MAIN")
+    chronosfs.write_at("agent", "/data.txt", 9, b"AGNT")
+
+    preview = chronosfs.merge_preview("agent", "main", policy="manual_review")
+    assert len(preview.conflicts) == 1
+    conflict = preview.conflicts[0]
+    assert conflict.table == "chronosfs_file_range"
+    assert conflict.conflict_id is not None
+    assert conflict.key["path"] == "/data.txt"
+    assert conflict.after is not None
+    assert "AGNT" in conflict.after["unified_diff"]
+
+    result = chronosfs.merge_apply(
+        "agent",
+        "main",
+        MergeResolution({conflict.conflict_id: "source"}),
+        policy="manual_review",
+    )
+
+    assert result.applied >= 1
+    assert chronosfs.read_file("main", "/data.txt") == b"aaaaaaaa\nAGNTbbbb\n"
 
 
 def test_errors_for_reserved_and_invalid_paths(chronosfs: ChronosFSStore) -> None:
@@ -470,6 +548,88 @@ def test_fuse_control_paths_create_and_checkout_branch(tmp_path: Path) -> None:
         assert not store.exists("main", "/branch.txt")
     finally:
         store.close()
+
+
+def test_fuse_control_paths_preview_and_apply_file_conflict(tmp_path: Path) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+
+    with _mounted_chronosfs(db_path, mountpoint):
+        (mountpoint / "data.txt").write_bytes(b"aaaaaaaa\nbbbbbbbb\n")
+        (mountpoint / ".chronos" / "branches" / "agent").mkdir()
+        (mountpoint / ".chronos" / "current").write_text("agent\n")
+        with (mountpoint / "data.txt").open("r+b") as handle:
+            handle.seek(9)
+            handle.write(b"AGNT")
+        (mountpoint / ".chronos" / "current").write_text("main\n")
+        with (mountpoint / "data.txt").open("r+b") as handle:
+            handle.seek(9)
+            handle.write(b"MAIN")
+
+        raw_preview = (mountpoint / ".chronos" / "merge-preview" / "agent..main.json").read_text()
+        preview = json.loads(raw_preview)
+        assert preview["source"] == "agent"
+        assert preview["target"] == "main"
+        assert len(preview["conflicts"]) == 1
+        conflict = preview["conflicts"][0]
+        assert conflict["table"] == "chronosfs_file_range"
+        assert conflict["key"]["path"] == "/data.txt"
+        assert "byte_range" in conflict["key"]
+        assert "unified_diff" in conflict["after"]
+        assert "AGNT" in conflict["after"]["unified_diff"]
+        assert "block_index" not in raw_preview
+        assert "inode_id" not in raw_preview
+
+        resolution = {
+            "policy": "manual_review",
+            "conflicts": {conflict["conflict_id"]: "source"},
+        }
+        (mountpoint / ".chronos" / "merge-apply" / "agent..main").write_text(
+            json.dumps(resolution)
+        )
+
+        assert (mountpoint / "data.txt").read_bytes() == b"aaaaaaaa\nAGNTbbbb\n"
+
+
+def test_fuse_control_merge_from_main_mountpoint_across_mounts(tmp_path: Path) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    main_mount = tmp_path / "mnt-main"
+    worker_mount = tmp_path / "mnt-worker"
+    main_mount.mkdir()
+    worker_mount.mkdir()
+
+    with _mounted_chronosfs(db_path, main_mount):
+        with _mounted_chronosfs(db_path, worker_mount):
+            (main_mount / "plan.txt").write_text("base line\n")
+            (main_mount / ".chronos" / "branches" / "agent").mkdir()
+
+            (worker_mount / ".chronos" / "current").write_text("agent\n")
+            (worker_mount / "plan.txt").write_text("agent line\n")
+
+            (main_mount / ".chronos" / "current").write_text("main\n")
+            (main_mount / "plan.txt").write_text("main line\n")
+
+            raw_preview = (
+                main_mount / ".chronos" / "merge-preview" / "agent..main.json"
+            ).read_text()
+            preview = json.loads(raw_preview)
+            assert len(preview["conflicts"]) == 1
+            conflict_id = preview["conflicts"][0]["conflict_id"]
+            assert preview["conflicts"][0]["key"]["path"] == "/plan.txt"
+
+            (main_mount / ".chronos" / "merge-apply" / "agent..main.json").write_text(
+                json.dumps(
+                    {
+                        "policy": "manual_review",
+                        "conflicts": {conflict_id: "source"},
+                    }
+                )
+            )
+
+            assert (main_mount / "plan.txt").read_text() == "agent line\n"
 
 
 def test_multiple_local_mountpoints_share_daemon_cache(tmp_path: Path) -> None:

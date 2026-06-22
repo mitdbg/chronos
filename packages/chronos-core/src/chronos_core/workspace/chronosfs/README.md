@@ -102,29 +102,29 @@ inodes.
 
 ```text
 .chronos/current
-.chronos/status
-.chronos/ctl
 .chronos/branches/
-.chronos/checkpoints/
-.chronos/diff/
 .chronos/merge-preview/
+.chronos/merge-apply/
 ```
 
 Implemented operations:
 
 ```bash
 cat .chronos/current
-cat .chronos/status
 mkdir .chronos/branches/agent
 printf 'agent\n' > .chronos/current
-printf 'create-branch exp from main\n' > .chronos/ctl
-printf 'create-checkpoint before-edit\n' > .chronos/ctl
-printf 'delete-branch exp\n' > .chronos/ctl
-printf 'merge exp into main\n' > .chronos/ctl
+cat .chronos/merge-preview/agent..main.json
+cat > .chronos/merge-apply/agent..main <<'JSON'
+{"policy":"weak_snapshot_isolation"}
+JSON
 ```
 
-`.chronos/checkpoints`, `.chronos/diff`, and `.chronos/merge-preview` are
-reserved virtual directories for richer read-only views.
+`merge-preview` reports file-content conflicts as
+`chronosfs_file_range` entries with `path`, byte range, and a text unified diff
+when the block content is textual. Internal `inode_id` and `block_index` values
+are not exposed through the control plane. `merge-apply` accepts
+`abort_on_conflict`, `snapshot_isolation`, `weak_snapshot_isolation`,
+`source_wins`, `target_wins`, and `manual_review` policies.
 
 ## Python API
 
@@ -153,17 +153,19 @@ Important direct store operations:
 - `unlink(branch, path)` / `rmdir(branch, path)`
 - `rename(branch, old_path, new_path)`
 - `symlink(branch, target, link_path)` / `readlink(branch, path)`
-- `diff(left, right)` / `merge_apply(source, target)`
+- `diff(left, right)`
+- `merge_preview(source, target, policy=...)`
+- `merge_apply(source, target, resolution=None, policy=...)`
 
 ## Current Limits
 
-- Linux FUSE support requires `pyfuse3`, `trio`, FUSE 3 development/runtime
-  libraries, and `/dev/fuse`.
+- Linux FUSE support requires FUSE 3 development/runtime libraries and
+  `/dev/fuse`.
 - POSIX support is practical but incomplete: hardlinks, xattrs, device files,
   full permissions enforcement, writable `mmap` correctness, file locks, and
   branch-pinned open handles are not complete.
-- The v1 merge implementation is path-oriented and conservative; conflict-aware
-  merge preview remains future work.
+- Merge preview reports file conflicts by public path and byte range. Textual
+  block conflicts include a unified diff; binary conflicts include hex payloads.
 - The FUSE adapter currently shares one branch id across a mount, so branch
   checkout should be treated as a mount-level operation.
 - Same-machine mount points share a daemon by default. Separate machines, or

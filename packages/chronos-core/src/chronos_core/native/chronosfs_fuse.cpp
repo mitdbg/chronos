@@ -6,12 +6,15 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <iomanip>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -19,17 +22,26 @@
 #include <vector>
 
 #include <fuse3/fuse.h>
+#include <nlohmann/json.hpp>
 #include <pybind11/stl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 namespace py = pybind11;
+using Json = nlohmann::json;
 
 namespace {
 
 using chronos::native::IntervalBlob;
 using chronos::native::IntervalRows;
 using chronos::native::IntervalValue;
+using chronos::native::NativeMergeChange;
+using chronos::native::NativeMergePreview;
+using chronos::native::NativeRowDiff;
+
+std::int64_t as_int(const IntervalValue &value);
+std::string as_string(const IntervalValue &value);
+IntervalBlob as_blob(const IntervalValue &value);
 
 // ChronosFS table map
 // -------------------
@@ -191,6 +203,151 @@ std::string json_array(const std::vector<std::string> &items) {
     return out;
 }
 
+std::string hex_blob(const IntervalBlob &blob) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(blob.size() * 2);
+    for (unsigned char byte : blob) {
+        out.push_back(kHex[(byte >> 4) & 0x0f]);
+        out.push_back(kHex[byte & 0x0f]);
+    }
+    return out;
+}
+
+bool looks_textual(const IntervalBlob &blob) {
+    for (unsigned char ch : blob) {
+        if (ch == '\n' || ch == '\r' || ch == '\t') continue;
+        if (ch < 0x20 || ch == 0x7f) return false;
+    }
+    return true;
+}
+
+std::string blob_text(const IntervalBlob &blob) {
+    return std::string(reinterpret_cast<const char *>(blob.data()), blob.size());
+}
+
+std::vector<std::string> split_diff_lines(const std::string &text) {
+    std::vector<std::string> lines;
+    std::size_t start = 0;
+    while (start < text.size()) {
+        std::size_t end = text.find('\n', start);
+        if (end == std::string::npos) {
+            lines.push_back(text.substr(start));
+            break;
+        }
+        lines.push_back(text.substr(start, end - start));
+        start = end + 1;
+    }
+    if (text.empty()) lines.emplace_back();
+    return lines;
+}
+
+std::string simple_unified_diff(
+    const std::string &before_label,
+    const std::string &after_label,
+    const IntervalBlob &before,
+    const IntervalBlob &after) {
+    if (!looks_textual(before) || !looks_textual(after)) return {};
+    std::ostringstream out;
+    out << "--- " << before_label << "\n";
+    out << "+++ " << after_label << "\n";
+    out << "@@\n";
+    for (const auto &line : split_diff_lines(blob_text(before))) out << "-" << line << "\n";
+    for (const auto &line : split_diff_lines(blob_text(after))) out << "+" << line << "\n";
+    return out.str();
+}
+
+Json interval_value_to_json(const IntervalValue &value) {
+    if (std::holds_alternative<std::monostate>(value)) return nullptr;
+    if (auto ptr = std::get_if<std::int64_t>(&value)) return *ptr;
+    if (auto ptr = std::get_if<double>(&value)) return *ptr;
+    if (auto ptr = std::get_if<std::string>(&value)) return *ptr;
+    if (auto ptr = std::get_if<IntervalBlob>(&value)) {
+        return Json{
+            {"encoding", "hex"},
+            {"size", ptr->size()},
+            {"hex", hex_blob(*ptr)},
+        };
+    }
+    return nullptr;
+}
+
+const IntervalValue *value_for_column(
+    const std::vector<std::string> &columns,
+    const std::vector<IntervalValue> &values,
+    const std::string &column) {
+    for (std::size_t i = 0; i < columns.size() && i < values.size(); ++i) {
+        if (columns[i] == column) return &values[i];
+    }
+    return nullptr;
+}
+
+std::int64_t int_for_column(
+    const std::vector<std::string> &columns,
+    const std::vector<IntervalValue> &values,
+    const std::string &column,
+    std::int64_t fallback = 0) {
+    const IntervalValue *value = value_for_column(columns, values, column);
+    return value ? as_int(*value) : fallback;
+}
+
+IntervalBlob blob_for_column(
+    const std::vector<std::string> &columns,
+    const std::vector<IntervalValue> &values,
+    const std::string &column) {
+    const IntervalValue *value = value_for_column(columns, values, column);
+    return value ? as_blob(*value) : IntervalBlob{};
+}
+
+std::string path_join(const std::string &parent, const std::string &name) {
+    if (parent.empty() || parent == "/") return "/" + name;
+    return parent + "/" + name;
+}
+
+std::uint64_t fnv1a64(const std::string &text) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char ch : text) {
+        hash ^= ch;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::string stable_control_id(const std::string &payload) {
+    std::ostringstream out;
+    out << std::hex << std::setw(16) << std::setfill('0') << fnv1a64(payload);
+    return out.str();
+}
+
+struct ControlMergePath {
+    std::string source;
+    std::string target;
+    bool valid = false;
+};
+
+ControlMergePath parse_control_merge_path(const std::string &path, const std::string &prefix) {
+    if (path.rfind(prefix, 0) != 0 || path.size() <= prefix.size()) return {};
+    std::string spec = path.substr(prefix.size());
+    if (spec.size() > 5 && spec.substr(spec.size() - 5) == ".json") {
+        spec.resize(spec.size() - 5);
+    }
+    std::size_t sep = spec.find("..");
+    if (sep == std::string::npos || sep == 0 || sep + 2 >= spec.size()) return {};
+    return {spec.substr(0, sep), spec.substr(sep + 2), true};
+}
+
+NativeMergeChange merge_change_from_diff(const NativeRowDiff &diff) {
+    NativeMergeChange change;
+    change.table = diff.table;
+    change.change = diff.change;
+    change.key_columns = diff.key_columns;
+    change.key_values = diff.key_values;
+    change.after_columns = diff.columns;
+    change.after_values = diff.after;
+    change.has_after = diff.has_after;
+    return change;
+}
+
 std::string join_ident_list(const std::vector<std::string> &columns) {
     std::string out;
     for (std::size_t i = 0; i < columns.size(); ++i) {
@@ -323,8 +480,9 @@ class NativeChronosFS {
     }
 
     std::vector<std::string> listdir(const std::string &path) {
-        if (path == "/.chronos") return {"branches", "current"};
+        if (path == "/.chronos") return {"branches", "current", "merge-preview", "merge-apply"};
         if (path == "/.chronos/branches") return branches();
+        if (path == "/.chronos/merge-preview" || path == "/.chronos/merge-apply") return {};
         Inode dir = inode_for_path(path);
         if (dir.kind != "directory") throw FsError(ENOTDIR, "not a directory");
         auto rows = visible("chronosfs_dirents", {"name", "inode_id"}, "parent_inode_id = ?", {dir.id}, "ORDER BY name");
@@ -345,12 +503,7 @@ class NativeChronosFS {
     }
 
     IntervalBlob read(const std::string &path, std::int64_t offset, std::int64_t size) {
-        if (path == "/.chronos/current") {
-            std::string current = branch_id_ + "\n";
-            if (offset >= static_cast<std::int64_t>(current.size())) return {};
-            auto take = std::min<std::int64_t>(size, current.size() - offset);
-            return IntervalBlob(current.begin() + offset, current.begin() + offset + take);
-        }
+        if (is_control(path)) return control_read(path, offset, size);
         Inode inode = inode_for_path(path);
         if (inode.kind == "symlink") return IntervalBlob(inode.symlink_target.begin(), inode.symlink_target.end());
         if (inode.kind != "file") throw FsError(EISDIR, "not a file");
@@ -366,17 +519,7 @@ class NativeChronosFS {
     }
 
     void write(const std::string &path, const char *data, std::int64_t size, std::int64_t offset) {
-        if (path == "/.chronos/current") {
-            if (offset != 0) throw FsError(EINVAL, "current branch writes must start at zero");
-            std::string next(data, data + size);
-            while (!next.empty() && (next.back() == '\n' || next.back() == '\r' || next.back() == '\0')) next.pop_back();
-            auto names = branches();
-            if (std::find(names.begin(), names.end(), next) == names.end()) throw FsError(ENOENT, "branch not found");
-            branch_id_ = next;
-            session_ = store_->checkout(branch_id_);
-            clear_metadata_cache();
-            return;
-        }
+        if (is_control(path)) return control_write(path, data, size, offset);
         Inode inode = inode_for_path(path);
         if (inode.kind != "file") throw FsError(EISDIR, "not a file");
         IntervalBlob payload(
@@ -448,6 +591,7 @@ class NativeChronosFS {
     }
 
     OpenHandle *create_handle(const std::string &path, mode_t mode) {
+        if (is_control(path)) return nullptr;
         return new OpenHandle{create(path, mode)};
     }
 
@@ -795,6 +939,52 @@ class NativeChronosFS {
         clear_metadata_cache();
     }
 
+    IntervalBlob control_read(const std::string &path, std::int64_t offset, std::int64_t size) {
+        std::string content;
+        if (path == "/.chronos/current") {
+            content = branch_id_ + "\n";
+        } else if (parse_control_merge_path(path, "/.chronos/merge-preview/").valid) {
+            content = merge_preview_json(path);
+        } else if (parse_control_merge_path(path, "/.chronos/merge-apply/").valid) {
+            content.clear();
+        } else if (
+            path == "/.chronos" ||
+            path == "/.chronos/branches" ||
+            path == "/.chronos/merge-preview" ||
+            path == "/.chronos/merge-apply" ||
+            !control_branch_name(path).empty()) {
+            throw FsError(EISDIR, "control path is a directory");
+        } else {
+            throw FsError(ENOENT, "control path not found");
+        }
+        if (size <= 0 || offset >= static_cast<std::int64_t>(content.size())) return {};
+        auto take = std::min<std::int64_t>(size, content.size() - offset);
+        return IntervalBlob(content.begin() + offset, content.begin() + offset + take);
+    }
+
+    void control_write(const std::string &path, const char *data, std::int64_t size, std::int64_t offset) {
+        if (path == "/.chronos/current") {
+            if (offset != 0) throw FsError(EINVAL, "current branch writes must start at zero");
+            std::string next(data, data + size);
+            while (!next.empty() && (next.back() == '\n' || next.back() == '\r' || next.back() == '\0')) next.pop_back();
+            auto names = branches();
+            if (std::find(names.begin(), names.end(), next) == names.end()) throw FsError(ENOENT, "branch not found");
+            branch_id_ = next;
+            session_ = store_->checkout(branch_id_);
+            clear_metadata_cache();
+            return;
+        }
+        if (parse_control_merge_path(path, "/.chronos/merge-preview/").valid) {
+            throw FsError(EROFS, "merge preview is read-only");
+        }
+        if (parse_control_merge_path(path, "/.chronos/merge-apply/").valid) {
+            if (offset != 0) throw FsError(EINVAL, "merge-apply control writes must start at zero");
+            apply_control_merge(path, std::string(data, data + size));
+            return;
+        }
+        throw FsError(EINVAL, "unsupported control write");
+    }
+
   private:
     // chronosfs_inodes is the POSIX metadata table. It is interval-versioned by
     // inode_id, so chmod/truncate/link metadata changes are branch-local rows.
@@ -835,6 +1025,267 @@ class NativeChronosFS {
             "data",
             "valid_length",
         };
+    }
+
+    void validate_branch_pair(const ControlMergePath &spec) {
+        if (!spec.valid) throw FsError(ENOENT, "invalid merge control path");
+        auto names = branches();
+        if (std::find(names.begin(), names.end(), spec.source) == names.end()) {
+            throw FsError(ENOENT, "source branch not found");
+        }
+        if (std::find(names.begin(), names.end(), spec.target) == names.end()) {
+            throw FsError(ENOENT, "target branch not found");
+        }
+    }
+
+    std::unordered_map<std::int64_t, std::string> inode_paths_for_branch(const std::string &branch) {
+        NativeChronosFS fs(store_, branch, block_size_);
+        std::unordered_map<std::int64_t, std::string> paths;
+        collect_inode_paths(fs, "/", paths);
+        return paths;
+    }
+
+    void collect_inode_paths(
+        NativeChronosFS &fs,
+        const std::string &path,
+        std::unordered_map<std::int64_t, std::string> &paths) {
+        Inode inode = fs.stat_path(path);
+        paths[inode.id] = path;
+        if (inode.kind != "directory") return;
+        for (const auto &name : fs.listdir(path)) {
+            collect_inode_paths(fs, path_join(path, name), paths);
+        }
+    }
+
+    std::string path_for_inode(
+        std::int64_t inode_id,
+        const std::unordered_map<std::int64_t, std::string> &source_paths,
+        const std::unordered_map<std::int64_t, std::string> &target_paths) const {
+        auto found_source = source_paths.find(inode_id);
+        if (found_source != source_paths.end()) return found_source->second;
+        auto found_target = target_paths.find(inode_id);
+        if (found_target != target_paths.end()) return found_target->second;
+        return "/.chronosfs/inode/" + std::to_string(inode_id);
+    }
+
+    Json row_payload_json(
+        const std::string &table,
+        const std::vector<std::string> &columns,
+        const std::vector<IntervalValue> &values,
+        const std::unordered_map<std::int64_t, std::string> &source_paths,
+        const std::unordered_map<std::int64_t, std::string> &target_paths) const {
+        if (values.empty()) return nullptr;
+        Json out = Json::object();
+        for (std::size_t i = 0; i < columns.size() && i < values.size(); ++i) {
+            const std::string &column = columns[i];
+            // These ids are implementation details for record-level COW.  The
+            // public control plane reports paths and byte ranges instead.
+            if (table.rfind("chronosfs_", 0) == 0 &&
+                (column == "inode_id" || column == "parent_inode_id" || column == "block_index")) {
+                continue;
+            }
+            out[column] = interval_value_to_json(values[i]);
+        }
+        if (table == "chronosfs_inodes") {
+            std::int64_t inode_id = int_for_column(columns, values, "inode_id", 0);
+            if (inode_id) out["path"] = path_for_inode(inode_id, source_paths, target_paths);
+        } else if (table == "chronosfs_dirents") {
+            std::int64_t parent_id = int_for_column(columns, values, "parent_inode_id", 0);
+            std::int64_t child_id = int_for_column(columns, values, "inode_id", 0);
+            const IntervalValue *name_value = value_for_column(columns, values, "name");
+            std::string name = name_value ? as_string(*name_value) : std::string();
+            std::string parent_path = path_for_inode(parent_id, source_paths, target_paths);
+            out["parent_path"] = parent_path;
+            out["path"] = child_id ? path_for_inode(child_id, source_paths, target_paths) : path_join(parent_path, name);
+        }
+        return out;
+    }
+
+    Json content_json(const IntervalBlob &blob, const std::string &diff = {}) const {
+        if (looks_textual(blob)) {
+            Json out = {
+                {"encoding", "utf-8"},
+                {"text", blob_text(blob)},
+            };
+            if (!diff.empty()) out["unified_diff"] = diff;
+            return out;
+        }
+        return Json{
+            {"encoding", "hex"},
+            {"size", blob.size()},
+            {"hex", hex_blob(blob)},
+        };
+    }
+
+    Json file_block_diff_json(
+        const NativeRowDiff &diff,
+        const std::unordered_map<std::int64_t, std::string> &source_paths,
+        const std::unordered_map<std::int64_t, std::string> &target_paths) const {
+        std::int64_t inode_id = int_for_column(diff.key_columns, diff.key_values, "inode_id", 0);
+        std::int64_t block_index = int_for_column(diff.key_columns, diff.key_values, "block_index", 0);
+        std::int64_t before_valid = diff.has_before ? int_for_column(diff.columns, diff.before, "valid_length", 0) : 0;
+        std::int64_t after_valid = diff.has_after ? int_for_column(diff.columns, diff.after, "valid_length", 0) : 0;
+        IntervalBlob before_blob = diff.has_before ? blob_for_column(diff.columns, diff.before, "data") : IntervalBlob{};
+        IntervalBlob after_blob = diff.has_after ? blob_for_column(diff.columns, diff.after, "data") : IntervalBlob{};
+        before_valid = std::max<std::int64_t>(before_valid, before_blob.size());
+        after_valid = std::max<std::int64_t>(after_valid, after_blob.size());
+        std::int64_t start = block_index * block_size_;
+        std::int64_t end = start + std::max(before_valid, after_valid);
+        std::string path = path_for_inode(inode_id, source_paths, target_paths);
+        std::string label = path + "@bytes:" + std::to_string(start) + "-" + std::to_string(end);
+        std::string unified = simple_unified_diff("target:" + label, "source:" + label, before_blob, after_blob);
+
+        return Json{
+            {"table", "chronosfs_file_range"},
+            {"key", Json{
+                {"path", path},
+                {"byte_range", Json{{"start", start}, {"end", end}}},
+            }},
+            {"change", diff.change},
+            {"before", diff.has_before ? content_json(before_blob) : Json(nullptr)},
+            {"after", diff.has_after ? content_json(after_blob, unified) : Json(nullptr)},
+        };
+    }
+
+    Json row_diff_json(
+        const NativeRowDiff &diff,
+        const std::unordered_map<std::int64_t, std::string> &source_paths,
+        const std::unordered_map<std::int64_t, std::string> &target_paths,
+        bool include_conflict_id = false) const {
+        if (diff.table == "chronosfs_file_blocks") {
+            Json out = file_block_diff_json(diff, source_paths, target_paths);
+            if (include_conflict_id) out["conflict_id"] = public_conflict_id(diff, source_paths, target_paths);
+            return out;
+        }
+        Json key = Json::object();
+        if (diff.table == "chronosfs_inodes") {
+            std::int64_t inode_id = int_for_column(diff.key_columns, diff.key_values, "inode_id", 0);
+            key["path"] = path_for_inode(inode_id, source_paths, target_paths);
+        } else if (diff.table == "chronosfs_dirents") {
+            std::int64_t parent_id = int_for_column(diff.key_columns, diff.key_values, "parent_inode_id", 0);
+            const IntervalValue *name_value = value_for_column(diff.key_columns, diff.key_values, "name");
+            std::string name = name_value ? as_string(*name_value) : std::string();
+            std::string parent_path = path_for_inode(parent_id, source_paths, target_paths);
+            key["parent_path"] = parent_path;
+            key["name"] = name;
+            key["path"] = path_join(parent_path, name);
+        } else {
+            for (std::size_t i = 0; i < diff.key_columns.size() && i < diff.key_values.size(); ++i) {
+                key[diff.key_columns[i]] = interval_value_to_json(diff.key_values[i]);
+            }
+        }
+        Json out = {
+            {"table", diff.table},
+            {"key", key},
+            {"change", diff.change},
+            {"before", diff.has_before ? row_payload_json(diff.table, diff.columns, diff.before, source_paths, target_paths) : Json(nullptr)},
+            {"after", diff.has_after ? row_payload_json(diff.table, diff.columns, diff.after, source_paths, target_paths) : Json(nullptr)},
+        };
+        if (include_conflict_id) out["conflict_id"] = public_conflict_id(diff, source_paths, target_paths);
+        return out;
+    }
+
+    std::string public_conflict_id(
+        const NativeRowDiff &diff,
+        const std::unordered_map<std::int64_t, std::string> &source_paths,
+        const std::unordered_map<std::int64_t, std::string> &target_paths) const {
+        return stable_control_id(row_diff_json(diff, source_paths, target_paths, false).dump());
+    }
+
+    std::string merge_preview_json(const std::string &path) {
+        ControlMergePath spec = parse_control_merge_path(path, "/.chronos/merge-preview/");
+        validate_branch_pair(spec);
+        NativeMergePreview preview = store_->merge_preview(spec.source, spec.target);
+        auto source_paths = inode_paths_for_branch(spec.source);
+        auto target_paths = inode_paths_for_branch(spec.target);
+        Json out = {
+            {"source", spec.source},
+            {"target", spec.target},
+            {"changes", Json::array()},
+            {"conflicts", Json::array()},
+        };
+        for (const auto &change : preview.changes) {
+            out["changes"].push_back(row_diff_json(change, source_paths, target_paths, false));
+        }
+        for (const auto &conflict : preview.conflicts) {
+            out["conflicts"].push_back(row_diff_json(conflict, source_paths, target_paths, true));
+        }
+        return out.dump();
+    }
+
+    void apply_control_merge(const std::string &path, const std::string &body) {
+        ControlMergePath spec = parse_control_merge_path(path, "/.chronos/merge-apply/");
+        validate_branch_pair(spec);
+        NativeMergePreview preview = store_->merge_preview(spec.source, spec.target);
+        auto source_paths = inode_paths_for_branch(spec.source);
+        auto target_paths = inode_paths_for_branch(spec.target);
+        Json request = Json::object();
+        if (body.find_first_not_of(" \t\r\n") != std::string::npos) {
+            request = Json::parse(body, nullptr, false);
+            if (request.is_discarded() || !request.is_object()) {
+                throw FsError(EINVAL, "invalid merge-apply JSON object");
+            }
+        }
+        std::string policy;
+        if (request.contains("policy")) {
+            if (!request["policy"].is_string()) throw FsError(EINVAL, "merge policy must be a string");
+            policy = request["policy"].get<std::string>();
+        }
+        std::unordered_map<std::string, std::string> choices;
+        if (request.contains("conflicts")) {
+            if (!request["conflicts"].is_object()) {
+                throw FsError(EINVAL, "merge conflicts must be a JSON object");
+            }
+            for (auto it = request["conflicts"].begin(); it != request["conflicts"].end(); ++it) {
+                if (!it.value().is_string()) {
+                    throw FsError(EINVAL, "merge conflict choices must be strings");
+                }
+                choices[it.key()] = it.value().get<std::string>();
+            }
+        }
+        if (policy.empty()) policy = choices.empty() ? "abort_on_conflict" : "manual_review";
+
+        std::vector<NativeMergeChange> changes;
+        changes.reserve(preview.changes.size() + preview.conflicts.size());
+        for (const auto &change : preview.changes) {
+            changes.push_back(merge_change_from_diff(change));
+        }
+
+        std::unordered_map<std::string, bool> seen_conflicts;
+        for (const auto &conflict : preview.conflicts) {
+            std::string id = public_conflict_id(conflict, source_paths, target_paths);
+            seen_conflicts[id] = true;
+            std::string choice;
+            auto explicit_choice = choices.find(id);
+            if (policy == "source_wins" || policy == "weak_snapshot_isolation") {
+                choice = "source";
+            } else if (policy == "target_wins") {
+                choice = "target";
+            } else if (policy == "abort_on_conflict" || policy == "snapshot_isolation") {
+                throw FsError(EINVAL, "merge has unresolved conflicts");
+            } else if (explicit_choice != choices.end()) {
+                choice = explicit_choice->second;
+            } else {
+                throw FsError(EINVAL, "merge conflict is unresolved: " + id);
+            }
+
+            if (choice == "source" || choice == "theirs") {
+                changes.push_back(merge_change_from_diff(conflict));
+            } else if (choice == "target" || choice == "ours" || choice == "skip") {
+                continue;
+            } else {
+                throw FsError(EINVAL, "unsupported merge conflict choice: " + choice);
+            }
+        }
+        for (const auto &entry : choices) {
+            if (seen_conflicts.find(entry.first) == seen_conflicts.end()) {
+                throw FsError(EINVAL, "merge resolution is stale for conflict: " + entry.first);
+            }
+        }
+
+        store_->apply_merge_changes(spec.source, spec.target, changes);
+        session_ = store_->checkout(branch_id_);
+        clear_metadata_cache();
     }
 
     void ensure_schema() {
@@ -1410,7 +1861,11 @@ class NativeChronosFS {
         return path == "/.chronos" ||
                path == "/.chronos/current" ||
                path == "/.chronos/branches" ||
-               path.rfind("/.chronos/branches/", 0) == 0;
+               path.rfind("/.chronos/branches/", 0) == 0 ||
+               path == "/.chronos/merge-preview" ||
+               path.rfind("/.chronos/merge-preview/", 0) == 0 ||
+               path == "/.chronos/merge-apply" ||
+               path.rfind("/.chronos/merge-apply/", 0) == 0;
     }
     static std::string control_branch_name(const std::string &path) {
         const std::string prefix = "/.chronos/branches/";
@@ -1422,6 +1877,14 @@ class NativeChronosFS {
             std::string name = control_branch_name(path);
             if (std::find(names.begin(), names.end(), name) == names.end()) throw FsError(ENOENT, "branch not found");
         }
+        ControlMergePath preview_spec = parse_control_merge_path(path, "/.chronos/merge-preview/");
+        ControlMergePath apply_spec = parse_control_merge_path(path, "/.chronos/merge-apply/");
+        if ((path.rfind("/.chronos/merge-preview/", 0) == 0 && !preview_spec.valid) ||
+            (path.rfind("/.chronos/merge-apply/", 0) == 0 && !apply_spec.valid)) {
+            throw FsError(ENOENT, "invalid merge control path");
+        }
+        if (preview_spec.valid) validate_branch_pair(preview_spec);
+        if (apply_spec.valid) validate_branch_pair(apply_spec);
         std::memset(st, 0, sizeof(struct stat));
         st->st_uid = getuid();
         st->st_gid = getgid();
@@ -1429,6 +1892,12 @@ class NativeChronosFS {
         if (path == "/.chronos/current") {
             st->st_mode = S_IFREG | 0644;
             st->st_size = branch_id_.size() + 1;
+        } else if (preview_spec.valid) {
+            st->st_mode = S_IFREG | 0444;
+            st->st_size = static_cast<off_t>(merge_preview_json(path).size());
+        } else if (apply_spec.valid) {
+            st->st_mode = S_IFREG | 0222;
+            st->st_size = 0;
         } else {
             st->st_mode = S_IFDIR | 0755;
             st->st_nlink = 2;

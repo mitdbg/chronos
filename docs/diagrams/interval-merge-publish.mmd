@@ -5,12 +5,13 @@ sequenceDiagram
   participant Data as Data Stores
 
   User->>Native: merge_apply(source, target)
-  Native->>Meta: lock source/target branch rows
+  Native->>Meta: read source/target/base branch heads
   Native->>Meta: find source/target/base segments
   Native->>Data: compute changed keys and conflicts
-  Native->>Meta: allocate successor target segment
-  Native->>Data: write merged rows into successor segment
-  Native->>Meta: atomically update target.current_segment_id
+  Native->>Meta: reserve branch transaction commit<br/>allocate merge + continuation segments
+  Native->>Data: write merged rows into merge segment
+  Native->>Meta: atomically update target.current_segment_id<br/>old target -> continuation
+  Native->>Meta: delete commit record
   Native-->>User: MergeResult(applied=n)
 
-  Note over Meta,Data: Readers see either old target segment<br/>or new successor segment, never partial merge.
+  Note over Meta,Data: Readers see either old target segment<br/>or continuation segment that sees merge rows,<br/>never partial merge.

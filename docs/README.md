@@ -120,6 +120,27 @@ See `filesystem-on-chronos.md` for the SQL-backed filesystem design,
 See `related-work.md` for a research log of papers and systems related to
 Chronos branching.
 
+When mounted through ChronosFS, agents can use POSIX paths and the `.chronos`
+control plane:
+
+```bash
+mkdir .chronos/branches/agent
+printf 'agent\n' > .chronos/current
+cat .chronos/merge-preview/agent..main.json
+cat > .chronos/merge-apply/agent..main <<'JSON'
+{"policy":"weak_snapshot_isolation"}
+JSON
+```
+
+Mermaid diagrams live in `docs/diagrams/`, including:
+
+- `interval-architecture-overview.mmd`
+- `interval-dml-processing.mmd`
+- `interval-merge-publish.mmd`
+- `polystore-session-processing.mmd`
+- `polystore-workspace-processing.mmd`
+- `chronosfs-posix-control-plane.mmd`
+
 ## Branch Transactions Versus Database Transactions
 
 A normal database transaction is fast, but holding it open while an LLM thinks

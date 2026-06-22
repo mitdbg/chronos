@@ -223,6 +223,7 @@ class NativeBranchStoreImpl {
         return lowered.find("_chronos_branch_tables") != std::string::npos ||
             lowered.find("_chronos_branch_indexes") != std::string::npos ||
             lowered.find("_chronos_branch_interval_") != std::string::npos ||
+            lowered.find("_chronos_branch_transaction_commits") != std::string::npos ||
             lowered.find("_chronos_branch_table_schema_versions") != std::string::npos ||
             lowered.find("_chronos_branch_table_bindings") != std::string::npos ||
             lowered.find("pg_advisory_") != std::string::npos;

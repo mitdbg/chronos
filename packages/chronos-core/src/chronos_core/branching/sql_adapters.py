@@ -4,6 +4,7 @@ import sqlite3
 from abc import ABC, abstractmethod
 from pathlib import Path
 import re
+import threading
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
@@ -554,6 +555,10 @@ class DuckDBCursorAdapter:
             yield self._rows.pop(0)
 
 
+_DUCKDB_CONNECTIONS_GUARD = threading.Lock()
+_DUCKDB_CONNECTIONS: dict[str, Any] = {}
+
+
 class DuckDBDatabaseAdapter(SQLDatabaseAdapter):
     """DuckDB adapter backed by the native SQL data-plane driver.
 
@@ -590,7 +595,21 @@ class DuckDBDatabaseAdapter(SQLDatabaseAdapter):
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         from chronos_core import _native_interval
 
-        return cls(_native_interval.NativeSqlConnection(database_url), path, database_url)
+        if path == ":memory:":
+            store = _native_interval.NativeSqlConnection(database_url)
+        else:
+            # DuckDB file-backed database handles do not behave like independent
+            # row-store connections for concurrent writers in one process: a
+            # freshly opened handle can miss commits from another still-open
+            # handle. Chronos polystore workspaces therefore share one native
+            # DuckDB connection per file URL and serialize access at the
+            # workspace/session layer.
+            with _DUCKDB_CONNECTIONS_GUARD:
+                store = _DUCKDB_CONNECTIONS.get(database_url)
+                if store is None:
+                    store = _native_interval.NativeSqlConnection(database_url)
+                    _DUCKDB_CONNECTIONS[database_url] = store
+        return cls(store, path, database_url)
 
     def execute(
         self, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()
@@ -788,6 +807,12 @@ class RoutedIntervalDatabaseAdapter(SQLDatabaseAdapter):
 
     def last_insert_id(self) -> int:
         return self.data_db.last_insert_id()
+
+    def refresh_connection(self) -> None:
+        for adapter in (self.data_db, self.metadata_db):
+            refresh = getattr(adapter, "refresh_connection", None)
+            if callable(refresh):
+                refresh()
 
     def _adapter_for_table(self, table: str) -> SQLDatabaseAdapter:
         return self.metadata_db if self._is_metadata_text(table) else self.data_db

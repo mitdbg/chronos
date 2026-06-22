@@ -22,3 +22,15 @@ sequenceDiagram
   User->>FS: write files
   FS->>Meta: read same branch segment metadata
   FS->>FS: block-level interval CoW
+
+  User->>WS: merge_preview("experiment", "main")
+  WS->>PG: preview row changes
+  WS->>Duck: preview OLAP-table changes
+  WS->>FS: preview path/byte-range changes
+
+  User->>WS: merge_apply("experiment", "main", policy)
+  WS->>Meta: reserve branch transaction commit
+  WS->>PG: write accepted rows into merge segment
+  WS->>Duck: write accepted rows into merge segment
+  WS->>FS: write accepted file rows into merge segment
+  WS->>Meta: publish continuation as main head

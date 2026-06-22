@@ -13,7 +13,7 @@ The implementation provides:
 
 - A storage layer, `ChronosFSStore`, that registers filesystem tables with the
   Chronos interval backend.
-- A Linux FUSE adapter, `mount_chronosfs`, implemented with `pyfuse3`.
+- A native Linux FUSE adapter, `mount_chronosfs`, implemented with libfuse.
 - A small POSIX control plane under `.chronos/` for branch operations using
   ordinary file reads, writes, and mkdir.
 
@@ -36,8 +36,8 @@ rows and lets Chronos intervals version those rows.
   is copied at fork time.
 - Support block-level branch isolation by choosing small logical filesystem
   records and letting Chronos interval row versioning handle writes.
-- Keep v1 implementation close to Chronos core by using Python and the existing
-  interval backend.
+- Keep filesystem branching on the same native interval backend as relational
+  stores instead of implementing a second branch algorithm.
 
 ## Non-Goals
 
@@ -139,8 +139,9 @@ ChronosFS reuses the existing interval branch lifecycle:
 - `create_branch_from_checkpoint(branch, checkpoint)` creates a branch view from
   a checkpoint.
 - `diff(left, right)` compares visible path manifests.
-- `merge_apply(source, target)` applies accepted file changes to the target
-  branch through normal Chronos writes.
+- `merge_preview(source, target, policy=...)` reports row/file conflicts.
+- `merge_apply(source, target, ...)` commits accepted source changes through the
+  native branch transaction commit path.
 
 Reads do not walk ancestry manually. A Chronos branch session supplies one
 branch point, and table reads use the standard interval visibility predicate.
@@ -166,10 +167,6 @@ synchronous at the FUSE write-handler boundary. A write patches affected logical
 blocks and upserts them through Chronos immediately. `flush()` and `fsync()`
 currently have little buffered regular-file work to do, but they are
 implemented so tools that call them receive normal responses.
-
-Control-file writes under `.chronos/` are buffered until `flush`, `fsync`, or
-`release`, because the adapter needs complete command text before dispatching a
-branch operation.
 
 ## POSIX Semantics
 
@@ -201,12 +198,9 @@ paths are not persisted as user inodes.
 
 ```text
 .chronos/current
-.chronos/status
-.chronos/ctl
 .chronos/branches/
-.chronos/checkpoints/
-.chronos/diff/
 .chronos/merge-preview/
+.chronos/merge-apply/
 ```
 
 Implemented workflows:
@@ -224,33 +218,58 @@ printf 'agent_run_1\n' > .chronos/current
 # List known branches.
 ls .chronos/branches/
 
-# Read branch metadata.
-cat .chronos/branches/agent_run_1/info
+# Preview source-into-target merge.
+cat .chronos/merge-preview/agent_run_1..main.json
+
+# Commit accepted changes with a policy.
+cat > .chronos/merge-apply/agent_run_1..main <<'JSON'
+{"policy":"weak_snapshot_isolation"}
+JSON
 ```
 
-`.chronos/ctl` accepts one newline-terminated command per write for operations
-that need arguments:
+Preview files are virtual JSON files named `<source>..<target>.json`. Apply
+files accept JSON written to `.chronos/merge-apply/<source>..<target>` or
+`.chronos/merge-apply/<source>..<target>.json`. The preview/apply paths are not
+tied to the mount's current branch, so operators usually run them from a
+main-branch mount while worker mounts remain checked out to private branches.
+
+ChronosFS file conflicts are reported as public file-range conflicts:
+
+```json
+{
+  "table": "chronosfs_file_range",
+  "key": {
+    "path": "/src/solution.py",
+    "byte_range": {"start": 4096, "end": 8192}
+  },
+  "before": {"encoding": "utf-8", "text": "target text"},
+  "after": {
+    "encoding": "utf-8",
+    "text": "source text",
+    "unified_diff": "--- target:/src/solution.py@bytes:4096-8192\n+++ source:/src/solution.py@bytes:4096-8192\n..."
+  },
+  "conflict_id": "..."
+}
+```
+
+The control plane hides internal `inode_id` and `block_index` values. Agents
+see paths, byte ranges, and text diffs when content is textual. Manual
+resolution writes choices keyed by the preview's `conflict_id`:
 
 ```bash
-printf 'create-branch experiment from main\n' > .chronos/ctl
-printf 'create-checkpoint before-refactor\n' > .chronos/ctl
-printf 'delete-branch experiment\n' > .chronos/ctl
-printf 'merge experiment into main\n' > .chronos/ctl
+cat > .chronos/merge-apply/agent..main <<'JSON'
+{
+  "policy": "manual_review",
+  "conflicts": {
+    "CONFLICT_ID_FROM_PREVIEW": "source"
+  }
+}
+JSON
 ```
 
-`cat .chronos/status` returns shell-friendly text:
-
-```text
-branch main
-readonly false
-dirty_handles 0
-open_handles 3
-block_size 3072
-```
-
-`.chronos/checkpoints`, `.chronos/diff`, and `.chronos/merge-preview` are
-reserved virtual directories in v1. Rich read-only views can be added without
-changing persisted schemas.
+Supported choices are `source`/`theirs` and `target`/`ours`/`skip`. Supported
+policies are `abort_on_conflict`, `snapshot_isolation`,
+`weak_snapshot_isolation`, `source_wins`, `target_wins`, and `manual_review`.
 
 ## Python API
 
@@ -282,7 +301,9 @@ Direct store methods are used by tests and by the FUSE adapter:
 - `unlink(branch, path)` / `rmdir(branch, path)`
 - `rename(branch, old_path, new_path)`
 - `symlink(branch, target, link_path)` / `readlink(branch, path)`
-- `diff(left, right)` / `merge_apply(source, target)`
+- `diff(left, right)`
+- `merge_preview(source, target, policy=...)`
+- `merge_apply(source, target, resolution=None, policy=...)`
 
 Existing relational-only users continue to use `ChronosBranchContext` directly.
 
@@ -295,10 +316,12 @@ The current diff is path-oriented and built from visible branch manifests:
 - Metadata change: mode, size, symlink target, or kind differs.
 - Content change: file hash differs.
 
-The current merge implementation is conservative and path-oriented. It is enough
-for non-conflicting file operations in tests, but it is not a full three-way
-filesystem merge. Future work should present conflicts as filesystem paths and
-map them back to row-level interval changes.
+The merge path uses the same interval merge machinery as relational stores.
+For file-content conflicts, the public preview reports paths and byte ranges,
+while internally mapping choices back to block rows. `weak_snapshot_isolation`
+and `source_wins` choose source content for conflicts; `target_wins` skips
+source conflict rows; `manual_review` requires explicit choices by
+`conflict_id`.
 
 ## Performance Notes
 
@@ -350,8 +373,8 @@ The test suite includes:
 
 - Branch-pinned file handles and `EBUSY` on unsafe checkout.
 - Read-only checkpoint mounts.
-- Rich `.chronos/diff`, `.chronos/merge-preview`, and `.chronos/checkpoints`
-  directory views.
-- Full three-way merge and conflict reporting.
+- Rich `.chronos/diff` and `.chronos/checkpoints` directory views.
+- Higher-level whole-file and semantic merge helpers built on top of the
+  existing byte-range conflict preview.
 - Hardlinks, xattrs, locks, timestamp setting, and stronger permissions.
 - PostgreSQL stress tests under concurrent writers.

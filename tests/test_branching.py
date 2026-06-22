@@ -2565,7 +2565,34 @@ def test_interval_merge_apply_writes_to_new_target_segment(sql_backend: str) -> 
         ).fetchone()
         assert new_row is not None
         assert new_row["price"] == 11
-        assert int(new_row["writer_segment_id"]) == new_target.segment_id
+        merge_segment_id = int(new_row["writer_segment_id"])
+        assert merge_segment_id != new_target.segment_id
+        continuation_metadata = ctx.db.execute(
+            """
+            SELECT parent_segment_id, owner_branch_id, segment_kind
+            FROM _chronos_branch_interval_segments
+            WHERE segment_id = ?
+            """,
+            (new_target.segment_id,),
+        ).fetchone()
+        assert continuation_metadata is not None
+        assert int(continuation_metadata["parent_segment_id"]) == merge_segment_id
+        assert continuation_metadata["owner_branch_id"] == "main"
+        assert continuation_metadata["segment_kind"] == "mutable"
+        merge_metadata = ctx.db.execute(
+            """
+            SELECT parent_segment_id, owner_branch_id, segment_kind, live_lo, live_hi
+            FROM _chronos_branch_interval_segments
+            WHERE segment_id = ?
+            """,
+            (merge_segment_id,),
+        ).fetchone()
+        assert merge_metadata is not None
+        assert int(merge_metadata["parent_segment_id"]) == old_target.segment_id
+        assert merge_metadata["owner_branch_id"] == "main"
+        assert merge_metadata["segment_kind"] == "merge"
+        assert int(merge_metadata["live_lo"]) <= new_target.branch_point
+        assert new_target.branch_point < int(merge_metadata["live_hi"])
         old_row = ctx.db.execute(
             """
             SELECT price
@@ -2579,6 +2606,46 @@ def test_interval_merge_apply_writes_to_new_target_segment(sql_backend: str) -> 
         ).fetchone()
         assert old_row is not None
         assert old_row["price"] == 10
+    finally:
+        ctx.close()
+
+
+def test_interval_merge_apply_branch_transaction_commit_record_is_atomic(
+    sql_backend: str,
+) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        agent.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 11},
+        )
+        before = ctx.db.execute(
+            """
+            SELECT current_segment_id
+            FROM _chronos_branch_interval_branches
+            WHERE branch_id = ?
+            """,
+            ("main",),
+        ).fetchone()
+
+        result = ctx.merge_apply(source="agent", target="main")
+
+        after = ctx.db.execute(
+            """
+            SELECT current_segment_id
+            FROM _chronos_branch_interval_branches
+            WHERE branch_id = ?
+            """,
+            ("main",),
+        ).fetchone()
+        assert result.applied == 1
+        assert int(after["current_segment_id"]) != int(before["current_segment_id"])
+        assert ctx.db.execute(
+            "SELECT count(*) AS c FROM _chronos_branch_transaction_commits"
+        ).fetchone()["c"] == 0
+        assert _product(ctx.checkout("main"), "abc")["price"] == 11
     finally:
         ctx.close()
 
@@ -2628,7 +2695,7 @@ def test_interval_merge_apply_successive_terminal_merges_advance_successors(
 
         assert first.applied == 1
         assert after_first.segment_id != before_first.segment_id
-        assert after_first.branch_point == before_first.branch_point + 1
+        assert after_first.branch_point > before_first.branch_point
         assert _product(ctx.checkout("main"), "abc")["price"] == 11
         assert _product(ctx.checkout("main"), "def")["price"] == 20
 
@@ -2641,9 +2708,21 @@ def test_interval_merge_apply_successive_terminal_merges_advance_successors(
             (after_first.segment_id,),
         ).fetchone()
         assert first_metadata is not None
-        assert int(first_metadata["parent_segment_id"]) == before_first.segment_id
+        first_merge_id = int(first_metadata["parent_segment_id"])
         assert first_metadata["owner_branch_id"] == "main"
         assert first_metadata["segment_kind"] == "mutable"
+        first_merge = ctx.db.execute(
+            """
+            SELECT parent_segment_id, owner_branch_id, segment_kind
+            FROM _chronos_branch_interval_segments
+            WHERE segment_id = ?
+            """,
+            (first_merge_id,),
+        ).fetchone()
+        assert first_merge is not None
+        assert int(first_merge["parent_segment_id"]) == before_first.segment_id
+        assert first_merge["owner_branch_id"] == "main"
+        assert first_merge["segment_kind"] == "merge"
 
         ctx.create_branch("txn_b", from_branch="main", terminal=True)
         txn_b = ctx.checkout("txn_b")
@@ -2661,7 +2740,7 @@ def test_interval_merge_apply_successive_terminal_merges_advance_successors(
         assert second.applied == 1
         assert before_second.segment_id != after_first.segment_id
         assert after_second.segment_id != after_first.segment_id
-        assert after_second.branch_point == before_second.branch_point + 1
+        assert after_second.branch_point > before_second.branch_point
         assert _product(ctx.checkout("main"), "abc")["price"] == 11
         assert _product(ctx.checkout("main"), "def")["price"] == 21
 
@@ -2674,9 +2753,21 @@ def test_interval_merge_apply_successive_terminal_merges_advance_successors(
             (after_second.segment_id,),
         ).fetchone()
         assert second_metadata is not None
-        assert int(second_metadata["parent_segment_id"]) == before_second.segment_id
+        second_merge_id = int(second_metadata["parent_segment_id"])
         assert second_metadata["owner_branch_id"] == "main"
         assert second_metadata["segment_kind"] == "mutable"
+        second_merge = ctx.db.execute(
+            """
+            SELECT parent_segment_id, owner_branch_id, segment_kind
+            FROM _chronos_branch_interval_segments
+            WHERE segment_id = ?
+            """,
+            (second_merge_id,),
+        ).fetchone()
+        assert second_merge is not None
+        assert int(second_merge["parent_segment_id"]) == before_second.segment_id
+        assert second_merge["owner_branch_id"] == "main"
+        assert second_merge["segment_kind"] == "merge"
     finally:
         ctx.close()
 

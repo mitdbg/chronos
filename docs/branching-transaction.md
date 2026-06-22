@@ -132,37 +132,39 @@ existing state stores. The merge phase is Chronos' commit-validation phase:
 candidate changes = diff(branch, target)
 conflicts = detect_conflicts(candidate changes, target changes)
 resolution = reconcile(conflicts, policy)
-stage candidate changes in an unpublished target successor
-publish the successor atomically
+write candidate changes into an unpublished merge segment
+publish a mutable continuation segment atomically
 ```
 
 Atomic publish is the critical implementation detail. Chronos must not write
 merge results directly into the target branch's currently published interval
 segment, because those writes would become visible before every participant in a
-multi-store merge has finished. Instead, merge creates a new successor segment
-for the target branch, writes the resolved merge changes into that successor
-using the same branch-local write path as ordinary DML, and then publishes the
-successor with one metadata update:
+multi-store merge has finished. Instead, merge creates a `merge` segment and a
+mutable continuation segment for the target branch. Chronos writes the resolved
+merge changes into the merge segment using the same branch-local write path as
+ordinary DML, and then publishes the continuation with one metadata update:
 
 ```text
 target before merge: main -> S10
 
-stage:
-  create S11 as an unpublished successor of S10
+commit writes:
+  create S11 kind=merge under S10
+  create S12 kind=mutable under S11
   write resolved merge rows into S11
 
 publish:
   UPDATE branches
-     SET current_segment_id = S11
+     SET current_segment_id = S12
    WHERE branch_id = 'main'
      AND current_segment_id = S10;
 ```
 
 Readers obtain their branch read point from branch metadata. A reader that
 resolved `main -> S10` before publish keeps seeing S10. A reader that resolves
-`main -> S11` after publish sees the merged state. The old segment is therefore
-sealed by reachability: it remains historical state but is no longer the branch
-head. The new segment is ordinary mutable target state after publication.
+`main -> S12` after publish sees the merge rows in S11 and future target writes
+in S12. The old segment is sealed by reachability: it remains historical state
+but is no longer the branch head. The continuation segment is ordinary mutable
+target state after publication.
 
 This framing is important because the validation policy defines the isolation
 semantics. Chronos' `snapshot_isolation` policy is first-committer-wins: a merge
@@ -265,13 +267,13 @@ SQL and schema evolution. The application should not have to reason separately
 about each store's native snapshot mechanism.
 
 For multi-store branch transactions, the branch transaction commit protocol is
-also how Chronos avoids needing two-phase commit in the common Epoxy-style
-case. Each store first writes durable but unpublished versions for the same
-logical target successor. The single commit decision is the metadata transaction
-that installs the successor as the target branch head. If the metadata commit
-never completes, successor versions are unreachable and can be ignored or
-garbage-collected. If it commits, all stores resolve the target branch through
-the new head.
+also how Chronos avoids needing two-phase commit.
+Each store first writes durable but unpublished versions into the same
+logical merge segment. The single commit decision is the metadata transaction
+that installs the continuation segment as the target branch head. If the
+metadata commit never completes, merge versions are unreachable and can be
+ignored or garbage-collected. If it commits, all stores resolve the target
+branch through the new continuation head.
 
 This relies on one transactional metadata store for the polystore workspace.
 PostgreSQL or SQLite owns branch heads, segment allocation, checkpoints, table
@@ -279,14 +281,15 @@ registries, and branch transaction commit records. Additional stores such as Duc
 ChronosFS, vector stores, or search indexes store only physical branchable data.
 They do not independently decide branch visibility.
 
-The branch transaction commit record is keyed by the successor segment id:
+The branch transaction commit record is keyed by the merge segment id and also
+names the continuation segment:
 
 ```sql
 CREATE TABLE _chronos_branch_transaction_commits (
-  successor_segment_id INTEGER PRIMARY KEY,
+  merge_segment_id INTEGER PRIMARY KEY,
+  continuation_segment_id INTEGER NOT NULL,
   target_branch_id TEXT NOT NULL UNIQUE,
   old_target_segment_id INTEGER NOT NULL,
-  old_target_revision INTEGER NOT NULL,
   source_branch_id TEXT,
   participant_stores TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -301,13 +304,14 @@ segment and enter the branch transaction commit pipeline for a target branch. Th
 keeps the interval read path fast: abandoned successors are not competing
 sibling intervals for the same target read point.
 
-The successor is a normal `mutable` segment. It does not need a special commit
-segment kind. Visibility is determined by the target branch head:
+The merge segment is `segment_kind='merge'`; the published head is
+`segment_kind='mutable'`. Visibility is determined by the target branch head:
 
 ```text
 main -> S10        published old state
-S11 exists         durable reserved successor, not visible
-main -> S11        committed merge
+S11 merge exists   durable merge rows, not visible
+S12 mutable exists continuation, not visible
+main -> S12        committed merge; S12 sees rows in S11
 ```
 
 The final metadata commit transaction is intentionally short and contains no model calls,
@@ -316,8 +320,8 @@ human review, filesystem execution, or expensive diff computation:
 ```text
 BEGIN
   lock target branch row
-  verify the commit record still names this successor
-  conditionally set current_segment_id = successor_segment_id
+  verify the commit record still names this merge/continuation pair
+  conditionally set current_segment_id = continuation_segment_id
     only if the target token still matches
   verify exactly one branch row was updated
   delete branch transaction commit record
@@ -342,21 +346,62 @@ reserve:
   lock target branch row
   check target_token is still current
   check no active branch transaction commit exists for target
-  allocate one successor segment
+  allocate merge and continuation segments
   insert branch transaction commit record
   commit
 
 commit writes:
-  write merge output into the successor segment in each store
+  write merge output into the merge segment in each store
   use store-local transactions where available
 
 publish:
   short metadata transaction
   lock target branch row
   check target_token and commit record still match
-  flip target branch head to successor
+  flip target branch head to continuation
   delete commit record
   commit
+```
+
+### User APIs
+
+Relational branch transactions use the existing Python API:
+
+```python
+ctx.create_branch("txn_1", from_branch="main")
+txn = ctx.checkout("txn_1")
+txn.execute("UPDATE items SET value = :value WHERE id = :id", {"id": 1, "value": 7})
+
+preview = ctx.merge_preview("txn_1", "main", policy="manual_review")
+ctx.merge_apply("txn_1", "main", policy="snapshot_isolation")
+```
+
+Workspace branch transactions coordinate named stores:
+
+```python
+workspace.create_branch("agent", from_branch="main")
+branch = workspace.checkout("agent")
+branch.postgresql.execute("UPDATE graph_nodes SET score = :score WHERE id = :id", {"score": 0.9, "id": "n1"})
+branch.duckdb.execute("INSERT INTO run_metrics VALUES (:id, :score)", {"id": "n1", "score": 0.9})
+filesystem.write_file("agent", "/reports/n1.md", "score: 0.9\n", parents=True)
+
+preview = workspace.merge_preview("agent", "main", policy="manual_review")
+workspace.merge_apply("agent", "main", policy="weak_snapshot_isolation")
+```
+
+ChronosFS also exposes POSIX control files for agents that only have shell or
+filesystem access:
+
+```bash
+mkdir .chronos/branches/agent
+printf 'agent\n' > .chronos/current
+python scripts/try_fix.py
+
+printf 'main\n' > .chronos/current
+cat .chronos/merge-preview/agent..main.json
+cat > .chronos/merge-apply/agent..main <<'JSON'
+{"policy":"weak_snapshot_isolation"}
+JSON
 ```
 
 If two concurrent merge attempts both compute clean diffs against the same

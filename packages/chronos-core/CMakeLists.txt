@@ -10,6 +10,21 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 
 include(FetchContent)
+find_package(nlohmann_json CONFIG QUIET)
+if(NOT TARGET nlohmann_json::nlohmann_json)
+  find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp QUIET)
+  if(NLOHMANN_JSON_INCLUDE_DIR)
+    add_library(nlohmann_json_header INTERFACE)
+    add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json_header)
+    target_include_directories(nlohmann_json_header INTERFACE "${NLOHMANN_JSON_INCLUDE_DIR}")
+  else()
+    FetchContent_Declare(
+      nlohmann_json
+      URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+  endif()
+endif()
 FetchContent_Declare(
   libpg_query
   URL https://github.com/pganalyze/libpg_query/archive/refs/tags/17-6.2.2.tar.gz
@@ -55,7 +70,7 @@ pybind11_add_module(_native_interval
   src/chronos_core/native/chronosfs_fuse.cpp
 )
 target_compile_features(_native_interval PRIVATE cxx_std_17)
-target_link_libraries(_native_interval PRIVATE SQLite::SQLite3 PostgreSQL::PostgreSQL PkgConfig::FUSE3 libpg_query_static duckdb_shared)
+target_link_libraries(_native_interval PRIVATE SQLite::SQLite3 PostgreSQL::PostgreSQL PkgConfig::FUSE3 libpg_query_static duckdb_shared nlohmann_json::nlohmann_json)
 set_target_properties(_native_interval PROPERTIES
   BUILD_RPATH "${duckdb_lib_SOURCE_DIR}"
   INSTALL_RPATH "$ORIGIN"

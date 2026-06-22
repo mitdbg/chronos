@@ -62,6 +62,11 @@ class _IntervalBackend(_SQLBranchBackend):
         if self._native_branch_store is None:
             self._native_branch_store = self._create_native_branch_store()
 
+    def refresh_native_connections(self) -> None:
+        self._invalidate_native_branch_sessions()
+        self._native_branch_store = None
+        self._initialize_native_branch_store()
+
     def _commit_native_branch_store(self) -> None:
         if self._native_branch_store is not None:
             self._native_branch_store.commit()

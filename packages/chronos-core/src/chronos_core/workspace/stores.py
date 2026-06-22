@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from chronos_core.branching import BranchSession, ChronosBranchContext
+from chronos_core.branching import (
+    BranchSession,
+    ChronosBranchContext,
+    MergeResolution,
+)
+from chronos_core.branching._common import MergePolicyInput
 
 
 @dataclass
@@ -88,8 +93,24 @@ class ChronosPostgresStore:
     def diff(self, left: str, right: str) -> Any:
         return self.context.diff(left, right)
 
-    def merge_apply(self, source: str, target: str) -> Any:
-        return self.context.merge_apply(source, target)
+    def merge_preview(
+        self,
+        source: str,
+        target: str,
+        *,
+        policy: MergePolicyInput = None,
+    ) -> Any:
+        return self.context.merge_preview(source, target, policy=policy)
+
+    def merge_apply(
+        self,
+        source: str,
+        target: str,
+        resolution: MergeResolution | None = None,
+        *,
+        policy: MergePolicyInput = None,
+    ) -> Any:
+        return self.context.merge_apply(source, target, resolution, policy=policy)
 
     def close(self) -> None:
         self.context.close()
@@ -162,8 +183,24 @@ class ChronosDuckDBStore:
     def diff(self, left: str, right: str) -> Any:
         return self.context.diff(left, right)
 
-    def merge_apply(self, source: str, target: str) -> Any:
-        return self.context.merge_apply(source, target)
+    def merge_preview(
+        self,
+        source: str,
+        target: str,
+        *,
+        policy: MergePolicyInput = None,
+    ) -> Any:
+        return self.context.merge_preview(source, target, policy=policy)
+
+    def merge_apply(
+        self,
+        source: str,
+        target: str,
+        resolution: MergeResolution | None = None,
+        *,
+        policy: MergePolicyInput = None,
+    ) -> Any:
+        return self.context.merge_apply(source, target, resolution, policy=policy)
 
     def close(self) -> None:
         self.context.close()

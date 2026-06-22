@@ -15,6 +15,7 @@ flowchart TB
     S["segments"]
     CP["checkpoints"]
     R["registries"]
+    C["branch transaction commits"]
   end
 
   subgraph PhysicalStores["Physical data stores"]
@@ -32,3 +33,4 @@ flowchart TB
   FSSession --> FS
 
   SharedMeta -. "single branch lifecycle authority" .-> WSession
+  WSession -. "merge_apply reserves merge + continuation<br/>then publishes one branch head" .-> C

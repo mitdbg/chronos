@@ -2,6 +2,7 @@
 
 from chronos_core.workspace.chronosfs.store import (
     CHRONOSFS_BLOCK_SIZE,
+    ChronosFSBranchSession,
     ChronosFSDiff,
     ChronosFSError,
     ChronosFSPathChange,
@@ -16,6 +17,7 @@ from chronos_core.workspace.chronosfs.fuse import (
 
 __all__ = [
     "CHRONOSFS_BLOCK_SIZE",
+    "ChronosFSBranchSession",
     "ChronosFSDiff",
     "ChronosFSError",
     "ChronosFSPathChange",

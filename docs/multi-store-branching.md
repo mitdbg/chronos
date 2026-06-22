@@ -350,6 +350,35 @@ host:    /mnt/chronosfs/run_42
 process: /workspace -> bind mount of run_42
 ```
 
+The `.chronos` control plane lets a main-branch mount coordinate branches
+created or modified through other mount points:
+
+```bash
+# On /mnt/main:
+mkdir .chronos/branches/agent
+
+# On /mnt/agent:
+printf 'agent\n' > .chronos/current
+python scripts/solve.py
+
+# Back on /mnt/main:
+cat .chronos/merge-preview/agent..main.json
+cat > .chronos/merge-apply/agent..main <<'JSON'
+{"policy":"weak_snapshot_isolation"}
+JSON
+```
+
+Manual review writes conflict choices by `conflict_id`:
+
+```json
+{
+  "policy": "manual_review",
+  "conflicts": {
+    "CONFLICT_ID_FROM_PREVIEW": "source"
+  }
+}
+```
+
 ### Direct Store API
 
 Agents that do not need POSIX can use the store API directly:
@@ -372,7 +401,9 @@ Important operations:
 - `rename(branch, old_path, new_path)`
 - `symlink(branch, target, link_path)` / `readlink(branch, path)`
 - `manifest(branch)`
-- `diff(left, right)` / `merge_apply(source, target)`
+- `diff(left, right)`
+- `merge_preview(source, target, policy=...)`
+- `merge_apply(source, target, resolution=None, policy=...)`
 
 ## Sandboxed Agent Execution
 
@@ -397,10 +428,10 @@ filesystem.write_file("run_42", "/reports/summary.md", "# Summary\n", parents=Tr
 mount_chronosfs(filesystem, "/mnt/run_42", branch_id="run_42")
 subprocess.run(["python", "scripts/build_report.py"], cwd="/mnt/run_42", check=True)
 
-preview = workspace.diff("main", "run_42")
+preview = workspace.merge_preview("run_42", "main", policy="manual_review")
 
 if policy_allows(preview):
-    workspace.merge_apply("run_42", "main")
+    workspace.merge_apply("run_42", "main", policy="snapshot_isolation")
 else:
     workspace.delete_branch("run_42")
 ```
@@ -457,44 +488,52 @@ For `merge_apply`:
 2. Compute diffs with a three-way comparison over source, target, and fork base.
 3. Run deterministic conflict checks and optional application/LLM-assisted
    resolution outside the metadata publish transaction.
-4. Reserve exactly one successor segment for the target branch in a short
-   metadata transaction. This revalidates the target token, verifies that no
-   active branch transaction commit already exists for the target, allocates a
-   fresh successor interval, and inserts the commit record.
+4. Reserve exactly one branch transaction commit for the target branch in a
+   short metadata transaction. This revalidates the target token, verifies that
+   no active commit already exists for the target, allocates a `merge` segment
+   plus a mutable continuation segment, and inserts the commit record.
 5. Run the policy-specific post-reservation validation. If the target changed
    during preview, the configured policy decides whether to abort, retry,
    rebase, apply source-over-target, or re-run LLM reconciliation against the
    new target state.
-6. Write the resolved merge output into the successor segment in every
+6. Write the resolved merge output into the `merge` segment in every
    participating store. Stores use the ordinary branch write path with the
-   explicit successor segment as the destination. If a store supports
+   explicit merge segment as the destination. If a store supports
    transactions, commit writes for that store should run inside a physical store
    transaction to minimize cleanup after failures.
 7. Open the final metadata publish transaction, lock the target branch row,
    revalidate the target token and commit record, atomically update the target
-   head to `successor_segment_id`, delete the commit record, and
+   head to `continuation_segment_id`, delete the commit record, and
    commit.
 8. Return a grouped merge result keyed by store name.
 
-The successor segment does not need a special segment kind. It is an ordinary
-`mutable` segment that is unpublished until a branch head points at it. Publish
-state is derived only from metadata reachability:
+The commit uses two ordinary interval segments:
+
+- `merge`: immutable source deltas accepted by the merge policy.
+- `mutable`: the continuation segment published as the new target branch head.
+
+The merge rows use the merge segment's interval. The continuation segment is a
+child of the merge segment, so its branch read point sees the merge rows and can
+serve future target-branch writes normally. Publish state is derived from
+metadata reachability:
 
 - Unpublished: commit record exists and target branch still points at the old
-  segment.
-- Published: target branch points at the successor segment and the commit
+  segment. The merge and continuation rows are not reachable from the target
+  branch head.
+- Published: target branch points at the continuation segment and the commit
   record was deleted by the publish transaction.
 - Abandoned: target branch moved somewhere else before publish; the commit
-  record and successor rows are garbage-collection candidates.
+  record, merge segment, continuation segment, and their rows are
+  garbage-collection candidates.
 
 The branch transaction commit table is intentionally small:
 
 ```sql
 CREATE TABLE _chronos_branch_transaction_commits (
-  successor_segment_id INTEGER PRIMARY KEY,
+  merge_segment_id INTEGER PRIMARY KEY,
+  continuation_segment_id INTEGER NOT NULL,
   target_branch_id TEXT NOT NULL UNIQUE,
   old_target_segment_id INTEGER NOT NULL,
-  old_target_revision INTEGER NOT NULL,
   source_branch_id TEXT,
   participant_stores TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -502,12 +541,12 @@ CREATE TABLE _chronos_branch_transaction_commits (
 );
 ```
 
-There is no separate `commit_id`, heartbeat, or status column. The successor
-segment id identifies the branch transaction commit attempt. The row is either
-present because an unpublished attempt may need cleanup, or absent because the
-commit completed.
+There is no separate `commit_id`, heartbeat, or status column. The
+`merge_segment_id` identifies the branch transaction commit attempt. The row is
+either present because an unpublished attempt may need cleanup, or absent
+because the commit completed.
 
-Only one reserved successor may exist for a target branch at a time. The
+Only one reserved commit may exist for a target branch at a time. The
 `UNIQUE(target_branch_id)` constraint makes the commit record a target-branch
 commit lock. Concurrent preview, diff, and LLM reconciliation can still run
 outside the lock, but only one merge enters the branch transaction commit
@@ -515,58 +554,48 @@ pipeline for a given target. This preserves the fast interval visibility
 predicate: a reader does not need a reachability join to filter out multiple
 sibling commit successors for the same target.
 
-`old_target_revision` is required if the target branch can accept in-place
-writes to its current segment. Every Chronos-mediated write that can change the
-target branch's visible contents must advance this revision in the metadata
-store. If an implementation instead makes every visible branch update publish a
-new immutable segment head, then `old_target_segment_id` alone is a sufficient
-validation token. Chronos' general polystore protocol should use the pair
-`(old_target_segment_id, old_target_revision)` so it is correct for both modes.
-
 The publish transaction is the only visibility commit:
 
 ```sql
 BEGIN;
 
-SELECT current_segment_id, content_revision
+SELECT current_segment_id
   FROM _chronos_branch_interval_branches
  WHERE branch_id = :target_branch_id
  FOR UPDATE;
 
 UPDATE _chronos_branch_interval_branches
-   SET current_segment_id = :successor_segment_id,
-       content_revision = content_revision + 1
+   SET current_segment_id = :continuation_segment_id
  WHERE branch_id = :target_branch_id
-   AND current_segment_id = :old_target_segment_id
-   AND content_revision = :old_target_revision;
+   AND current_segment_id = :old_target_segment_id;
 
 DELETE FROM _chronos_branch_transaction_commits
- WHERE successor_segment_id = :successor_segment_id;
+ WHERE merge_segment_id = :merge_segment_id
+   AND target_branch_id = :target_branch_id;
 
 COMMIT;
 ```
 
 SQLite uses the same logical protocol inside a write transaction instead of
-`FOR UPDATE`. If the conditional update affects zero rows, the target moved or
-its current segment was modified. The merge attempt is then handled according
-to the configured merge policy: strict snapshot isolation rejects it, while
-weaker or semantic policies may retry, rebase, or re-run reconciliation against
-the new head.
+`FOR UPDATE`. If the conditional branch-head update affects zero rows, the
+target moved. The merge attempt is then handled according to the configured
+merge policy: strict snapshot isolation rejects it, while weaker or semantic
+policies may retry, rebase, or re-run reconciliation against the new head.
 
 The row-count check is mandatory. A publish implementation must never do
 `SELECT current_segment_id`, observe that it changed, and then unconditionally
-overwrite the branch head with the reserved successor. It also must not ignore a
-revision change on the same head segment. The conditional update is the
-commit-validation step. A successful publish requires exactly one updated branch
-row. Any other result means the merge candidate was validated against a stale
-target and cannot be exposed.
+overwrite the branch head with the reserved continuation. The conditional update
+is the commit-validation step. A successful publish requires exactly one updated
+branch row. Any other result means the merge candidate was validated against a
+stale target and cannot be exposed.
 
 Old readers that acquired their branch read point before publish continue to
 see the old segment. New readers resolve the branch after publish and see the
-successor segment. This gives all participating stores atomic visibility as
-long as their commit writes are durable before the metadata publish commits.
-If a store-local commit write transaction fails before publish, the successor
-remains invisible and GC can later remove any rows that escaped rollback.
+continuation segment, including rows written in the merge segment. This gives
+all participating stores atomic visibility as long as their commit writes are
+durable before the metadata publish commits. If a store-local commit write
+transaction fails before publish, the merge and continuation segments remain
+invisible and GC can later remove any rows that escaped rollback.
 
 ### Concurrent Merge Control
 
@@ -581,35 +610,35 @@ reservation for the branch transaction commit:
 1. Merge preview reads `(source, target, fork_base)` at a stable target head.
 2. Conflict detection and optional LLM reconciliation produce a resolved merge
    candidate for that specific target token:
-   `(old_target_segment_id, old_target_revision)`.
+   `old_target_segment_id`.
 3. A short reservation transaction locks the target branch row, checks that the
    target token still matches, checks that no branch transaction commit exists
-   for the target, allocates a successor interval, and inserts the commit
-   record.
+   for the target, allocates the merge/continuation segment pair, and inserts
+   the commit record.
 4. After reservation, Chronos runs any policy-required validation against the
    current target state. Under `snapshot_isolation`, a changed target usually
    means abort/retry. Under weaker or semantic policies, Chronos may rebase,
    apply source-over-target, or re-run the application/LLM resolver to minimize
    wasted work.
 5. While the commit record exists, all target-visible writes for that branch must
-   wait, fail, or participate in the same reserved successor protocol. The
+   wait, fail, or participate in the same reserved commit protocol. The
    reservation is the commit lock for the target branch.
 6. The final publish transaction revalidates the target token and commit record,
    then flips the branch head.
 
 This handles the race where two concurrent previews both pass diff validation
-against the same target head. The first merge that reserves the successor slot
+against the same target head. The first merge that reserves the commit record
 enters the commit pipeline. The second merge cannot reserve while the commit
 record exists. After the first merge publishes or aborts, the second merge must
 consult its configured policy against the current target state before it can
-reserve a new successor.
+reserve a new merge/continuation pair.
 
 The same validation handles concurrent ordinary writes to the target branch.
-Those writes may not allocate a new segment, but they must advance the target
-branch content revision or be blocked by an active commit record. A merge
-validated against an old revision then fails validation instead of silently overwriting
-data that appeared after diff validation. Direct writes that bypass Chronos and
-do not update the metadata revision are outside the protocol.
+Those writes should be blocked by an active commit record or routed through a
+new branch head update that changes `current_segment_id`. A merge validated
+against an old head then fails validation instead of silently overwriting data
+that appeared after diff validation. Direct writes that bypass Chronos metadata
+are outside the protocol.
 
 ## Workspace Transactions
 
@@ -676,11 +705,14 @@ Relational merge:
 
 ChronosFS merge:
 
-- Compares source and target branch-visible manifests.
-- Applies accepted path changes through normal ChronosFS write/delete/rename
-  operations on the target branch.
-- Uses the interval backend's branch transaction commit behavior so target-branch readers
-  do not observe partial merge writes inside one store.
+- Compares source, target, and fork-base rows through the native interval merge
+  path.
+- Presents file-content conflicts to users as `chronosfs_file_range` entries
+  keyed by public path and byte range.
+- Includes unified text diffs for textual block conflicts and hex payloads for
+  binary conflicts.
+- Applies accepted changes into the merge segment and publishes the target
+  continuation through the branch transaction commit protocol.
 
 Workspace conflict reporting should preserve store identity:
 
@@ -690,8 +722,9 @@ postgresql:graph_nodes[node_id=n1] modified on both branches
 postgresql:schema graph_nodes column quality_score differs
 ```
 
-The v1 ChronosFS merge is conservative and path-oriented. Rich text merge and
-binary conflict-resolution policies can be layered above the store diff.
+Higher-level whole-file or semantic merge policies can be layered above the
+byte-range conflict preview without exposing internal inode ids or block
+indexes to agents.
 
 ## Security and Isolation
 
@@ -730,13 +763,12 @@ ChronosFS GC should remove unreachable inode, dirent, and block row versions
 only after no branch/checkpoint/read point can see them. Relational GC can use
 the same interval reachability logic.
 
-For branch transaction commit cleanup, GC must preserve any successor segment
-referenced by a commit record until the system decides the attempt is abandoned.
-A commit record whose target branch still matches
-`(old_target_segment_id, old_target_revision)` can be retried or explicitly
-aborted. A commit record whose target branch points somewhere else, or whose
-content revision has advanced, is stale and can be collected after the
-retention policy allows it.
+For branch transaction commit cleanup, GC must preserve any merge and
+continuation segments referenced by a commit record until the system decides the
+attempt is abandoned. A commit record whose target branch still matches
+`old_target_segment_id` can be retried or explicitly aborted. A commit record
+whose target branch points somewhere else is stale and can be collected after
+the retention policy allows it.
 
 ## Failure Modes
 
@@ -758,10 +790,10 @@ active checkout references are released or a timeout expires.
 
 ### Commit writes succeed, metadata commit fails
 
-The target branch still points at the old segment, so successor rows are
-invisible. The branch transaction commit record remains as a cleanup root. The
-merge can either retry the same final metadata commit if the target head is
-unchanged, or abort and let GC remove the successor later.
+The target branch still points at the old segment, so merge rows are invisible.
+The branch transaction commit record remains as a cleanup root. The merge can
+either retry the same final metadata commit if the target head is unchanged, or
+abort and let GC remove the merge/continuation segments later.
 
 ### Target branch moves before publish
 
@@ -788,8 +820,9 @@ use an idempotency key in higher-level orchestration.
 - Should ChronosFS support a highly optimized local interval data plane in
   addition to SQL-backed interval tables?
 - What block size should be the default for agent code execution workloads?
-- How should ChronosFS expose conflict-aware text merges without turning the
-  filesystem store into a source-control system?
+- How far should ChronosFS go beyond byte-range text diffs into whole-file or
+  semantic merge helpers without turning the filesystem store into a
+  source-control system?
 - Should workspace `merge_apply()` be allowed when one store has conflicts and
   another does not, or should all store conflicts block the entire merge?
 - What retention policy should decide when abandoned commit successors are
@@ -807,7 +840,8 @@ use an idempotency key in higher-level orchestration.
 5. Add workspace diff that groups relational and ChronosFS changes.
 6. Publish multi-store `merge_apply` through the transactional metadata-store
    branch-head swap.
-7. Add richer ChronosFS merge preview and conflict reporting.
+7. Extend ChronosFS merge preview with higher-level whole-file or semantic
+   helpers where applications need them.
 8. Add schema-branching support behind the PostgreSQL relational store.
 9. Add GC and compaction for ChronosFS row versions and old relational versions.
 10. Explore a high-performance local ChronosFS data plane that still supports

@@ -303,9 +303,9 @@ ctx.merge_apply(source="exp_pricing", target="main", resolution=preview.resoluti
 ```
 
 `merge_preview` reports additions, deletions, modifications, and conflicts.
-`merge_apply` runs in a normal database transaction, stages resolved changes in
-a new target successor segment, and publishes that successor if conflicts are
-resolved.
+`merge_apply` runs in a normal database transaction, writes resolved changes
+into an unpublished merge segment, and publishes a mutable continuation segment
+if conflicts are resolved.
 
 ## System Model
 
@@ -2061,23 +2061,23 @@ protocol:
 1. Compute diff and resolve conflicts against a target validation token.
 2. Lock the target branch row in a short reservation transaction.
 3. Verify or recompute the merge preview against the current target head.
-4. Allocate one mutable successor segment whose read point does not overlap
-   the old target read point.
+4. Allocate a merge segment plus a mutable continuation segment whose read
+   point does not overlap the old target read point.
 5. Record the active branch transaction commit for the target branch.
-6. Apply resolved merge changes into that successor using the same interval
+6. Apply resolved merge changes into the merge segment using the same interval
    write path as ordinary DML.
 7. Commit by updating branches.current_segment_id from the old target segment
-   to the successor segment and deleting the commit record.
+   to the continuation segment and deleting the commit record.
 ```
 
 The old target segment becomes sealed by reachability: readers that already
 resolved the target branch to that segment keep seeing the old state, but new
-checkouts resolve the target branch to the successor. The old segment currently
+checkouts resolve the target branch to the continuation. The old segment currently
 keeps `segment_kind = 'mutable'` for compatibility; "sealed" is a structural
 property because it is no longer the branch head.
 
-For clean source-only changes, the successor receives the source result. The
-source branch is not modified and the fork-base segment remains immutable.
+For clean source-only changes, the merge segment receives the source result.
+The source branch is not modified and the fork-base segment remains immutable.
 
 The merge result can optionally be recorded as metadata:
 

@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import contextlib
+import threading
 from dataclasses import dataclass
 from typing import Any, Iterator, Protocol
 
-from chronos_core.branching import BranchSession
+from chronos_core.branching import BranchSession, BranchingError, MergeResolution
+from chronos_core.branching._common import (
+    MergePolicyInput,
+    _normalize_merge_policy,
+    _resolve_merge_changes,
+)
 from chronos_core.workspace.filesystem import (
     ChronosFilesystemStore,
     FilesystemBranchSession,
     FilesystemDiff,
 )
+
+_GLOBAL_MERGE_LOCKS_GUARD = threading.Lock()
+_GLOBAL_MERGE_LOCKS: dict[tuple[tuple[tuple[str, str], ...], str], threading.Lock] = {}
+_GLOBAL_STORE_LOCKS_GUARD = threading.Lock()
+_GLOBAL_STORE_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 
 
 class BranchStore(Protocol):
@@ -20,7 +31,12 @@ class BranchStore(Protocol):
         metadata: dict[str, Any] | None = None,
     ) -> None: ...
 
-    def create_branch_from_checkpoint(self, branch_id: str, checkpoint: str) -> None: ...
+    def create_branch_from_checkpoint(
+        self,
+        branch_id: str,
+        checkpoint: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None: ...
 
     def delete_branch(self, branch_id: str) -> None: ...
 
@@ -37,7 +53,22 @@ class BranchStore(Protocol):
 
     def diff(self, left: str, right: str) -> Any: ...
 
-    def merge_apply(self, source: str, target: str) -> Any: ...
+    def merge_preview(
+        self,
+        source: str,
+        target: str,
+        *,
+        policy: MergePolicyInput = None,
+    ) -> Any: ...
+
+    def merge_apply(
+        self,
+        source: str,
+        target: str,
+        resolution: MergeResolution | None = None,
+        *,
+        policy: MergePolicyInput = None,
+    ) -> Any: ...
 
     def close(self) -> None: ...
 
@@ -45,8 +76,8 @@ class BranchStore(Protocol):
 @dataclass(frozen=True)
 class WorkspaceBranchSession:
     branch_id: str
-    fs: FilesystemBranchSession | None = None
-    stores: dict[str, BranchSession] | None = None
+    fs: Any | None = None
+    stores: dict[str, Any] | None = None
 
     def __getattr__(self, name: str) -> BranchSession:
         stores = self.stores or {}
@@ -60,6 +91,107 @@ class WorkspaceBranchSession:
             for session in (self.stores or {}).values():
                 stack.enter_context(session.transaction())
             yield
+
+
+class _SynchronizedSession:
+    """Serialize access to a checked-out session that shares one store handle."""
+
+    def __init__(self, session: Any, lock: threading.RLock):
+        self._session = session
+        self._lock = lock
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._session, name)
+        if not callable(attr):
+            return attr
+
+        def synchronized(*args: Any, **kwargs: Any) -> Any:
+            with self._lock:
+                return attr(*args, **kwargs)
+
+        return synchronized
+
+    @property
+    def branch_id(self) -> str:
+        with self._lock:
+            return self._session.branch_id
+
+    @property
+    def current_ref(self) -> str:
+        with self._lock:
+            return self._session.current_ref
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[None]:
+        with self._lock:
+            with self._session.transaction():
+                yield
+
+
+def _workspace_store_identity(store: Any) -> str:
+    filesystem_url = getattr(store, "_database_url", None)
+    if filesystem_url:
+        return str(filesystem_url)
+    context = getattr(store, "context", store)
+    db = getattr(context, "db", None)
+    metadata_db = getattr(context, "metadata_db", None)
+    db_key = _database_identity(db)
+    metadata_key = _database_identity(metadata_db)
+    if db_key or metadata_key:
+        return "|".join(part for part in (db_key, metadata_key) if part)
+    root = getattr(store, "root", None)
+    state_dir = getattr(store, "state_dir", None)
+    if root or state_dir:
+        return f"{root}|{state_dir}"
+    return f"{type(store).__module__}.{type(store).__qualname__}:{id(store)}"
+
+
+def _database_identity(db: Any) -> str:
+    if db is None:
+        return ""
+    data_db = getattr(db, "data_db", None)
+    metadata_db = getattr(db, "metadata_db", None)
+    if data_db is not None or metadata_db is not None:
+        return "|".join(
+            part
+            for part in (
+                _database_identity(data_db),
+                _database_identity(metadata_db),
+            )
+            if part
+        )
+    database_url = getattr(db, "database_url", None)
+    if database_url:
+        return str(database_url)
+    database_path = getattr(db, "database_path", None)
+    if database_path:
+        return str(database_path)
+    return ""
+
+
+def _refresh_workspace_store(store: Any) -> None:
+    context = getattr(store, "context", store)
+    db = getattr(context, "db", None)
+    refresh = getattr(db, "refresh_connection", None)
+    if callable(refresh):
+        refresh()
+    backend = getattr(context, "_backend", None)
+    refresh_native = getattr(backend, "refresh_native_connections", None)
+    if callable(refresh_native):
+        refresh_native()
+    else:
+        invalidate = getattr(backend, "_invalidate_native_branch_sessions", None)
+        if callable(invalidate):
+            invalidate()
+
+
+def _global_store_lock(key: tuple[str, str]) -> threading.RLock:
+    with _GLOBAL_STORE_LOCKS_GUARD:
+        lock = _GLOBAL_STORE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _GLOBAL_STORE_LOCKS[key] = lock
+        return lock
 
 
 class ChronosWorkspaceContext:
@@ -99,6 +231,16 @@ class ChronosWorkspaceContext:
             raise ValueError(f"workspace store names conflict with session attributes: {joined}")
         self.filesystem = filesystem
         self.stores = all_stores
+        self._filesystem_lock = (
+            _global_store_lock(("filesystem", _workspace_store_identity(filesystem)))
+            if filesystem is not None
+            else threading.RLock()
+        )
+        self._store_locks = {
+            name: _global_store_lock((name, _workspace_store_identity(store)))
+            for name, store in all_stores.items()
+        }
+        self._merge_lock_namespace = self._merge_namespace()
 
     def create_branch(
         self,
@@ -163,21 +305,33 @@ class ChronosWorkspaceContext:
             raise errors[0]
 
     def checkout(self, branch_id: str = "main") -> WorkspaceBranchSession:
-        fs = self.filesystem.checkout(branch_id) if self.filesystem is not None else None
+        fs = (
+            _SynchronizedSession(
+                self.filesystem.checkout(branch_id),
+                self._filesystem_lock,
+            )
+            if self.filesystem is not None else None
+        )
         stores = {
-            name: store.checkout(branch_id)
+            name: _SynchronizedSession(store.checkout(branch_id), self._store_locks[name])
             for name, store in self.stores.items()
         }
         return WorkspaceBranchSession(branch_id=branch_id, fs=fs, stores=stores)
 
     def checkout_checkpoint(self, checkpoint: str) -> WorkspaceBranchSession:
         fs = (
-            self.filesystem.checkout_checkpoint(checkpoint)
+            _SynchronizedSession(
+                self.filesystem.checkout_checkpoint(checkpoint),
+                self._filesystem_lock,
+            )
             if self.filesystem is not None
             else None
         )
         stores = {
-            name: store.checkout_checkpoint(checkpoint)
+            name: _SynchronizedSession(
+                store.checkout_checkpoint(checkpoint),
+                self._store_locks[name],
+            )
             for name, store in self.stores.items()
         }
         return WorkspaceBranchSession(branch_id=checkpoint, fs=fs, stores=stores)
@@ -211,13 +365,206 @@ class ChronosWorkspaceContext:
             result[name] = store.diff(left, right)
         return result
 
-    def merge_apply(self, source: str, target: str) -> dict[str, Any]:
+    def merge_preview(
+        self,
+        source: str,
+        target: str,
+        *,
+        policy: MergePolicyInput = None,
+    ) -> dict[str, Any]:
         result: dict[str, Any] = {}
         if self.filesystem is not None:
-            result["filesystem"] = self.filesystem.merge_apply(source, target)
+            preview = getattr(self.filesystem, "merge_preview", None)
+            if callable(preview):
+                with self._filesystem_lock:
+                    result["filesystem"] = preview(source, target, policy=policy)
+            elif policy is not None:
+                raise BranchingError(
+                    "policy-aware workspace merge preview is not supported for filesystem stores"
+                )
+            else:
+                result["filesystem"] = self.filesystem.diff(target, source)
         for name, store in self.stores.items():
-            result[name] = store.merge_apply(source, target)
+            preview = getattr(store, "merge_preview", None)
+            if preview is None:
+                raise BranchingError(
+                    f"workspace store does not support merge preview: {name}"
+                )
+            with self._store_locks[name]:
+                _refresh_workspace_store(store)
+                result[name] = preview(source, target, policy=policy)
         return result
+
+    def merge_apply(
+        self,
+        source: str,
+        target: str,
+        resolution: MergeResolution | dict[str, MergeResolution] | None = None,
+        *,
+        policy: MergePolicyInput = None,
+    ) -> dict[str, Any]:
+        with self._merge_lock(target):
+            return self._merge_apply_locked(
+                source,
+                target,
+                resolution,
+                policy=policy,
+            )
+
+    @contextlib.contextmanager
+    def _merge_lock(self, target: str) -> Iterator[None]:
+        key = (self._merge_lock_namespace, target)
+        with _GLOBAL_MERGE_LOCKS_GUARD:
+            lock = _GLOBAL_MERGE_LOCKS.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                _GLOBAL_MERGE_LOCKS[key] = lock
+        with lock:
+            yield
+
+    def _merge_namespace(self) -> tuple[tuple[str, str], ...]:
+        members: list[tuple[str, str]] = []
+        if self.filesystem is not None:
+            members.append(("filesystem", _workspace_store_identity(self.filesystem)))
+        for name, store in self.stores.items():
+            members.append((name, _workspace_store_identity(store)))
+        return tuple(sorted(members))
+
+    def _merge_apply_locked(
+        self,
+        source: str,
+        target: str,
+        resolution: MergeResolution | dict[str, MergeResolution] | None = None,
+        *,
+        policy: MergePolicyInput = None,
+    ) -> dict[str, Any]:
+        previews = self._preview_stores_for_merge(source, target, policy=policy)
+        self._prevalidate_store_previews(previews, resolution, policy=policy)
+
+        result: dict[str, Any] = {}
+        if self.filesystem is not None:
+            filesystem_resolution = self._resolution_for_store(
+                "filesystem",
+                resolution,
+                previews.get("filesystem"),
+            )
+            with self._filesystem_lock:
+                if filesystem_resolution is None and policy is None:
+                    result["filesystem"] = self.filesystem.merge_apply(source, target)
+                else:
+                    try:
+                        result["filesystem"] = self.filesystem.merge_apply(
+                            source,
+                            target,
+                            filesystem_resolution,
+                            policy=policy,
+                        )
+                    except TypeError as exc:
+                        raise BranchingError(
+                            "filesystem store does not support policy-aware merge"
+                        ) from exc
+        for name, store in self.stores.items():
+            store_resolution = self._resolution_for_store(
+                name,
+                resolution,
+                previews.get(name),
+            )
+            with self._store_locks[name]:
+                _refresh_workspace_store(store)
+                if store_resolution is None and policy is None:
+                    result[name] = store.merge_apply(source, target)
+                else:
+                    try:
+                        result[name] = store.merge_apply(
+                            source,
+                            target,
+                            store_resolution,
+                            policy=policy,
+                        )
+                    except TypeError as exc:
+                        raise BranchingError(
+                            f"workspace store does not support policy-aware merge: {name}"
+                        ) from exc
+        return result
+
+    def _preview_stores_for_merge(
+        self,
+        source: str,
+        target: str,
+        *,
+        policy: MergePolicyInput,
+    ) -> dict[str, Any]:
+        previews: dict[str, Any] = {}
+        if self.filesystem is not None:
+            preview = getattr(self.filesystem, "merge_preview", None)
+            if callable(preview):
+                with self._filesystem_lock:
+                    previews["filesystem"] = preview(source, target, policy=policy)
+            elif policy is not None:
+                raise BranchingError(
+                    "filesystem store does not support policy-aware merge"
+                )
+        for name, store in self.stores.items():
+            preview = getattr(store, "merge_preview", None)
+            if preview is None:
+                if policy is not None:
+                    raise BranchingError(
+                        f"workspace store does not support policy-aware merge: {name}"
+                    )
+                continue
+            with self._store_locks[name]:
+                _refresh_workspace_store(store)
+                previews[name] = preview(source, target, policy=policy)
+        return previews
+
+    def _prevalidate_store_previews(
+        self,
+        previews: dict[str, Any],
+        resolution: MergeResolution | dict[str, MergeResolution] | None,
+        *,
+        policy: MergePolicyInput,
+    ) -> None:
+        normalized = _normalize_merge_policy(policy)
+        for name, preview in previews.items():
+            store_resolution = self._resolution_for_store(name, resolution, preview)
+            try:
+                _resolve_merge_changes(
+                    preview,
+                    normalized,
+                    store_resolution,
+                    backend=f"workspace.{name}",
+                )
+            except BranchingError as exc:
+                raise BranchingError(
+                    f"workspace merge validation failed for store {name}: {exc}"
+                ) from exc
+
+    @staticmethod
+    def _resolution_for_store(
+        name: str,
+        resolution: MergeResolution | dict[str, MergeResolution] | None,
+        preview: Any | None,
+    ) -> MergeResolution | None:
+        if resolution is None:
+            return None
+        if isinstance(resolution, dict):
+            return resolution.get(name)
+        if preview is None:
+            return resolution
+        conflict_ids = {
+            conflict.conflict_id
+            for conflict in getattr(preview, "conflicts", [])
+            if conflict.conflict_id is not None
+        }
+        if not conflict_ids:
+            return MergeResolution()
+        return MergeResolution(
+            {
+                conflict_id: choice
+                for conflict_id, choice in resolution.conflict_choices.items()
+                if conflict_id in conflict_ids
+            }
+        )
 
     def close(self) -> None:
         if self.filesystem is not None:
