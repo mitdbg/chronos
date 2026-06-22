@@ -219,7 +219,7 @@ class BranchStore:
     def close(self) -> None: ...
 ```
 
-`ChronosPostgresStore` and `ChronosDuckDBStore` fit this shape directly.
+`ChronosPostgresStore` and `ChronosDuckDBStore` fit this use case directly.
 `ChronosFSStore` supplies the same branch lifecycle and filesystem operations;
 workspace integration can wrap it so checkout returns a branch-bound filesystem
 session or mount descriptor. Existing `ChronosBranchContext` instances can also

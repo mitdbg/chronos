@@ -29,7 +29,7 @@ The interval branching model can be understood with one number-line model:
 - the same physical row version can be shared by many branches when its
   interval contains their read points
 
-Branch visibility is tested with a constant-shape predicate:
+Branch visibility is tested with a fixed-form predicate:
 
 ```sql
 live_lo <= current_branch_point()
@@ -847,7 +847,7 @@ WHERE live_lo <= current_branch_point()
   AND price > 100;
 ```
 
-The important property is that the added predicate has constant shape:
+The important property is that the added predicate has a fixed form:
 
 ```text
 live_lo <= current_branch_point()
@@ -1117,7 +1117,7 @@ Databases without exclusion constraints can enforce the invariant with serializa
 ## Interval Allocation
 
 Chronos needs an allocation rule that works for the two common branch-tree
-shapes:
+use cases:
 
 - shallow and very wide trees, such as branch transactions and agent
   speculation from `main`
@@ -1268,7 +1268,7 @@ x_s1    range: [80.40, 80.41)
 y_s1    range: [80.40.90, 80.40.91)
 ```
 
-The read predicate stays the same shape:
+The read predicate stays in the same form:
 
 ```sql
 live_lo <= current_branch_label()

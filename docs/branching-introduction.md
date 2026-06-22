@@ -339,7 +339,7 @@ Chronos aims to provide:
 - Unified branching: agents use one branch/checkpoint/diff/merge abstraction
   across relational data, files, sandboxes, vector stores, and other state
   state systems.
-- Constant-shape read visibility: reads use a fixed predicate independent of
+- Constant-form read visibility: reads use a fixed predicate independent of
   branch depth.
 - Shared physical storage: unchanged rows are shared across branches.
 - Explicit state management: branches, checkpoints, diffs, and merges are

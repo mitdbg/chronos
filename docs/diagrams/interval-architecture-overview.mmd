@@ -31,7 +31,7 @@ flowchart TB
   Metadata -. "branch read point<br/>segment + branch_point" .-> Native
   Native -. "visible predicate" .-> Data
 
-  DataNote["Physical row shape:<br/>user columns + live_lo + live_hi<br/>+ writer_segment_id + deleted"]
+  DataNote["Physical row layout:<br/>user columns + live_lo + live_hi<br/>+ writer_segment_id + deleted"]
   PGData --> DataNote
   SQLiteData --> DataNote
   DuckData --> DataNote

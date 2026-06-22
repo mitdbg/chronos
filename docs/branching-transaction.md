@@ -9,7 +9,7 @@ workflows. A customer-service agent may read an order, call an LLM, update an
 item, call an LLM again, issue a refund, and then email the user. The useful
 unit of work is the whole attempt, not each individual database statement.
 
-Traditional ACID transactions are a poor fit for this shape because the
+Traditional ACID transactions are a poor fit for this use case because the
 workflow includes slow model calls and external tool execution. Saga-style
 transactions avoid holding one large database transaction open, but they expose
 intermediate states and rely on compensation logic after failure. Chronos can
