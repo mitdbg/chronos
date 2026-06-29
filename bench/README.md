@@ -62,20 +62,23 @@ The cross-backend `merge_apply` phase includes whatever validation the backend
 requires to commit a branch transaction: Chronos performs row-level merge
 validation inside `merge_apply`, while Doltgres performs its native merge logic.
 
-The filesystem benchmark compares SQLite-backed ChronosFS with the basic
-`fuse-overlayfs` branch store baseline. It records branch creation/deletion,
-POSIX read/write micro-operations, and a large-file copy-on-write workload. The
-large-file COW workload branches from a parent containing one large file, then
-overwrites varied byte ranges and records both latency and backend storage
-growth. This is intended to make record/block-level COW visible against
-file-level overlay copy-up behavior. The optional compile workload imports a
-Redis source tree, creates a branch, and runs `make` inside the branch.
+The filesystem benchmark compares SQLite-backed ChronosFS with basic
+`fuse-overlayfs`, XFS reflink, Btrfs subvolume, and Turso AgentFS baselines. It
+records branch creation/deletion, POSIX read/write micro-operations, and a
+large-file copy-on-write workload. The large-file COW workload branches from a
+parent containing one large file, then overwrites varied byte ranges and
+records both latency and backend storage growth. This is intended to make
+record/block-level COW visible against file-level overlay copy-up, extent COW,
+Btrfs subvolume COW, and AgentFS overlay COW behavior. The optional compile
+workload imports a Redis source tree, creates a branch, and runs `make` inside
+the branch.
 
 Example COW-focused run:
 
 ```bash
+CHRONOS_FS_BENCH_XFS_ROOT=/path/to/xfs/workdir \
+CHRONOS_FS_BENCH_BTRFS_ROOT=/path/to/btrfs/workdir \
 bench/fs/run_fs_experiments.sh \
-  --backends chronosfs,overlayfs \
   --cow-file-size 64M \
   --cow-write-sizes 512,4K,64K,1M,4M
 ```
@@ -152,7 +155,7 @@ bench/branching/run_branching_experiments.sh postgres-doltgres --backends copy,i
 `all` is an alias for `postgres-doltgres`. SQLite only runs when you ask for
 `sqlite` or `both`.
 
-The default benchmark runs two separate branch shapes. It does not run
+The default benchmark runs two separate branch topologies. It does not run
 depth-by-width combinations.
 
 For each dataset size and depth, the depth benchmark first loads the data,
@@ -171,7 +174,7 @@ branches in reverse.
 
 Read metrics include point reads and primary-key range reads. Point reads,
 updates, and deletes use seeded random primary keys so backends see the same
-workload for a given dataset, branch shape, and branch id. `--read-ops` controls
+workload for a given dataset, branch topology, and branch id. `--read-ops` controls
 point reads and optional join aggregates. `--range-read-ops` controls range
 scans independently and defaults to `100` in the runner.
 
