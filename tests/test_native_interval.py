@@ -58,6 +58,25 @@ def test_native_connectors_smoke(tmp_path):
     assert native_interval.supports_connection_dialect("postgres") is True
 
 
+def test_native_sqlite_connection_uses_chronos_wal_checkpoint_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("CHRONOS_NATIVE_SQLITE_WAL_AUTOCHECKPOINT_PAGES", raising=False)
+    db_path = tmp_path / "wal_default.sqlite"
+    sqlite3.connect(db_path).close()
+
+    conn = native_interval.NativeSqlConnection(f"sqlite:///{db_path}")
+
+    assert conn.query_sql("PRAGMA wal_autocheckpoint") == [[16384]]
+
+
+def test_sqlite_adapter_uses_chronos_wal_checkpoint_default(tmp_path):
+    db_path = tmp_path / "adapter_wal_default.sqlite"
+    ctx = ChronosBranchContext.connect(f"sqlite:///{db_path}", backend="interval")
+    try:
+        assert ctx.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 16384
+    finally:
+        ctx.close()
+
+
 def test_sqlite_interval_bulk_upsert_splits_overlapping_rows(tmp_path):
     db_path = tmp_path / "blocks.sqlite"
     with _connect(db_path) as conn:

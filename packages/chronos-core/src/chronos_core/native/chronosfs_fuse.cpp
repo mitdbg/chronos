@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fcntl.h>
 #include <iomanip>
 #include <memory>
@@ -18,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -62,9 +64,11 @@ IntervalBlob as_blob(const IntervalValue &value);
 //       in this table.
 //
 //   chronosfs_file_blocks
-//       Fixed-size file-content records keyed by (inode_id, block_index).  This
-//       is the record-level COW layer: small overwrites splice only touched
-//       blocks instead of copying whole files.
+//       Byte-range content records keyed by (inode_id, byte_start).  Imported
+//       host files may start as one large external extent with SQL NULL data,
+//       while Chronos-owned writes are stored as inline block extents.
+//       The interval backend only versions rows; ChronosFS enforces the
+//       branch-visible no-overlap range invariant before calling upsert_many().
 //
 // Physical interval tables:
 //   _chronos_b_interval_chronosfs_inodes
@@ -172,10 +176,19 @@ struct Inode {
     std::string atime;
     std::string mtime;
     std::string ctime;
+    std::string source_path;
 };
 
 struct OpenHandle {
     Inode inode;
+};
+
+struct FileExtent {
+    std::int64_t inode_id = 0;
+    std::int64_t byte_start = 0;
+    std::int64_t byte_end = 0;
+    bool external = false;
+    IntervalBlob data;
 };
 
 std::string quote_ident(const std::string &identifier) {
@@ -348,6 +361,29 @@ NativeMergeChange merge_change_from_diff(const NativeRowDiff &diff) {
     return change;
 }
 
+bool is_file_block_diff(const NativeRowDiff &diff) {
+    return diff.table == "chronosfs_file_blocks";
+}
+
+bool is_inode_diff(const NativeRowDiff &diff) {
+    return diff.table == "chronosfs_inodes";
+}
+
+std::int64_t diff_inode_id(const NativeRowDiff &diff) {
+    return int_for_column(diff.key_columns, diff.key_values, "inode_id", 0);
+}
+
+std::unordered_set<std::int64_t> file_conflict_inodes(const std::vector<NativeRowDiff> &conflicts) {
+    std::unordered_set<std::int64_t> out;
+    for (const auto &conflict : conflicts) {
+        if (is_file_block_diff(conflict)) {
+            std::int64_t inode_id = diff_inode_id(conflict);
+            if (inode_id) out.insert(inode_id);
+        }
+    }
+    return out;
+}
+
 std::string join_ident_list(const std::vector<std::string> &columns) {
     std::string out;
     for (std::size_t i = 0; i < columns.size(); ++i) {
@@ -405,6 +441,7 @@ class NativeChronosFS {
                 "atime TEXT NOT NULL",
                 "mtime TEXT NOT NULL",
                 "ctime TEXT NOT NULL",
+                "source_path TEXT",
             },
             {"inode_id"});
         ensure_registered_table(
@@ -422,11 +459,12 @@ class NativeChronosFS {
             block_cols(),
             {
                 "inode_id BIGINT NOT NULL",
-                "block_index BIGINT NOT NULL",
-                "data " + blob_sql_type(*store_) + " NOT NULL",
-                "valid_length INTEGER NOT NULL",
+                "byte_start BIGINT NOT NULL",
+                "byte_end BIGINT NOT NULL",
+                "external BOOLEAN NOT NULL",
+                "data " + blob_sql_type(*store_),
             },
-            {"inode_id", "block_index"});
+            {"inode_id", "byte_start"});
 
         store_->execute_sql(
             "CREATE TABLE IF NOT EXISTS _chronosfs_inode_allocator "
@@ -470,6 +508,7 @@ class NativeChronosFS {
                     now,
                     now,
                     now,
+                    std::monostate{},
                 }});
         }
     }
@@ -507,7 +546,7 @@ class NativeChronosFS {
         Inode inode = inode_for_path(path);
         if (inode.kind == "symlink") return IntervalBlob(inode.symlink_target.begin(), inode.symlink_target.end());
         if (inode.kind != "file") throw FsError(EISDIR, "not a file");
-        return read_inode_range(inode.id, offset, size, inode.size);
+        return read_inode_range(inode, offset, size);
     }
 
     IntervalBlob read_handle(const OpenHandle *handle, const std::string &path, std::int64_t offset, std::int64_t size) {
@@ -515,7 +554,7 @@ class NativeChronosFS {
         const Inode &inode = handle->inode;
         if (inode.kind == "symlink") return IntervalBlob(inode.symlink_target.begin(), inode.symlink_target.end());
         if (inode.kind != "file") throw FsError(EISDIR, "not a file");
-        return read_inode_range(inode.id, offset, size, inode.size);
+        return read_inode_range(inode, offset, size);
     }
 
     void write(const std::string &path, const char *data, std::int64_t size, std::int64_t offset) {
@@ -567,11 +606,12 @@ class NativeChronosFS {
                  std::monostate{},
                  now,
                  now,
-                 now},
+                 now,
+                 std::monostate{}},
                 false);
             upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
             touch(parent.id);
-            inode = Inode{id, "file", static_cast<mode_t>(mode & 07777), getuid(), getgid(), 0, 1, "", now, now, now};
+            inode = Inode{id, "file", static_cast<mode_t>(mode & 07777), getuid(), getgid(), 0, 1, "", now, now, now, ""};
         });
         remember_created_path(path, parent.id, name, inode);
         return inode;
@@ -616,14 +656,15 @@ class NativeChronosFS {
                  static_cast<std::int64_t>(getgid()),
                  std::int64_t{0},
                  std::int64_t{1},
-                 std::monostate{},
-                 now,
-                 now,
-                 now},
+	                 std::monostate{},
+	                 now,
+	                 now,
+	                 now,
+	                 std::monostate{}},
                 false);
             upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
             touch(parent.id);
-            inode = Inode{id, "directory", static_cast<mode_t>(mode & 07777), getuid(), getgid(), 0, 1, "", now, now, now};
+            inode = Inode{id, "directory", static_cast<mode_t>(mode & 07777), getuid(), getgid(), 0, 1, "", now, now, now, ""};
         });
         remember_created_path(path, parent.id, name, inode);
     }
@@ -728,6 +769,7 @@ class NativeChronosFS {
             now,
             now,
             now,
+            "",
         };
         upsert(
             "chronosfs_inodes",
@@ -740,11 +782,12 @@ class NativeChronosFS {
              static_cast<std::int64_t>(getgid()),
              static_cast<std::int64_t>(target.size()),
              std::int64_t{1},
-             target,
-             now,
-             now,
-             now},
-            false);
+	             target,
+	             now,
+	             now,
+	             now,
+	             std::monostate{}},
+	            false);
         upsert(
             "chronosfs_dirents",
             dirent_cols(),
@@ -798,14 +841,14 @@ class NativeChronosFS {
         Inode inode = inode_for_path(path);
         if (inode.kind == "symlink") return read_file_path(resolve_symlink_target(path, inode.symlink_target));
         if (inode.kind != "file") throw FsError(EISDIR, "not a file");
-        return read_inode_range(inode.id, 0, inode.size, inode.size);
+        return read_inode_range(inode, 0, inode.size);
     }
 
     IntervalBlob read_inode_range_public(std::int64_t inode_id, std::int64_t offset, std::int64_t size) {
         if (offset < 0 || size < 0) throw FsError(EINVAL, "negative read range");
         Inode inode = inode_by_id(inode_id);
         if (inode.kind != "file") throw FsError(EISDIR, "not a file");
-        return read_inode_range(inode.id, offset, size, inode.size);
+        return read_inode_range(inode, offset, size);
     }
 
     void write_file_path(const std::string &path, const IntervalBlob &payload, mode_t mode, bool parents) {
@@ -934,6 +977,31 @@ class NativeChronosFS {
         return symlink_child(parent, name, target).id;
     }
 
+    void import_tree_public(const std::string &source_root) {
+        namespace fs = std::filesystem;
+        fs::path root = fs::absolute(fs::path(source_root)).lexically_normal();
+        if (!fs::exists(root) || !fs::is_directory(root)) {
+            throw FsError(ENOENT, "ChronosFS import source is not a directory");
+        }
+        transaction([&] {
+            for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied), end;
+                 it != end;
+                 ++it) {
+                const fs::path path = it->path();
+                const fs::path rel_path = path.lexically_relative(root);
+                if (rel_path.empty()) continue;
+                std::string rel = rel_path.generic_string();
+                if (rel == ".chronos" || rel.rfind(".chronos/", 0) == 0) {
+                    if (it->is_directory()) it.disable_recursion_pending();
+                    continue;
+                }
+                const std::string target = "/" + rel;
+                import_one_path(path, target);
+            }
+        });
+        clear_metadata_cache();
+    }
+
     void clear_cache_public() {
         session_ = store_->checkout(branch_id_);
         clear_metadata_cache();
@@ -1001,6 +1069,7 @@ class NativeChronosFS {
             "atime",
             "mtime",
             "ctime",
+            "source_path",
         };
     }
 
@@ -1015,15 +1084,18 @@ class NativeChronosFS {
         };
     }
 
-    // chronosfs_file_blocks is the record-level COW data table. Each block row
-    // is independently interval-versioned, so small overwrites do not copy the
-    // full file as file-level COW systems do.
+    // chronosfs_file_blocks is the record-level COW data table. External rows
+    // can cover a large imported source-file range with data empty. Inline rows
+    // are the actual Chronos-owned block payloads produced by writes. Both row
+    // kinds are ordinary interval-versioned records; ChronosFS performs range
+    // splitting before upsert so the interval backend remains generic.
     static std::vector<std::string> block_cols() {
         return {
             "inode_id",
-            "block_index",
+            "byte_start",
+            "byte_end",
+            "external",
             "data",
-            "valid_length",
         };
     }
 
@@ -1081,7 +1153,8 @@ class NativeChronosFS {
             // These ids are implementation details for record-level COW.  The
             // public control plane reports paths and byte ranges instead.
             if (table.rfind("chronosfs_", 0) == 0 &&
-                (column == "inode_id" || column == "parent_inode_id" || column == "block_index")) {
+                (column == "inode_id" || column == "parent_inode_id" ||
+                 column == "byte_start" || column == "byte_end")) {
                 continue;
             }
             out[column] = interval_value_to_json(values[i]);
@@ -1122,15 +1195,15 @@ class NativeChronosFS {
         const std::unordered_map<std::int64_t, std::string> &source_paths,
         const std::unordered_map<std::int64_t, std::string> &target_paths) const {
         std::int64_t inode_id = int_for_column(diff.key_columns, diff.key_values, "inode_id", 0);
-        std::int64_t block_index = int_for_column(diff.key_columns, diff.key_values, "block_index", 0);
-        std::int64_t before_valid = diff.has_before ? int_for_column(diff.columns, diff.before, "valid_length", 0) : 0;
-        std::int64_t after_valid = diff.has_after ? int_for_column(diff.columns, diff.after, "valid_length", 0) : 0;
+        std::int64_t key_start = int_for_column(diff.key_columns, diff.key_values, "byte_start", 0);
+        std::int64_t before_start = diff.has_before ? int_for_column(diff.columns, diff.before, "byte_start", key_start) : key_start;
+        std::int64_t before_end = diff.has_before ? int_for_column(diff.columns, diff.before, "byte_end", key_start) : key_start;
+        std::int64_t after_start = diff.has_after ? int_for_column(diff.columns, diff.after, "byte_start", key_start) : key_start;
+        std::int64_t after_end = diff.has_after ? int_for_column(diff.columns, diff.after, "byte_end", key_start) : key_start;
         IntervalBlob before_blob = diff.has_before ? blob_for_column(diff.columns, diff.before, "data") : IntervalBlob{};
         IntervalBlob after_blob = diff.has_after ? blob_for_column(diff.columns, diff.after, "data") : IntervalBlob{};
-        before_valid = std::max<std::int64_t>(before_valid, before_blob.size());
-        after_valid = std::max<std::int64_t>(after_valid, after_blob.size());
-        std::int64_t start = block_index * block_size_;
-        std::int64_t end = start + std::max(before_valid, after_valid);
+        std::int64_t start = std::min(before_start, after_start);
+        std::int64_t end = std::max(before_end, after_end);
         std::string path = path_for_inode(inode_id, source_paths, target_paths);
         std::string label = path + "@bytes:" + std::to_string(start) + "-" + std::to_string(end);
         std::string unified = simple_unified_diff("target:" + label, "source:" + label, before_blob, after_blob);
@@ -1198,6 +1271,7 @@ class NativeChronosFS {
         NativeMergePreview preview = store_->merge_preview(spec.source, spec.target);
         auto source_paths = inode_paths_for_branch(spec.source);
         auto target_paths = inode_paths_for_branch(spec.target);
+        auto content_conflict_inodes = file_conflict_inodes(preview.conflicts);
         Json out = {
             {"source", spec.source},
             {"target", spec.target},
@@ -1208,6 +1282,12 @@ class NativeChronosFS {
             out["changes"].push_back(row_diff_json(change, source_paths, target_paths, false));
         }
         for (const auto &conflict : preview.conflicts) {
+            if (is_inode_diff(conflict) && content_conflict_inodes.count(diff_inode_id(conflict)) > 0) {
+                // A file-content conflict and its inode metadata conflict are
+                // the same agent-facing decision: choose source/target bytes
+                // and carry the matching size/timestamp metadata with it.
+                continue;
+            }
             out["conflicts"].push_back(row_diff_json(conflict, source_paths, target_paths, true));
         }
         return out.dump();
@@ -1219,6 +1299,7 @@ class NativeChronosFS {
         NativeMergePreview preview = store_->merge_preview(spec.source, spec.target);
         auto source_paths = inode_paths_for_branch(spec.source);
         auto target_paths = inode_paths_for_branch(spec.target);
+        auto content_conflict_inodes = file_conflict_inodes(preview.conflicts);
         Json request = Json::object();
         if (body.find_first_not_of(" \t\r\n") != std::string::npos) {
             request = Json::parse(body, nullptr, false);
@@ -1245,6 +1326,25 @@ class NativeChronosFS {
         }
         if (policy.empty()) policy = choices.empty() ? "abort_on_conflict" : "manual_review";
 
+        auto normalize_choice = [](const std::string &raw) -> std::string {
+            if (raw == "source" || raw == "theirs") return "source";
+            if (raw == "target" || raw == "ours" || raw == "skip") return "target";
+            return raw;
+        };
+        auto matching_content_choice = [&](std::int64_t inode_id) -> std::string {
+            std::string chosen;
+            for (const auto &conflict : preview.conflicts) {
+                if (!is_file_block_diff(conflict) || diff_inode_id(conflict) != inode_id) continue;
+                std::string id = public_conflict_id(conflict, source_paths, target_paths);
+                auto explicit_choice = choices.find(id);
+                if (explicit_choice == choices.end()) continue;
+                std::string normalized = normalize_choice(explicit_choice->second);
+                if (normalized == "source") return normalized;
+                if (normalized == "target") chosen = normalized;
+            }
+            return chosen;
+        };
+
         std::vector<NativeMergeChange> changes;
         changes.reserve(preview.changes.size() + preview.conflicts.size());
         for (const auto &change : preview.changes) {
@@ -1254,9 +1354,13 @@ class NativeChronosFS {
         std::unordered_map<std::string, bool> seen_conflicts;
         for (const auto &conflict : preview.conflicts) {
             std::string id = public_conflict_id(conflict, source_paths, target_paths);
-            seen_conflicts[id] = true;
+            bool hidden_inode_conflict =
+                is_inode_diff(conflict) && content_conflict_inodes.count(diff_inode_id(conflict)) > 0;
             std::string choice;
             auto explicit_choice = choices.find(id);
+            if (!hidden_inode_conflict || explicit_choice != choices.end()) {
+                seen_conflicts[id] = true;
+            }
             if (policy == "source_wins" || policy == "weak_snapshot_isolation") {
                 choice = "source";
             } else if (policy == "target_wins") {
@@ -1264,14 +1368,19 @@ class NativeChronosFS {
             } else if (policy == "abort_on_conflict" || policy == "snapshot_isolation") {
                 throw FsError(EINVAL, "merge has unresolved conflicts");
             } else if (explicit_choice != choices.end()) {
-                choice = explicit_choice->second;
+                choice = normalize_choice(explicit_choice->second);
+            } else if (hidden_inode_conflict) {
+                choice = matching_content_choice(diff_inode_id(conflict));
+                if (choice.empty()) {
+                    throw FsError(EINVAL, "merge conflict is unresolved: " + id);
+                }
             } else {
                 throw FsError(EINVAL, "merge conflict is unresolved: " + id);
             }
 
-            if (choice == "source" || choice == "theirs") {
+            if (choice == "source") {
                 changes.push_back(merge_change_from_diff(conflict));
-            } else if (choice == "target" || choice == "ours" || choice == "skip") {
+            } else if (choice == "target") {
                 continue;
             } else {
                 throw FsError(EINVAL, "unsupported merge conflict choice: " + choice);
@@ -1291,9 +1400,12 @@ class NativeChronosFS {
     void ensure_schema() {
         // ChronosFS is stored as three ordinary logical tables and then
         // registered with the native interval store:
-        //   chronosfs_inodes      POSIX inode metadata and file size
+        //   chronosfs_inodes      POSIX inode metadata, file size, and optional
+        //                         source_path for lazy-imported file bytes
         //   chronosfs_dirents     directory edges from parent/name to child
-        //   chronosfs_file_blocks fixed-size file-content records
+        //   chronosfs_file_blocks byte-range content records. Large external
+        //                         ranges point at inode.source_path; inline
+        //                         ranges contain Chronos-owned block payloads.
         // Once registered, these logical tables are copied into physical
         // _chronos_b_interval_* tables and inherit the same branch/diff/merge
         // semantics as SQL user tables.
@@ -1310,7 +1422,8 @@ class NativeChronosFS {
             "symlink_target TEXT, "
             "atime TEXT NOT NULL, "
             "mtime TEXT NOT NULL, "
-            "ctime TEXT NOT NULL)");
+            "ctime TEXT NOT NULL, "
+            "source_path TEXT)");
         store_->execute_sql(
             "CREATE TABLE IF NOT EXISTS chronosfs_dirents ("
             "parent_inode_id BIGINT NOT NULL, "
@@ -1321,10 +1434,12 @@ class NativeChronosFS {
         store_->execute_sql(
             "CREATE TABLE IF NOT EXISTS chronosfs_file_blocks ("
             "inode_id BIGINT NOT NULL, "
-            "block_index BIGINT NOT NULL, "
-            "data " + blob_type + " NOT NULL, "
-            "valid_length INTEGER NOT NULL, "
-            "PRIMARY KEY (inode_id, block_index))");
+            "byte_start BIGINT NOT NULL, "
+            "byte_end BIGINT NOT NULL, "
+            "external BOOLEAN NOT NULL, "
+            "data " + blob_type + ", "
+            "PRIMARY KEY (inode_id, byte_start), "
+            "CHECK (byte_start < byte_end))");
     }
 
     void ensure_registered_table(
@@ -1421,7 +1536,7 @@ class NativeChronosFS {
         if (dirent(parent.id, name).first) throw FsError(EEXIST, "path exists");
         std::int64_t id = allocate_inode();
         std::string now = now_text();
-        Inode inode{id, "file", static_cast<mode_t>(mode & 07777), getuid(), getgid(), 0, 1, "", now, now, now};
+        Inode inode{id, "file", static_cast<mode_t>(mode & 07777), getuid(), getgid(), 0, 1, "", now, now, now, ""};
         upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
         touch(parent.id);
@@ -1435,7 +1550,7 @@ class NativeChronosFS {
         if (dirent(parent.id, name).first) throw FsError(EEXIST, "path exists");
         std::int64_t id = allocate_inode();
         std::string now = now_text();
-        Inode inode{id, "directory", static_cast<mode_t>(mode & 07777), getuid(), getgid(), 0, 1, "", now, now, now};
+        Inode inode{id, "directory", static_cast<mode_t>(mode & 07777), getuid(), getgid(), 0, 1, "", now, now, now, ""};
         upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
         touch(parent.id);
@@ -1449,7 +1564,7 @@ class NativeChronosFS {
         if (dirent(parent.id, name).first) throw FsError(EEXIST, "path exists");
         std::int64_t id = allocate_inode();
         std::string now = now_text();
-        Inode inode{id, "symlink", 0777, getuid(), getgid(), static_cast<std::int64_t>(target.size()), 1, target, now, now, now};
+        Inode inode{id, "symlink", 0777, getuid(), getgid(), static_cast<std::int64_t>(target.size()), 1, target, now, now, now, ""};
         upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
         touch(parent.id);
@@ -1458,39 +1573,106 @@ class NativeChronosFS {
         return inode;
     }
 
+    Inode import_file_child(
+        const Inode &parent,
+        const std::string &name,
+        const std::filesystem::path &source_path,
+        const struct stat &st) {
+        if (parent.kind != "directory") throw FsError(ENOTDIR, "not a directory");
+        if (dirent(parent.id, name).first) throw FsError(EEXIST, "path exists");
+        const std::int64_t id = allocate_inode();
+        std::string now = now_text();
+        Inode inode{
+            id,
+            "file",
+            static_cast<mode_t>(st.st_mode & 07777),
+            st.st_uid,
+            st.st_gid,
+            static_cast<std::int64_t>(st.st_size),
+            1,
+            "",
+            now,
+            time_text(st.st_mtim),
+            time_text(st.st_ctim),
+            source_path.string(),
+        };
+        upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
+        upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
+        if (inode.size > 0) {
+            FileExtent external{
+                inode.id,
+                0,
+                inode.size,
+                true,
+                IntervalBlob{},
+            };
+            upsert("chronosfs_file_blocks", block_cols(), {"inode_id", "byte_start"}, extent_values(external), false);
+        }
+        touch(parent.id);
+        cache_inode(inode);
+        dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
+        return inode;
+    }
+
+    void import_one_path(const std::filesystem::path &source_path, const std::string &target) {
+        struct stat st {};
+        if (::lstat(source_path.c_str(), &st) != 0) {
+            throw FsError(errno, "could not stat ChronosFS import source");
+        }
+        auto [parent_path, name] = split_parent(target);
+        Inode parent = ensure_directory_path(parent_path, 0755);
+        if (S_ISLNK(st.st_mode)) {
+            std::filesystem::path link_target = std::filesystem::read_symlink(source_path);
+            symlink_child(parent, name, link_target.string());
+            return;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (dirent(parent.id, name).first) {
+                Inode existing = inode_by_id(dirent(parent.id, name).second);
+                if (existing.kind != "directory") throw FsError(EEXIST, "path exists");
+                return;
+            }
+            Inode inode = mkdir_child(parent, name, static_cast<mode_t>(st.st_mode & 07777));
+            inode.uid = st.st_uid;
+            inode.gid = st.st_gid;
+            inode.mtime = time_text(st.st_mtim);
+            inode.ctime = time_text(st.st_ctim);
+            upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
+            cache_inode(inode);
+            return;
+        }
+        if (S_ISREG(st.st_mode)) {
+            import_file_child(parent, name, std::filesystem::absolute(source_path).lexically_normal(), st);
+        }
+    }
+
     void truncate_inode(Inode inode, std::int64_t size) {
         if (size < 0) throw FsError(EINVAL, "negative truncate size");
-        const std::int64_t old_size = inode.size;
         transaction([&] {
             std::string now = now_text();
-            if (size < old_size) {
-                const std::int64_t first_removed_block =
-                    size == 0 ? 0 : ((size - 1) / block_size_) + 1;
-                auto removed = visible(
-                    "chronosfs_file_blocks",
-                    block_cols(),
-                    "inode_id = ? AND block_index >= ?",
-                    {inode.id, first_removed_block});
+            if (size < inode.size) {
+                IntervalRows removed;
+                IntervalRows replacements;
+                auto extents = visible_extents_after(inode.id, size);
+                removed.reserve(extents.size());
+                replacements.reserve(extents.size());
+                for (const auto &extent : extents) {
+                    removed.push_back(extent_values(extent));
+                    if (extent.byte_start < size) {
+                        replacements.push_back(extent_values(trim_extent(extent, extent.byte_start, size)));
+                    }
+                }
                 if (!removed.empty()) {
-                    upsert_many(
-                        "chronosfs_file_blocks",
-                        block_cols(),
-                        {"inode_id", "block_index"},
-                        removed,
-                        true);
+                    upsert_many("chronosfs_file_blocks", block_cols(), {"inode_id", "byte_start"}, removed, true);
+                }
+                if (!replacements.empty()) {
+                    upsert_many("chronosfs_file_blocks", block_cols(), {"inode_id", "byte_start"}, replacements, false);
                 }
             }
             inode.size = size;
             inode.mtime = now;
             inode.ctime = now;
             upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
-            if (size > 0 && size < old_size && (size % block_size_) != 0) {
-                std::int64_t last = (size - 1) / block_size_;
-                std::int64_t valid = size - last * block_size_;
-                IntervalBlob data = read_inode_range(inode.id, last * block_size_, valid, old_size);
-                data.resize(static_cast<std::size_t>(valid), 0);
-                upsert("chronosfs_file_blocks", block_cols(), {"inode_id", "block_index"}, {inode.id, last, data, valid}, false);
-            }
         });
         cache_inode(inode);
     }
@@ -1602,6 +1784,7 @@ class NativeChronosFS {
             as_string(row[8]),
             as_string(row[9]),
             as_string(row[10]),
+            row.size() > 11 ? as_string(row[11]) : std::string(),
         };
     }
 
@@ -1619,6 +1802,7 @@ class NativeChronosFS {
             inode.atime.empty() ? now : inode.atime,
             inode.mtime.empty() ? now : inode.mtime,
             inode.ctime.empty() ? now : inode.ctime,
+            inode.source_path.empty() ? IntervalValue(std::monostate{}) : IntervalValue(inode.source_path),
         };
     }
 
@@ -1715,49 +1899,272 @@ class NativeChronosFS {
         return next_reserved_inode_id_++;
     }
 
-    IntervalBlob read_inode_range(
-        std::int64_t inode,
-        std::int64_t offset,
-        std::int64_t size,
-        std::int64_t file_size) {
-        if (size <= 0 || offset >= file_size) return {};
-        std::int64_t end = std::min(file_size, offset + size);
-        std::int64_t first = offset / block_size_;
-        std::int64_t last = (end - 1) / block_size_;
-        std::unordered_map<std::int64_t, std::pair<IntervalBlob, std::int64_t>> blocks;
-        // Reads stay sparse.  We fetch only touched blocks and synthesize holes
-        // as zero bytes; there is no full-file materialization or FUSE-layer
-        // data cache.
+    FileExtent extent_from_row(const std::vector<IntervalValue> &row) const {
+        return FileExtent{
+            as_int(row[0]),
+            as_int(row[1]),
+            as_int(row[2]),
+            as_int(row[3]) != 0,
+            as_blob(row[4]),
+        };
+    }
+
+    std::vector<IntervalValue> extent_values(const FileExtent &extent) const {
+        return {
+            extent.inode_id,
+            extent.byte_start,
+            extent.byte_end,
+            std::int64_t{extent.external ? 1 : 0},
+            extent.external ? IntervalValue(std::monostate{}) : IntervalValue(extent.data),
+        };
+    }
+
+    FileExtent trim_extent(const FileExtent &extent, std::int64_t start, std::int64_t end) const {
+        FileExtent out = extent;
+        start = std::max(start, extent.byte_start);
+        end = std::min(end, extent.byte_end);
+        if (start >= end) throw FsError(EINVAL, "invalid extent trim");
+        if (!extent.external) {
+            const std::int64_t data_start = start - extent.byte_start;
+            const std::int64_t data_end = end - extent.byte_start;
+            IntervalBlob sliced;
+            if (data_start < static_cast<std::int64_t>(extent.data.size())) {
+                const std::int64_t clamped_end =
+                    std::min<std::int64_t>(data_end, extent.data.size());
+                sliced.insert(
+                    sliced.end(),
+                    extent.data.begin() + data_start,
+                    extent.data.begin() + clamped_end);
+            }
+            sliced.resize(static_cast<std::size_t>(end - start), 0);
+            out.data = std::move(sliced);
+        } else {
+            out.data.clear();
+        }
+        out.byte_start = start;
+        out.byte_end = end;
+        return out;
+    }
+
+    std::vector<FileExtent> visible_extents(std::int64_t inode_id, std::int64_t start, std::int64_t end) {
+        if (start >= end) return {};
         auto rows = visible(
             "chronosfs_file_blocks",
-            {"block_index", "data", "valid_length"},
-            "inode_id = ? AND block_index >= ? AND block_index <= ?",
-            {inode, first, last});
-        for (auto &row : rows) {
-            std::int64_t block = as_int(row[0]);
-            blocks[block] = std::make_pair(as_blob(row[1]), as_int(row[2]));
+            block_cols(),
+            "inode_id = ? AND byte_start < ? AND byte_end > ?",
+            {inode_id, end, start},
+            "ORDER BY byte_start");
+        std::vector<FileExtent> extents;
+        extents.reserve(rows.size());
+        for (auto &row : rows) extents.push_back(extent_from_row(row));
+        return extents;
+    }
+
+    std::vector<FileExtent> visible_extents_after(std::int64_t inode_id, std::int64_t start) {
+        auto rows = visible(
+            "chronosfs_file_blocks",
+            block_cols(),
+            "inode_id = ? AND byte_end > ?",
+            {inode_id, start},
+            "ORDER BY byte_start");
+        std::vector<FileExtent> extents;
+        extents.reserve(rows.size());
+        for (auto &row : rows) extents.push_back(extent_from_row(row));
+        return extents;
+    }
+
+    IntervalBlob read_source_range(
+        const Inode &inode,
+        std::int64_t offset,
+        std::int64_t size) const {
+        if (size <= 0) return {};
+        if (inode.source_path.empty()) {
+            throw FsError(EIO, "external ChronosFS extent has no source path");
         }
-        IntervalBlob out;
-        for (std::int64_t cursor = offset; cursor < end;) {
-            std::int64_t block = cursor / block_size_;
-            std::int64_t block_offset = cursor % block_size_;
-            std::int64_t want = std::min(end - cursor, block_size_ - block_offset);
-            auto found = blocks.find(block);
-            if (found == blocks.end() || block_offset >= found->second.second) {
-                out.insert(out.end(), want, 0);
-            } else {
-                auto &data = found->second.first;
-                std::int64_t available =
-                    std::min<std::int64_t>(found->second.second, data.size()) - block_offset;
-                std::int64_t bytes = std::min<std::int64_t>(
-                    want,
-                    std::max<std::int64_t>(0, available));
-                if (bytes > 0) out.insert(out.end(), data.begin() + block_offset, data.begin() + block_offset + bytes);
-                if (bytes < want) out.insert(out.end(), want - bytes, 0);
+        int fd = ::open(inode.source_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) throw FsError(errno, "could not open external ChronosFS source");
+        IntervalBlob out(static_cast<std::size_t>(size), 0);
+        std::int64_t done = 0;
+        while (done < size) {
+            ssize_t got = ::pread(
+                fd,
+                out.data() + done,
+                static_cast<std::size_t>(size - done),
+                static_cast<off_t>(offset + done));
+            if (got < 0) {
+                int err = errno;
+                ::close(fd);
+                throw FsError(err, "could not read external ChronosFS source");
             }
-            cursor += want;
+            if (got == 0) break;
+            done += got;
         }
+        ::close(fd);
         return out;
+    }
+
+    void append_extent_bytes(
+        IntervalBlob &out,
+        const Inode &inode,
+        const FileExtent &extent,
+        std::int64_t start,
+        std::int64_t end) const {
+        start = std::max(start, extent.byte_start);
+        end = std::min(end, extent.byte_end);
+        if (start >= end) return;
+        const std::int64_t len = end - start;
+        if (extent.external) {
+            auto bytes = read_source_range(inode, start, len);
+            out.insert(out.end(), bytes.begin(), bytes.end());
+            return;
+        }
+        const std::int64_t data_start = start - extent.byte_start;
+        std::int64_t copied = 0;
+        if (data_start < static_cast<std::int64_t>(extent.data.size())) {
+            const std::int64_t available = std::min<std::int64_t>(
+                len,
+                static_cast<std::int64_t>(extent.data.size()) - data_start);
+            out.insert(
+                out.end(),
+                extent.data.begin() + data_start,
+                extent.data.begin() + data_start + available);
+            copied = available;
+        }
+        if (copied < len) out.insert(out.end(), len - copied, 0);
+    }
+
+    IntervalBlob read_inode_range(
+        const Inode &inode,
+        std::int64_t offset,
+        std::int64_t size) {
+        if (size <= 0 || offset >= inode.size) return {};
+        std::int64_t end = std::min(inode.size, offset + size);
+        auto extents = visible_extents(inode.id, offset, end);
+        IntervalBlob out;
+        out.reserve(static_cast<std::size_t>(end - offset));
+        std::int64_t cursor = offset;
+        for (const auto &extent : extents) {
+            if (extent.byte_start > cursor) {
+                std::int64_t gap_end = std::min(extent.byte_start, end);
+                out.insert(out.end(), gap_end - cursor, 0);
+                cursor = gap_end;
+            }
+            if (cursor >= end) break;
+            append_extent_bytes(out, inode, extent, cursor, end);
+            cursor = std::max(cursor, std::min(extent.byte_end, end));
+        }
+        if (cursor < end) out.insert(out.end(), end - cursor, 0);
+        return out;
+    }
+
+    IntervalRows replacement_rows_for_write(
+        const Inode &inode,
+        std::int64_t offset,
+        const IntervalBlob &payload,
+        std::int64_t &replace_start,
+        std::int64_t &replace_end) {
+        IntervalRows replacements;
+        replace_start = (offset / block_size_) * block_size_;
+        replace_end = replace_start;
+        for (std::int64_t cursor = 0; cursor < static_cast<std::int64_t>(payload.size());) {
+            const std::int64_t absolute = offset + cursor;
+            const std::int64_t block_start = (absolute / block_size_) * block_size_;
+            const std::int64_t block_offset = absolute - block_start;
+            const std::int64_t take =
+                std::min<std::int64_t>(payload.size() - cursor, block_size_ - block_offset);
+            const bool full_block_write = block_offset == 0 && take == block_size_;
+            const std::int64_t prior_valid = std::min<std::int64_t>(
+                block_size_,
+                std::max<std::int64_t>(0, inode.size - block_start));
+            std::int64_t valid = std::max<std::int64_t>(block_offset + take, prior_valid);
+            IntervalBlob current;
+            if (!full_block_write && prior_valid > 0) {
+                current = read_inode_range(inode, block_start, prior_valid);
+            }
+            current.resize(static_cast<std::size_t>(valid), 0);
+            std::copy(
+                payload.begin() + cursor,
+                payload.begin() + cursor + take,
+                current.begin() + block_offset);
+            const std::int64_t byte_end = block_start + valid;
+            replacements.push_back(
+                {inode.id, block_start, byte_end, std::int64_t{0}, std::move(current)});
+            replace_end = std::max(replace_end, byte_end);
+            cursor += take;
+        }
+        return replacements;
+    }
+
+    IntervalRows fixed_block_replacement_rows_for_write(
+        const Inode &inode,
+        std::int64_t offset,
+        const IntervalBlob &payload) {
+        IntervalRows replacements;
+        std::vector<std::int64_t> partial_starts;
+
+        // Ordinary Chronos-owned files are stored as fixed-size byte ranges
+        // whose keys are block-aligned byte_start values.  For these files we
+        // can keep the old fast write behavior: full-block writes are blind
+        // exact-key upserts, and only partial writes read existing touched
+        // blocks to preserve bytes outside the write range.
+        for (std::int64_t cursor = 0; cursor < static_cast<std::int64_t>(payload.size());) {
+            const std::int64_t absolute = offset + cursor;
+            const std::int64_t block_start = (absolute / block_size_) * block_size_;
+            const std::int64_t block_offset = absolute - block_start;
+            const std::int64_t take =
+                std::min<std::int64_t>(payload.size() - cursor, block_size_ - block_offset);
+            const bool full_block_write = block_offset == 0 && take == block_size_;
+            const bool block_has_existing_bytes = block_start < inode.size;
+            if (!full_block_write && block_has_existing_bytes) {
+                partial_starts.push_back(block_start);
+            }
+            cursor += take;
+        }
+
+        std::unordered_map<std::int64_t, std::pair<IntervalBlob, std::int64_t>> blocks;
+        if (!partial_starts.empty()) {
+            std::vector<IntervalValue> params{inode.id};
+            for (std::int64_t block_start : partial_starts) params.push_back(block_start);
+            auto rows = visible(
+                "chronosfs_file_blocks",
+                {"byte_start", "byte_end", "external", "data"},
+                "inode_id = ? AND byte_start IN (" + sql_placeholders(partial_starts.size()) + ")",
+                params);
+            blocks.reserve(rows.size());
+            for (auto &row : rows) {
+                const std::int64_t block_start = as_int(row[0]);
+                const std::int64_t byte_end = as_int(row[1]);
+                const bool external = as_int(row[2]) != 0;
+                if (external) {
+                    throw FsError(EIO, "external file extent is missing its source inode");
+                }
+                blocks[block_start] = std::make_pair(as_blob(row[3]), byte_end - block_start);
+            }
+        }
+
+        for (std::int64_t cursor = 0; cursor < static_cast<std::int64_t>(payload.size());) {
+            const std::int64_t absolute = offset + cursor;
+            const std::int64_t block_start = (absolute / block_size_) * block_size_;
+            const std::int64_t block_offset = absolute - block_start;
+            const std::int64_t take =
+                std::min<std::int64_t>(payload.size() - cursor, block_size_ - block_offset);
+            IntervalBlob current;
+            auto found = blocks.find(block_start);
+            if (found != blocks.end()) current = found->second.first;
+            const std::int64_t prior_valid = std::min<std::int64_t>(
+                block_size_,
+                std::max<std::int64_t>(0, inode.size - block_start));
+            const std::int64_t valid = std::max<std::int64_t>(block_offset + take, prior_valid);
+            current.resize(static_cast<std::size_t>(valid), 0);
+            std::copy(
+                payload.begin() + cursor,
+                payload.begin() + cursor + take,
+                current.begin() + block_offset);
+            replacements.push_back(
+                {inode.id, block_start, block_start + valid, std::int64_t{0}, std::move(current)});
+            cursor += take;
+        }
+        return replacements;
     }
 
     void write_inode_at(
@@ -1766,60 +2173,42 @@ class NativeChronosFS {
         const IntervalBlob &payload) {
         if (payload.empty()) return;
         transaction([&] {
-            IntervalRows replacement_blocks;
-            std::vector<std::int64_t> partial_blocks;
-            // Full-block overwrites are blind writes: the old block content is
-            // irrelevant.  Partial overwrites must fetch only the touched
-            // existing blocks so unchanged bytes in those blocks can be carried
-            // forward into the replacement records.
-            for (std::int64_t cursor = 0; cursor < static_cast<std::int64_t>(payload.size());) {
-                std::int64_t absolute = offset + cursor;
-                std::int64_t block = absolute / block_size_;
-                std::int64_t block_offset = absolute % block_size_;
-                std::int64_t take = std::min<std::int64_t>(payload.size() - cursor, block_size_ - block_offset);
-                const bool full_block_write = block_offset == 0 && take == block_size_;
-                const bool block_has_existing_bytes = block * block_size_ < inode.size;
-                if (!full_block_write && block_has_existing_bytes) {
-                    partial_blocks.push_back(block);
+            if (inode.source_path.empty()) {
+                IntervalRows replacement_blocks =
+                    fixed_block_replacement_rows_for_write(inode, offset, payload);
+                if (!replacement_blocks.empty()) {
+                    upsert_many("chronosfs_file_blocks", block_cols(), {"inode_id", "byte_start"}, replacement_blocks, false);
                 }
-                cursor += take;
-            }
+            } else {
+                std::int64_t replace_start = 0;
+                std::int64_t replace_end = 0;
+                IntervalRows replacement_blocks =
+                    replacement_rows_for_write(inode, offset, payload, replace_start, replace_end);
 
-            std::unordered_map<std::int64_t, std::pair<IntervalBlob, std::int64_t>> blocks;
-            if (!partial_blocks.empty()) {
-                std::vector<IntervalValue> params{inode.id};
-                for (std::int64_t block : partial_blocks) params.push_back(block);
-                auto rows = visible(
-                    "chronosfs_file_blocks",
-                    {"block_index", "data", "valid_length"},
-                    "inode_id = ? AND block_index IN (" + sql_placeholders(partial_blocks.size()) + ")",
-                    params);
-                blocks.reserve(rows.size());
-                for (auto &row : rows) {
-                    std::int64_t block = as_int(row[0]);
-                    blocks[block] = std::make_pair(as_blob(row[1]), as_int(row[2]));
+                IntervalRows removed;
+                IntervalRows fragments;
+                auto overlapped = visible_extents(inode.id, replace_start, replace_end);
+                removed.reserve(overlapped.size());
+                fragments.reserve(overlapped.size() * 2);
+                for (const auto &extent : overlapped) {
+                    removed.push_back(extent_values(extent));
+                    if (extent.byte_start < replace_start) {
+                        fragments.push_back(extent_values(trim_extent(extent, extent.byte_start, replace_start)));
+                    }
+                    if (replace_end < extent.byte_end) {
+                        fragments.push_back(extent_values(trim_extent(extent, replace_end, extent.byte_end)));
+                    }
+                }
+                if (!removed.empty()) {
+                    upsert_many("chronosfs_file_blocks", block_cols(), {"inode_id", "byte_start"}, removed, true);
+                }
+                if (!fragments.empty()) {
+                    upsert_many("chronosfs_file_blocks", block_cols(), {"inode_id", "byte_start"}, fragments, false);
+                }
+                if (!replacement_blocks.empty()) {
+                    upsert_many("chronosfs_file_blocks", block_cols(), {"inode_id", "byte_start"}, replacement_blocks, false);
                 }
             }
-
-            for (std::int64_t cursor = 0; cursor < static_cast<std::int64_t>(payload.size());) {
-                std::int64_t absolute = offset + cursor;
-                std::int64_t block = absolute / block_size_;
-                std::int64_t block_offset = absolute % block_size_;
-                std::int64_t take = std::min<std::int64_t>(payload.size() - cursor, block_size_ - block_offset);
-                IntervalBlob current;
-                auto found = blocks.find(block);
-                if (found != blocks.end()) current = found->second.first;
-                current.resize(block_size_, 0);
-                std::copy(payload.begin() + cursor, payload.begin() + cursor + take, current.begin() + block_offset);
-                std::int64_t prior_valid = std::min<std::int64_t>(
-                    block_size_,
-                    std::max<std::int64_t>(0, inode.size - block * block_size_));
-                std::int64_t valid = std::max<std::int64_t>(block_offset + take, prior_valid);
-                current.resize(valid);
-                replacement_blocks.push_back({inode.id, block, current, valid});
-                cursor += take;
-            }
-            upsert_many("chronosfs_file_blocks", block_cols(), {"inode_id", "block_index"}, replacement_blocks, false);
 
             std::int64_t new_size = std::max<std::int64_t>(inode.size, offset + payload.size());
             if (new_size != inode.size) {
@@ -2082,6 +2471,12 @@ class NativeChronosFSStoreApi {
         auto &fs = fs_for(branch);
         fs.write_file_path(path, blob_from_py(data), mode, parents);
         return fs.stat_path(path).id;
+    }
+
+    void import_tree(const std::string &branch, const std::string &source_path) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).import_tree_public(source_path);
+        clear_all_caches();
     }
 
     void write_at(const std::string &branch, const std::string &path, std::int64_t offset, const py::object &data) {
@@ -2502,6 +2897,7 @@ void bind_chronosfs_fuse(py::module_ &m) {
         .def("read_file", &NativeChronosFSStoreApi::read_file, py::arg("branch"), py::arg("path"))
         .def("read_inode_range", &NativeChronosFSStoreApi::read_inode_range, py::arg("branch"), py::arg("inode_id"), py::arg("offset"), py::arg("size"))
         .def("write_file", &NativeChronosFSStoreApi::write_file, py::arg("branch"), py::arg("path"), py::arg("data"), py::arg("mode") = 0644, py::arg("parents") = false)
+        .def("import_tree", &NativeChronosFSStoreApi::import_tree, py::arg("branch"), py::arg("source_path"))
         .def("write_at", &NativeChronosFSStoreApi::write_at, py::arg("branch"), py::arg("path"), py::arg("offset"), py::arg("data"))
         .def("write_inode_at", &NativeChronosFSStoreApi::write_inode_at, py::arg("branch"), py::arg("inode_id"), py::arg("offset"), py::arg("data"))
         .def("truncate", &NativeChronosFSStoreApi::truncate, py::arg("branch"), py::arg("path"), py::arg("size"))

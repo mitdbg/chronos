@@ -37,6 +37,8 @@ def _serve_mount(
 ) -> None:
     with state.active_guard:
         state.active_mounts += 1
+        state.active_mountpoints.add(mountpoint)
+        state.unmounted_since = None
     try:
         _native_interval.mount_chronosfs_native(
             database_url,
@@ -48,27 +50,49 @@ def _serve_mount(
     finally:
         with state.active_guard:
             state.active_mounts -= 1
+            state.active_mountpoints.discard(mountpoint)
+            state.unmounted_since = None
             state.last_idle_at = time.monotonic()
 
 
 class _DaemonState:
     def __init__(self) -> None:
         self.active_mounts = 0
+        self.active_mountpoints: set[str] = set()
         self.last_idle_at = time.monotonic()
+        self.shutdown_requested = False
+        self.unmounted_since: float | None = None
         self.active_guard = threading.Lock()
 
-    def should_exit(self, idle_timeout_s: float) -> bool:
+    def should_exit(self, idle_timeout_s: float, stale_unmounted_timeout_s: float) -> bool:
         with self.active_guard:
-            return self.active_mounts == 0 and time.monotonic() - self.last_idle_at >= idle_timeout_s
+            now = time.monotonic()
+            if self.shutdown_requested:
+                return True
+            if self.active_mounts == 0:
+                self.unmounted_since = None
+                return now - self.last_idle_at >= idle_timeout_s
+            any_mounted = any(os.path.ismount(path) for path in self.active_mountpoints)
+            if any_mounted:
+                self.unmounted_since = None
+                return False
+            if self.unmounted_since is None:
+                self.unmounted_since = now
+                return False
+            return now - self.unmounted_since >= stale_unmounted_timeout_s
+
+    def request_shutdown(self) -> None:
+        with self.active_guard:
+            self.shutdown_requested = True
 
 
 def _handle_client(
     conn: socket.socket,
     *,
     database_url: str,
-    branch_id: str,
+    default_branch_id: str,
     block_size: int,
-    options: list[str],
+    default_options: list[str],
     state: _DaemonState,
 ) -> None:
     with conn:
@@ -78,9 +102,22 @@ def _handle_client(
             if request.get("ping") is True:
                 conn.sendall(b'{"status":"ok"}\n')
                 return
+            if request.get("shutdown") is True:
+                state.request_shutdown()
+                conn.sendall(b'{"status":"ok"}\n')
+                return
             mountpoint = request["mountpoint"]
             if not isinstance(mountpoint, str):
                 raise ValueError("mountpoint must be a string")
+            branch_id = request.get("branch_id", default_branch_id)
+            if not isinstance(branch_id, str):
+                raise ValueError("branch_id must be a string")
+            options = request.get("options", default_options)
+            if (
+                not isinstance(options, list)
+                or not all(isinstance(item, str) for item in options)
+            ):
+                raise ValueError("options must be a list of strings")
             thread = threading.Thread(
                 target=_serve_mount,
                 args=(database_url, branch_id, block_size, options, mountpoint, state),
@@ -97,10 +134,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run a shared local ChronosFS mount daemon.")
     parser.add_argument("--socket", required=True)
     parser.add_argument("--database-url", required=True)
-    parser.add_argument("--branch-id", required=True)
+    parser.add_argument("--branch-id", default="main")
     parser.add_argument("--block-size", type=int, required=True)
     parser.add_argument("--options-json", default="[]")
     parser.add_argument("--idle-timeout", type=float, default=30.0)
+    parser.add_argument("--stale-unmounted-timeout", type=float, default=5.0)
     args = parser.parse_args()
 
     socket_path = Path(args.socket)
@@ -120,7 +158,7 @@ def main() -> None:
 
     try:
         while True:
-            if state.should_exit(args.idle_timeout):
+            if state.should_exit(args.idle_timeout, args.stale_unmounted_timeout):
                 break
             try:
                 conn, _ = server.accept()
@@ -131,9 +169,9 @@ def main() -> None:
                 kwargs={
                     "conn": conn,
                     "database_url": args.database_url,
-                    "branch_id": args.branch_id,
+                    "default_branch_id": args.branch_id,
                     "block_size": args.block_size,
-                    "options": options,
+                    "default_options": options,
                     "state": state,
                 },
                 daemon=True,

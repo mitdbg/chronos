@@ -15,6 +15,7 @@ from psycopg.types.json import Jsonb
 
 
 SQLRow = Mapping[str, Any]
+SQLITE_WAL_AUTOCHECKPOINT_PAGES = 16384
 
 
 class SQLAdapterError(Exception):
@@ -141,6 +142,7 @@ class SQLiteDatabaseAdapter(SQLDatabaseAdapter):
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=OFF")
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA wal_autocheckpoint={SQLITE_WAL_AUTOCHECKPOINT_PAGES}")
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA fullfsync=ON")
         conn.execute("PRAGMA checkpoint_fullfsync=ON")

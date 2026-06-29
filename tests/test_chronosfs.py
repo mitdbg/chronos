@@ -64,16 +64,118 @@ def test_fixed_blocks_use_chronos_interval_cow(chronosfs: ChronosFSStore) -> Non
 
     rows = chronosfs.context.db.execute(
         """
-        SELECT block_index, count(*) AS c
+        SELECT byte_start, count(*) AS c
         FROM _chronos_b_interval_chronosfs_file_blocks
-        GROUP BY block_index
-        ORDER BY block_index
+        GROUP BY byte_start
+        ORDER BY byte_start
         """
     ).fetchall()
-    counts = {int(row["block_index"]): int(row["c"]) for row in rows}
+    counts = {int(row["byte_start"]): int(row["c"]) for row in rows}
     assert counts[0] == 1
-    assert counts[1] > counts[0]
-    assert counts[2] == 1
+    assert counts[8] > counts[0]
+    assert counts[16] == 1
+
+
+def test_lazy_import_records_external_extent_and_reads_source(
+    chronosfs: ChronosFSStore,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    payload = b"abcdefgh" * 32
+    (source / "large.bin").write_bytes(payload)
+    (source / "sub").mkdir()
+    (source / "sub" / "note.txt").write_text("nested\n")
+
+    chronosfs.import_tree("main", source)
+
+    assert chronosfs.read_file("main", "/large.bin") == payload
+    assert chronosfs.read_text("main", "/sub/note.txt") == "nested\n"
+    rows = chronosfs.context.db.execute(
+        """
+        SELECT byte_start, byte_end, external, length(data) AS data_len
+        FROM _chronos_b_interval_chronosfs_file_blocks
+        WHERE byte_end = ?
+        """,
+        (len(payload),),
+    ).fetchall()
+    assert [dict(row) for row in rows] == [
+        {
+            "byte_start": 0,
+            "byte_end": len(payload),
+            "external": 1,
+            "data_len": None,
+        }
+    ]
+
+
+def test_lazy_import_overwrite_splits_external_extent_by_block(
+    chronosfs: ChronosFSStore,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "data.bin").write_bytes(b"aaaaaaaabbbbbbbbcccccccc")
+    chronosfs.import_tree("main", source)
+    chronosfs.create_branch("child", from_branch="main")
+
+    chronosfs.write_at("child", "/data.bin", 10, b"XX")
+
+    assert chronosfs.read_file("main", "/data.bin") == b"aaaaaaaabbbbbbbbcccccccc"
+    assert chronosfs.read_file("child", "/data.bin") == b"aaaaaaaabbXXbbbbcccccccc"
+    rows = chronosfs.context.checkout("child").query(
+        """
+        SELECT byte_start, byte_end, external, length(data) AS data_len
+        FROM chronosfs_file_blocks
+        ORDER BY byte_start
+        """
+    )
+    assert [dict(row) for row in rows] == [
+        {"byte_start": 0, "byte_end": 8, "external": 1, "data_len": None},
+        {"byte_start": 8, "byte_end": 16, "external": 0, "data_len": 8},
+        {"byte_start": 16, "byte_end": 24, "external": 1, "data_len": None},
+    ]
+
+
+def test_lazy_import_nested_branch_inherits_external_and_inline_ranges(
+    chronosfs: ChronosFSStore,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "data.bin").write_bytes(b"aaaaaaaabbbbbbbbcccccccc")
+    chronosfs.import_tree("main", source)
+
+    chronosfs.create_branch("a", from_branch="main")
+    chronosfs.write_at("a", "/data.bin", 8, b"BBBB")
+    chronosfs.create_branch("b", from_branch="a")
+    chronosfs.write_at("b", "/data.bin", 16, b"CCCC")
+
+    assert chronosfs.read_file("main", "/data.bin") == b"aaaaaaaabbbbbbbbcccccccc"
+    assert chronosfs.read_file("a", "/data.bin") == b"aaaaaaaaBBBBbbbbcccccccc"
+    assert chronosfs.read_file("b", "/data.bin") == b"aaaaaaaaBBBBbbbbCCCCcccc"
+
+
+def test_lazy_import_delete_and_rename_are_metadata_only(
+    chronosfs: ChronosFSStore,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "keep.txt").write_text("keep\n")
+    (source / "move.txt").write_text("move\n")
+    chronosfs.import_tree("main", source)
+    chronosfs.create_branch("child", from_branch="main")
+
+    chronosfs.unlink("child", "/keep.txt")
+    chronosfs.rename("child", "/move.txt", "/moved.txt")
+
+    assert chronosfs.exists("main", "/keep.txt")
+    assert chronosfs.read_text("main", "/move.txt") == "move\n"
+    assert not chronosfs.exists("child", "/keep.txt")
+    assert chronosfs.read_text("child", "/moved.txt") == "move\n"
+    assert (source / "keep.txt").read_text() == "keep\n"
+    assert (source / "move.txt").read_text() == "move\n"
 
 
 def test_write_at_patches_touched_blocks(chronosfs: ChronosFSStore) -> None:
@@ -320,16 +422,16 @@ def test_postgres_direct_file_blocks_are_branch_isolated() -> None:
 
         rows = store.context.db.execute(
             """
-            SELECT block_index, count(*) AS c
+            SELECT byte_start, count(*) AS c
             FROM _chronos_b_interval_chronosfs_file_blocks
-            GROUP BY block_index
-            ORDER BY block_index
+            GROUP BY byte_start
+            ORDER BY byte_start
             """
         ).fetchall()
-        counts = {int(row["block_index"]): int(row["c"]) for row in rows}
+        counts = {int(row["byte_start"]): int(row["c"]) for row in rows}
         assert counts[0] == 1
-        assert counts[1] > counts[0]
-        assert counts[2] == 1
+        assert counts[8] > counts[0]
+        assert counts[16] == 1
     finally:
         store.close()
 
@@ -648,6 +750,17 @@ def test_multiple_local_mountpoints_share_daemon_cache(tmp_path: Path) -> None:
             assert result.stdout == "shared\n"
 
 
+def test_shared_daemon_identity_is_store_scoped() -> None:
+    import inspect
+
+    from chronos_core.workspace.chronosfs.fuse import _daemon_key
+
+    assert list(inspect.signature(_daemon_key).parameters) == [
+        "database_url",
+        "block_size",
+    ]
+
+
 def test_fuse_large_scale_blocks_and_unix_tools(tmp_path: Path) -> None:
     _require_fuse_tools()
     db_path = tmp_path / "chronosfs.sqlite"
@@ -769,7 +882,7 @@ def _mounted_chronosfs_database(
             store = ChronosFSStore.connect({database_url!r}, backend="interval")
             store.ensure()
             try:
-                mount_chronosfs(store, {str(mountpoint)!r})
+                mount_chronosfs(store, {str(mountpoint)!r}, shutdown_daemon_on_unmount=True)
             finally:
                 store.close()
             """

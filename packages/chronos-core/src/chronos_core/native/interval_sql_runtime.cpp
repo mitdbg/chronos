@@ -773,15 +773,27 @@ struct DecimalIntervalBounds {
     }
 };
 
-// Shared physical interval copy-on-write algorithm.  SQL engines only provide
-// adapter operations for locating, deleting, and inserting physical rows; the
-// visibility math stays here so SQLite/Postgres/DuckDB cannot drift apart.
+// Shared physical interval copy-on-write algorithm. SQL engines only provide
+// adapter operations for locating existing physical rows, narrowing an old row
+// in place, replacing an old row whose live_lo is already the new start, and
+// inserting new middle/right fragments. The visibility math stays here so
+// SQLite/Postgres/DuckDB cannot drift apart.
+//
+// For old [old_lo, old_hi) and write [write_lo, write_hi), the split is:
+//   1. UPDATE old live_hi to overlap_lo when a left fragment exists.
+//   2. INSERT the replacement middle fragment, or UPDATE old in place when the
+//      replacement starts at old live_lo.
+//   3. INSERT the old right fragment when one exists.
+//
+// The physical key includes live_lo. Adapters may update live_hi and payload
+// columns in place, but must never move live_lo.
 template <
     typename PhysicalRow,
     typename Bound,
     typename Bounds,
     typename InsertRow,
-    typename DeleteRow
+    typename ShrinkLeftRow,
+    typename ReplaceRow
 >
 void splice_interval_rows(
     BulkUpsertStats &stats,
@@ -792,7 +804,8 @@ void splice_interval_rows(
     std::int64_t writer_segment_id,
     bool replacement_deleted,
     InsertRow insert_row,
-    DeleteRow delete_row
+    ShrinkLeftRow shrink_left_row,
+    ReplaceRow replace_row
 ) {
     stats.selected += static_cast<std::int64_t>(physical_rows.size());
     if (physical_rows.empty()) {
@@ -805,33 +818,41 @@ void splice_interval_rows(
     for (const auto &physical : physical_rows) {
         const Bound overlap_lo = Bounds::max(physical.live_lo, live_lo);
         const Bound overlap_hi = Bounds::min(physical.live_hi, live_hi);
+        const bool has_left = Bounds::less(physical.live_lo, overlap_lo);
+        const bool has_right = Bounds::less(overlap_hi, physical.live_hi);
+        const std::vector<Value> &replacement_values =
+            replacement_deleted ? physical.values : replacement_row;
 
         // Replace only the overlapping slice.  Left/right fragments preserve
         // the old row for readers outside the current branch interval, while
         // the middle fragment becomes either the replacement row or a tombstone.
-        delete_row(physical);
         ++stats.deleted_rows;
 
-        if (Bounds::less(physical.live_lo, overlap_lo)) {
+        if (has_left) {
+            shrink_left_row(physical, overlap_lo);
+            // Preserve the historical stats contract: this left fragment is an
+            // output physical interval even if the adapter implemented it as an
+            // UPDATE instead of a literal INSERT.
+            ++stats.inserted;
             insert_row(
-                physical.values,
-                physical.live_lo,
+                replacement_values,
                 overlap_lo,
-                physical.writer_segment_id,
-                physical.deleted
+                overlap_hi,
+                writer_segment_id,
+                replacement_deleted ? 1 : 0
             );
+        } else {
+            replace_row(
+                physical,
+                replacement_values,
+                overlap_hi,
+                writer_segment_id,
+                replacement_deleted ? 1 : 0
+            );
+            ++stats.inserted;
         }
-        insert_row(
-            // Deletes intentionally keep the previous value payload in the
-            // tombstone.  Merge/diff can then reason about "row deleted" by key
-            // without losing the inherited row shape.
-            replacement_deleted ? physical.values : replacement_row,
-            overlap_lo,
-            overlap_hi,
-            writer_segment_id,
-            replacement_deleted ? 1 : 0
-        );
-        if (Bounds::less(overlap_hi, physical.live_hi)) {
+
+        if (has_right) {
             insert_row(
                 physical.values,
                 overlap_hi,
@@ -875,6 +896,78 @@ std::optional<std::string> native_sqlite_synchronous_from_env() {
         return value;
     }
     throw std::invalid_argument("invalid CHRONOS_NATIVE_SQLITE_SYNCHRONOUS: " + value);
+}
+
+std::optional<std::int64_t> native_sqlite_cache_size_kib_from_env() {
+    const char *raw = std::getenv("CHRONOS_NATIVE_SQLITE_CACHE_SIZE_KIB");
+    if (!raw || !*raw) return std::nullopt;
+    std::string value(raw);
+    std::int64_t cache_size = 0;
+    try {
+        cache_size = std::stoll(value);
+    } catch (const std::exception &) {
+        throw std::invalid_argument("invalid CHRONOS_NATIVE_SQLITE_CACHE_SIZE_KIB: " + value);
+    }
+    if (cache_size <= 0) {
+        throw std::invalid_argument("CHRONOS_NATIVE_SQLITE_CACHE_SIZE_KIB must be positive");
+    }
+    return cache_size;
+}
+
+std::optional<std::int64_t> native_sqlite_wal_autocheckpoint_pages_from_env() {
+    const char *raw = std::getenv("CHRONOS_NATIVE_SQLITE_WAL_AUTOCHECKPOINT_PAGES");
+    if (!raw || !*raw) return std::nullopt;
+    std::string value(raw);
+    std::int64_t pages = 0;
+    try {
+        pages = std::stoll(value);
+    } catch (const std::exception &) {
+        throw std::invalid_argument(
+            "invalid CHRONOS_NATIVE_SQLITE_WAL_AUTOCHECKPOINT_PAGES: " + value);
+    }
+    if (pages < 0) {
+        throw std::invalid_argument(
+            "CHRONOS_NATIVE_SQLITE_WAL_AUTOCHECKPOINT_PAGES must be non-negative");
+    }
+    return pages;
+}
+
+constexpr std::int64_t kDefaultNativeSqliteWalAutocheckpointPages = 16384;
+
+std::optional<std::int64_t> native_sqlite_journal_size_limit_bytes_from_env() {
+    const char *raw = std::getenv("CHRONOS_NATIVE_SQLITE_JOURNAL_SIZE_LIMIT_BYTES");
+    if (!raw || !*raw) return std::nullopt;
+    std::string value(raw);
+    std::int64_t bytes = 0;
+    try {
+        bytes = std::stoll(value);
+    } catch (const std::exception &) {
+        throw std::invalid_argument(
+            "invalid CHRONOS_NATIVE_SQLITE_JOURNAL_SIZE_LIMIT_BYTES: " + value);
+    }
+    if (bytes < -1) {
+        throw std::invalid_argument(
+            "CHRONOS_NATIVE_SQLITE_JOURNAL_SIZE_LIMIT_BYTES must be -1 or non-negative");
+    }
+    return bytes;
+}
+
+std::size_t native_sqlite_physical_write_batch_size_from_env() {
+    const char *raw = std::getenv("CHRONOS_NATIVE_SQLITE_PHYSICAL_WRITE_BATCH_SIZE");
+    if (!raw || !*raw) return 256;
+    std::string value(raw);
+    std::uint64_t batch_size = 0;
+    try {
+        batch_size = std::stoull(value);
+    } catch (const std::exception &) {
+        throw std::invalid_argument(
+            "invalid CHRONOS_NATIVE_SQLITE_PHYSICAL_WRITE_BATCH_SIZE: " + value);
+    }
+    if (batch_size == 0) {
+        throw std::invalid_argument(
+            "CHRONOS_NATIVE_SQLITE_PHYSICAL_WRITE_BATCH_SIZE must be positive");
+    }
+    return static_cast<std::size_t>(std::min<std::uint64_t>(batch_size, 1024));
 }
 
 std::string duckdb_path_from_url(const std::string &database_url) {
@@ -1132,9 +1225,8 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
     const std::string quoted_table = quote_ident(physical_name);
     const std::vector<std::size_t> pk_indices = pk_column_indices(columns, pk_columns);
     // This adapter owns SQLite mechanics only: batching, prepared statements,
-    // rowid-based deletes, and parameter binding.  It delegates all interval
-    // fragmentation to splice_interval_rows so SQLite, Postgres, and DuckDB
-    // keep identical CoW semantics.
+    // rowid-based updates, and parameter binding. The shared splice algorithm
+    // decides which interval fragments exist.
     // Chronos upserts are last-writer-wins within one logical batch.  Deduping
     // by primary key in native memory avoids running the interval splice more
     // than once for the same key and keeps the Python caller from owning any
@@ -1161,11 +1253,19 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
         "FROM " + quoted_table + " "
         "WHERE " + key_where + " AND live_lo < ? AND ? < live_hi "
         "ORDER BY live_lo";
-    const std::string delete_sql =
-        "DELETE FROM " + quoted_table + " WHERE rowid = ?";
-    const std::string insert_sql =
-        "INSERT INTO " + quoted_table + " (" + all_insert_cols + ") "
-        "VALUES (" + placeholders(columns.size() + 4) + ")";
+    const std::size_t physical_write_batch_size =
+        native_sqlite_physical_write_batch_size_from_env();
+    const std::size_t insert_value_count = columns.size() + 4;
+    const std::size_t sqlite_variable_limit =
+        static_cast<std::size_t>(std::max(1, sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1)));
+    const std::size_t max_update_batch =
+        std::max<std::size_t>(1, std::min(physical_write_batch_size, sqlite_variable_limit));
+    const std::size_t max_insert_batch =
+        std::max<std::size_t>(
+            1,
+            std::min(
+                physical_write_batch_size,
+                sqlite_variable_limit / std::max<std::size_t>(1, insert_value_count)));
 
     struct PhysicalRow {
         std::int64_t rowid;
@@ -1174,6 +1274,23 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
         std::int64_t live_hi;
         std::int64_t writer_segment_id;
         std::int64_t deleted;
+    };
+
+    struct PendingInsert {
+        // Points either at the replacement row or at a fetched physical row.
+        // Both owners outlive the pending queue: replacement rows are held by
+        // splice_rows/deduped_storage, and physical rows are held in the current
+        // PendingSplice chunk until flush_inserts() runs.
+        const std::vector<Value> *values;
+        std::int64_t live_lo;
+        std::int64_t live_hi;
+        std::int64_t writer_segment_id;
+        std::int64_t deleted;
+    };
+
+    struct PendingLiveHiUpdate {
+        std::int64_t rowid;
+        std::int64_t live_hi;
     };
 
     auto key_for_row = [&](const std::vector<Value> &row) {
@@ -1197,27 +1314,39 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
         return sql;
     };
 
-    auto bind_insert = [&](SqliteStatement &stmt,
-                           const std::vector<Value> &values,
-                           std::int64_t row_live_lo,
-                           std::int64_t row_live_hi,
-                           std::int64_t row_writer_segment_id,
-                           std::int64_t row_deleted) {
-        stmt.reset();
-        int bind_index = 1;
-        for (const auto &value : values) {
-            stmt.bind(bind_index++, value);
+    auto insert_batch_sql = [&](std::size_t count) {
+        std::string sql =
+            "INSERT INTO " + quoted_table + " (" + all_insert_cols + ") VALUES ";
+        for (std::size_t row_index = 0; row_index < count; ++row_index) {
+            if (row_index) sql += ", ";
+            sql += "(" + placeholders(insert_value_count) + ")";
         }
-        stmt.bind_int64(bind_index++, row_live_lo);
-        stmt.bind_int64(bind_index++, row_live_hi);
-        stmt.bind_int64(bind_index++, row_writer_segment_id);
-        stmt.bind_int64(bind_index++, row_deleted);
-        stmt.step_done();
-        ++stats.inserted;
+        return sql;
     };
 
-	    try {
-	        if (manage_transaction) {
+    auto live_hi_update_batch_sql = [&](std::size_t count) {
+        std::string sql = "UPDATE " + quoted_table + " SET \"live_hi\" = CASE rowid ";
+        for (std::size_t row_index = 0; row_index < count; ++row_index) {
+            sql += "WHEN ? THEN ? ";
+        }
+        sql += "END WHERE rowid IN (" + placeholders(count) + ")";
+        return sql;
+    };
+
+    auto replacement_update_sql = [&] {
+        std::string sql = "UPDATE " + quoted_table + " SET ";
+        for (std::size_t i = 0; i < columns.size(); ++i) {
+            if (i) {
+                sql += ", ";
+            }
+            sql += quote_ident(columns[i]) + " = ?";
+        }
+        sql += ", \"live_hi\" = ?, \"writer_segment_id\" = ?, \"deleted\" = ? WHERE rowid = ?";
+        return sql;
+    };
+
+    try {
+        if (manage_transaction) {
             // Standalone calls own the SQLite transaction.  Calls from
             // BranchSession.transaction() pass manage_transaction=false so this
             // native splice is atomic with metadata/inode updates in the
@@ -1225,23 +1354,104 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
             execute_sql(db, "BEGIN IMMEDIATE");
         }
         std::unique_ptr<SqliteStatement> local_select_stmt;
-        std::unique_ptr<SqliteStatement> local_delete_stmt;
-        std::unique_ptr<SqliteStatement> local_insert_stmt;
         SqliteStatement *select_stmt = nullptr;
-        SqliteStatement *delete_stmt = nullptr;
-        SqliteStatement *insert_stmt = nullptr;
         if (statement_cache) {
             select_stmt = &statement_cache->statement(db, select_sql);
-            delete_stmt = &statement_cache->statement(db, delete_sql);
-            insert_stmt = &statement_cache->statement(db, insert_sql);
         } else {
             local_select_stmt = std::make_unique<SqliteStatement>(db, select_sql);
-            local_delete_stmt = std::make_unique<SqliteStatement>(db, delete_sql);
-            local_insert_stmt = std::make_unique<SqliteStatement>(db, insert_sql);
             select_stmt = local_select_stmt.get();
-            delete_stmt = local_delete_stmt.get();
-            insert_stmt = local_insert_stmt.get();
         }
+
+        std::vector<PendingLiveHiUpdate> pending_live_hi_updates;
+        std::vector<PendingInsert> pending_inserts;
+        pending_live_hi_updates.reserve(max_update_batch);
+        pending_inserts.reserve(max_insert_batch);
+
+        auto statement_for_sql = [&](const std::string &sql, std::unique_ptr<SqliteStatement> &local_stmt) -> SqliteStatement & {
+            if (statement_cache) {
+                return statement_cache->statement(db, sql);
+            }
+            local_stmt = std::make_unique<SqliteStatement>(db, sql);
+            return *local_stmt;
+        };
+
+        auto flush_live_hi_updates = [&] {
+            for (std::size_t start = 0; start < pending_live_hi_updates.size(); start += max_update_batch) {
+                const std::size_t count =
+                    std::min<std::size_t>(max_update_batch, pending_live_hi_updates.size() - start);
+                const std::string sql = live_hi_update_batch_sql(count);
+                std::unique_ptr<SqliteStatement> local_stmt;
+                SqliteStatement &stmt = statement_for_sql(sql, local_stmt);
+                stmt.reset();
+                int bind_index = 1;
+                for (std::size_t i = 0; i < count; ++i) {
+                    const PendingLiveHiUpdate &pending = pending_live_hi_updates[start + i];
+                    stmt.bind_int64(bind_index++, pending.rowid);
+                    stmt.bind_int64(bind_index++, pending.live_hi);
+                }
+                for (std::size_t i = 0; i < count; ++i) {
+                    stmt.bind_int64(bind_index++, pending_live_hi_updates[start + i].rowid);
+                }
+                stmt.step_done();
+            }
+            pending_live_hi_updates.clear();
+        };
+
+        const std::string update_replacement_sql = replacement_update_sql();
+        std::unique_ptr<SqliteStatement> local_update_replacement_stmt;
+        SqliteStatement *update_replacement_stmt = nullptr;
+        if (statement_cache) {
+            update_replacement_stmt = &statement_cache->statement(db, update_replacement_sql);
+        } else {
+            local_update_replacement_stmt = std::make_unique<SqliteStatement>(db, update_replacement_sql);
+            update_replacement_stmt = local_update_replacement_stmt.get();
+        }
+
+        auto update_replacement_row = [&](const PhysicalRow &physical,
+                                          const std::vector<Value> &values,
+                                          std::int64_t row_live_hi,
+                                          std::int64_t row_writer_segment_id,
+                                          std::int64_t row_deleted) {
+            update_replacement_stmt->reset();
+            int bind_index = 1;
+            for (const auto &value : values) {
+                update_replacement_stmt->bind(bind_index++, value);
+            }
+            update_replacement_stmt->bind_int64(bind_index++, row_live_hi);
+            update_replacement_stmt->bind_int64(bind_index++, row_writer_segment_id);
+            update_replacement_stmt->bind_int64(bind_index++, row_deleted);
+            update_replacement_stmt->bind_int64(bind_index++, physical.rowid);
+            update_replacement_stmt->step_done();
+        };
+
+        auto flush_inserts = [&] {
+            if (pending_inserts.empty()) return;
+            // Narrow old rows first, then insert replacement/right fragments.
+            // Physical table keys include live_lo, so middle/right fragments do
+            // not collide with the old row after its live_hi is shortened.
+            flush_live_hi_updates();
+            for (std::size_t start = 0; start < pending_inserts.size(); start += max_insert_batch) {
+                const std::size_t count =
+                    std::min<std::size_t>(max_insert_batch, pending_inserts.size() - start);
+                const std::string sql = insert_batch_sql(count);
+                std::unique_ptr<SqliteStatement> local_stmt;
+                SqliteStatement &stmt = statement_for_sql(sql, local_stmt);
+                stmt.reset();
+                int bind_index = 1;
+                for (std::size_t i = 0; i < count; ++i) {
+                    const PendingInsert &pending = pending_inserts[start + i];
+                    for (const auto &value : *pending.values) {
+                        stmt.bind(bind_index++, value);
+                    }
+                    stmt.bind_int64(bind_index++, pending.live_lo);
+                    stmt.bind_int64(bind_index++, pending.live_hi);
+                    stmt.bind_int64(bind_index++, pending.writer_segment_id);
+                    stmt.bind_int64(bind_index++, pending.deleted);
+                }
+                stmt.step_done();
+            }
+            pending_inserts.clear();
+        };
 
         std::unordered_map<NativeRowKey, std::vector<PhysicalRow>, NativeRowKeyHash> batch_physical_rows;
         const bool use_batch_select = splice_rows->size() > 1;
@@ -1291,72 +1501,104 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
             }
         }
 
-        for (const auto &row : *splice_rows) {
-            // Physical rows overlap the branch-local write interval when:
-            //   old.live_lo < branch.live_hi AND branch.live_lo < old.live_hi
-            // They may be inherited parent rows, rows written by sibling
-            // segments, or prior rows written by this branch.  Visibility reads
-            // later need only test branch_point against [live_lo, live_hi).
+        auto load_physical_rows = [&](const std::vector<Value> &row) {
             std::vector<PhysicalRow> physical_rows;
             if (use_batch_select) {
                 auto found = batch_physical_rows.find(key_for_row(row));
                 if (found != batch_physical_rows.end()) {
                     physical_rows = std::move(found->second);
                 }
-            } else {
-                select_stmt->reset();
-                int bind_index = 1;
-                for (std::size_t index : pk_indices) {
-                    select_stmt->bind(bind_index++, row[index]);
-                }
-                select_stmt->bind_int64(bind_index++, live_hi);
-                select_stmt->bind_int64(bind_index++, live_lo);
-                while (select_stmt->step_row()) {
-                    PhysicalRow physical;
-                    physical.rowid = sqlite3_column_int64(select_stmt->get(), 0);
-                    physical.values.reserve(columns.size());
-                    for (std::size_t i = 0; i < columns.size(); ++i) {
-                        physical.values.push_back(column_value(select_stmt->get(), static_cast<int>(1 + i)));
-                    }
-                    int metadata_offset = static_cast<int>(1 + columns.size());
-                    physical.live_lo = sqlite3_column_int64(select_stmt->get(), metadata_offset);
-                    physical.live_hi = sqlite3_column_int64(select_stmt->get(), metadata_offset + 1);
-                    physical.writer_segment_id = sqlite3_column_int64(select_stmt->get(), metadata_offset + 2);
-                    physical.deleted = sqlite3_column_int64(select_stmt->get(), metadata_offset + 3);
-                    physical_rows.push_back(std::move(physical));
-                }
+                return physical_rows;
             }
+            select_stmt->reset();
+            int bind_index = 1;
+            for (std::size_t index : pk_indices) {
+                select_stmt->bind(bind_index++, row[index]);
+            }
+            select_stmt->bind_int64(bind_index++, live_hi);
+            select_stmt->bind_int64(bind_index++, live_lo);
+            while (select_stmt->step_row()) {
+                PhysicalRow physical;
+                physical.rowid = sqlite3_column_int64(select_stmt->get(), 0);
+                physical.values.reserve(columns.size());
+                for (std::size_t i = 0; i < columns.size(); ++i) {
+                    physical.values.push_back(column_value(select_stmt->get(), static_cast<int>(1 + i)));
+                }
+                int metadata_offset = static_cast<int>(1 + columns.size());
+                physical.live_lo = sqlite3_column_int64(select_stmt->get(), metadata_offset);
+                physical.live_hi = sqlite3_column_int64(select_stmt->get(), metadata_offset + 1);
+                physical.writer_segment_id = sqlite3_column_int64(select_stmt->get(), metadata_offset + 2);
+                physical.deleted = sqlite3_column_int64(select_stmt->get(), metadata_offset + 3);
+                physical_rows.push_back(std::move(physical));
+            }
+            return physical_rows;
+        };
+
+        struct PendingSplice {
+            const std::vector<Value> *replacement = nullptr;
+            std::vector<PhysicalRow> physical_rows;
+        };
+
+        for (std::size_t chunk_start = 0; chunk_start < splice_rows->size(); chunk_start += physical_write_batch_size) {
+            const std::size_t chunk_count =
+                std::min<std::size_t>(physical_write_batch_size, splice_rows->size() - chunk_start);
+            std::vector<PendingSplice> chunk;
+            chunk.reserve(chunk_count);
+            for (std::size_t offset = 0; offset < chunk_count; ++offset) {
+                const auto &row = (*splice_rows)[chunk_start + offset];
+                std::vector<PhysicalRow> physical_rows = load_physical_rows(row);
+                chunk.push_back(PendingSplice{&row, std::move(physical_rows)});
+            }
+
             auto insert_physical = [&](const std::vector<Value> &values,
                                        std::int64_t row_live_lo,
                                        std::int64_t row_live_hi,
                                        std::int64_t row_writer_segment_id,
                                        std::int64_t row_deleted) {
-                bind_insert(
-                    *insert_stmt,
+                pending_inserts.push_back(
+                    PendingInsert{&values, row_live_lo, row_live_hi, row_writer_segment_id, row_deleted});
+                ++stats.inserted;
+                if (pending_inserts.size() >= max_insert_batch) {
+                    flush_inserts();
+                }
+            };
+            auto shrink_left_row = [&](const PhysicalRow &physical, std::int64_t row_live_hi) {
+                pending_live_hi_updates.push_back(PendingLiveHiUpdate{physical.rowid, row_live_hi});
+                if (pending_live_hi_updates.size() >= max_update_batch) {
+                    flush_live_hi_updates();
+                }
+            };
+            auto replace_row = [&](const PhysicalRow &physical,
+                                   const std::vector<Value> &values,
+                                   std::int64_t row_live_hi,
+                                   std::int64_t row_writer_segment_id,
+                                   std::int64_t row_deleted) {
+                update_replacement_row(
+                    physical,
                     values,
-                    row_live_lo,
                     row_live_hi,
                     row_writer_segment_id,
                     row_deleted
                 );
             };
-            auto delete_physical = [&](const PhysicalRow &physical) {
-                delete_stmt->reset();
-                delete_stmt->bind_int64(1, physical.rowid);
-                delete_stmt->step_done();
-            };
-            splice_interval_rows<PhysicalRow, std::int64_t, Int64IntervalBounds>(
-                stats,
-                row,
-                physical_rows,
-                live_lo,
-                live_hi,
-                writer_segment_id,
-                replacement_deleted,
-                insert_physical,
-                delete_physical
-            );
+            for (const PendingSplice &work : chunk) {
+                splice_interval_rows<PhysicalRow, std::int64_t, Int64IntervalBounds>(
+                    stats,
+                    *work.replacement,
+                    work.physical_rows,
+                    live_lo,
+                    live_hi,
+                    writer_segment_id,
+                    replacement_deleted,
+                    insert_physical,
+                    shrink_left_row,
+                    replace_row
+                );
+            }
+            flush_inserts();
         }
+        flush_inserts();
+        flush_live_hi_updates();
         if (manage_transaction) {
             execute_sql(db, "COMMIT");
         }
@@ -1404,9 +1646,9 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
     BulkUpsertStats stats;
     const std::string quoted_table = quote_ident(physical_name);
     const std::vector<std::size_t> pk_indices = pk_column_indices(columns, pk_columns);
-    // PostgreSQL uses ctid for the selected physical row instances, but the
-    // versioning contract remains engine-independent: select overlapping rows,
-    // delete exact physical versions, and insert replacement fragments.
+    // PostgreSQL uses ctid for the selected physical row instances. The shared
+    // splice algorithm decides interval fragments; this adapter implements the
+    // engine operations for UPDATE-in-place and INSERT.
     NativeRows deduped_storage;
     const NativeRows *splice_rows = &rows;
     if (rows.size() > 1) {
@@ -1424,11 +1666,27 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
         "WHERE " + pg_key_where_sql(pk_columns) + " AND live_lo < $" + std::to_string(live_lo_param) +
         " AND $" + std::to_string(live_hi_param) + " < live_hi "
         "ORDER BY live_lo FOR UPDATE";
-    const std::string delete_sql =
-        "DELETE FROM " + quoted_table + " WHERE ctid = $1::tid";
-	const std::string insert_sql =
-	    "INSERT INTO " + quoted_table + " (" + all_insert_cols + ") VALUES (" +
-	    pg_placeholders(columns.size() + 4) + ")";
+    const std::string shrink_left_sql =
+        "UPDATE " + quoted_table + " SET \"live_hi\" = $1 WHERE ctid = $2::tid";
+    const std::string insert_sql =
+        "INSERT INTO " + quoted_table + " (" + all_insert_cols + ") VALUES (" +
+        pg_placeholders(columns.size() + 4) + ")";
+
+    auto replacement_update_sql = [&] {
+        std::string sql = "UPDATE " + quoted_table + " SET ";
+        int param = 1;
+        for (std::size_t i = 0; i < columns.size(); ++i) {
+            if (i) {
+                sql += ", ";
+            }
+            sql += quote_ident(columns[i]) + " = $" + std::to_string(param++);
+        }
+        sql += ", \"live_hi\" = $" + std::to_string(param++);
+        sql += ", \"writer_segment_id\" = $" + std::to_string(param++);
+        sql += ", \"deleted\" = $" + std::to_string(param++);
+        sql += " WHERE ctid = $" + std::to_string(param) + "::tid";
+        return sql;
+    };
 
     auto key_for_row = [&](const std::vector<Value> &row) {
         NativeRowKey key;
@@ -1457,87 +1715,6 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
         result.require(PGRES_COMMAND_OK);
     };
 
-    auto try_single_row_cte_splice = [&]() -> bool {
-        if (splice_rows->size() != 1) return false;
-        const auto &row = (*splice_rows)[0];
-
-        // Fast path for the common point-write case.  The generic splice
-        // algorithm below performs SELECT FOR UPDATE, DELETE, and one INSERT
-        // per interval fragment.  PostgreSQL can do the same interval surgery
-        // atomically in one data-modifying CTE:
-        //
-        //   1. delete every physical interval overlapping this branch write,
-        //      returning the old rows;
-        //   2. reinsert any left/right fragments outside the write interval;
-        //   3. insert the replacement row for [live_lo, live_hi).
-        //
-        // This preserves record-level CoW semantics while removing several
-        // network round trips from single-row UPDATE/DELETE/upsert workloads.
-        std::vector<Value> params;
-        params.reserve(pk_indices.size() + 2 + columns.size() + 2);
-        for (std::size_t index : pk_indices) params.push_back(row[index]);
-        const int live_hi_param = static_cast<int>(params.size()) + 1;
-        params.push_back(live_hi);
-        const int live_lo_param = static_cast<int>(params.size()) + 1;
-        params.push_back(live_lo);
-        const int replacement_start = static_cast<int>(params.size()) + 1;
-        for (const auto &value : row) params.push_back(value);
-        const int writer_param = static_cast<int>(params.size()) + 1;
-        params.push_back(writer_segment_id);
-        const int deleted_param = static_cast<int>(params.size()) + 1;
-        params.push_back(std::string(replacement_deleted ? "true" : "false"));
-
-        std::string sql =
-            "WITH existing AS ("
-            "DELETE FROM " + quoted_table +
-            " WHERE " + pg_key_where_sql(pk_columns) +
-            " AND live_lo < $" + std::to_string(live_hi_param) +
-            " AND $" + std::to_string(live_lo_param) + " < live_hi "
-            "RETURNING " + data_cols + ", live_lo, live_hi, writer_segment_id, deleted"
-            "), left_rows AS ("
-            "INSERT INTO " + quoted_table + " (" + all_insert_cols + ") "
-            "SELECT " + data_cols + ", live_lo, $" + std::to_string(live_lo_param) +
-            ", writer_segment_id, deleted FROM existing "
-            "WHERE live_lo < $" + std::to_string(live_lo_param) +
-            " RETURNING 1"
-            "), right_rows AS ("
-            "INSERT INTO " + quoted_table + " (" + all_insert_cols + ") "
-            "SELECT " + data_cols + ", $" + std::to_string(live_hi_param) +
-            ", live_hi, writer_segment_id, deleted FROM existing "
-            "WHERE $" + std::to_string(live_hi_param) + " < live_hi "
-            "RETURNING 1"
-            "), replacement AS ("
-            "INSERT INTO " + quoted_table + " (" + all_insert_cols + ") VALUES (";
-        for (std::size_t i = 0; i < columns.size(); ++i) {
-            if (i) sql += ", ";
-            sql += "$" + std::to_string(replacement_start + static_cast<int>(i));
-        }
-        sql += ", $" + std::to_string(live_lo_param) +
-            ", $" + std::to_string(live_hi_param) +
-            ", $" + std::to_string(writer_param) +
-            ", $" + std::to_string(deleted_param) +
-            ") RETURNING 1"
-            ") SELECT "
-            "(SELECT COUNT(*) FROM existing), "
-            "(SELECT COUNT(*) FROM left_rows), "
-            "(SELECT COUNT(*) FROM right_rows), "
-            "(SELECT COUNT(*) FROM replacement)";
-
-        PgResult result = statement_cache
-            ? statement_cache->exec(conn, sql, params)
-            : pg_exec_params(conn, sql, params);
-        result.require(PGRES_TUPLES_OK);
-        if (PQntuples(result.get()) != 1 || PQnfields(result.get()) != 4) {
-            throw PgError("unexpected PostgreSQL splice CTE result");
-        }
-        stats.selected += std::get<std::int64_t>(pg_column_value(result.get(), 0, 0));
-        const auto left_count = std::get<std::int64_t>(pg_column_value(result.get(), 0, 1));
-        const auto right_count = std::get<std::int64_t>(pg_column_value(result.get(), 0, 2));
-        const auto replacement_count = std::get<std::int64_t>(pg_column_value(result.get(), 0, 3));
-        stats.inserted += left_count + right_count + replacement_count;
-        return true;
-    };
-
     auto insert_row = [&](const std::vector<Value> &values,
                           const std::string &row_live_lo,
                           const std::string &row_live_hi,
@@ -1556,15 +1733,34 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
         ++stats.inserted;
     };
 
-	    try {
-	        if (manage_transaction) {
-	            exec_simple("BEGIN");
-	        }
-        if (try_single_row_cte_splice()) {
-            if (manage_transaction) {
-                exec_simple("COMMIT");
-            }
-            return stats;
+    auto shrink_left_row = [&](const PgPhysicalRow &physical, const std::string &row_live_hi) {
+        PgResult result = statement_cache
+            ? statement_cache->exec(conn, shrink_left_sql, {row_live_hi, std::string(physical.ctid)})
+            : pg_exec_params(conn, shrink_left_sql, {row_live_hi, std::string(physical.ctid)});
+        result.require(PGRES_COMMAND_OK);
+    };
+
+    const std::string update_replacement_sql = replacement_update_sql();
+    auto replace_row = [&](const PgPhysicalRow &physical,
+                           const std::vector<Value> &values,
+                           const std::string &row_live_hi,
+                           std::int64_t row_writer_segment_id,
+                           std::int64_t row_deleted) {
+        std::vector<Value> params = values;
+        params.reserve(columns.size() + 4);
+        params.push_back(row_live_hi);
+        params.push_back(row_writer_segment_id);
+        params.push_back(std::string(row_deleted ? "true" : "false"));
+        params.push_back(std::string(physical.ctid));
+        PgResult result = statement_cache
+            ? statement_cache->exec(conn, update_replacement_sql, params)
+            : pg_exec_params(conn, update_replacement_sql, params);
+        result.require(PGRES_COMMAND_OK);
+    };
+
+    try {
+        if (manage_transaction) {
+            exec_simple("BEGIN");
         }
 
         std::unordered_map<NativeRowKey, std::vector<PgPhysicalRow>, NativeRowKeyHash> batch_physical_rows;
@@ -1614,8 +1810,8 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
             }
         }
 
-	        for (const auto &row : *splice_rows) {
-	            std::vector<PgPhysicalRow> physical_rows;
+        for (const auto &row : *splice_rows) {
+            std::vector<PgPhysicalRow> physical_rows;
             if (use_batch_select) {
                 auto found = batch_physical_rows.find(key_for_row(row));
                 if (found != batch_physical_rows.end()) {
@@ -1653,12 +1849,6 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
                     physical_rows.push_back(std::move(physical));
                 }
             }
-            auto delete_physical = [&](const PgPhysicalRow &physical) {
-                PgResult deleted_result = statement_cache
-                    ? statement_cache->exec(conn, delete_sql, {std::string(physical.ctid)})
-                    : pg_exec_params(conn, delete_sql, {std::string(physical.ctid)});
-                deleted_result.require(PGRES_COMMAND_OK);
-            };
             splice_interval_rows<PgPhysicalRow, std::string, DecimalIntervalBounds>(
                 stats,
                 row,
@@ -1668,7 +1858,8 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
                 writer_segment_id,
                 replacement_deleted,
                 insert_row,
-                delete_physical
+                shrink_left_row,
+                replace_row
             );
         }
 
@@ -1743,10 +1934,28 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
         sqlite3_busy_timeout(db_, 30000);
         execute("PRAGMA foreign_keys=OFF");
         execute("PRAGMA journal_mode=WAL");
+        const std::int64_t wal_autocheckpoint_pages =
+            native_sqlite_wal_autocheckpoint_pages_from_env().value_or(
+                kDefaultNativeSqliteWalAutocheckpointPages);
+        // SQLite measures wal_autocheckpoint in database pages.  The native
+        // default is intentionally larger than SQLite's 1000-page default so
+        // large ChronosFS/interval writes do not synchronously checkpoint in
+        // the middle of one logical copy-on-write operation.  Value 0 remains
+        // an explicit override that disables automatic checkpoints.
+        execute("PRAGMA wal_autocheckpoint=" + std::to_string(wal_autocheckpoint_pages));
+        if (auto bytes = native_sqlite_journal_size_limit_bytes_from_env()) {
+            execute("PRAGMA journal_size_limit=" + std::to_string(*bytes));
+        }
         if (auto synchronous = native_sqlite_synchronous_from_env()) {
             execute("PRAGMA synchronous=" + *synchronous);
             execute("PRAGMA fullfsync=OFF");
             execute("PRAGMA checkpoint_fullfsync=OFF");
+        }
+        if (auto cache_size = native_sqlite_cache_size_kib_from_env()) {
+            // Negative cache_size values are KiB units in SQLite.  The benchmark
+            // uses this to cap SQLite's page cache while direct I/O bypasses the
+            // kernel page cache for the mounted filesystem path.
+            execute("PRAGMA cache_size=-" + std::to_string(*cache_size));
         }
     }
     explicit NativeSQLiteDriver(sqlite3 *db) : db_(db), dialect_("sqlite"), owns_connection_(false) {
@@ -1754,6 +1963,10 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
             throw SqliteError("SQLite connection pointer is null");
         }
         sqlite3_busy_timeout(db_, 30000);
+        const std::int64_t wal_autocheckpoint_pages =
+            native_sqlite_wal_autocheckpoint_pages_from_env().value_or(
+                kDefaultNativeSqliteWalAutocheckpointPages);
+        execute("PRAGMA wal_autocheckpoint=" + std::to_string(wal_autocheckpoint_pages));
     }
     ~NativeSQLiteDriver() override {
         for (auto &[_, stmt] : statements_) sqlite3_finalize(stmt);
@@ -1821,11 +2034,11 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
         bool replacement_deleted,
         bool manage_transaction
     ) override {
-	        sqlite_adapter_bulk_upsert(
-	            db_, physical_name, columns, pk_columns, rows,
-	            std::stoll(live_lo), std::stoll(live_hi), writer_segment_id,
-	            replacement_deleted, manage_transaction, &interval_upsert_statements_
-	        );
+        sqlite_adapter_bulk_upsert(
+            db_, physical_name, columns, pk_columns, rows,
+            std::stoll(live_lo), std::stoll(live_hi), writer_segment_id,
+            replacement_deleted, manage_transaction, &interval_upsert_statements_
+        );
     }
 
   private:
@@ -1859,10 +2072,10 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
     }
     sqlite3 *db_ = nullptr;
     std::string dialect_;
-	    bool owns_connection_ = false;
-	    std::unordered_map<std::string, sqlite3_stmt *> statements_;
-	    SQLiteStatementCache interval_upsert_statements_;
-	};
+    bool owns_connection_ = false;
+    std::unordered_map<std::string, sqlite3_stmt *> statements_;
+    SQLiteStatementCache interval_upsert_statements_;
+};
 
 class NativeDuckDBDriver final : public NativeSqlDriver {
   public:
@@ -2115,9 +2328,21 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
         const std::string insert_sql =
             "INSERT INTO " + quoted_table + " (" + all_insert_cols + ") VALUES (" +
             placeholders(columns.size() + 4) + ")";
-        // DuckDB exposes rowid as a stable physical handle for this delete/reinsert
-        // splice.  The interval math itself stays in splice_interval_rows().
-        const std::string delete_sql = "DELETE FROM " + quoted_table + " WHERE rowid = ?";
+        // DuckDB exposes rowid as the physical handle used by the shared splice
+        // algorithm's UPDATE-in-place callbacks.
+        const std::string shrink_left_sql =
+            "UPDATE " + quoted_table + " SET \"live_hi\" = ? WHERE rowid = ?";
+        auto replacement_update_sql = [&] {
+            std::string sql = "UPDATE " + quoted_table + " SET ";
+            for (std::size_t i = 0; i < columns.size(); ++i) {
+                if (i) {
+                    sql += ", ";
+                }
+                sql += quote_ident(columns[i]) + " = ?";
+            }
+            sql += ", \"live_hi\" = ?, \"writer_segment_id\" = ?, \"deleted\" = ? WHERE rowid = ?";
+            return sql;
+        };
 
         auto key_for_row = [&](const std::vector<Value> &row) {
             NativeRowKey key;
@@ -2153,6 +2378,25 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
             params.push_back(row_deleted);
             execute(insert_sql, params);
             ++stats.inserted;
+        };
+
+        auto shrink_left_row = [&](const DuckDBPhysicalRow &physical, std::int64_t row_live_hi) {
+            execute(shrink_left_sql, {row_live_hi, physical.rowid});
+        };
+
+        const std::string update_replacement_sql = replacement_update_sql();
+        auto replace_row = [&](const DuckDBPhysicalRow &physical,
+                               const std::vector<Value> &values,
+                               std::int64_t row_live_hi,
+                               std::int64_t row_writer_segment_id,
+                               std::int64_t row_deleted) {
+            std::vector<Value> params = values;
+            params.reserve(columns.size() + 4);
+            params.push_back(row_live_hi);
+            params.push_back(row_writer_segment_id);
+            params.push_back(row_deleted);
+            params.push_back(physical.rowid);
+            execute(update_replacement_sql, params);
         };
 
         try {
@@ -2237,9 +2481,6 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
                     }
                 }
 
-                auto delete_physical = [&](const DuckDBPhysicalRow &physical) {
-                    execute(delete_sql, {physical.rowid});
-                };
                 splice_interval_rows<DuckDBPhysicalRow, std::int64_t, Int64IntervalBounds>(
                     stats,
                     row,
@@ -2249,7 +2490,8 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
                     writer_segment_id,
                     replacement_deleted,
                     insert_row,
-                    delete_physical
+                    shrink_left_row,
+                    replace_row
                 );
             }
 

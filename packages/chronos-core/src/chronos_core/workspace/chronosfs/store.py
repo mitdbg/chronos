@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import difflib
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from chronos_core import _native_interval
@@ -100,6 +100,9 @@ class ChronosFSBranchSession:
             mode=mode,
             parents=parents,
         )
+
+    def import_tree(self, source: str | Path) -> None:
+        self._store.import_tree(self.branch_id, source)
 
     def write_at(self, path: str, offset: int, data: bytes | str) -> None:
         self._store.write_at(self.branch_id, path, offset, data)
@@ -396,6 +399,12 @@ class ChronosFSStore:
             )
         )
 
+    def import_tree(self, branch_id: str, source: str | Path) -> None:
+        source_path = Path(source).expanduser().resolve()
+        if not source_path.is_dir():
+            raise ChronosFSError(f"import source is not a directory: {source_path}")
+        self._native.import_tree(branch_id, str(source_path))
+
     def write_at(self, branch_id: str, path: str, offset: int, data: bytes | str) -> None:
         if offset < 0:
             raise ValueError("offset must be non-negative")
@@ -578,12 +587,17 @@ class ChronosFSStore:
         target_manifest: dict[str, dict[str, Any]],
     ) -> RowDiff:
         inode_id = int(diff.key["inode_id"])
-        block_index = int(diff.key["block_index"])
         path = _path_for_inode(inode_id, source_manifest, target_manifest)
         before_bytes = _block_data(diff.before)
         after_bytes = _block_data(diff.after)
-        start = block_index * self.block_size
-        end = start + max(_block_valid_length(diff.before), _block_valid_length(diff.after))
+        start = min(
+            _range_start(diff.before, diff.key),
+            _range_start(diff.after, diff.key),
+        )
+        end = max(
+            _range_end(diff.before, diff.key),
+            _range_end(diff.after, diff.key),
+        )
         byte_range = {"start": start, "end": end}
         before = _content_payload(before_bytes, path, byte_range)
         after = _content_payload(after_bytes, path, byte_range)
@@ -779,14 +793,21 @@ def _block_data(row: dict[str, Any] | None) -> bytes | None:
     return bytes(value)
 
 
-def _block_valid_length(row: dict[str, Any] | None) -> int:
-    if row is None:
-        return 0
-    value = row.get("valid_length")
-    if value is not None:
-        return int(value)
+def _range_start(row: dict[str, Any] | None, key: dict[str, Any]) -> int:
+    if row is not None and row.get("byte_start") is not None:
+        return int(row["byte_start"])
+    if key.get("byte_start") is not None:
+        return int(key["byte_start"])
+    if key.get("block_index") is not None:
+        return int(key["block_index"]) * 4096
+    return 0
+
+
+def _range_end(row: dict[str, Any] | None, key: dict[str, Any]) -> int:
+    if row is not None and row.get("byte_end") is not None:
+        return int(row["byte_end"])
     data = _block_data(row)
-    return len(data) if data is not None else 0
+    return _range_start(row, key) + (len(data) if data is not None else 0)
 
 
 def _content_payload(
@@ -873,5 +894,5 @@ def _dirent_payload(row: dict[str, Any] | None, path: str) -> dict[str, Any] | N
 def _sanitize_internal_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if row is None:
         return None
-    hidden = {"inode_id", "parent_inode_id", "block_index"}
+    hidden = {"inode_id", "parent_inode_id", "block_index", "byte_start", "byte_end"}
     return {key: value for key, value in row.items() if key not in hidden}

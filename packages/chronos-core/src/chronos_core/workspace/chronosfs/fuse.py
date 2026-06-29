@@ -63,6 +63,7 @@ def mount_chronosfs(
     foreground: bool = True,
     options: set[str] | None = None,
     shared_daemon: bool = True,
+    shutdown_daemon_on_unmount: bool = False,
 ) -> None:
     """Mount ChronosFS with native libfuse and block until unmounted."""
     if not foreground:
@@ -83,6 +84,7 @@ def mount_chronosfs(
             branch_id=branch_id,
             block_size=store.block_size,
             options=mount_options,
+            shutdown_daemon_on_unmount=shutdown_daemon_on_unmount,
         )
         return
     try:
@@ -124,13 +126,11 @@ def _with_default_cache_options(options: set[str]) -> list[str]:
     return sorted(merged)
 
 
-def _daemon_key(database_url: str, branch_id: str, block_size: int, options: list[str]) -> str:
+def _daemon_key(database_url: str, block_size: int) -> str:
     raw = json.dumps(
         {
             "database_url": database_url,
-            "branch_id": branch_id,
             "block_size": block_size,
-            "options": options,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -191,7 +191,6 @@ def _ensure_shared_daemon(
     lock_path: Path,
     log_path: Path,
     database_url: str,
-    branch_id: str,
     block_size: int,
     options: list[str],
 ) -> None:
@@ -213,8 +212,6 @@ def _ensure_shared_daemon(
                     str(socket_path),
                     "--database-url",
                     database_url,
-                    "--branch-id",
-                    branch_id,
                     "--block-size",
                     str(block_size),
                     "--options-json",
@@ -229,7 +226,7 @@ def _ensure_shared_daemon(
         _wait_for_daemon(socket_path)
 
 
-def _mount_via_shared_daemon(
+def _start_shared_chronosfs_mount(
     database_url: str,
     mountpoint: Path,
     *,
@@ -238,7 +235,7 @@ def _mount_via_shared_daemon(
     options: list[str],
 ) -> None:
     mountpoint.mkdir(parents=True, exist_ok=True)
-    key = _daemon_key(database_url, branch_id, block_size, options)
+    key = _daemon_key(database_url, block_size)
     runtime = _runtime_dir()
     socket_path = runtime / f"{key}.sock"
     lock_path = runtime / f"{key}.lock"
@@ -248,24 +245,68 @@ def _mount_via_shared_daemon(
         lock_path=lock_path,
         log_path=log_path,
         database_url=database_url,
-        branch_id=branch_id,
         block_size=block_size,
         options=options,
     )
     try:
-        response = _socket_request(socket_path, {"mountpoint": str(mountpoint)})
+        response = _socket_request(
+            socket_path,
+            {
+                "mountpoint": str(mountpoint),
+                "branch_id": branch_id,
+                "options": options,
+            },
+        )
     except FileNotFoundError:
         _ensure_shared_daemon(
             socket_path=socket_path,
             lock_path=lock_path,
             log_path=log_path,
             database_url=database_url,
-            branch_id=branch_id,
             block_size=block_size,
             options=options,
         )
-        response = _socket_request(socket_path, {"mountpoint": str(mountpoint)})
+        response = _socket_request(
+            socket_path,
+            {
+                "mountpoint": str(mountpoint),
+                "branch_id": branch_id,
+                "options": options,
+            },
+        )
     if response.get("status") != "ok":
         raise ChronosFSMountError(str(response.get("error", "shared daemon mount failed")))
     _wait_for_mount(mountpoint, socket_path)
+    return None
+
+
+def _shutdown_shared_chronosfs_daemon(database_url: str, block_size: int) -> None:
+    key = _daemon_key(database_url, block_size)
+    socket_path = _runtime_dir() / f"{key}.sock"
+    if not socket_path.exists():
+        return
+    with suppress(Exception):
+        _socket_request(socket_path, {"shutdown": True}, timeout=0.2)
+
+
+def _mount_via_shared_daemon(
+    database_url: str,
+    mountpoint: Path,
+    *,
+    branch_id: str,
+    block_size: int,
+    options: list[str],
+    shutdown_daemon_on_unmount: bool = False,
+) -> None:
+    key = _daemon_key(database_url, block_size)
+    socket_path = _runtime_dir() / f"{key}.sock"
+    _start_shared_chronosfs_mount(
+        database_url,
+        mountpoint,
+        branch_id=branch_id,
+        block_size=block_size,
+        options=options,
+    )
     _block_until_unmounted(mountpoint, socket_path)
+    if shutdown_daemon_on_unmount:
+        _shutdown_shared_chronosfs_daemon(database_url, block_size)
