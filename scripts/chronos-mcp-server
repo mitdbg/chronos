@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+CORE_SRC="${REPO_ROOT}/packages/chronos-core/src"
+
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  export PYTHONPATH="${CORE_SRC}:${PYTHONPATH}"
+else
+  export PYTHONPATH="${CORE_SRC}"
+fi
+
+exec python3 -m chronos_core.mcp.cli "$@"

@@ -68,13 +68,7 @@ def mount_chronosfs(
     """Mount ChronosFS with native libfuse and block until unmounted."""
     if not foreground:
         raise ChronosFSMountError("native ChronosFS mounts currently run in foreground mode")
-    database_url = getattr(store.context.db, "database_url", None)
-    if not database_url:
-        database_path = getattr(store.context.db, "database_path", None)
-        if database_path:
-            database_url = f"sqlite:///{database_path}"
-    if not database_url:
-        raise ChronosFSMountError("native ChronosFS FUSE requires a file-backed database URL")
+    database_url = _database_url_for_mount(store)
     mount_path = Path(mountpoint)
     mount_options = _with_default_cache_options(options or set())
     if shared_daemon:
@@ -99,6 +93,44 @@ def mount_chronosfs(
         raise ChronosFSMountError(str(exc)) from exc
     if rc != 0:
         raise ChronosFSMountError(f"native ChronosFS mount exited with status {rc}")
+
+
+def start_chronosfs_mount(
+    store: ChronosFSStore,
+    mountpoint: str | Path,
+    *,
+    branch_id: str = "main",
+    options: set[str] | None = None,
+) -> Path:
+    """Start a shared-daemon ChronosFS mount and return once it is ready.
+
+    This is the non-blocking companion to :func:`mount_chronosfs`.  It is
+    intended for control-plane integrations such as MCP servers that need to
+    hand a mounted POSIX path back to another process.  The mount is hosted by
+    the same shared local daemon used by ``mount_chronosfs(shared_daemon=True)``,
+    so multiple mount points for one backing store share one native backend.
+    """
+    database_url = _database_url_for_mount(store)
+    mount_path = Path(mountpoint)
+    _start_shared_chronosfs_mount(
+        database_url,
+        mount_path,
+        branch_id=branch_id,
+        block_size=store.block_size,
+        options=_with_default_cache_options(options or set()),
+    )
+    return mount_path
+
+
+def _database_url_for_mount(store: ChronosFSStore) -> str:
+    database_url = getattr(store.context.db, "database_url", None)
+    if not database_url:
+        database_path = getattr(store.context.db, "database_path", None)
+        if database_path:
+            database_url = f"sqlite:///{database_path}"
+    if not database_url:
+        raise ChronosFSMountError("native ChronosFS FUSE requires a file-backed database URL")
+    return str(database_url)
 
 
 def _runtime_dir() -> Path:

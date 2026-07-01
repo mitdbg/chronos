@@ -20,6 +20,7 @@ from chronos_core.workspace.chronosfs import (
     ChronosFSStore,
     ChronosFuseOperations,
     mount_chronosfs,
+    start_chronosfs_mount,
 )
 from chronos_core.workspace.runtime import (
     BranchStore,
@@ -50,6 +51,7 @@ __all__ = [
     "ChronosFSStore",
     "ChronosFuseOperations",
     "mount_chronosfs",
+    "start_chronosfs_mount",
     "ChronosDuckDBStore",
     "ChronosPostgresStore",
     "ChronosWorkspaceContext",

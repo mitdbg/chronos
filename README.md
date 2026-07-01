@@ -63,6 +63,12 @@ DuckDB support is optional:
 python -m pip install -e 'packages/chronos-core[duckdb]'
 ```
 
+MCP server support for Codex is optional:
+
+```bash
+python -m pip install -e 'packages/chronos-core[mcp]'
+```
+
 If the package is not installed, run commands with:
 
 ```bash
@@ -78,6 +84,87 @@ PYTHONPATH=packages/chronos-core/src python3 examples/run_all.py
 Each script in [examples/](examples/) creates temporary state, checks the
 expected branch behavior with assertions, and prints a success line. The
 snippets below are excerpts from those runnable files.
+
+## Codex MCP Server
+
+Chronos can run as a Codex MCP server. Codex asks Chronos to prepare a source
+directory, create a branch sandbox, and return a ChronosFS mount path. Codex
+then uses its normal shell and file tools inside that mounted directory, while
+SQL goes through branch-aware MCP tools.
+
+Deploy the MCP server entry to Codex:
+
+```bash
+./scripts/chronos-mcp-deploy-codex --project .
+```
+
+The same helper can also be run as a Python module:
+
+```bash
+PYTHONPATH=packages/chronos-core/src python3 -m chronos_core.mcp.deploy_codex --project .
+```
+
+After an editable install, it is available as a console command:
+
+```bash
+chronos-mcp-deploy-codex --project .
+```
+
+The deploy helper adds a `[mcp_servers.chronos]` entry to
+`~/.codex/config.toml` and creates a starter `chronos.toml` when it is missing.
+If a `chronos` MCP server already exists, it leaves that entry unchanged unless
+`--overwrite` is passed. Restart Codex after deployment so the MCP server is
+loaded.
+
+Example `chronos.toml`:
+
+```toml
+[workspace]
+name = "my-project"
+default_branch = "main"
+state_dir = ".chronos"
+mount_root = ".chronos/mounts"
+allowed_source_roots = ["."]
+
+[filesystem]
+database_url = "sqlite:///.chronos/chronosfs.sqlite"
+block_size = 8192
+
+[stores.sqlite]
+kind = "sqlite"
+database_url = "sqlite:///.chronos/app.sqlite"
+
+[[stores.sqlite.tables]]
+name = "docs"
+primary_key = ["id"]
+```
+
+Repo-local development writes a Codex config entry like:
+
+```toml
+[mcp_servers.chronos]
+command = "/path/to/project/scripts/chronos-mcp-server"
+args = [
+    "--config",
+    "chronos.toml",
+    "--transport",
+    "stdio",
+]
+cwd = "/path/to/project"
+startup_timeout_sec = 30
+tool_timeout_sec = 300
+```
+
+The MCP tool flow is:
+
+```text
+chronos_prepare_source(source_dir=".", branch_id="main")
+chronos_create_sandbox(branch_id="codex-run-1", from_branch="main")
+run Codex commands inside the returned mount_path
+chronos_sql_query(branch_id="codex-run-1", store="sqlite", sql="...")
+chronos_merge_preview(source="codex-run-1", target="main")
+chronos_merge_apply(source="codex-run-1", target="main")
+```
 
 ## Multi-Store Branching
 
