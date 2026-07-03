@@ -3757,6 +3757,206 @@ def test_postgres_interval_batch_update_assigns_writer_segments_for_diff() -> No
         ctx.close()
 
 
+def test_postgres_interval_native_private_update_stops_at_child_branch() -> None:
+    import chronos_core._native_interval as native_interval
+
+    ctx = _make_products_only_context("postgres", "interval")
+    try:
+        ctx.create_branch("work", from_branch="main")
+        native_store = native_interval.NativeBranchStore(_postgres_dsn())
+        work = native_store.checkout("work")
+
+        def abc_physical_count() -> int:
+            return ctx.db.execute(
+                "SELECT COUNT(*) AS count FROM _chronos_b_interval_products WHERE sku = 'abc'"
+            ).fetchone()["count"]
+
+        assert work.execute(
+            "UPDATE products SET price = price + :delta WHERE sku = :sku",
+            {"delta": 1, "sku": "abc"},
+        ) == 1
+        after_first = abc_physical_count()
+        assert after_first > 1
+        assert work.query("SELECT price FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+            {"price": 11}
+        ]
+
+        assert work.execute(
+            "UPDATE products SET price = price + :delta WHERE sku = :sku",
+            {"delta": 1, "sku": "abc"},
+        ) == 1
+        after_second = abc_physical_count()
+        assert after_second == after_first
+        assert work.query("SELECT price FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+            {"price": 12}
+        ]
+
+        ctx.create_branch("child", from_branch="work")
+        child = native_store.checkout("child")
+        assert child.query("SELECT price FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+            {"price": 12}
+        ]
+
+        work_after_child = native_store.checkout("work")
+        assert work_after_child.execute(
+            "UPDATE products SET price = price + :delta WHERE sku = :sku",
+            {"delta": 1, "sku": "abc"},
+        ) == 1
+        assert abc_physical_count() > after_second
+        assert work_after_child.query(
+            "SELECT price FROM products WHERE sku = :sku",
+            {"sku": "abc"},
+        ) == [{"price": 13}]
+        assert child.query("SELECT price FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+            {"price": 12}
+        ]
+    finally:
+        ctx.close()
+
+
+def test_postgres_interval_native_private_prefix_update_stops_at_child_branch() -> None:
+    import chronos_core._native_interval as native_interval
+
+    _reset_postgres_schema()
+    ctx = ChronosBranchContext.connect(_postgres_dsn(), backend="interval")
+    try:
+        ctx.db.execute(
+            """
+            CREATE TABLE order_line (
+                w_id INTEGER NOT NULL,
+                d_id INTEGER NOT NULL,
+                o_id INTEGER NOT NULL,
+                line_number INTEGER NOT NULL,
+                delivered INTEGER NOT NULL,
+                PRIMARY KEY (w_id, d_id, o_id, line_number)
+            )
+            """
+        )
+        ctx.db.executemany(
+            "INSERT INTO order_line VALUES (?, ?, ?, ?, 0)",
+            [
+                (1, 1, 10, 1),
+                (1, 1, 10, 2),
+                (1, 1, 10, 3),
+                (1, 1, 11, 1),
+            ],
+        )
+        ctx.db.commit()
+        ctx.register_table("order_line", ["w_id", "d_id", "o_id", "line_number"])
+        ctx.create_branch("work", from_branch="main")
+
+        native_store = native_interval.NativeBranchStore(_postgres_dsn())
+        work = native_store.checkout("work")
+
+        def prefix_physical_count() -> int:
+            return ctx.db.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM _chronos_b_interval_order_line
+                WHERE w_id = 1 AND d_id = 1 AND o_id = 10
+                """
+            ).fetchone()["count"]
+
+        base_count = prefix_physical_count()
+        assert work.execute(
+            """
+            UPDATE order_line
+            SET delivered = :delivered
+            WHERE o_id = :o_id AND d_id = :d_id AND w_id = :w_id
+            """,
+            {"delivered": 1, "o_id": 10, "d_id": 1, "w_id": 1},
+        ) == 3
+        after_inherited_update = prefix_physical_count()
+        assert after_inherited_update > base_count
+
+        assert work.execute(
+            """
+            UPDATE order_line
+            SET delivered = :delivered
+            WHERE o_id = :o_id AND d_id = :d_id AND w_id = :w_id
+            """,
+            {"delivered": 2, "o_id": 10, "d_id": 1, "w_id": 1},
+        ) == 3
+        after_private_update = prefix_physical_count()
+        assert after_private_update == after_inherited_update
+
+        ctx.create_branch("child", from_branch="work")
+        child = native_store.checkout("child")
+        assert child.query(
+            """
+            SELECT delivered FROM order_line
+            WHERE w_id = :w_id AND d_id = :d_id AND o_id = :o_id
+            ORDER BY line_number
+            """,
+            {"w_id": 1, "d_id": 1, "o_id": 10},
+        ) == [{"delivered": 2}, {"delivered": 2}, {"delivered": 2}]
+
+        work_after_child = native_store.checkout("work")
+        assert work_after_child.execute(
+            """
+            UPDATE order_line
+            SET delivered = :delivered
+            WHERE o_id = :o_id AND d_id = :d_id AND w_id = :w_id
+            """,
+            {"delivered": 3, "o_id": 10, "d_id": 1, "w_id": 1},
+        ) == 3
+        assert prefix_physical_count() > after_private_update
+        assert child.query(
+            """
+            SELECT delivered FROM order_line
+            WHERE w_id = :w_id AND d_id = :d_id AND o_id = :o_id
+            ORDER BY line_number
+            """,
+            {"w_id": 1, "d_id": 1, "o_id": 10},
+        ) == [{"delivered": 2}, {"delivered": 2}, {"delivered": 2}]
+    finally:
+        ctx.close()
+
+
+def test_postgres_interval_native_private_delete_stops_at_child_branch() -> None:
+    import chronos_core._native_interval as native_interval
+
+    ctx = _make_products_only_context("postgres", "interval")
+    try:
+        ctx.create_branch("work", from_branch="main")
+        native_store = native_interval.NativeBranchStore(_postgres_dsn())
+        work = native_store.checkout("work")
+
+        assert work.execute("DELETE FROM products WHERE sku = :sku", {"sku": "abc"}) == 1
+        assert work.query("SELECT sku FROM products WHERE sku = :sku", {"sku": "abc"}) == []
+        assert native_store.checkout("main").query(
+            "SELECT sku FROM products WHERE sku = :sku",
+            {"sku": "abc"},
+        ) == [{"sku": "abc"}]
+
+        assert work.execute(
+            "INSERT INTO products (sku, name, price) VALUES (:sku, :name, :price)",
+            {"sku": "ghi", "name": "Gamma", "price": 30},
+        ) == 1
+
+        def ghi_physical_count() -> int:
+            return ctx.db.execute(
+                "SELECT COUNT(*) AS count FROM _chronos_b_interval_products WHERE sku = 'ghi'"
+            ).fetchone()["count"]
+
+        before_child_delete = ghi_physical_count()
+        ctx.create_branch("child", from_branch="work")
+        child = native_store.checkout("child")
+        work_after_child = native_store.checkout("work")
+        assert work_after_child.execute("DELETE FROM products WHERE sku = :sku", {"sku": "ghi"}) == 1
+        assert ghi_physical_count() > before_child_delete
+        assert work_after_child.query(
+            "SELECT sku FROM products WHERE sku = :sku",
+            {"sku": "ghi"},
+        ) == []
+        assert child.query(
+            "SELECT sku FROM products WHERE sku = :sku",
+            {"sku": "ghi"},
+        ) == [{"sku": "ghi"}]
+    finally:
+        ctx.close()
+
+
 def test_postgres_interval_large_sparse_diff_is_change_proportional() -> None:
     _reset_postgres_schema()
     ctx = ChronosBranchContext.connect(_postgres_dsn(), backend="interval")
@@ -3967,6 +4167,8 @@ def test_interval_multi_row_insert_batches_direct_physical_rows(sql_backend: str
     session = ctx.checkout("exp")
     executemany_calls = 0
     physical_insert_executes = 0
+    visible_key_selects = 0
+    overlap_key_selects = 0
     original_execute = ctx.db.execute
     original_executemany = ctx.db.executemany
 
@@ -3987,16 +4189,51 @@ def test_interval_multi_row_insert_batches_direct_physical_rows(sql_backend: str
 
     ctx.db.execute = counting_execute  # type: ignore[method-assign]
     ctx.db.executemany = counting_executemany  # type: ignore[method-assign]
-    result = session.execute(
-        """
-        INSERT INTO products (sku, name, price)
-        VALUES ('ghi', 'Gamma', 30), ('jkl', 'Juliet', 40)
-        """
-    )
+    trace_installed = False
+
+    def trace_sql(sql: str) -> None:
+        nonlocal visible_key_selects, overlap_key_selects
+        normalized = " ".join(sql.split())
+        if (
+            normalized.upper().startswith("SELECT")
+            and "_chronos_b_interval_products" in normalized
+            and "live_lo <=" in normalized
+            and "deleted = FALSE" in normalized
+            and "(\"sku\" =" in normalized
+        ):
+            visible_key_selects += 1
+        if (
+            normalized.upper().startswith("SELECT")
+            and "_chronos_b_interval_products" in normalized
+            and "rowid" in normalized
+            and "writer_segment_id" in normalized
+            and "live_lo <" in normalized
+            and "< live_hi" in normalized
+            and "(\"sku\" =" in normalized
+        ):
+            overlap_key_selects += 1
+
+    if sql_backend == "sqlite":
+        ctx.db.raw_connection.set_trace_callback(trace_sql)
+        trace_installed = True
+
+    try:
+        result = session.execute(
+            """
+            INSERT INTO products (sku, name, price)
+            VALUES ('ghi', 'Gamma', 30), ('jkl', 'Juliet', 40)
+            """
+        )
+    finally:
+        if trace_installed:
+            ctx.db.raw_connection.set_trace_callback(None)
 
     assert result.rowcount == 2
     assert executemany_calls == 0
     assert physical_insert_executes == 0
+    if sql_backend == "sqlite":
+        assert visible_key_selects == 0
+        assert overlap_key_selects == 1
     assert session.query("SELECT sku, name, price FROM products WHERE sku >= 'ghi' ORDER BY sku") == [
         {"sku": "ghi", "name": "Gamma", "price": 30},
         {"sku": "jkl", "name": "Juliet", "price": 40},

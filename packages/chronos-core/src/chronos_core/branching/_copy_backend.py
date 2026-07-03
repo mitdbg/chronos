@@ -19,8 +19,158 @@ class _CopyBackend(_SQLBranchBackend):
     ):
         super().__init__(db)
         self.enable_schema_branching = bool(enable_schema_branching)
+        self._native_copy_store = None
+        self._native_copy_transaction_active = False
+        if not self.enable_schema_branching:
+            self._native_copy_store = self._create_native_copy_store()
+
+    def _create_native_copy_store(self) -> Any:
+        try:
+            from chronos_core import _native_interval
+
+            if self.db.dialect == "postgres":
+                database_url = getattr(self.db, "database_url", None)
+                if not database_url:
+                    raise BranchingError(
+                        "native PostgreSQL copy backend requires a database URL"
+                    )
+                return _native_interval.NativeCopyBranchStore(database_url)
+            return _native_interval.NativeCopyBranchStore.from_connection(
+                self.db.dialect,
+                self.db.raw_connection,
+            )
+        except Exception as exc:
+            raise BranchingError("native copy branch store is required") from exc
+
+    def _native_branch_info(self, row: dict[str, Any]) -> BranchInfo:
+        return BranchInfo(
+            branch_id=row["branch_id"],
+            current_ref=row["current_ref"],
+            backend=self.name,
+            created_at=row["created_at"],
+            metadata=_json_loads(row.get("metadata_json")),
+        )
+
+    def _native_checkpoint_info(self, row: dict[str, Any]) -> CheckpointInfo:
+        return CheckpointInfo(
+            checkpoint_id=row["checkpoint_id"],
+            branch_id=row["branch_id"],
+            ref=row["ref"],
+            created_at=row["created_at"],
+            metadata=_json_loads(row.get("metadata_json")),
+        )
+
+    def _native_table_meta(self, row: dict[str, Any]) -> _TableMeta:
+        return _TableMeta(
+            name=row["table_name"],
+            physical_name=row["physical_table"],
+            pk_columns=tuple(row["pk_columns"]),
+            columns=tuple(row["columns"]),
+            column_defs=tuple(row["column_defs"]),
+            backend=self.name,
+        )
+
+    def _native_session(self, ref: _PreparedBranchRef) -> Any:
+        session = ref.metadata.get("native_session")
+        if session is None:
+            raise BranchingError("native copy branch session is unavailable")
+        return session
+
+    def _drain_adapter_transaction_for_native_postgres(self) -> None:
+        if self._native_copy_store is None or self.db.dialect != "postgres":
+            return
+        if self.db.in_transaction:
+            self.db.commit()
+
+    def _native_autocommit(self, session: Any, op: Any) -> Any:
+        if self._native_copy_store is None:
+            raise BranchingError("native copy branch store is unavailable")
+        if self._native_copy_transaction_active:
+            return op()
+        started = False
+        try:
+            if not self._native_copy_store.in_transaction():
+                session.begin()
+                started = True
+            result = op()
+            if started:
+                session.commit()
+            return result
+        except Exception:
+            if started:
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+            raise
+
+    def adapter_transaction_required(self, ref: _PreparedBranchRef) -> bool:
+        return self._native_copy_store is None
+
+    def prepare_transaction(self, ref: _PreparedBranchRef) -> None:
+        if self._native_copy_store is None or ref.readonly:
+            return
+        self._native_copy_transaction_active = True
+        session = self._native_session(ref)
+        if not self._native_copy_store.in_transaction():
+            session.begin()
+
+    def commit_transaction(self, ref: _PreparedBranchRef) -> _PreparedBranchRef:
+        try:
+            if self._native_copy_store is not None and self._native_copy_store.in_transaction():
+                self._native_copy_store.commit()
+            return ref
+        finally:
+            self._native_copy_transaction_active = False
+
+    def rollback_transaction(self, ref: _PreparedBranchRef) -> None:
+        try:
+            if self._native_copy_store is not None and self._native_copy_store.in_transaction():
+                self._native_copy_store.rollback()
+        finally:
+            self._native_copy_transaction_active = False
+
+    def after_commit(self) -> None:
+        if self._native_copy_store is not None and self._native_copy_store.in_transaction():
+            self._native_copy_store.commit()
+
+    def after_rollback(self) -> None:
+        if self._native_copy_store is not None and self._native_copy_store.in_transaction():
+            self._native_copy_store.rollback()
+        self._native_copy_transaction_active = False
+
+    def close(self) -> None:
+        self._native_copy_store = None
+
+    def _translate_native_error(self, exc: Exception) -> Exception:
+        message = str(exc)
+        if "chronos_copy_branch_not_found:" in message:
+            return BranchNotFoundError(message.rsplit("chronos_copy_branch_not_found:", 1)[-1])
+        if "chronos_copy_checkpoint_not_found:" in message:
+            return BranchNotFoundError(
+                f"checkpoint:{message.rsplit('chronos_copy_checkpoint_not_found:', 1)[-1]}"
+            )
+        if "chronos_copy_branch_exists:" in message:
+            return BranchAlreadyExistsError(message.rsplit("chronos_copy_branch_exists:", 1)[-1])
+        if "chronos_copy_table_not_registered:" in message:
+            return TableNotRegisteredError(message.rsplit("chronos_copy_table_not_registered:", 1)[-1])
+        if "index columns missing from" in message:
+            return TableNotRegisteredError(message)
+        if "chronos_copy_duplicate_key:" in message or "duplicate key" in message.lower():
+            return DuplicateKeyError(message)
+        if "read-only" in message:
+            return BranchingError(message)
+        if "schema changes are disabled" in message:
+            return UnsupportedSQLError(message)
+        return exc
 
     def ensure(self) -> None:
+        if self._native_copy_store is not None:
+            self._drain_adapter_transaction_for_native_postgres()
+            self._native_copy_store.ensure()
+            self._native_copy_store.commit()
+            self.refresh_registries()
+            return
         self.db.execute(
             """
             CREATE TABLE IF NOT EXISTS _chronos_branch_copy_branches (
@@ -77,6 +227,17 @@ class _CopyBackend(_SQLBranchBackend):
         )
 
     def register_table(self, table: str, primary_key: list[str]) -> None:
+        if self._native_copy_store is not None:
+            try:
+                self._drain_adapter_transaction_for_native_postgres()
+                self._native_copy_store.register_table(table, primary_key)
+                self._native_copy_store.commit()
+            except Exception as exc:
+                self._native_copy_store.rollback()
+                translated = self._translate_native_error(exc)
+                raise translated from exc
+            self.refresh_registries()
+            return
         if table in self.tables:
             if self.enable_schema_branching:
                 self._record_copy_binding("branch", "main", self.tables[table], False)
@@ -123,6 +284,18 @@ class _CopyBackend(_SQLBranchBackend):
     def create_index(
         self, table: str, columns: list[str], name: str | None = None
     ) -> IndexInfo:
+        if self._native_copy_store is not None:
+            try:
+                self._drain_adapter_transaction_for_native_postgres()
+                index_name = self._native_copy_store.create_index(table, columns, name or "")
+                self._native_copy_store.commit()
+            except Exception as exc:
+                self._native_copy_store.rollback()
+                translated = self._translate_native_error(exc)
+                raise translated from exc
+            self.refresh_registries()
+            index = self.indexes[index_name]
+            return IndexInfo(index.name, index.table, index.columns, index.backend)
         meta, index = self._validate_index(table, columns, name)
         if index.name not in self.indexes:
             self._record_index(index)
@@ -150,6 +323,21 @@ class _CopyBackend(_SQLBranchBackend):
         *,
         terminal: bool = False,
     ) -> None:
+        if self._native_copy_store is not None:
+            if terminal:
+                raise BranchingError("terminal branches are supported only by the interval backend")
+            try:
+                self._drain_adapter_transaction_for_native_postgres()
+                self._native_copy_store.create_branch(
+                    branch_id,
+                    from_branch,
+                    _json_dumps(metadata),
+                )
+            except Exception as exc:
+                self._native_copy_store.rollback()
+                translated = self._translate_native_error(exc)
+                raise translated from exc
+            return
         if terminal:
             raise BranchingError("terminal branches are supported only by the interval backend")
         if self._branch_row(branch_id) is not None:
@@ -186,6 +374,19 @@ class _CopyBackend(_SQLBranchBackend):
     def update_branch_metadata(
         self, branch_id: str, metadata: dict[str, Any]
     ) -> BranchInfo:
+        if self._native_copy_store is not None:
+            try:
+                self._drain_adapter_transaction_for_native_postgres()
+                return self._native_branch_info(
+                    self._native_copy_store.update_branch_metadata(
+                        branch_id,
+                        _json_dumps(metadata),
+                    )
+                )
+            except Exception as exc:
+                self._native_copy_store.rollback()
+                translated = self._translate_native_error(exc)
+                raise translated from exc
         if self._branch_row(branch_id) is None:
             raise BranchNotFoundError(branch_id)
         self.db.execute(
@@ -195,6 +396,15 @@ class _CopyBackend(_SQLBranchBackend):
         return self.get_branch(branch_id)
 
     def create_branch_from_checkpoint(self, branch_id: str, checkpoint: str) -> None:
+        if self._native_copy_store is not None:
+            try:
+                self._drain_adapter_transaction_for_native_postgres()
+                self._native_copy_store.create_branch_from_checkpoint(branch_id, checkpoint)
+            except Exception as exc:
+                self._native_copy_store.rollback()
+                translated = self._translate_native_error(exc)
+                raise translated from exc
+            return
         if self._branch_row(branch_id) is not None:
             raise BranchAlreadyExistsError(branch_id)
         if self._checkpoint_row(checkpoint) is None:
@@ -225,6 +435,15 @@ class _CopyBackend(_SQLBranchBackend):
         )
 
     def delete_branch(self, branch_id: str) -> None:
+        if self._native_copy_store is not None:
+            try:
+                self._drain_adapter_transaction_for_native_postgres()
+                self._native_copy_store.delete_branch(branch_id)
+            except Exception as exc:
+                self._native_copy_store.rollback()
+                translated = self._translate_native_error(exc)
+                raise translated from exc
+            return
         if branch_id == "main":
             raise BranchingError("main cannot be deleted")
         if self._branch_row(branch_id) is None:
@@ -250,6 +469,11 @@ class _CopyBackend(_SQLBranchBackend):
         )
 
     def list_branches(self) -> list[BranchInfo]:
+        if self._native_copy_store is not None:
+            return [
+                self._native_branch_info(row)
+                for row in self._native_copy_store.list_branch_infos()
+            ]
         rows = self.db.execute(
             """
             SELECT branch_id, created_at, metadata
@@ -269,6 +493,14 @@ class _CopyBackend(_SQLBranchBackend):
         ]
 
     def get_branch(self, branch_id: str) -> BranchInfo:
+        if self._native_copy_store is not None:
+            try:
+                return self._native_branch_info(
+                    self._native_copy_store.get_branch_info(branch_id)
+                )
+            except Exception as exc:
+                translated = self._translate_native_error(exc)
+                raise translated from exc
         row = self._branch_row(branch_id)
         if row is None:
             raise BranchNotFoundError(branch_id)
@@ -283,6 +515,20 @@ class _CopyBackend(_SQLBranchBackend):
     def create_checkpoint(
         self, checkpoint: str, branch: str, metadata: dict[str, Any] | None = None
     ) -> CheckpointInfo:
+        if self._native_copy_store is not None:
+            try:
+                self._drain_adapter_transaction_for_native_postgres()
+                return self._native_checkpoint_info(
+                    self._native_copy_store.create_checkpoint(
+                        checkpoint,
+                        branch,
+                        _json_dumps(metadata),
+                    )
+                )
+            except Exception as exc:
+                self._native_copy_store.rollback()
+                translated = self._translate_native_error(exc)
+                raise translated from exc
         if self._checkpoint_row(checkpoint) is not None:
             raise BranchAlreadyExistsError(checkpoint)
         if self._branch_row(branch) is None:
@@ -315,6 +561,14 @@ class _CopyBackend(_SQLBranchBackend):
         return CheckpointInfo(checkpoint, branch, checkpoint, now, metadata or {})
 
     def get_checkpoint(self, checkpoint: str) -> CheckpointInfo:
+        if self._native_copy_store is not None:
+            try:
+                return self._native_checkpoint_info(
+                    self._native_copy_store.get_checkpoint_info(checkpoint)
+                )
+            except Exception as exc:
+                translated = self._translate_native_error(exc)
+                raise translated from exc
         row = self._checkpoint_row(checkpoint)
         if row is None:
             raise BranchNotFoundError(f"checkpoint:{checkpoint}")
@@ -331,6 +585,18 @@ class _CopyBackend(_SQLBranchBackend):
         branch: str | None = None,
         metadata_filter: dict[str, Any] | None = None,
     ) -> list[CheckpointInfo]:
+        if self._native_copy_store is not None:
+            infos = [
+                self._native_checkpoint_info(row)
+                for row in self._native_copy_store.list_checkpoint_infos(branch or "")
+            ]
+            if metadata_filter:
+                infos = [
+                    info
+                    for info in infos
+                    if all(info.metadata.get(key) == value for key, value in metadata_filter.items())
+                ]
+            return infos
         params: list[Any] = []
         where = ""
         if branch is not None:
@@ -368,6 +634,22 @@ class _CopyBackend(_SQLBranchBackend):
         return _BranchRef(cp.branch_id, cp.ref, readonly=True)
 
     def prepare_ref(self, ref: _BranchRef) -> _PreparedBranchRef:
+        if self._native_copy_store is not None:
+            try:
+                session = (
+                    self._native_copy_store.checkout_checkpoint(ref.ref)
+                    if ref.readonly
+                    else self._native_copy_store.checkout(ref.branch_id)
+                )
+            except Exception as exc:
+                translated = self._translate_native_error(exc)
+                raise translated from exc
+            return _PreparedBranchRef(
+                ref.branch_id,
+                ref.ref,
+                ref.readonly,
+                {"native_session": session},
+            )
         return _PreparedBranchRef(
             ref.branch_id,
             ref.ref,
@@ -386,6 +668,16 @@ class _CopyBackend(_SQLBranchBackend):
         return self.prepare_ref(_BranchRef(ref.branch_id, ref.ref, ref.readonly))
 
     def query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        if self._native_copy_store is not None:
+            try:
+                session = self._native_session(ref)
+                return self._native_autocommit(
+                    session,
+                    lambda: session.query(sql, params),
+                )
+            except Exception as exc:
+                translated = self._translate_native_error(exc)
+                raise translated from exc
         if self.enable_schema_branching:
             self._validate_query_tables_visible(ref, sql)
         rewrite_cache = ref.metadata.setdefault("query_rewrite_cache", {})
@@ -396,7 +688,47 @@ class _CopyBackend(_SQLBranchBackend):
         rows = self.db.execute(rewritten, params).fetchall()
         return [dict(row) for row in rows]
 
+    def explain(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        if self._native_copy_store is not None:
+            try:
+                session = self._native_session(ref)
+                return self._native_autocommit(
+                    session,
+                    lambda: session.explain(sql, params),
+                )
+            except Exception as exc:
+                translated = self._translate_native_error(exc)
+                raise translated from exc
+        if self.enable_schema_branching:
+            self._validate_query_tables_visible(ref, sql)
+        rewritten = _rewrite_tables(sql, self._prepared_replacements(ref), self.db.dialect)
+        rows = self.db.execute(f"EXPLAIN {rewritten}", params).fetchall()
+        return [dict(row) for row in rows]
+
+    def rewrite_query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> str:
+        if self._native_copy_store is not None:
+            try:
+                return self._native_session(ref).rewrite_query(sql, params)
+            except Exception as exc:
+                translated = self._translate_native_error(exc)
+                raise translated from exc
+        if self.enable_schema_branching:
+            self._validate_query_tables_visible(ref, sql)
+        return _rewrite_tables(sql, self._prepared_replacements(ref), self.db.dialect)
+
     def execute(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> ExecuteResult:
+        if self._native_copy_store is not None:
+            try:
+                session = self._native_session(ref)
+                return ExecuteResult(
+                    self._native_autocommit(
+                        session,
+                        lambda: session.execute(sql, params),
+                    )
+                )
+            except Exception as exc:
+                translated = self._translate_native_error(exc)
+                raise translated from exc
         if ref.readonly:
             raise BranchingError("checkpoint sessions are read-only")
         if self._is_schema_statement(sql):
@@ -433,15 +765,31 @@ class _CopyBackend(_SQLBranchBackend):
         return ExecuteResult(max(int(getattr(cur, "rowcount", 0)), 0))
 
     def visible_rows(self, branch_id: str, table: str) -> list[dict[str, Any]]:
+        if self._native_copy_store is not None:
+            try:
+                return self._native_copy_store.visible_rows(branch_id, table)
+            except Exception as exc:
+                translated = self._translate_native_error(exc)
+                raise translated from exc
         ref = self.prepare_ref(_BranchRef(branch_id, branch_id))
         return self.query(ref, f"SELECT * FROM {_quote_table_name(table)}", {})
 
     def diff_tables(self) -> list[str]:
+        if self._native_copy_store is not None:
+            return sorted(self._native_copy_store.table_names())
         if not self.enable_schema_branching:
             return super().diff_tables()
         return sorted(self._known_copy_tables())
 
     def table_meta_for_branch(self, branch_id: str, table: str) -> _TableMeta:
+        if self._native_copy_store is not None:
+            try:
+                return self._native_table_meta(
+                    self._native_copy_store.table_info(branch_id, table)
+                )
+            except Exception as exc:
+                translated = self._translate_native_error(exc)
+                raise translated from exc
         if not self.enable_schema_branching:
             return super().table_meta_for_branch(branch_id, table)
         meta = self._meta_for_owner("branch", branch_id, table)
@@ -450,6 +798,9 @@ class _CopyBackend(_SQLBranchBackend):
         return meta
 
     def upsert_row(self, branch_id: str, table: str, row: dict[str, Any]) -> None:
+        if self._native_copy_store is not None:
+            self.upsert_rows(branch_id, table, [row])
+            return
         meta = (
             self._meta_for_owner("branch", branch_id, table)
             if self.enable_schema_branching
@@ -481,6 +832,9 @@ class _CopyBackend(_SQLBranchBackend):
         )
 
     def delete_key(self, branch_id: str, table: str, key: dict[str, Any]) -> None:
+        if self._native_copy_store is not None:
+            self.delete_keys(branch_id, table, [key])
+            return
         meta = (
             self._meta_for_owner("branch", branch_id, table)
             if self.enable_schema_branching
@@ -495,6 +849,61 @@ class _CopyBackend(_SQLBranchBackend):
             """,
             self._key_values(meta, key),
         )
+
+    def upsert_rows(
+        self, branch_id: str, table: str, rows: list[dict[str, Any]]
+    ) -> None:
+        if self._native_copy_store is None:
+            return super().upsert_rows(branch_id, table, rows)
+        if not rows:
+            return
+        try:
+            meta = self._native_table_meta(
+                self._native_copy_store.table_info(branch_id, table)
+            )
+            session = self._native_copy_store.checkout(branch_id)
+            self._native_autocommit(
+                session,
+                lambda: session.upsert_rows(
+                    table,
+                    list(meta.columns),
+                    list(meta.pk_columns),
+                    rows,
+                ),
+            )
+        except Exception as exc:
+            translated = self._translate_native_error(exc)
+            raise translated from exc
+
+    def delete_keys(
+        self, branch_id: str, table: str, keys: list[dict[str, Any]]
+    ) -> None:
+        if self._native_copy_store is None:
+            return super().delete_keys(branch_id, table, keys)
+        if not keys:
+            return
+        try:
+            meta = self._native_table_meta(
+                self._native_copy_store.table_info(branch_id, table)
+            )
+            tombstones = []
+            for key in keys:
+                tombstone = {column: None for column in meta.columns}
+                tombstone.update(key)
+                tombstones.append(tombstone)
+            session = self._native_copy_store.checkout(branch_id)
+            self._native_autocommit(
+                session,
+                lambda: session.delete_rows(
+                    table,
+                    list(meta.columns),
+                    list(meta.pk_columns),
+                    tombstones,
+                ),
+            )
+        except Exception as exc:
+            translated = self._translate_native_error(exc)
+            raise translated from exc
 
     def _visible_row(
         self, branch_id: str, table: str, key: dict[str, Any]

@@ -928,15 +928,43 @@ def _mounted_chronosfs_database(
             )
         yield
     finally:
-        subprocess.run(
-            ["fusermount3", "-u", str(mountpoint)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        for _ in range(20):
+            subprocess.run(
+                ["fusermount3", "-u", str(mountpoint)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            probe = subprocess.run(
+                ["mountpoint", "-q", str(mountpoint)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if probe.returncode != 0:
+                break
+            time.sleep(0.25)
+        else:
+            subprocess.run(
+                ["fusermount3", "-uz", str(mountpoint)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
+            subprocess.run(
+                ["fusermount3", "-uz", str(mountpoint)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+        if proc.poll() is None:
             proc.terminate()
             try:
                 proc.wait(timeout=5)

@@ -66,7 +66,7 @@ set_target_properties(duckdb_shared PROPERTIES
 
 pybind11_add_module(_native_interval
   src/chronos_core/native/interval_module.cpp
-  src/chronos_core/native/interval_data_plane.cpp
+  src/chronos_core/native/native_backends.cpp
   src/chronos_core/native/chronosfs_fuse.cpp
 )
 target_compile_features(_native_interval PRIVATE cxx_std_17)

@@ -105,6 +105,8 @@ class NativeBranchStoreImpl {
     NativeSqlDriver &driver() { return data_driver(); }
     NativeSqlDriver &metadata_driver() { return *driver_; }
     bool split_store() const { return data_driver_ptr() != nullptr; }
+    void set_create_secondary_indexes(bool enabled) { create_secondary_indexes_ = enabled; }
+    bool create_secondary_indexes() const { return create_secondary_indexes_; }
     bool in_transaction() const {
         NativeSqlDriver *data = data_driver_ptr();
         return driver_->in_transaction() || (data != nullptr && data->in_transaction());
@@ -233,6 +235,7 @@ class NativeBranchStoreImpl {
     std::unique_ptr<NativeSqlDriver> data_driver_;
     NativeSqlDriver *borrowed_data_driver_ = nullptr;
     NativeSqlDriver *driver_ = nullptr;
+    bool create_secondary_indexes_ = true;
     std::vector<std::string> deferred_schema_index_sqls_;
     std::mutex statement_plan_cache_mutex_;
     std::unordered_map<std::string, CachedNativeStatement> statement_plan_cache_;

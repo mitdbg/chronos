@@ -925,6 +925,72 @@ def test_duckdb_split_interval_store_with_local_metadata_adapter() -> None:
         ctx.close()
 
 
+def test_duckdb_split_interval_comma_join_rewrites_every_table() -> None:
+    from chronos_core.branching.sql_adapters import DuckDBDatabaseAdapter
+
+    data = DuckDBDatabaseAdapter.connect("duckdb:///:memory:")
+    metadata = _sqlite_memory()
+    ctx = ChronosBranchContext.from_database_adapter(
+        data,
+        backend="interval",
+        metadata_db=metadata,
+    )
+    try:
+        ctx.db.execute("CREATE TABLE dims (did VARCHAR PRIMARY KEY, label VARCHAR)")
+        ctx.db.execute(
+            "CREATE TABLE facts (id VARCHAR PRIMARY KEY, fk VARCHAR, amount INTEGER)"
+        )
+        ctx.db.execute("INSERT INTO dims VALUES (?, ?)", ("d1", "base"))
+        ctx.db.execute("INSERT INTO facts VALUES (?, ?, ?)", ("f1", "d1", 10))
+        ctx.db.commit()
+        ctx.register_table("dims", ["did"])
+        ctx.register_table("facts", ["id"])
+
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        agent.execute(
+            "UPDATE facts SET amount = :amount WHERE id = :id",
+            {"id": "f1", "amount": 50},
+        )
+
+        sql = "SELECT sum(amount) AS total FROM dims, facts WHERE did = fk"
+        rewritten = agent.rewrite_query(sql)
+
+        assert "_chronos_b_interval_dims" in rewritten
+        assert "_chronos_b_interval_facts" in rewritten
+        assert agent.query(sql) == [{"total": 50}]
+        assert ctx.checkout("main").query(sql) == [{"total": 10}]
+    finally:
+        ctx.close()
+
+
+def test_duckdb_split_interval_select_rewrite_wraps_visibility_predicate() -> None:
+    from chronos_core.branching.sql_adapters import DuckDBDatabaseAdapter
+
+    data = DuckDBDatabaseAdapter.connect("duckdb:///:memory:")
+    metadata = _sqlite_memory()
+    ctx = ChronosBranchContext.from_database_adapter(
+        data,
+        backend="interval",
+        metadata_db=metadata,
+    )
+    try:
+        ctx.db.execute("CREATE TABLE facts (id VARCHAR PRIMARY KEY, amount INTEGER)")
+        ctx.db.execute("INSERT INTO facts VALUES (?, ?)", ("f1", 10))
+        ctx.db.commit()
+        ctx.register_table("facts", ["id"])
+
+        session = ctx.checkout("main")
+        rewritten = session.rewrite_query("SELECT sum(amount) AS total FROM facts")
+
+        assert "_chronos_b_interval_facts" in rewritten
+        assert "WHERE if(live_lo <=" in rewritten
+        assert "deleted = FALSE, TRUE, FALSE)" in rewritten
+        assert session.query("SELECT sum(amount) AS total FROM facts") == [{"total": 10}]
+    finally:
+        ctx.close()
+
+
 def test_duckdb_split_interval_merge_apply_uses_row_store_commit_metadata() -> None:
     from chronos_core.branching.sql_adapters import DuckDBDatabaseAdapter
 
@@ -1101,6 +1167,77 @@ def test_duckdb_split_interval_create_index_uses_data_plane() -> None:
             """,
             ("_chronos_idx_interval_facts_amount",),
         ).fetchall() == []
+    finally:
+        ctx.close()
+
+
+def test_duckdb_split_interval_secondary_indexes_are_optional() -> None:
+    from chronos_core.branching.sql_adapters import DuckDBDatabaseAdapter
+
+    def registered_index_names(*, create_secondary_indexes: bool = True) -> set[str]:
+        data = DuckDBDatabaseAdapter.connect("duckdb:///:memory:")
+        metadata = _sqlite_memory()
+        ctx = ChronosBranchContext.from_database_adapter(
+            data,
+            backend="interval",
+            metadata_db=metadata,
+            interval_create_secondary_indexes=create_secondary_indexes,
+        )
+        try:
+            ctx.db.execute("CREATE TABLE facts (id VARCHAR PRIMARY KEY, amount BIGINT)")
+            ctx.db.execute("INSERT INTO facts VALUES (?, ?)", ("f1", 10))
+            ctx.db.commit()
+            ctx.register_table("facts", ["id"])
+            return {
+                row["index_name"]
+                for row in ctx.db.execute(
+                    """
+                    SELECT index_name
+                    FROM duckdb_indexes()
+                    WHERE table_name = '_chronos_b_interval_facts'
+                      AND index_name LIKE 'idx__chronos_b_interval_facts_%'
+                    """
+                ).fetchall()
+            }
+        finally:
+            ctx.close()
+
+    assert registered_index_names() == {
+        "idx__chronos_b_interval_facts_pk_hi",
+        "idx__chronos_b_interval_facts_writer_segment",
+    }
+    assert registered_index_names(create_secondary_indexes=False) == set()
+
+
+def test_duckdb_split_interval_preserves_date_and_decimal_result_types() -> None:
+    from datetime import date
+    from decimal import Decimal
+
+    from chronos_core.branching.sql_adapters import DuckDBDatabaseAdapter
+
+    data = DuckDBDatabaseAdapter.connect("duckdb:///:memory:")
+    metadata = _sqlite_memory()
+    ctx = ChronosBranchContext.from_database_adapter(
+        data,
+        backend="interval",
+        metadata_db=metadata,
+        interval_create_secondary_indexes=False,
+    )
+    try:
+        ctx.db.execute(
+            "CREATE TABLE facts (id INTEGER PRIMARY KEY, d DATE, x DECIMAL(10,2))"
+        )
+        ctx.db.execute("INSERT INTO facts VALUES (1, DATE '1995-02-23', 318.00)")
+        ctx.db.commit()
+        ctx.register_table("facts", ["id"])
+        ctx.create_branch("bench", from_branch="main")
+
+        native = ctx.db.execute("SELECT id, d, x FROM facts").fetchall()[0]
+        chronos = ctx.checkout("bench").query("SELECT id, d, x FROM facts")[0]
+
+        assert chronos == native
+        assert chronos["d"] == date(1995, 2, 23)
+        assert chronos["x"] == Decimal("318.00")
     finally:
         ctx.close()
 

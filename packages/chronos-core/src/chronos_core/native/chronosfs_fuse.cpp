@@ -678,18 +678,24 @@ class NativeChronosFS {
 
     void unlink_path(const std::string &path, bool allow_dir) {
         auto [parent_path, name] = split_parent(path);
-        Inode parent = inode_for_path(parent_path);
-        auto entry = dirent(parent.id, name);
-        if (!entry.first) throw FsError(ENOENT, "path not found");
-        Inode inode = inode_by_id(entry.second);
-        if (inode.kind == "directory" && !allow_dir) throw FsError(EISDIR, "is directory");
-        if (inode.kind == "directory" && !listdir(path).empty()) throw FsError(ENOTEMPTY, "not empty");
-        upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, entry.second, now_text()}, true);
-        upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), true);
-        touch(parent.id);
+        std::int64_t parent_id = 0;
+        std::int64_t inode_id = 0;
+        transaction([&] {
+            Inode parent = inode_for_path(parent_path);
+            parent_id = parent.id;
+            auto entry = dirent(parent.id, name);
+            if (!entry.first) throw FsError(ENOENT, "path not found");
+            inode_id = entry.second;
+            Inode inode = inode_by_id(entry.second);
+            if (inode.kind == "directory" && !allow_dir) throw FsError(EISDIR, "is directory");
+            if (inode.kind == "directory" && !listdir(path).empty()) throw FsError(ENOTEMPTY, "not empty");
+            upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, entry.second, now_text()}, true);
+            upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), true);
+            touch(parent.id);
+        });
         forget_path_tree(path);
-        inode_cache_.erase(entry.second);
-        dirent_cache_.erase(dirent_key(parent.id, name));
+        inode_cache_.erase(inode_id);
+        dirent_cache_.erase(dirent_key(parent_id, name));
     }
 
     void rename_path(const std::string &from, const std::string &to) {
@@ -924,17 +930,21 @@ class NativeChronosFS {
     }
 
     void unlink_at_public(std::int64_t parent_inode_id, const std::string &name, bool allow_dir) {
-        Inode parent = inode_by_id(parent_inode_id);
-        auto entry = dirent(parent.id, name);
-        if (!entry.first) throw FsError(ENOENT, "path not found");
-        Inode inode = inode_by_id(entry.second);
-        if (inode.kind == "directory" && !allow_dir) throw FsError(EISDIR, "is directory");
-        if (inode.kind == "directory" && !listdir_inode_id(inode.id).empty()) throw FsError(ENOTEMPTY, "not empty");
-        upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, entry.second, now_text()}, true);
-        upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), true);
-        touch(parent.id);
-        inode_cache_.erase(entry.second);
-        dirent_cache_[dirent_key(parent.id, name)] = {false, 0};
+        std::int64_t inode_id = 0;
+        transaction([&] {
+            Inode parent = inode_by_id(parent_inode_id);
+            auto entry = dirent(parent.id, name);
+            if (!entry.first) throw FsError(ENOENT, "path not found");
+            inode_id = entry.second;
+            Inode inode = inode_by_id(entry.second);
+            if (inode.kind == "directory" && !allow_dir) throw FsError(EISDIR, "is directory");
+            if (inode.kind == "directory" && !listdir_inode_id(inode.id).empty()) throw FsError(ENOTEMPTY, "not empty");
+            upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, entry.second, now_text()}, true);
+            upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), true);
+            touch(parent.id);
+        });
+        inode_cache_.erase(inode_id);
+        dirent_cache_[dirent_key(parent_inode_id, name)] = {false, 0};
     }
 
     void rename_at_public(
@@ -1973,6 +1983,41 @@ class NativeChronosFS {
         return extents;
     }
 
+    std::vector<FileExtent> visible_fixed_block_extents(
+        std::int64_t inode_id,
+        std::int64_t start,
+        std::int64_t end) {
+        if (start >= end) return {};
+        std::vector<std::int64_t> block_starts;
+        std::int64_t block_start = (start / block_size_) * block_size_;
+        const std::int64_t last_block = ((end - 1) / block_size_) * block_size_;
+        while (block_start <= last_block) {
+            block_starts.push_back(block_start);
+            block_start += block_size_;
+        }
+        if (block_starts.empty()) return {};
+
+        constexpr std::size_t kMaxExactBlockLookup = 512;
+        if (block_starts.size() > kMaxExactBlockLookup) {
+            return visible_extents(inode_id, start, end);
+        }
+
+        std::vector<IntervalValue> params;
+        params.reserve(1 + block_starts.size());
+        params.push_back(inode_id);
+        for (std::int64_t value : block_starts) params.push_back(value);
+        auto rows = visible(
+            "chronosfs_file_blocks",
+            block_cols(),
+            "inode_id = ? AND byte_start IN (" + sql_placeholders(block_starts.size()) + ")",
+            params,
+            "ORDER BY byte_start");
+        std::vector<FileExtent> extents;
+        extents.reserve(rows.size());
+        for (auto &row : rows) extents.push_back(extent_from_row(row));
+        return extents;
+    }
+
     IntervalBlob read_source_range(
         const Inode &inode,
         std::int64_t offset,
@@ -2039,7 +2084,9 @@ class NativeChronosFS {
         std::int64_t size) {
         if (size <= 0 || offset >= inode.size) return {};
         std::int64_t end = std::min(inode.size, offset + size);
-        auto extents = visible_extents(inode.id, offset, end);
+        auto extents = inode.source_path.empty()
+            ? visible_fixed_block_extents(inode.id, offset, end)
+            : visible_extents(inode.id, offset, end);
         IntervalBlob out;
         out.reserve(static_cast<std::size_t>(end - offset));
         std::int64_t cursor = offset;

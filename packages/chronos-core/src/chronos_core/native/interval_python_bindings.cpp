@@ -68,19 +68,21 @@ class SQLiteIntervalConnectionAdapter final : public IntervalConnectionAdapter {
         bool replacement_deleted,
         bool manage_transaction
     ) override {
-	        return sqlite_adapter_bulk_upsert(
-	            db_,
-	            physical_name,
+		        return sqlite_adapter_bulk_upsert(
+		            db_,
+		            physical_name,
             columns,
             pk_columns,
             rows,
             live_lo,
 	            live_hi,
 	            writer_segment_id,
-	            replacement_deleted,
-	            manage_transaction,
-	            &interval_upsert_statements_
-	        );
+		            replacement_deleted,
+		            manage_transaction,
+		            &interval_upsert_statements_,
+                    IntervalWriteMode::Upsert,
+                    live_lo
+		        ).stats;
 	    }
 
   private:
@@ -161,8 +163,10 @@ class PostgresIntervalConnectionAdapter final : public IntervalConnectionAdapter
             writer_segment_id,
             replacement_deleted,
             manage_transaction,
-            &interval_upsert_statements_
-        );
+            &interval_upsert_statements_,
+            IntervalWriteMode::Upsert,
+            std::to_string(live_lo)
+        ).stats;
     }
 
   private:
@@ -537,6 +541,18 @@ IntervalQueryResult NativeBranchSession::query(
     return {std::move(result.columns), std::move(result.rows)};
 }
 
+IntervalQueryResult NativeBranchSession::explain(
+    const std::string &sql,
+    const std::vector<IntervalValue> &params
+) {
+    QueryResult result = impl_->explain(sql, params);
+    return {std::move(result.columns), std::move(result.rows)};
+}
+
+std::string NativeBranchSession::rewrite_query(const std::string &sql) {
+    return impl_->rewrite_query(sql);
+}
+
 std::int64_t NativeBranchSession::execute(
     const std::string &sql,
     const std::vector<IntervalValue> &params
@@ -614,6 +630,14 @@ NativeBranchSession NativeBranchStore::checkout_segment(
 
 void NativeBranchStore::ensure(bool enable_schema_branching) {
     impl_->ensure_metadata(enable_schema_branching);
+}
+
+void NativeBranchStore::set_create_secondary_indexes(bool enabled) {
+    impl_->set_create_secondary_indexes(enabled);
+}
+
+bool NativeBranchStore::create_secondary_indexes() const {
+    return impl_->create_secondary_indexes();
 }
 
 void NativeBranchStore::register_table(
@@ -817,7 +841,7 @@ IntervalBulkUpsertStats sqlite_interval_bulk_upsert(
     bool replacement_deleted,
     bool manage_transaction
 ) {
-    BulkUpsertStats stats = sqlite_adapter_bulk_upsert(
+    BulkUpsertResult result = sqlite_adapter_bulk_upsert(
         db,
         physical_name,
         columns,
@@ -828,8 +852,11 @@ IntervalBulkUpsertStats sqlite_interval_bulk_upsert(
         writer_segment_id,
         replacement_deleted,
         manage_transaction,
-        nullptr
+        nullptr,
+        IntervalWriteMode::Upsert,
+        live_lo
     );
+    BulkUpsertStats stats = result.stats;
     return {stats.selected, stats.deleted_rows, stats.inserted};
 }
 
@@ -871,7 +898,7 @@ IntervalBulkUpsertStats postgres_interval_bulk_upsert(
     bool replacement_deleted,
     bool manage_transaction
 ) {
-    BulkUpsertStats stats = postgres_adapter_bulk_upsert(
+    BulkUpsertResult result = postgres_adapter_bulk_upsert(
         conn,
         physical_name,
         columns,
@@ -881,8 +908,12 @@ IntervalBulkUpsertStats postgres_interval_bulk_upsert(
         live_hi,
         writer_segment_id,
         replacement_deleted,
-        manage_transaction
+        manage_transaction,
+        nullptr,
+        IntervalWriteMode::Upsert,
+        live_lo
     );
+    BulkUpsertStats stats = result.stats;
     return {stats.selected, stats.deleted_rows, stats.inserted};
 }
 
@@ -918,6 +949,33 @@ void bind_interval_data_plane(py::module_ &m) {
                     out.append(item);
                 }
                 return out;
+            },
+            py::arg("sql"),
+            py::arg("params") = py::dict()
+        )
+        .def(
+            "explain",
+            [](NativeBranchSession &session, const std::string &sql, const py::object &params) {
+                BoundSql bound = bind_sql_params(sql, params);
+                auto result = session.explain(bound.sql, bound.positional_params);
+                py::list out;
+                for (const auto &row : result.rows) {
+                    py::dict item;
+                    for (std::size_t i = 0; i < result.columns.size() && i < row.size(); ++i) {
+                        item[result.columns[i].c_str()] = value_to_py(row[i]);
+                    }
+                    out.append(item);
+                }
+                return out;
+            },
+            py::arg("sql"),
+            py::arg("params") = py::dict()
+        )
+        .def(
+            "rewrite_query",
+            [](NativeBranchSession &session, const std::string &sql, const py::object &params) {
+                BoundSql bound = bind_sql_params(sql, params);
+                return session.rewrite_query(bound.sql);
             },
             py::arg("sql"),
             py::arg("params") = py::dict()
@@ -1067,6 +1125,12 @@ void bind_interval_data_plane(py::module_ &m) {
             py::arg("branch_point")
         )
         .def("ensure", &NativeBranchStore::ensure, py::arg("enable_schema_branching") = false)
+        .def(
+            "set_create_secondary_indexes",
+            &NativeBranchStore::set_create_secondary_indexes,
+            py::arg("enabled")
+        )
+        .def("create_secondary_indexes", &NativeBranchStore::create_secondary_indexes)
         .def(
             "register_table",
             &NativeBranchStore::register_table,

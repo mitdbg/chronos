@@ -980,6 +980,12 @@ class _SQLBranchBackend:
     def query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         raise NotImplementedError
 
+    def explain(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def rewrite_query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> str:
+        raise NotImplementedError
+
     def execute(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> ExecuteResult:
         raise NotImplementedError
 

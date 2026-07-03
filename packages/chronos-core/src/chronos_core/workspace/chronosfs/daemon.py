@@ -19,6 +19,9 @@ from typing import Any
 
 from chronos_core import _native_interval
 
+MOUNT_READY_TIMEOUT_S = 30.0
+MOUNT_START_ATTEMPTS = 3
+
 
 def _load_options(raw: str) -> list[str]:
     value = json.loads(raw)
@@ -40,13 +43,20 @@ def _serve_mount(
         state.active_mountpoints.add(mountpoint)
         state.unmounted_since = None
     try:
-        _native_interval.mount_chronosfs_native(
+        rc = _native_interval.mount_chronosfs_native(
             database_url,
             mountpoint,
             branch_id,
             block_size,
             options,
         )
+        if rc != 0:
+            with state.active_guard:
+                state.last_mount_error = f"native ChronosFS mount exited with status {rc}"
+    except BaseException as exc:
+        with state.active_guard:
+            state.last_mount_error = repr(exc)
+        raise
     finally:
         with state.active_guard:
             state.active_mounts -= 1
@@ -62,6 +72,7 @@ class _DaemonState:
         self.last_idle_at = time.monotonic()
         self.shutdown_requested = False
         self.unmounted_since: float | None = None
+        self.last_mount_error: str | None = None
         self.active_guard = threading.Lock()
 
     def should_exit(self, idle_timeout_s: float, stale_unmounted_timeout_s: float) -> bool:
@@ -118,12 +129,35 @@ def _handle_client(
                 or not all(isinstance(item, str) for item in options)
             ):
                 raise ValueError("options must be a list of strings")
-            thread = threading.Thread(
-                target=_serve_mount,
-                args=(database_url, branch_id, block_size, options, mountpoint, state),
-                daemon=True,
-            )
-            thread.start()
+            last_error = ""
+            for attempt in range(1, MOUNT_START_ATTEMPTS + 1):
+                with state.active_guard:
+                    state.last_mount_error = None
+                thread = threading.Thread(
+                    target=_serve_mount,
+                    args=(database_url, branch_id, block_size, options, mountpoint, state),
+                    daemon=True,
+                )
+                thread.start()
+                deadline = time.monotonic() + MOUNT_READY_TIMEOUT_S
+                while time.monotonic() < deadline:
+                    if os.path.ismount(mountpoint):
+                        break
+                    if not thread.is_alive():
+                        with state.active_guard:
+                            last_error = state.last_mount_error or ""
+                        if not last_error:
+                            last_error = f"ChronosFS mount thread exited before mounting {mountpoint}"
+                        break
+                    time.sleep(0.05)
+                else:
+                    last_error = f"timed out waiting for ChronosFS mount at {mountpoint}"
+                if os.path.ismount(mountpoint):
+                    break
+                if attempt < MOUNT_START_ATTEMPTS:
+                    time.sleep(0.2)
+            else:
+                raise RuntimeError(last_error or f"ChronosFS mount failed for {mountpoint}")
             response: dict[str, Any] = {"status": "ok"}
         except Exception as exc:
             response = {"status": "error", "error": str(exc)}

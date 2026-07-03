@@ -35,6 +35,7 @@ class _IntervalBackend(_SQLBranchBackend):
         child_width: int | None = None,
         allocation_strategy: IntervalAllocationStrategy = "adaptive",
         enable_schema_branching: bool = False,
+        create_secondary_indexes: bool = True,
     ):
         super().__init__(db)
         self.continuation_percent = _validate_interval_continuation_percent(
@@ -45,6 +46,7 @@ class _IntervalBackend(_SQLBranchBackend):
             allocation_strategy
         )
         self.enable_schema_branching = bool(enable_schema_branching)
+        self.create_secondary_indexes = bool(create_secondary_indexes)
         self._interval_gc_requested = False
         self._native_branch_store = None
         self._native_branch_sessions: dict[tuple[str, int], Any] = {}
@@ -61,6 +63,13 @@ class _IntervalBackend(_SQLBranchBackend):
     def _initialize_native_branch_store(self) -> None:
         if self._native_branch_store is None:
             self._native_branch_store = self._create_native_branch_store()
+            set_create_secondary_indexes = getattr(
+                self._native_branch_store,
+                "set_create_secondary_indexes",
+                None,
+            )
+            if callable(set_create_secondary_indexes):
+                set_create_secondary_indexes(self.create_secondary_indexes)
 
     def refresh_native_connections(self) -> None:
         self._invalidate_native_branch_sessions()
@@ -632,6 +641,38 @@ class _IntervalBackend(_SQLBranchBackend):
                 raise TableNotRegisteredError(message) from exc
             raise
         return self._coerce_native_query_rows(ref, sql, rows)
+
+    def explain(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        segment = self._prepared_segment(ref)
+        if self._native_branch_store is None:
+            raise BranchingError("native interval branch store is unavailable")
+        native_session = self._native_branch_session_for_segment(ref.branch_id, segment)
+        try:
+            return native_session.explain(sql, params)
+        except Exception as exc:
+            message = str(exc)
+            if "chronos_table_not_registered:" in message:
+                table = message.rsplit("chronos_table_not_registered:", 1)[-1].strip()
+                raise TableNotRegisteredError(table) from exc
+            if "table is not registered for interval branching" in message:
+                raise TableNotRegisteredError(message) from exc
+            raise
+
+    def rewrite_query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> str:
+        segment = self._prepared_segment(ref)
+        if self._native_branch_store is None:
+            raise BranchingError("native interval branch store is unavailable")
+        native_session = self._native_branch_session_for_segment(ref.branch_id, segment)
+        try:
+            return native_session.rewrite_query(sql, params)
+        except Exception as exc:
+            message = str(exc)
+            if "chronos_table_not_registered:" in message:
+                table = message.rsplit("chronos_table_not_registered:", 1)[-1].strip()
+                raise TableNotRegisteredError(table) from exc
+            if "table is not registered for interval branching" in message:
+                raise TableNotRegisteredError(message) from exc
+            raise
 
     def _coerce_native_query_rows(
         self,

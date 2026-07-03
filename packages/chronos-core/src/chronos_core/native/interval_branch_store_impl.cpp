@@ -145,8 +145,9 @@
 //       Secondary indexes:
 //         (<pk columns...>, live_hi)
 //         (writer_segment_id, <pk columns...>)
-//       These are data-plane tables, but their physical names are stored in
-//       _chronos_branch_tables and are created by this metadata/control layer.
+//       These optional data-plane indexes default to enabled. The physical
+//       table names are stored in _chronos_branch_tables and are created by
+//       this metadata/control layer.
 //
 
 
@@ -470,12 +471,16 @@
                 if (enable_schema_branching) {
                     ensure_base_schema_version(meta, "register");
                 }
+                if (create_secondary_indexes()) {
+                    driver().execute(pk_hi_index_sql(meta.physical_name, meta.pk_columns));
+                    driver().execute(writer_segment_index_sql(meta.physical_name, meta.pk_columns));
+                }
                 if (started_tx) driver_->execute("COMMIT");
                 return;
             }
 
             const std::string physical = "_chronos_b_interval_" + physical_table_suffix(table);
-            create_interval_physical_table(physical, defs, primary_key);
+            create_interval_physical_table(physical, defs, primary_key, create_secondary_indexes());
             std::vector<std::string> target_columns = columns;
             target_columns.push_back("live_lo");
             target_columns.push_back("live_hi");
@@ -2043,7 +2048,9 @@
                                 reservation.merge_segment.live_hi,
                                 reservation.merge_segment.segment_id,
                                 true,
-                                false
+                                false,
+                                IntervalWriteMode::Upsert,
+                                reservation.merge_segment.branch_point
                             );
                         }
                         if (!pending.upserts.empty()) {
@@ -2056,7 +2063,9 @@
                                 reservation.merge_segment.live_hi,
                                 reservation.merge_segment.segment_id,
                                 false,
-                                false
+                                false,
+                                IntervalWriteMode::Upsert,
+                                reservation.merge_segment.branch_point
                             );
                         }
                     }
@@ -3350,7 +3359,9 @@
                             reservation.merge_segment.live_hi,
                             reservation.merge_segment.segment_id,
                             true,
-                            false
+                            false,
+                            IntervalWriteMode::Upsert,
+                            reservation.merge_segment.branch_point
                         );
                         applied += static_cast<std::int64_t>(deletes.size());
                     }
@@ -3364,7 +3375,9 @@
                             reservation.merge_segment.live_hi,
                             reservation.merge_segment.segment_id,
                             false,
-                            false
+                            false,
+                            IntervalWriteMode::Upsert,
+                            reservation.merge_segment.branch_point
                         );
                         applied += static_cast<std::int64_t>(upserts.size());
                     }

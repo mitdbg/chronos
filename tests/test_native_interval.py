@@ -278,6 +278,70 @@ def test_native_branch_session_executes_branch_aware_sql(tmp_path):
         ctx.close()
 
 
+def test_native_branch_session_updates_with_primary_key_prefix_predicate(tmp_path):
+    db_path = tmp_path / "branch_prefix_update.sqlite"
+    ctx = ChronosBranchContext.connect(f"sqlite:///{db_path}", backend="interval")
+    try:
+        ctx.conn.execute(
+            """
+            CREATE TABLE order_line (
+                w_id INTEGER NOT NULL,
+                d_id INTEGER NOT NULL,
+                o_id INTEGER NOT NULL,
+                line_number INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                delivered INTEGER NOT NULL,
+                PRIMARY KEY (w_id, d_id, o_id, line_number)
+            )
+            """
+        )
+        ctx.conn.executemany(
+            "INSERT INTO order_line VALUES (?, ?, ?, ?, ?, 0)",
+            [
+                (1, 1, 10, 1, 10),
+                (1, 1, 10, 2, 20),
+                (1, 1, 10, 3, 30),
+                (1, 1, 11, 1, 40),
+                (1, 2, 10, 1, 50),
+                (2, 1, 10, 1, 60),
+            ],
+        )
+        ctx.conn.commit()
+        ctx.register_table("order_line", ["w_id", "d_id", "o_id", "line_number"])
+        ctx.create_branch("child")
+
+        native_store = native_interval.NativeBranchStore("sqlite", ctx.db.raw_connection)
+        child = native_store.checkout("child")
+        assert child.execute(
+            """
+            UPDATE order_line
+            SET delivered = :delivered
+            WHERE o_id = :o_id AND d_id = :d_id AND w_id = :w_id
+            """,
+            {"delivered": 1, "o_id": 10, "d_id": 1, "w_id": 1},
+        ) == 3
+
+        assert child.query(
+            """
+            SELECT w_id, d_id, o_id, line_number, delivered
+            FROM order_line
+            ORDER BY w_id, d_id, o_id, line_number
+            """
+        ) == [
+            {"w_id": 1, "d_id": 1, "o_id": 10, "line_number": 1, "delivered": 1},
+            {"w_id": 1, "d_id": 1, "o_id": 10, "line_number": 2, "delivered": 1},
+            {"w_id": 1, "d_id": 1, "o_id": 10, "line_number": 3, "delivered": 1},
+            {"w_id": 1, "d_id": 1, "o_id": 11, "line_number": 1, "delivered": 0},
+            {"w_id": 1, "d_id": 2, "o_id": 10, "line_number": 1, "delivered": 0},
+            {"w_id": 2, "d_id": 1, "o_id": 10, "line_number": 1, "delivered": 0},
+        ]
+        assert native_store.checkout("main").query(
+            "SELECT COUNT(*) AS changed FROM order_line WHERE delivered = 1"
+        ) == [{"changed": 0}]
+    finally:
+        ctx.close()
+
+
 def test_native_branch_store_creates_logical_index(tmp_path):
     db_path = tmp_path / "branch_index.sqlite"
     ctx = ChronosBranchContext.connect(f"sqlite:///{db_path}", backend="interval")

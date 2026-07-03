@@ -15,6 +15,211 @@ class SqliteError : public std::runtime_error {
     explicit SqliteError(const std::string &message) : std::runtime_error(message) {}
 };
 
+enum class SqlProfileBucket {
+    General,
+    BulkSelect,
+    BulkWrite,
+    BulkTransaction,
+};
+
+enum class SqlProfileCall {
+    DirectExecParams,
+    PreparedExec,
+    Prepare,
+    SimpleExec,
+};
+
+thread_local chronos::native::NativeSqlProfile tls_sql_profile;
+thread_local SqlProfileBucket tls_sql_profile_bucket = SqlProfileBucket::General;
+thread_local bool tls_sql_profile_enabled = false;
+thread_local std::vector<chronos::native::NativeSqlTraceEntry> tls_sql_trace;
+thread_local bool tls_sql_trace_enabled = false;
+
+std::string sql_profile_statement_keyword(const std::string &sql) {
+    std::size_t pos = 0;
+    while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) ++pos;
+    std::string keyword;
+    while (pos < sql.size() && std::isalpha(static_cast<unsigned char>(sql[pos]))) {
+        keyword.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(sql[pos]))));
+        ++pos;
+    }
+    return keyword;
+}
+
+bool sql_profile_is_query(const std::string &sql) {
+    const std::string keyword = sql_profile_statement_keyword(sql);
+    return keyword == "SELECT" || keyword == "WITH" || keyword == "EXPLAIN";
+}
+
+void record_sql_profile_bucket(chronos::native::NativeSqlProfile &profile) {
+    switch (tls_sql_profile_bucket) {
+    case SqlProfileBucket::BulkSelect:
+        ++profile.bulk_select_round_trips;
+        break;
+    case SqlProfileBucket::BulkWrite:
+        ++profile.bulk_write_round_trips;
+        break;
+    case SqlProfileBucket::BulkTransaction:
+        ++profile.bulk_tx_round_trips;
+        break;
+    case SqlProfileBucket::General:
+        break;
+    }
+}
+
+void record_sql_profile_statement(const std::string &sql, SqlProfileCall call) {
+    if (!tls_sql_profile_enabled) return;
+    auto &profile = tls_sql_profile;
+    ++profile.round_trips;
+    if (sql_profile_is_query(sql)) ++profile.queries;
+    else ++profile.executes;
+
+    switch (call) {
+    case SqlProfileCall::DirectExecParams:
+        ++profile.direct_exec_params;
+        break;
+    case SqlProfileCall::PreparedExec:
+        ++profile.prepared_execs;
+        break;
+    case SqlProfileCall::Prepare:
+        ++profile.prepares;
+        break;
+    case SqlProfileCall::SimpleExec:
+        ++profile.simple_execs;
+        break;
+    }
+    record_sql_profile_bucket(profile);
+}
+
+void record_sql_profile_pipeline(std::int64_t statements, std::int64_t queries, std::int64_t executes) {
+    if (!tls_sql_profile_enabled) return;
+    auto &profile = tls_sql_profile;
+    ++profile.round_trips;
+    ++profile.pipeline_round_trips;
+    profile.pipeline_statements += statements;
+    profile.queries += queries;
+    profile.executes += executes;
+    record_sql_profile_bucket(profile);
+}
+
+void record_sql_profile_pipeline(std::int64_t statements) {
+    record_sql_profile_pipeline(statements, statements, 0);
+}
+
+const char *sql_profile_call_name(SqlProfileCall call) {
+    switch (call) {
+    case SqlProfileCall::DirectExecParams:
+        return "direct_exec_params";
+    case SqlProfileCall::PreparedExec:
+        return "prepared_exec";
+    case SqlProfileCall::Prepare:
+        return "prepare";
+    case SqlProfileCall::SimpleExec:
+        return "simple_exec";
+    }
+    return "unknown";
+}
+
+const char *sql_profile_bucket_name(SqlProfileBucket bucket) {
+    switch (bucket) {
+    case SqlProfileBucket::BulkSelect:
+        return "bulk_select";
+    case SqlProfileBucket::BulkWrite:
+        return "bulk_write";
+    case SqlProfileBucket::BulkTransaction:
+        return "bulk_transaction";
+    case SqlProfileBucket::General:
+        return "general";
+    }
+    return "unknown";
+}
+
+double elapsed_ms_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+std::int64_t pg_result_rows(PGresult *result) {
+    if (!result) return -1;
+    const ExecStatusType status = PQresultStatus(result);
+    if (status == PGRES_TUPLES_OK) return PQntuples(result);
+    const char *tuples = PQcmdTuples(result);
+    if (tuples && *tuples) return std::strtoll(tuples, nullptr, 10);
+    return 0;
+}
+
+void record_sql_trace_statement(
+    const std::string &sql,
+    const std::string &call,
+    SqlProfileBucket bucket,
+    double elapsed_ms,
+    std::int64_t rows,
+    std::int64_t param_count
+) {
+    if (!tls_sql_trace_enabled) return;
+    tls_sql_trace.push_back(chronos::native::NativeSqlTraceEntry{
+        sql,
+        call,
+        sql_profile_bucket_name(bucket),
+        elapsed_ms,
+        rows,
+        param_count,
+    });
+}
+
+void record_sql_trace_statement(
+    const std::string &sql,
+    SqlProfileCall call,
+    double elapsed_ms,
+    std::int64_t rows,
+    std::int64_t param_count
+) {
+    record_sql_trace_statement(
+        sql,
+        sql_profile_call_name(call),
+        tls_sql_profile_bucket,
+        elapsed_ms,
+        rows,
+        param_count
+    );
+}
+
+class SqlProfileScope {
+  public:
+    explicit SqlProfileScope(SqlProfileBucket bucket) : previous_(tls_sql_profile_bucket) {
+        tls_sql_profile_bucket = bucket;
+    }
+    ~SqlProfileScope() {
+        tls_sql_profile_bucket = previous_;
+    }
+
+  private:
+    SqlProfileBucket previous_;
+};
+
+void reset_sql_profile_impl() {
+    tls_sql_profile = {};
+}
+
+chronos::native::NativeSqlProfile snapshot_sql_profile_impl() {
+    return tls_sql_profile;
+}
+
+void set_sql_profile_enabled_impl(bool enabled) {
+    tls_sql_profile_enabled = enabled;
+}
+
+void reset_sql_trace_impl() {
+    tls_sql_trace.clear();
+}
+
+std::vector<chronos::native::NativeSqlTraceEntry> snapshot_sql_trace_impl() {
+    return tls_sql_trace;
+}
+
+void set_sql_trace_enabled_impl(bool enabled) {
+    tls_sql_trace_enabled = enabled;
+}
+
 void execute_sql(sqlite3 *db, const std::string &sql) {
     char *error = nullptr;
     int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &error);
@@ -64,6 +269,10 @@ class SqliteStatement {
             rc = sqlite3_bind_double(stmt_, index, *ptr);
         } else if (auto ptr = std::get_if<std::string>(&value)) {
             rc = sqlite3_bind_text(stmt_, index, ptr->c_str(), static_cast<int>(ptr->size()), SQLITE_TRANSIENT);
+        } else if (std::holds_alternative<DecimalValue>(value) ||
+                   std::holds_alternative<DateValue>(value)) {
+            const std::string text = value_text(value);
+            rc = sqlite3_bind_text(stmt_, index, text.c_str(), static_cast<int>(text.size()), SQLITE_TRANSIENT);
         } else {
             const auto &blob = std::get<Blob>(value);
             rc = sqlite3_bind_blob(stmt_, index, blob.data(), static_cast<int>(blob.size()), SQLITE_TRANSIENT);
@@ -348,6 +557,10 @@ std::string value_to_pg_text(const Value &value) {
     if (auto ptr = std::get_if<std::string>(&value)) {
         return *ptr;
     }
+    if (std::holds_alternative<DecimalValue>(value) ||
+        std::holds_alternative<DateValue>(value)) {
+        return value_text(value);
+    }
     const auto &blob = std::get<Blob>(value);
     static constexpr char hex[] = "0123456789abcdef";
     std::string out;
@@ -390,7 +603,9 @@ PgParams make_pg_params(const std::vector<Value> &params) {
 }
 
 PgResult pg_exec_params(PGconn *conn, const std::string &sql, const std::vector<Value> &params) {
+    record_sql_profile_statement(sql, SqlProfileCall::DirectExecParams);
     PgParams bound = make_pg_params(params);
+    const auto start = std::chrono::steady_clock::now();
     PGresult *result = PQexecParams(
         conn,
         sql.c_str(),
@@ -400,6 +615,13 @@ PgResult pg_exec_params(PGconn *conn, const std::string &sql, const std::vector<
         bound.lengths.empty() ? nullptr : bound.lengths.data(),
         bound.formats.empty() ? nullptr : bound.formats.data(),
         0
+    );
+    record_sql_trace_statement(
+        sql,
+        SqlProfileCall::DirectExecParams,
+        elapsed_ms_since(start),
+        pg_result_rows(result),
+        static_cast<std::int64_t>(params.size())
     );
     return PgResult(conn, result);
 }
@@ -436,7 +658,17 @@ class PgPreparedStatementCache {
             prepared.name = "__chronos_native_stmt_" + std::to_string(cache_id_) +
                 "_" + std::to_string(next_id_++);
             prepared.param_count = params.size();
-            PgResult prepared_result(conn, PQprepare(conn, prepared.name.c_str(), sql.c_str(), static_cast<int>(prepared.param_count), nullptr));
+            record_sql_profile_statement(sql, SqlProfileCall::Prepare);
+            const auto prepare_start = std::chrono::steady_clock::now();
+            PGresult *prepare_raw = PQprepare(conn, prepared.name.c_str(), sql.c_str(), static_cast<int>(prepared.param_count), nullptr);
+            record_sql_trace_statement(
+                sql,
+                SqlProfileCall::Prepare,
+                elapsed_ms_since(prepare_start),
+                pg_result_rows(prepare_raw),
+                static_cast<std::int64_t>(prepared.param_count)
+            );
+            PgResult prepared_result(conn, prepare_raw);
             prepared_result.require(PGRES_COMMAND_OK);
             found = statements_.emplace(sql, std::move(prepared)).first;
         } else if (found->second.param_count != params.size()) {
@@ -444,6 +676,8 @@ class PgPreparedStatementCache {
         }
 
         PgParams bound = make_pg_params(params);
+        record_sql_profile_statement(sql, SqlProfileCall::PreparedExec);
+        const auto exec_start = std::chrono::steady_clock::now();
         PGresult *result = PQexecPrepared(
             conn,
             found->second.name.c_str(),
@@ -452,6 +686,13 @@ class PgPreparedStatementCache {
             bound.lengths.empty() ? nullptr : bound.lengths.data(),
             bound.formats.empty() ? nullptr : bound.formats.data(),
             0
+        );
+        record_sql_trace_statement(
+            sql,
+            SqlProfileCall::PreparedExec,
+            elapsed_ms_since(exec_start),
+            pg_result_rows(result),
+            static_cast<std::int64_t>(params.size())
         );
         return PgResult(conn, result);
     }
@@ -726,6 +967,11 @@ std::string key_where_sql(const std::vector<std::string> &pk_columns) {
     return key_where;
 }
 
+struct NativeKeyPrefixFilter {
+    std::vector<std::string> columns;
+    std::vector<Value> values;
+};
+
 std::string pg_key_where_sql(const std::vector<std::string> &pk_columns, int start = 1) {
     std::string key_where;
     for (std::size_t i = 0; i < pk_columns.size(); ++i) {
@@ -862,6 +1108,33 @@ void splice_interval_rows(
             );
         }
     }
+}
+
+template <typename PhysicalRow, typename Bound, typename Bounds>
+bool physical_rows_contain_visible_live_conflict(
+    const std::vector<PhysicalRow> &physical_rows,
+    const Bound &branch_point
+) {
+    for (const auto &physical : physical_rows) {
+        if (physical.deleted) continue;
+        const bool starts_at_or_before_branch = !Bounds::less(branch_point, physical.live_lo);
+        const bool ends_after_branch = Bounds::less(branch_point, physical.live_hi);
+        if (starts_at_or_before_branch && ends_after_branch) return true;
+    }
+    return false;
+}
+
+bool insert_mode_should_skip_conflict(IntervalWriteMode write_mode) {
+    return write_mode == IntervalWriteMode::InsertIgnoreConflicts;
+}
+
+bool insert_mode_checks_conflicts(IntervalWriteMode write_mode) {
+    return write_mode == IntervalWriteMode::Insert ||
+        write_mode == IntervalWriteMode::InsertIgnoreConflicts;
+}
+
+void raise_insert_duplicate_key() {
+    throw std::runtime_error("duplicate key value violates unique constraint");
 }
 
 // -----------------------------------------------------------------------------
@@ -1006,6 +1279,32 @@ class DuckDBResult {
     duckdb_result result_{};
 };
 
+cpp_int duckdb_hugeint_to_cpp_int(const duckdb_hugeint &value) {
+    cpp_int out = value.upper;
+    out <<= 64;
+    out += value.lower;
+    return out;
+}
+
+std::string duckdb_decimal_to_text(const duckdb_decimal &value) {
+    cpp_int integer = duckdb_hugeint_to_cpp_int(value.value);
+    const bool negative = integer < 0;
+    if (negative) integer = -integer;
+
+    std::string digits = integer.convert_to<std::string>();
+    if (value.scale == 0) {
+        return negative ? "-" + digits : digits;
+    }
+
+    const std::size_t scale = static_cast<std::size_t>(value.scale);
+    if (digits.size() <= scale) {
+        digits.insert(0, scale + 1 - digits.size(), '0');
+    }
+    const std::size_t point = digits.size() - scale;
+    digits.insert(point, ".");
+    return negative ? "-" + digits : digits;
+}
+
 Value duckdb_column_value(duckdb_result *result, idx_t column, idx_t row) {
     if (duckdb_value_is_null(result, column, row)) return std::monostate{};
     switch (duckdb_column_type(result, column)) {
@@ -1061,6 +1360,20 @@ Value duckdb_column_value(duckdb_result *result, idx_t column, idx_t row) {
         return static_cast<double>(duckdb_value_float(result, column, row));
     case DUCKDB_TYPE_DOUBLE:
         return duckdb_value_double(result, column, row);
+    case DUCKDB_TYPE_DATE: {
+        const duckdb_date_struct value = duckdb_from_date(
+            duckdb_value_date(result, column, row)
+        );
+        return DateValue{
+            static_cast<int>(value.year),
+            static_cast<int>(value.month),
+            static_cast<int>(value.day),
+        };
+    }
+    case DUCKDB_TYPE_DECIMAL:
+        return DecimalValue{duckdb_decimal_to_text(
+            duckdb_value_decimal(result, column, row)
+        )};
     case DUCKDB_TYPE_BLOB: {
         duckdb_blob blob = duckdb_value_blob(result, column, row);
         Blob out;
@@ -1089,11 +1402,18 @@ std::int64_t native_as_int(const Value &value) {
         if (*ptr == "f" || *ptr == "false") return 0;
         return ptr->empty() ? 0 : std::stoll(*ptr);
     }
+    if (auto ptr = std::get_if<DecimalValue>(&value)) {
+        return ptr->text.empty() ? 0 : std::stoll(ptr->text);
+    }
     return 0;
 }
 
 std::string native_as_string(const Value &value) {
     if (auto ptr = std::get_if<std::string>(&value)) return *ptr;
+    if (std::holds_alternative<DecimalValue>(value) ||
+        std::holds_alternative<DateValue>(value)) {
+        return value_text(value);
+    }
     if (auto ptr = std::get_if<std::int64_t>(&value)) return std::to_string(*ptr);
     if (auto ptr = std::get_if<double>(&value)) {
         std::ostringstream out;
@@ -1169,7 +1489,7 @@ Value pg_branch_value(PGresult *result, int row, int column) {
     }
 }
 
-BulkUpsertStats sqlite_adapter_bulk_upsert(
+BulkUpsertResult sqlite_adapter_bulk_upsert(
     sqlite3 *db,
     const std::string &physical_name,
     const std::vector<std::string> &columns,
@@ -1180,10 +1500,12 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
     std::int64_t writer_segment_id,
     bool replacement_deleted,
     bool manage_transaction,
-    SQLiteStatementCache *statement_cache
+    SQLiteStatementCache *statement_cache,
+    IntervalWriteMode write_mode = IntervalWriteMode::Upsert,
+    std::int64_t branch_point = 0
 );
 
-BulkUpsertStats postgres_adapter_bulk_upsert(
+BulkUpsertResult postgres_adapter_bulk_upsert(
     PGconn *conn,
     const std::string &physical_name,
     const std::vector<std::string> &columns,
@@ -1194,14 +1516,16 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
     std::int64_t writer_segment_id,
     bool replacement_deleted,
     bool manage_transaction,
-    PgPreparedStatementCache *statement_cache
+    PgPreparedStatementCache *statement_cache,
+    IntervalWriteMode write_mode = IntervalWriteMode::Upsert,
+    const std::string &branch_point = ""
 );
 
 // -----------------------------------------------------------------------------
 // SQLite/PostgreSQL interval splice adapters
 // Source: interval_splice_adapters.cpp
 // -----------------------------------------------------------------------------
-BulkUpsertStats sqlite_adapter_bulk_upsert(
+BulkUpsertResult sqlite_adapter_bulk_upsert(
     sqlite3 *db,
     const std::string &physical_name,
     const std::vector<std::string> &columns,
@@ -1212,7 +1536,9 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
     std::int64_t writer_segment_id,
     bool replacement_deleted,
     bool manage_transaction,
-    SQLiteStatementCache *statement_cache = nullptr
+    SQLiteStatementCache *statement_cache,
+    IntervalWriteMode write_mode,
+    std::int64_t branch_point
 ) {
     if (columns.empty()) {
         throw std::invalid_argument("columns must not be empty");
@@ -1221,7 +1547,8 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
         throw std::invalid_argument("pk_columns must not be empty");
     }
 
-    BulkUpsertStats stats;
+    BulkUpsertResult result;
+    BulkUpsertStats &stats = result.stats;
     const std::string quoted_table = quote_ident(physical_name);
     const std::vector<std::size_t> pk_indices = pk_column_indices(columns, pk_columns);
     // This adapter owns SQLite mechanics only: batching, prepared statements,
@@ -1547,6 +1874,15 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
             for (std::size_t offset = 0; offset < chunk_count; ++offset) {
                 const auto &row = (*splice_rows)[chunk_start + offset];
                 std::vector<PhysicalRow> physical_rows = load_physical_rows(row);
+                if (insert_mode_checks_conflicts(write_mode) &&
+                    physical_rows_contain_visible_live_conflict<PhysicalRow, std::int64_t, Int64IntervalBounds>(
+                        physical_rows,
+                        branch_point
+                    )) {
+                    if (insert_mode_should_skip_conflict(write_mode)) continue;
+                    raise_insert_duplicate_key();
+                }
+                ++result.logical_rows_written;
                 chunk.push_back(PendingSplice{&row, std::move(physical_rows)});
             }
 
@@ -1611,7 +1947,7 @@ BulkUpsertStats sqlite_adapter_bulk_upsert(
         }
         throw;
     }
-    return stats;
+    return result;
 }
 
 struct PgPhysicalRow {
@@ -1623,7 +1959,7 @@ struct PgPhysicalRow {
     std::int64_t deleted;
 };
 
-BulkUpsertStats postgres_adapter_bulk_upsert(
+BulkUpsertResult postgres_adapter_bulk_upsert(
     PGconn *conn,
     const std::string &physical_name,
     const std::vector<std::string> &columns,
@@ -1634,7 +1970,9 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
     std::int64_t writer_segment_id,
     bool replacement_deleted,
     bool manage_transaction,
-    PgPreparedStatementCache *statement_cache = nullptr
+    PgPreparedStatementCache *statement_cache,
+    IntervalWriteMode write_mode,
+    const std::string &branch_point
 ) {
     if (columns.empty()) {
         throw std::invalid_argument("columns must not be empty");
@@ -1643,7 +1981,8 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
         throw std::invalid_argument("pk_columns must not be empty");
     }
 
-    BulkUpsertStats stats;
+    BulkUpsertResult result;
+    BulkUpsertStats &stats = result.stats;
     const std::string quoted_table = quote_ident(physical_name);
     const std::vector<std::size_t> pk_indices = pk_column_indices(columns, pk_columns);
     // PostgreSQL uses ctid for the selected physical row instances. The shared
@@ -1666,33 +2005,129 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
         "WHERE " + pg_key_where_sql(pk_columns) + " AND live_lo < $" + std::to_string(live_lo_param) +
         " AND $" + std::to_string(live_hi_param) + " < live_hi "
         "ORDER BY live_lo FOR UPDATE";
-    const std::string shrink_left_sql =
-        "UPDATE " + quoted_table + " SET \"live_hi\" = $1 WHERE ctid = $2::tid";
-    const std::string insert_sql =
-        "INSERT INTO " + quoted_table + " (" + all_insert_cols + ") VALUES (" +
-        pg_placeholders(columns.size() + 4) + ")";
-
-    auto replacement_update_sql = [&] {
-        std::string sql = "UPDATE " + quoted_table + " SET ";
-        int param = 1;
-        for (std::size_t i = 0; i < columns.size(); ++i) {
-            if (i) {
-                sql += ", ";
-            }
-            sql += quote_ident(columns[i]) + " = $" + std::to_string(param++);
-        }
-        sql += ", \"live_hi\" = $" + std::to_string(param++);
-        sql += ", \"writer_segment_id\" = $" + std::to_string(param++);
-        sql += ", \"deleted\" = $" + std::to_string(param++);
-        sql += " WHERE ctid = $" + std::to_string(param) + "::tid";
-        return sql;
-    };
+    const std::size_t max_pg_params = 60000;
+    const std::size_t physical_write_batch_size = 500;
+    const std::size_t insert_value_count = columns.size() + 4;
+    const std::size_t replacement_value_count = columns.size() + 4;
+    const std::size_t max_insert_batch =
+        std::max<std::size_t>(
+            1,
+            std::min(
+                physical_write_batch_size,
+                max_pg_params / std::max<std::size_t>(1, insert_value_count)));
+    const std::size_t max_live_hi_update_batch =
+        std::max<std::size_t>(1, std::min<std::size_t>(physical_write_batch_size, max_pg_params / 2));
+    const std::size_t max_replacement_update_batch =
+        std::max<std::size_t>(
+            1,
+            std::min(
+                physical_write_batch_size,
+                max_pg_params / std::max<std::size_t>(1, replacement_value_count)));
 
     auto key_for_row = [&](const std::vector<Value> &row) {
         NativeRowKey key;
         key.values.reserve(pk_indices.size());
         for (std::size_t index : pk_indices) key.values.push_back(row[index]);
         return key;
+    };
+
+    struct PendingInsert {
+        std::vector<Value> values;
+        std::string live_lo;
+        std::string live_hi;
+        std::int64_t writer_segment_id = 0;
+        std::int64_t deleted = 0;
+    };
+
+    struct PendingLiveHiUpdate {
+        std::string ctid;
+        std::string live_hi;
+    };
+
+    struct PendingReplacementUpdate {
+        std::string ctid;
+        std::vector<Value> values;
+        std::string live_hi;
+        std::int64_t writer_segment_id = 0;
+        std::int64_t deleted = 0;
+    };
+
+    auto insert_batch_sql = [&](std::size_t count) {
+        std::string sql =
+            "INSERT INTO " + quoted_table + " (" + all_insert_cols + ") VALUES ";
+        int param = 1;
+        for (std::size_t row_index = 0; row_index < count; ++row_index) {
+            if (row_index) sql += ", ";
+            sql += "(" + pg_placeholders(insert_value_count, param) + ")";
+            param += static_cast<int>(insert_value_count);
+        }
+        return sql;
+    };
+
+    auto live_hi_update_batch_sql = [&](std::size_t count) {
+        std::string sql =
+            "UPDATE " + quoted_table + " AS t SET \"live_hi\" = v.\"live_hi\" "
+            "FROM (VALUES ";
+        int param = 1;
+        for (std::size_t row_index = 0; row_index < count; ++row_index) {
+            if (row_index) sql += ", ";
+            const int ctid_param = param++;
+            const int live_hi_param = param++;
+            sql += "($" + std::to_string(ctid_param) + "::tid, $" +
+                std::to_string(live_hi_param) + "::numeric)";
+        }
+        sql += ") AS v(\"__chronos_ctid\", \"live_hi\") "
+            "WHERE t.ctid = v.\"__chronos_ctid\"";
+        return sql;
+    };
+
+    auto replacement_update_batch_sql = [&](std::size_t count) {
+        std::string sql = "UPDATE " + quoted_table + " AS t SET ";
+        for (std::size_t i = 0; i < columns.size(); ++i) {
+            if (i) sql += ", ";
+            sql += quote_ident(columns[i]) + " = CASE t.ctid ";
+            for (std::size_t row_index = 0; row_index < count; ++row_index) {
+                const int base_param = 1 + static_cast<int>(row_index * replacement_value_count);
+                const int ctid_param = base_param;
+                const int value_param = base_param + 1 + static_cast<int>(i);
+                sql += "WHEN $" + std::to_string(ctid_param) + "::tid THEN $" +
+                    std::to_string(value_param) + " ";
+            }
+            sql += "ELSE t." + quote_ident(columns[i]) + " END";
+        }
+        sql += ", \"live_hi\" = CASE t.ctid ";
+        for (std::size_t row_index = 0; row_index < count; ++row_index) {
+            const int base_param = 1 + static_cast<int>(row_index * replacement_value_count);
+            sql += "WHEN $" + std::to_string(base_param) + "::tid THEN $" +
+                std::to_string(base_param + 1 + static_cast<int>(columns.size())) +
+                "::numeric ";
+        }
+        sql += "ELSE t.\"live_hi\" END";
+
+        sql += ", \"writer_segment_id\" = CASE t.ctid ";
+        for (std::size_t row_index = 0; row_index < count; ++row_index) {
+            const int base_param = 1 + static_cast<int>(row_index * replacement_value_count);
+            sql += "WHEN $" + std::to_string(base_param) + "::tid THEN $" +
+                std::to_string(base_param + 2 + static_cast<int>(columns.size())) +
+                "::bigint ";
+        }
+        sql += "ELSE t.\"writer_segment_id\" END";
+
+        sql += ", \"deleted\" = CASE t.ctid ";
+        for (std::size_t row_index = 0; row_index < count; ++row_index) {
+            const int base_param = 1 + static_cast<int>(row_index * replacement_value_count);
+            sql += "WHEN $" + std::to_string(base_param) + "::tid THEN $" +
+                std::to_string(base_param + 3 + static_cast<int>(columns.size())) +
+                "::boolean ";
+        }
+        sql += "ELSE t.\"deleted\" END WHERE t.ctid IN (";
+        for (std::size_t row_index = 0; row_index < count; ++row_index) {
+            if (row_index) sql += ", ";
+            const int base_param = 1 + static_cast<int>(row_index * replacement_value_count);
+            sql += "$" + std::to_string(base_param) + "::tid";
+        }
+        sql += ")";
+        return sql;
     };
 
     auto pg_key_batch_where = [&](std::size_t count, int start_param) {
@@ -1711,8 +2146,214 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
     };
 
     auto exec_simple = [&](const std::string &sql) {
-        PgResult result(conn, PQexec(conn, sql.c_str()));
+        record_sql_profile_statement(sql, SqlProfileCall::SimpleExec);
+        const auto start = std::chrono::steady_clock::now();
+        PGresult *raw = PQexec(conn, sql.c_str());
+        record_sql_trace_statement(
+            sql,
+            SqlProfileCall::SimpleExec,
+            elapsed_ms_since(start),
+            pg_result_rows(raw),
+            0
+        );
+        PgResult result(conn, raw);
         result.require(PGRES_COMMAND_OK);
+    };
+
+    struct PendingPgWriteCommand {
+        std::string sql;
+        std::vector<Value> params;
+    };
+
+    std::vector<PendingInsert> pending_inserts;
+    std::vector<PendingLiveHiUpdate> pending_live_hi_updates;
+    std::vector<PendingReplacementUpdate> pending_replacement_updates;
+    pending_inserts.reserve(max_insert_batch);
+    pending_live_hi_updates.reserve(max_live_hi_update_batch);
+    pending_replacement_updates.reserve(max_replacement_update_batch);
+
+    auto execute_bulk_write = [&](const std::string &sql, const std::vector<Value> &params) {
+        SqlProfileScope scope(SqlProfileBucket::BulkWrite);
+        PgResult result = statement_cache
+            ? statement_cache->exec(conn, sql, params)
+            : pg_exec_params(conn, sql, params);
+        result.require(PGRES_COMMAND_OK);
+    };
+
+    auto execute_bulk_write_commands = [&](const std::vector<PendingPgWriteCommand> &commands) {
+        if (commands.empty()) return;
+        if (commands.size() == 1) {
+            execute_bulk_write(commands[0].sql, commands[0].params);
+            return;
+        }
+
+        struct PendingPipelineCommand {
+            std::string sql;
+            PgParams params;
+        };
+        std::vector<PendingPipelineCommand> pending;
+        pending.reserve(commands.size());
+        for (const auto &command : commands) {
+            pending.push_back({command.sql, make_pg_params(command.params)});
+        }
+
+        {
+            SqlProfileScope scope(SqlProfileBucket::BulkWrite);
+            record_sql_profile_pipeline(
+                static_cast<std::int64_t>(pending.size()),
+                0,
+                static_cast<std::int64_t>(pending.size())
+            );
+        }
+        const auto pipeline_start = std::chrono::steady_clock::now();
+        if (PQenterPipelineMode(conn) != 1) {
+            throw PgError(PQerrorMessage(conn));
+        }
+        bool pipeline_active = true;
+        try {
+            for (const auto &command : pending) {
+                const int param_count = static_cast<int>(command.params.values.size());
+                if (PQsendQueryParams(
+                        conn,
+                        command.sql.c_str(),
+                        param_count,
+                        nullptr,
+                        command.params.values.empty() ? nullptr : command.params.values.data(),
+                        command.params.lengths.empty() ? nullptr : command.params.lengths.data(),
+                        command.params.formats.empty() ? nullptr : command.params.formats.data(),
+                        0
+                    ) != 1) {
+                    throw PgError(PQerrorMessage(conn));
+                }
+            }
+            if (PQpipelineSync(conn) != 1 || PQflush(conn) == -1) {
+                throw PgError(PQerrorMessage(conn));
+            }
+
+            std::size_t command_results = 0;
+            bool saw_sync = false;
+            while (!saw_sync) {
+                PGresult *raw = PQgetResult(conn);
+                if (raw == nullptr) continue;
+                PgResult result(conn, raw);
+                const ExecStatusType status = PQresultStatus(result.get());
+                if (status == PGRES_PIPELINE_SYNC) {
+                    saw_sync = true;
+                    break;
+                }
+                result.require(PGRES_COMMAND_OK);
+                ++command_results;
+            }
+            if (PQexitPipelineMode(conn) != 1) {
+                throw PgError(PQerrorMessage(conn));
+            }
+            pipeline_active = false;
+            if (command_results != commands.size()) {
+                throw PgError("PostgreSQL bulk write pipeline returned an unexpected result count");
+            }
+            const double pipeline_elapsed_ms = elapsed_ms_since(pipeline_start);
+            record_sql_trace_statement(
+                "PIPELINE_SYNC statements=" + std::to_string(commands.size()),
+                "pipeline_batch",
+                SqlProfileBucket::BulkWrite,
+                pipeline_elapsed_ms,
+                static_cast<std::int64_t>(command_results),
+                static_cast<std::int64_t>(commands.size())
+            );
+            const double allocated_ms = commands.empty()
+                ? 0.0
+                : pipeline_elapsed_ms / static_cast<double>(commands.size());
+            for (const auto &command : commands) {
+                record_sql_trace_statement(
+                    command.sql,
+                    "pipeline_statement",
+                    SqlProfileBucket::BulkWrite,
+                    allocated_ms,
+                    -1,
+                    static_cast<std::int64_t>(command.params.size())
+                );
+            }
+        } catch (...) {
+            while (PGresult *raw = PQgetResult(conn)) {
+                PQclear(raw);
+            }
+            if (pipeline_active) {
+                PQexitPipelineMode(conn);
+            }
+            throw;
+        }
+    };
+
+    auto append_live_hi_update_commands = [&](std::vector<PendingPgWriteCommand> &commands) {
+        if (pending_live_hi_updates.empty()) return;
+        for (std::size_t start = 0; start < pending_live_hi_updates.size(); start += max_live_hi_update_batch) {
+            const std::size_t count =
+                std::min<std::size_t>(max_live_hi_update_batch, pending_live_hi_updates.size() - start);
+            std::vector<Value> params;
+            params.reserve(count * 2);
+            for (std::size_t i = 0; i < count; ++i) {
+                const PendingLiveHiUpdate &pending = pending_live_hi_updates[start + i];
+                params.push_back(pending.ctid);
+                params.push_back(pending.live_hi);
+            }
+            commands.push_back(PendingPgWriteCommand{live_hi_update_batch_sql(count), std::move(params)});
+        }
+        pending_live_hi_updates.clear();
+    };
+
+    auto append_replacement_update_commands = [&](std::vector<PendingPgWriteCommand> &commands) {
+        if (pending_replacement_updates.empty()) return;
+        for (std::size_t start = 0; start < pending_replacement_updates.size(); start += max_replacement_update_batch) {
+            const std::size_t count =
+                std::min<std::size_t>(max_replacement_update_batch, pending_replacement_updates.size() - start);
+            std::vector<Value> params;
+            params.reserve(count * replacement_value_count);
+            for (std::size_t i = 0; i < count; ++i) {
+                const PendingReplacementUpdate &pending = pending_replacement_updates[start + i];
+                params.push_back(pending.ctid);
+                params.insert(params.end(), pending.values.begin(), pending.values.end());
+                params.push_back(pending.live_hi);
+                params.push_back(pending.writer_segment_id);
+                params.push_back(std::string(pending.deleted ? "true" : "false"));
+            }
+            commands.push_back(PendingPgWriteCommand{replacement_update_batch_sql(count), std::move(params)});
+        }
+        pending_replacement_updates.clear();
+    };
+
+    auto append_insert_commands = [&](std::vector<PendingPgWriteCommand> &commands) {
+        if (pending_inserts.empty()) return;
+        for (std::size_t start = 0; start < pending_inserts.size(); start += max_insert_batch) {
+            const std::size_t count =
+                std::min<std::size_t>(max_insert_batch, pending_inserts.size() - start);
+            std::vector<Value> params;
+            params.reserve(count * insert_value_count);
+            for (std::size_t i = 0; i < count; ++i) {
+                const PendingInsert &pending = pending_inserts[start + i];
+                params.insert(params.end(), pending.values.begin(), pending.values.end());
+                params.push_back(pending.live_lo);
+                params.push_back(pending.live_hi);
+                params.push_back(pending.writer_segment_id);
+                params.push_back(std::string(pending.deleted ? "true" : "false"));
+            }
+            commands.push_back(PendingPgWriteCommand{insert_batch_sql(count), std::move(params)});
+            stats.inserted += static_cast<std::int64_t>(count);
+        }
+        pending_inserts.clear();
+    };
+
+    auto flush_pending_writes = [&] {
+        std::vector<PendingPgWriteCommand> commands;
+        commands.reserve(3);
+        append_live_hi_update_commands(commands);
+        append_replacement_update_commands(commands);
+        append_insert_commands(commands);
+        execute_bulk_write_commands(commands);
+    };
+
+    auto flush_inserts = [&] {
+        if (pending_inserts.empty()) return;
+        flush_pending_writes();
     };
 
     auto insert_row = [&](const std::vector<Value> &values,
@@ -1720,46 +2361,40 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
                           const std::string &row_live_hi,
                           std::int64_t row_writer_segment_id,
                           std::int64_t row_deleted) {
-        std::vector<Value> params = values;
-        params.reserve(columns.size() + 4);
-        params.push_back(row_live_lo);
-        params.push_back(row_live_hi);
-        params.push_back(row_writer_segment_id);
-        params.push_back(std::string(row_deleted ? "true" : "false"));
-        PgResult result = statement_cache
-            ? statement_cache->exec(conn, insert_sql, params)
-            : pg_exec_params(conn, insert_sql, params);
-        result.require(PGRES_COMMAND_OK);
-        ++stats.inserted;
+        pending_inserts.push_back(
+            PendingInsert{values, row_live_lo, row_live_hi, row_writer_segment_id, row_deleted});
+        if (pending_inserts.size() >= max_insert_batch) {
+            flush_inserts();
+        }
     };
 
     auto shrink_left_row = [&](const PgPhysicalRow &physical, const std::string &row_live_hi) {
-        PgResult result = statement_cache
-            ? statement_cache->exec(conn, shrink_left_sql, {row_live_hi, std::string(physical.ctid)})
-            : pg_exec_params(conn, shrink_left_sql, {row_live_hi, std::string(physical.ctid)});
-        result.require(PGRES_COMMAND_OK);
+        pending_live_hi_updates.push_back(PendingLiveHiUpdate{physical.ctid, row_live_hi});
+        if (pending_live_hi_updates.size() >= max_live_hi_update_batch) {
+            flush_pending_writes();
+        }
     };
 
-    const std::string update_replacement_sql = replacement_update_sql();
     auto replace_row = [&](const PgPhysicalRow &physical,
                            const std::vector<Value> &values,
                            const std::string &row_live_hi,
                            std::int64_t row_writer_segment_id,
                            std::int64_t row_deleted) {
-        std::vector<Value> params = values;
-        params.reserve(columns.size() + 4);
-        params.push_back(row_live_hi);
-        params.push_back(row_writer_segment_id);
-        params.push_back(std::string(row_deleted ? "true" : "false"));
-        params.push_back(std::string(physical.ctid));
-        PgResult result = statement_cache
-            ? statement_cache->exec(conn, update_replacement_sql, params)
-            : pg_exec_params(conn, update_replacement_sql, params);
-        result.require(PGRES_COMMAND_OK);
+        pending_replacement_updates.push_back(PendingReplacementUpdate{
+            physical.ctid,
+            values,
+            row_live_hi,
+            row_writer_segment_id,
+            row_deleted
+        });
+        if (pending_replacement_updates.size() >= max_replacement_update_batch) {
+            flush_pending_writes();
+        }
     };
 
     try {
         if (manage_transaction) {
+            SqlProfileScope scope(SqlProfileBucket::BulkTransaction);
             exec_simple("BEGIN");
         }
 
@@ -1786,6 +2421,7 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
                 }
                 batch_params.push_back(live_hi);
                 batch_params.push_back(live_lo);
+                SqlProfileScope scope(SqlProfileBucket::BulkSelect);
                 PgResult selected = statement_cache
                     ? statement_cache->exec(conn, batch_sql, batch_params)
                     : pg_exec_params(conn, batch_sql, batch_params);
@@ -1826,6 +2462,7 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
                 select_params.push_back(live_hi);
                 select_params.push_back(live_lo);
 
+                SqlProfileScope scope(SqlProfileBucket::BulkSelect);
                 PgResult selected = statement_cache
                     ? statement_cache->exec(conn, select_sql, select_params)
                     : pg_exec_params(conn, select_sql, select_params);
@@ -1849,6 +2486,15 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
                     physical_rows.push_back(std::move(physical));
                 }
             }
+            if (insert_mode_checks_conflicts(write_mode) &&
+                physical_rows_contain_visible_live_conflict<PgPhysicalRow, std::string, DecimalIntervalBounds>(
+                    physical_rows,
+                    branch_point
+                )) {
+                if (insert_mode_should_skip_conflict(write_mode)) continue;
+                raise_insert_duplicate_key();
+            }
+            ++result.logical_rows_written;
             splice_interval_rows<PgPhysicalRow, std::string, DecimalIntervalBounds>(
                 stats,
                 row,
@@ -1862,20 +2508,23 @@ BulkUpsertStats postgres_adapter_bulk_upsert(
                 replace_row
             );
         }
+        flush_pending_writes();
 
         if (manage_transaction) {
+            SqlProfileScope scope(SqlProfileBucket::BulkTransaction);
             exec_simple("COMMIT");
         }
     } catch (...) {
         if (manage_transaction) {
             try {
+                SqlProfileScope scope(SqlProfileBucket::BulkTransaction);
                 exec_simple("ROLLBACK");
             } catch (...) {
             }
         }
         throw;
     }
-    return stats;
+    return result;
 }
 
 // -----------------------------------------------------------------------------
@@ -1904,7 +2553,7 @@ class NativeSqlDriver {
     virtual void execute(const std::string &sql, const std::vector<Value> &params = {}) = 0;
     virtual std::int64_t execute_changes(const std::string &sql, const std::vector<Value> &params = {}) = 0;
     virtual void refresh_catalog() {}
-    virtual void interval_upsert(
+    virtual BulkUpsertResult interval_upsert(
         const std::string &physical_name,
         const std::vector<std::string> &columns,
         const std::vector<std::string> &pk_columns,
@@ -1913,7 +2562,9 @@ class NativeSqlDriver {
         const std::string &live_hi,
         std::int64_t writer_segment_id,
         bool replacement_deleted,
-        bool manage_transaction
+        bool manage_transaction,
+        IntervalWriteMode write_mode,
+        const std::string &branch_point
     ) = 0;
 };
 
@@ -2023,7 +2674,7 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
         return sqlite3_changes(db_);
     }
 
-    void interval_upsert(
+    BulkUpsertResult interval_upsert(
         const std::string &physical_name,
         const std::vector<std::string> &columns,
         const std::vector<std::string> &pk_columns,
@@ -2032,12 +2683,15 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
         const std::string &live_hi,
         std::int64_t writer_segment_id,
         bool replacement_deleted,
-        bool manage_transaction
+        bool manage_transaction,
+        IntervalWriteMode write_mode,
+        const std::string &branch_point
     ) override {
-        sqlite_adapter_bulk_upsert(
+        return sqlite_adapter_bulk_upsert(
             db_, physical_name, columns, pk_columns, rows,
             std::stoll(live_lo), std::stoll(live_hi), writer_segment_id,
-            replacement_deleted, manage_transaction, &interval_upsert_statements_
+            replacement_deleted, manage_transaction, &interval_upsert_statements_,
+            write_mode, std::stoll(branch_point)
         );
     }
 
@@ -2062,6 +2716,11 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
             else if (auto ptr = std::get_if<std::int64_t>(&value)) rc = sqlite3_bind_int64(stmt, index, *ptr);
             else if (auto ptr = std::get_if<double>(&value)) rc = sqlite3_bind_double(stmt, index, *ptr);
             else if (auto ptr = std::get_if<std::string>(&value)) rc = sqlite3_bind_text(stmt, index, ptr->c_str(), static_cast<int>(ptr->size()), SQLITE_TRANSIENT);
+            else if (std::holds_alternative<DecimalValue>(value) ||
+                     std::holds_alternative<DateValue>(value)) {
+                const std::string text = value_text(value);
+                rc = sqlite3_bind_text(stmt, index, text.c_str(), static_cast<int>(text.size()), SQLITE_TRANSIENT);
+            }
             else {
                 const auto &blob = std::get<Blob>(value);
                 rc = sqlite3_bind_blob(stmt, index, blob.data(), static_cast<int>(blob.size()), SQLITE_TRANSIENT);
@@ -2140,7 +2799,7 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
         reconnect();
     }
 
-    void interval_upsert(
+    BulkUpsertResult interval_upsert(
         const std::string &physical_name,
         const std::vector<std::string> &columns,
         const std::vector<std::string> &pk_columns,
@@ -2149,9 +2808,11 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
         const std::string &live_hi,
         std::int64_t writer_segment_id,
         bool replacement_deleted,
-        bool manage_transaction
+        bool manage_transaction,
+        IntervalWriteMode write_mode,
+        const std::string &branch_point
     ) override {
-        duckdb_interval_bulk_upsert(
+        return duckdb_interval_bulk_upsert(
             physical_name,
             columns,
             pk_columns,
@@ -2160,7 +2821,9 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
             std::stoll(live_hi),
             writer_segment_id,
             replacement_deleted,
-            manage_transaction
+            manage_transaction,
+            write_mode,
+            std::stoll(branch_point)
         );
     }
 
@@ -2219,6 +2882,10 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
                 rc = duckdb_bind_double(stmt, index, *ptr);
             } else if (auto ptr = std::get_if<std::string>(&value)) {
                 rc = duckdb_bind_varchar_length(stmt, index, ptr->c_str(), ptr->size());
+            } else if (std::holds_alternative<DecimalValue>(value) ||
+                       std::holds_alternative<DateValue>(value)) {
+                const std::string text = value_text(value);
+                rc = duckdb_bind_varchar_length(stmt, index, text.c_str(), text.size());
             } else {
                 const auto &blob = std::get<Blob>(value);
                 rc = duckdb_bind_blob(stmt, index, blob.data(), blob.size());
@@ -2298,7 +2965,7 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
         std::int64_t deleted = 0;
     };
 
-    void duckdb_interval_bulk_upsert(
+    BulkUpsertResult duckdb_interval_bulk_upsert(
         const std::string &physical_name,
         const std::vector<std::string> &columns,
         const std::vector<std::string> &pk_columns,
@@ -2307,12 +2974,15 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
         std::int64_t live_hi,
         std::int64_t writer_segment_id,
         bool replacement_deleted,
-        bool manage_transaction
+        bool manage_transaction,
+        IntervalWriteMode write_mode,
+        std::int64_t branch_point
     ) {
         if (columns.empty()) throw std::invalid_argument("columns must not be empty");
         if (pk_columns.empty()) throw std::invalid_argument("pk_columns must not be empty");
 
-        BulkUpsertStats stats;
+        BulkUpsertResult result;
+        BulkUpsertStats &stats = result.stats;
         const std::vector<std::size_t> pk_indices = pk_column_indices(columns, pk_columns);
         NativeRows deduped_storage;
         const NativeRows *splice_rows = &rows;
@@ -2481,6 +3151,15 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
                     }
                 }
 
+                if (insert_mode_checks_conflicts(write_mode) &&
+                    physical_rows_contain_visible_live_conflict<DuckDBPhysicalRow, std::int64_t, Int64IntervalBounds>(
+                        physical_rows,
+                        branch_point
+                    )) {
+                    if (insert_mode_should_skip_conflict(write_mode)) continue;
+                    raise_insert_duplicate_key();
+                }
+                ++result.logical_rows_written;
                 splice_interval_rows<DuckDBPhysicalRow, std::int64_t, Int64IntervalBounds>(
                     stats,
                     row,
@@ -2505,6 +3184,7 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
             }
             throw;
         }
+        return result;
     }
 
     std::string dialect_;
@@ -2566,6 +3246,8 @@ class NativePostgresDriver final : public NativeSqlDriver {
             pending.push_back({pg_sql_cached(sql), make_pg_params(params)});
         }
 
+        record_sql_profile_pipeline(static_cast<std::int64_t>(pending.size()));
+        const auto pipeline_start = std::chrono::steady_clock::now();
         if (PQenterPipelineMode(conn_) != 1) {
             throw PgError(PQerrorMessage(conn_));
         }
@@ -2618,6 +3300,28 @@ class NativePostgresDriver final : public NativeSqlDriver {
             if (results.size() != queries.size()) {
                 throw PgError("PostgreSQL pipeline returned an unexpected result count");
             }
+            const double pipeline_elapsed_ms = elapsed_ms_since(pipeline_start);
+            record_sql_trace_statement(
+                "PIPELINE_SYNC statements=" + std::to_string(queries.size()),
+                "pipeline_batch",
+                tls_sql_profile_bucket,
+                pipeline_elapsed_ms,
+                static_cast<std::int64_t>(results.size()),
+                static_cast<std::int64_t>(queries.size())
+            );
+            const double allocated_ms = queries.empty()
+                ? 0.0
+                : pipeline_elapsed_ms / static_cast<double>(queries.size());
+            for (const auto &[sql, params] : queries) {
+                record_sql_trace_statement(
+                    pg_sql_cached(sql),
+                    "pipeline_statement",
+                    tls_sql_profile_bucket,
+                    allocated_ms,
+                    -1,
+                    static_cast<std::int64_t>(params.size())
+                );
+            }
             return results;
         } catch (...) {
             while (PGresult *raw = PQgetResult(conn_)) {
@@ -2667,7 +3371,7 @@ class NativePostgresDriver final : public NativeSqlDriver {
         return std::strtoll(tuples, nullptr, 10);
     }
 
-    void interval_upsert(
+    BulkUpsertResult interval_upsert(
         const std::string &physical_name,
         const std::vector<std::string> &columns,
         const std::vector<std::string> &pk_columns,
@@ -2676,12 +3380,14 @@ class NativePostgresDriver final : public NativeSqlDriver {
         const std::string &live_hi,
         std::int64_t writer_segment_id,
         bool replacement_deleted,
-        bool manage_transaction
+        bool manage_transaction,
+        IntervalWriteMode write_mode,
+        const std::string &branch_point
     ) override {
-        postgres_adapter_bulk_upsert(
+        return postgres_adapter_bulk_upsert(
             conn_, physical_name, columns, pk_columns, rows,
             live_lo, live_hi, writer_segment_id, replacement_deleted, manage_transaction,
-            &interval_upsert_statements_
+            &interval_upsert_statements_, write_mode, branch_point
         );
     }
 
@@ -2833,6 +3539,19 @@ std::string visible_where_sql(const std::string &branch_point) {
     return "live_lo <= " + branch_point + " AND " + branch_point + " < live_hi AND deleted = FALSE";
 }
 
+std::string visible_select_where_sql(const std::string &branch_point, const std::string &dialect) {
+    std::string predicate = visible_where_sql(branch_point);
+    if (dialect == "duckdb") {
+        // DuckDB treats the raw interval predicate as a scan-local filter, which
+        // prevents dynamic filters on user columns from reaching large fact
+        // table scans. Keeping the visibility check in a vectorized scalar
+        // expression preserves those pushed join filters while retaining the
+        // same three-valued SQL semantics as a WHERE predicate.
+        return "if(" + predicate + ", TRUE, FALSE)";
+    }
+    return predicate;
+}
+
 std::string node_string_value(const PgQuery__Node *node) {
     if (!node || node->node_case != PG_QUERY__NODE__NODE_STRING || !node->string) {
         throw std::runtime_error("expected string node");
@@ -2864,6 +3583,7 @@ double value_as_double(const Value &value) {
     if (auto ptr = std::get_if<std::int64_t>(&value)) return static_cast<double>(*ptr);
     if (auto ptr = std::get_if<double>(&value)) return *ptr;
     if (auto ptr = std::get_if<std::string>(&value)) return std::stod(*ptr);
+    if (auto ptr = std::get_if<DecimalValue>(&value)) return std::stod(ptr->text);
     throw std::runtime_error("expected numeric SQL value");
 }
 
@@ -2873,6 +3593,8 @@ bool value_truthy(const Value &value) {
     if (auto ptr = std::get_if<double>(&value)) return *ptr != 0.0;
     if (auto ptr = std::get_if<std::string>(&value)) return !ptr->empty();
     if (auto ptr = std::get_if<Blob>(&value)) return !ptr->empty();
+    if (auto ptr = std::get_if<DecimalValue>(&value)) return ptr->text != "0";
+    if (std::holds_alternative<DateValue>(value)) return true;
     return false;
 }
 
@@ -3078,8 +3800,13 @@ std::string unique_schema_suffix() {
 }
 
 int compare_values(const Value &left, const Value &right) {
-    if ((std::holds_alternative<std::int64_t>(left) || std::holds_alternative<double>(left)) &&
-        (std::holds_alternative<std::int64_t>(right) || std::holds_alternative<double>(right))) {
+    const bool left_numeric = std::holds_alternative<std::int64_t>(left) ||
+        std::holds_alternative<double>(left) ||
+        std::holds_alternative<DecimalValue>(left);
+    const bool right_numeric = std::holds_alternative<std::int64_t>(right) ||
+        std::holds_alternative<double>(right) ||
+        std::holds_alternative<DecimalValue>(right);
+    if (left_numeric && right_numeric) {
         const double l = value_as_double(left);
         const double r = value_as_double(right);
         return l < r ? -1 : (l > r ? 1 : 0);
@@ -3418,6 +4145,72 @@ std::optional<std::vector<Value>> point_key_values_from_predicate(
     return values;
 }
 
+void collect_key_equality_conjunction(
+    const PgQuery__Node *node,
+    const std::vector<std::string> &pk_columns,
+    const std::vector<Value> &params,
+    std::unordered_map<std::string, Value> &out
+) {
+    if (!node) return;
+    if (node->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR && node->bool_expr &&
+        node->bool_expr->boolop == PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR) {
+        for (std::size_t i = 0; i < node->bool_expr->n_args; ++i) {
+            collect_key_equality_conjunction(node->bool_expr->args[i], pk_columns, params, out);
+        }
+        return;
+    }
+    try {
+        (void)extract_key_equality_atom(node, pk_columns, params, out);
+    } catch (...) {
+    }
+}
+
+std::optional<NativeKeyPrefixFilter> leading_key_prefix_from_predicate(
+    const PgQuery__Node *where,
+    const NativeTableMeta &meta,
+    const std::vector<Value> &params
+) {
+    if (!where || meta.pk_columns.empty()) return std::nullopt;
+    std::unordered_map<std::string, Value> by_column;
+    by_column.reserve(meta.pk_columns.size());
+    collect_key_equality_conjunction(where, meta.pk_columns, params, by_column);
+
+    NativeKeyPrefixFilter prefix;
+    for (const auto &pk : meta.pk_columns) {
+        auto found = by_column.find(pk);
+        if (found == by_column.end()) break;
+        prefix.columns.push_back(pk);
+        prefix.values.push_back(found->second);
+    }
+    if (prefix.columns.empty()) return std::nullopt;
+    return prefix;
+}
+
+std::optional<NativeKeyPrefixFilter> exact_leading_key_prefix_from_predicate(
+    const PgQuery__Node *where,
+    const NativeTableMeta &meta,
+    const std::vector<Value> &params
+) {
+    if (!where || meta.pk_columns.empty()) return std::nullopt;
+    std::unordered_map<std::string, Value> by_column;
+    by_column.reserve(meta.pk_columns.size());
+    if (!extract_key_equality_conjunction(where, meta.pk_columns, params, by_column)) {
+        return std::nullopt;
+    }
+
+    NativeKeyPrefixFilter prefix;
+    for (const auto &pk : meta.pk_columns) {
+        auto found = by_column.find(pk);
+        if (found == by_column.end()) break;
+        prefix.columns.push_back(pk);
+        prefix.values.push_back(found->second);
+    }
+    if (prefix.columns.empty() || prefix.columns.size() != by_column.size()) {
+        return std::nullopt;
+    }
+    return prefix;
+}
+
 std::unordered_map<std::string, Value> column_default_values(const NativeTableMeta &meta) {
     std::unordered_map<std::string, Value> defaults;
     for (std::size_t i = 0; i < meta.columns.size() && i < meta.column_defs.size(); ++i) {
@@ -3454,3 +4247,31 @@ std::string select_columns_sql(const std::vector<std::string> &columns) {
 }
 
 } // namespace chronos::native::detail
+
+namespace chronos::native {
+
+void set_sql_profile_enabled(bool enabled) {
+    detail::set_sql_profile_enabled_impl(enabled);
+}
+
+void reset_sql_profile() {
+    detail::reset_sql_profile_impl();
+}
+
+NativeSqlProfile snapshot_sql_profile() {
+    return detail::snapshot_sql_profile_impl();
+}
+
+void set_sql_trace_enabled(bool enabled) {
+    detail::set_sql_trace_enabled_impl(enabled);
+}
+
+void reset_sql_trace() {
+    detail::reset_sql_trace_impl();
+}
+
+std::vector<NativeSqlTraceEntry> snapshot_sql_trace() {
+    return detail::snapshot_sql_trace_impl();
+}
+
+} // namespace chronos::native

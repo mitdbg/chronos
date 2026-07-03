@@ -1,9 +1,11 @@
 namespace chronos::native::detail {
 
 using boost::multiprecision::cpp_int;
-using Blob = std::vector<unsigned char>;
-using Value = std::variant<std::monostate, std::int64_t, double, std::string, Blob>;
-using NativeRows = std::vector<std::vector<Value>>;
+using Blob = chronos::native::IntervalBlob;
+using DecimalValue = chronos::native::IntervalDecimal;
+using DateValue = chronos::native::IntervalDate;
+using Value = chronos::native::IntervalValue;
+using NativeRows = chronos::native::IntervalRows;
 
 class PgProtobufParseResult;
 
@@ -21,6 +23,17 @@ struct BulkUpsertStats {
     std::int64_t selected = 0;
     std::int64_t deleted_rows = 0;
     std::int64_t inserted = 0;
+};
+
+enum class IntervalWriteMode {
+    Upsert,
+    Insert,
+    InsertIgnoreConflicts,
+};
+
+struct BulkUpsertResult {
+    BulkUpsertStats stats;
+    std::int64_t logical_rows_written = 0;
 };
 
 struct QueryResult {
@@ -122,6 +135,29 @@ std::string placeholders(std::size_t count) {
     return out;
 }
 
+std::string date_value_to_iso(const DateValue &value) {
+    std::ostringstream out;
+    out << std::setfill('0')
+        << std::setw(4) << value.year << "-"
+        << std::setw(2) << value.month << "-"
+        << std::setw(2) << value.day;
+    return out.str();
+}
+
+std::string value_text(const Value &value) {
+    if (auto ptr = std::get_if<std::string>(&value)) return *ptr;
+    if (auto ptr = std::get_if<DecimalValue>(&value)) return ptr->text;
+    if (auto ptr = std::get_if<DateValue>(&value)) return date_value_to_iso(*ptr);
+    if (auto ptr = std::get_if<std::int64_t>(&value)) return std::to_string(*ptr);
+    if (auto ptr = std::get_if<double>(&value)) {
+        std::ostringstream out;
+        out.precision(17);
+        out << *ptr;
+        return out.str();
+    }
+    return {};
+}
+
 Value py_to_value(const py::handle &obj) {
     if (obj.is_none()) {
         return std::monostate{};
@@ -166,13 +202,24 @@ std::size_t value_hash(const Value &value) {
     if (auto ptr = std::get_if<std::string>(&value)) {
         return hash_combine(0x03ULL, std::hash<std::string>{}(*ptr));
     }
-    const auto &blob = std::get<Blob>(value);
-    std::size_t hash = 1469598103934665603ULL;
-    for (unsigned char byte : blob) {
-        hash ^= static_cast<std::size_t>(byte);
-        hash *= 1099511628211ULL;
+    if (auto ptr = std::get_if<Blob>(&value)) {
+        std::size_t hash = 1469598103934665603ULL;
+        for (unsigned char byte : *ptr) {
+            hash ^= static_cast<std::size_t>(byte);
+            hash *= 1099511628211ULL;
+        }
+        return hash_combine(0x04ULL, hash);
     }
-    return hash_combine(0x04ULL, hash);
+    if (auto ptr = std::get_if<DecimalValue>(&value)) {
+        return hash_combine(0x05ULL, std::hash<std::string>{}(ptr->text));
+    }
+    if (auto ptr = std::get_if<DateValue>(&value)) {
+        std::size_t hash = std::hash<int>{}(ptr->year);
+        hash = hash_combine(hash, std::hash<int>{}(ptr->month));
+        hash = hash_combine(hash, std::hash<int>{}(ptr->day));
+        return hash_combine(0x06ULL, hash);
+    }
+    return 0;
 }
 
 struct NativeRowKeyHash {
@@ -203,6 +250,16 @@ py::object value_to_py(const Value &value) {
             }
         }
         return py::str(*ptr);
+    }
+    if (auto ptr = std::get_if<DecimalValue>(&value)) {
+        return py::module_::import("decimal").attr("Decimal")(ptr->text);
+    }
+    if (auto ptr = std::get_if<DateValue>(&value)) {
+        return py::module_::import("datetime").attr("date")(
+            ptr->year,
+            ptr->month,
+            ptr->day
+        );
     }
     const auto &blob = std::get<Blob>(value);
     return py::bytes(reinterpret_cast<const char *>(blob.data()), blob.size());
@@ -473,6 +530,16 @@ std::string rewrite_visible_tables(const std::string &sql, const Replacements &r
     bool single_quote = false;
     bool double_quote = false;
     bool expect_table = false;
+    bool in_from_list = false;
+    int paren_depth = 0;
+    int from_list_depth = 0;
+    auto is_from_clause_boundary = [](const std::string &upper) {
+        return upper == "WHERE" || upper == "GROUP" || upper == "ORDER" ||
+            upper == "HAVING" || upper == "LIMIT" || upper == "OFFSET" ||
+            upper == "FETCH" || upper == "UNION" || upper == "EXCEPT" ||
+            upper == "INTERSECT" || upper == "QUALIFY" || upper == "WINDOW" ||
+            upper == "ON" || upper == "USING";
+    };
     for (std::size_t i = 0; i < sql.size();) {
         const char ch = sql[i];
         if (ch == '\'' && !double_quote) {
@@ -521,6 +588,19 @@ std::string rewrite_visible_tables(const std::string &sql, const Replacements &r
             continue;
         }
         if (single_quote || double_quote || !is_identifier_start(ch)) {
+            if (!single_quote && !double_quote) {
+                if (ch == '(') {
+                    ++paren_depth;
+                } else if (ch == ')') {
+                    if (paren_depth > 0) --paren_depth;
+                    if (in_from_list && paren_depth < from_list_depth) {
+                        in_from_list = false;
+                        expect_table = false;
+                    }
+                } else if (ch == ',' && in_from_list && paren_depth == from_list_depth) {
+                    expect_table = true;
+                }
+            }
             out.push_back(ch);
             ++i;
             continue;
@@ -569,8 +649,17 @@ std::string rewrite_visible_tables(const std::string &sql, const Replacements &r
         }
 
         out += ident;
-        if (upper == "FROM" || upper == "JOIN" || upper == "INTO" || upper == "UPDATE") {
+        if (is_from_clause_boundary(upper) && paren_depth == from_list_depth) {
+            in_from_list = false;
+            expect_table = false;
+        }
+        if (upper == "FROM" || upper == "JOIN") {
             expect_table = true;
+            in_from_list = true;
+            from_list_depth = paren_depth;
+        } else if (upper == "INTO" || upper == "UPDATE") {
+            expect_table = true;
+            in_from_list = false;
         }
         i = j;
     }

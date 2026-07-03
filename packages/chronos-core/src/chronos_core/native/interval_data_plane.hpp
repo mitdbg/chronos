@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <string>
-#include <variant>
 #include <vector>
 #include <memory>
 
@@ -10,85 +9,9 @@
 #include <pybind11/pybind11.h>
 #include <sqlite3.h>
 
+#include "native_types.hpp"
+
 namespace chronos::native {
-
-using IntervalBlob = std::vector<unsigned char>;
-using IntervalValue = std::variant<std::monostate, std::int64_t, double, std::string, IntervalBlob>;
-using IntervalRows = std::vector<std::vector<IntervalValue>>;
-
-struct IntervalQueryResult {
-    std::vector<std::string> columns;
-    IntervalRows rows;
-};
-
-struct IntervalBulkUpsertStats {
-    std::int64_t selected = 0;
-    std::int64_t deleted_rows = 0;
-    std::int64_t inserted = 0;
-};
-
-struct NativeBranchInfo {
-    std::string branch_id;
-    std::string current_ref;
-    std::string created_at;
-    std::string metadata_json;
-};
-
-struct NativeCheckpointInfo {
-    std::string checkpoint_id;
-    std::string branch_id;
-    std::string ref;
-    std::string created_at;
-    std::string metadata_json;
-};
-
-struct NativeSegmentInfo {
-    std::int64_t segment_id = 0;
-    std::string live_lo;
-    std::string live_hi;
-    std::string branch_point;
-};
-
-struct NativeTableInfo {
-    std::string logical_name;
-    std::string physical_name;
-    std::vector<std::string> primary_key;
-    std::vector<std::string> columns;
-    std::vector<std::string> column_defs;
-};
-
-struct NativePreparedRefInfo {
-    NativeSegmentInfo segment;
-    std::vector<NativeTableInfo> tables;
-    std::vector<std::string> known_schema_tables;
-};
-
-struct NativeRowDiff {
-    std::string table;
-    std::vector<std::string> key_columns;
-    std::vector<IntervalValue> key_values;
-    std::string change;
-    std::vector<std::string> columns;
-    std::vector<IntervalValue> before;
-    std::vector<IntervalValue> after;
-    bool has_before = false;
-    bool has_after = false;
-};
-
-struct NativeMergePreview {
-    std::vector<NativeRowDiff> changes;
-    std::vector<NativeRowDiff> conflicts;
-};
-
-struct NativeMergeChange {
-    std::string table;
-    std::string change;
-    std::vector<std::string> key_columns;
-    std::vector<IntervalValue> key_values;
-    std::vector<std::string> after_columns;
-    std::vector<IntervalValue> after_values;
-    bool has_after = false;
-};
 
 class NativeBranchSessionImpl;
 class NativeBranchStoreImpl;
@@ -120,6 +43,11 @@ class NativeBranchSession {
         const std::string &sql,
         const std::vector<IntervalValue> &params = {}
     );
+    IntervalQueryResult explain(
+        const std::string &sql,
+        const std::vector<IntervalValue> &params = {}
+    );
+    std::string rewrite_query(const std::string &sql);
     std::int64_t execute(
         const std::string &sql,
         const std::vector<IntervalValue> &params = {}
@@ -178,6 +106,8 @@ class NativeBranchStore {
         const std::string &branch_point
     );
     void ensure(bool enable_schema_branching = false);
+    void set_create_secondary_indexes(bool enabled);
+    bool create_secondary_indexes() const;
     void register_table(
         const std::string &table,
         const std::vector<std::string> &primary_key,
@@ -294,6 +224,13 @@ class NativeSqlConnection {
 };
 
 void bind_interval_data_plane(pybind11::module_ &m);
+
+void set_sql_profile_enabled(bool enabled);
+void reset_sql_profile();
+NativeSqlProfile snapshot_sql_profile();
+void set_sql_trace_enabled(bool enabled);
+void reset_sql_trace();
+std::vector<NativeSqlTraceEntry> snapshot_sql_trace();
 
 IntervalBulkUpsertStats sqlite_interval_bulk_upsert(
     sqlite3 *db,

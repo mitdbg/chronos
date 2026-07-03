@@ -53,6 +53,27 @@ class BranchSession:
             self._context._commit_autocommit()
         return rows
 
+    def explain(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        self._ensure_fresh()
+        try:
+            rows = self._context._backend.explain(self._ref, sql, _ensure_params(params))
+        except Exception:
+            if self._transaction_depth == 0:
+                self._context._rollback_autocommit()
+            raise
+        if self._transaction_depth == 0 and self._context._db.in_transaction:
+            self._context._commit_autocommit()
+        return rows
+
+    def rewrite_query(self, sql: str, params: dict[str, Any] | None = None) -> str:
+        self._ensure_fresh()
+        try:
+            return self._context._backend.rewrite_query(self._ref, sql, _ensure_params(params))
+        except Exception:
+            if self._transaction_depth == 0:
+                self._context._rollback_autocommit()
+            raise
+
     def execute(
         self, sql: str, params: dict[str, Any] | None = None
     ) -> ExecuteResult:
@@ -216,6 +237,7 @@ class ChronosBranchContext:
         interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         interval_child_width: int | None = None,
         interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
+        interval_create_secondary_indexes: bool = True,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
         enable_diff_merge_tracking: bool = False,
@@ -228,6 +250,7 @@ class ChronosBranchContext:
             interval_continuation_percent=interval_continuation_percent,
             interval_child_width=interval_child_width,
             interval_allocation_strategy=interval_allocation_strategy,
+            interval_create_secondary_indexes=interval_create_secondary_indexes,
             ensure_metadata=ensure_metadata,
             enable_schema_branching=enable_schema_branching,
             enable_diff_merge_tracking=enable_diff_merge_tracking,
@@ -243,6 +266,7 @@ class ChronosBranchContext:
         interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         interval_child_width: int | None = None,
         interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
+        interval_create_secondary_indexes: bool = True,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
         enable_diff_merge_tracking: bool = False,
@@ -270,6 +294,7 @@ class ChronosBranchContext:
                     child_width=interval_child_width,
                     allocation_strategy=interval_allocation_strategy,
                     enable_schema_branching=enable_schema_branching,
+                    create_secondary_indexes=interval_create_secondary_indexes,
                 )
             if enable_schema_branching and backend not in {"copy", "orpheus"}:
                 raise ValueError("schema branching is currently supported only by the interval, copy, and orpheus backends")
@@ -308,6 +333,7 @@ class ChronosBranchContext:
         interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         interval_child_width: int | None = None,
         interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
+        interval_create_secondary_indexes: bool = True,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
     ) -> ChronosBranchContext:
@@ -323,6 +349,7 @@ class ChronosBranchContext:
             interval_continuation_percent=interval_continuation_percent,
             interval_child_width=interval_child_width,
             interval_allocation_strategy=interval_allocation_strategy,
+            interval_create_secondary_indexes=interval_create_secondary_indexes,
             ensure_metadata=ensure_metadata,
             enable_schema_branching=enable_schema_branching,
         )

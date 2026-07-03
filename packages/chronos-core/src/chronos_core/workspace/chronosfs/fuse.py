@@ -182,6 +182,18 @@ def _socket_request(socket_path: Path, request: dict[str, object], *, timeout: f
     return response
 
 
+def _is_stale_daemon_socket_error(exc: BaseException) -> bool:
+    return isinstance(
+        exc,
+        (
+            FileNotFoundError,
+            ConnectionRefusedError,
+            ConnectionResetError,
+            BrokenPipeError,
+        ),
+    )
+
+
 def _wait_for_daemon(socket_path: Path, *, deadline_s: float = 10.0) -> None:
     deadline = time.monotonic() + deadline_s
     last_error: Exception | None = None
@@ -280,32 +292,33 @@ def _start_shared_chronosfs_mount(
         block_size=block_size,
         options=options,
     )
-    try:
-        response = _socket_request(
-            socket_path,
-            {
-                "mountpoint": str(mountpoint),
-                "branch_id": branch_id,
-                "options": options,
-            },
-        )
-    except FileNotFoundError:
-        _ensure_shared_daemon(
-            socket_path=socket_path,
-            lock_path=lock_path,
-            log_path=log_path,
-            database_url=database_url,
-            block_size=block_size,
-            options=options,
-        )
-        response = _socket_request(
-            socket_path,
-            {
-                "mountpoint": str(mountpoint),
-                "branch_id": branch_id,
-                "options": options,
-            },
-        )
+    request = {
+        "mountpoint": str(mountpoint),
+        "branch_id": branch_id,
+        "options": options,
+    }
+    response: dict[str, object] | None = None
+    last_error: BaseException | None = None
+    for attempt in range(2):
+        try:
+            response = _socket_request(socket_path, request, timeout=35.0)
+            break
+        except BaseException as exc:
+            if not _is_stale_daemon_socket_error(exc) or attempt:
+                raise
+            last_error = exc
+            with suppress(FileNotFoundError):
+                socket_path.unlink()
+            _ensure_shared_daemon(
+                socket_path=socket_path,
+                lock_path=lock_path,
+                log_path=log_path,
+                database_url=database_url,
+                block_size=block_size,
+                options=options,
+            )
+    if response is None:  # pragma: no cover - loop always raises or breaks.
+        raise ChronosFSMountError(f"shared daemon mount failed: {last_error}")
     if response.get("status") != "ok":
         raise ChronosFSMountError(str(response.get("error", "shared daemon mount failed")))
     _wait_for_mount(mountpoint, socket_path)
