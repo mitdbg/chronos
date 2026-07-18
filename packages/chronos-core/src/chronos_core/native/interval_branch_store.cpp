@@ -63,11 +63,13 @@ class NativeBranchStoreImpl {
     NativeBranchStoreImpl(const std::string &data_url, sqlite3 *metadata_db)
         : metadata_driver_(std::make_unique<NativeSQLiteDriver>(metadata_db)),
           data_driver_(open_native_sql_driver(data_url)),
-          driver_(metadata_driver_.get()) {}
+          driver_(metadata_driver_.get()) {
+    }
     NativeBranchStoreImpl(const std::string &data_url, PGconn *metadata_conn)
         : metadata_driver_(std::make_unique<NativePostgresDriver>(metadata_conn)),
           data_driver_(open_native_sql_driver(data_url)),
-          driver_(metadata_driver_.get()) {}
+          driver_(metadata_driver_.get()) {
+    }
     NativeBranchStoreImpl(NativeSqlConnectionImpl &data_conn, const std::string &metadata_url)
         : metadata_driver_(open_native_sql_driver(metadata_url)),
           borrowed_data_driver_(&data_conn.driver()),
@@ -107,6 +109,8 @@ class NativeBranchStoreImpl {
     bool split_store() const { return data_driver_ptr() != nullptr; }
     void set_create_secondary_indexes(bool enabled) { create_secondary_indexes_ = enabled; }
     bool create_secondary_indexes() const { return create_secondary_indexes_; }
+    void set_create_writer_segment_index(bool enabled) { create_writer_segment_index_ = enabled; }
+    bool create_writer_segment_index() const { return create_writer_segment_index_; }
     bool in_transaction() const {
         NativeSqlDriver *data = data_driver_ptr();
         return driver_->in_transaction() || (data != nullptr && data->in_transaction());
@@ -133,30 +137,14 @@ class NativeBranchStoreImpl {
     }
 
     void defer_or_execute_schema_index_sqls(const std::vector<std::string> &sqls) {
-        if (dialect() == "postgres") {
-            deferred_schema_index_sqls_.insert(
-                deferred_schema_index_sqls_.end(),
-                sqls.begin(),
-                sqls.end()
-            );
-            return;
-        }
         for (const auto &sql : sqls) {
             driver().execute(sql);
         }
     }
 
-    void flush_deferred_schema_indexes() {
-        std::vector<std::string> sqls;
-        sqls.swap(deferred_schema_index_sqls_);
-        for (const auto &sql : sqls) {
-            driver().execute(sql);
-        }
-    }
+    void flush_deferred_schema_indexes() {}
 
-    void clear_deferred_schema_indexes() {
-        deferred_schema_index_sqls_.clear();
-    }
+    void clear_deferred_schema_indexes() {}
 
     CachedNativeStatement cached_statement_plan(
         const std::string &sql,
@@ -236,7 +224,7 @@ class NativeBranchStoreImpl {
     NativeSqlDriver *borrowed_data_driver_ = nullptr;
     NativeSqlDriver *driver_ = nullptr;
     bool create_secondary_indexes_ = true;
-    std::vector<std::string> deferred_schema_index_sqls_;
+    bool create_writer_segment_index_ = true;
     std::mutex statement_plan_cache_mutex_;
     std::unordered_map<std::string, CachedNativeStatement> statement_plan_cache_;
 };

@@ -1174,7 +1174,11 @@ def test_duckdb_split_interval_create_index_uses_data_plane() -> None:
 def test_duckdb_split_interval_secondary_indexes_are_optional() -> None:
     from chronos_core.branching.sql_adapters import DuckDBDatabaseAdapter
 
-    def registered_index_names(*, create_secondary_indexes: bool = True) -> set[str]:
+    def registered_index_names(
+        *,
+        create_secondary_indexes: bool = True,
+        create_writer_segment_index: bool = True,
+    ) -> set[str]:
         data = DuckDBDatabaseAdapter.connect("duckdb:///:memory:")
         metadata = _sqlite_memory()
         ctx = ChronosBranchContext.from_database_adapter(
@@ -1182,6 +1186,7 @@ def test_duckdb_split_interval_secondary_indexes_are_optional() -> None:
             backend="interval",
             metadata_db=metadata,
             interval_create_secondary_indexes=create_secondary_indexes,
+            interval_create_writer_segment_index=create_writer_segment_index,
         )
         try:
             ctx.db.execute("CREATE TABLE facts (id VARCHAR PRIMARY KEY, amount BIGINT)")
@@ -1205,6 +1210,9 @@ def test_duckdb_split_interval_secondary_indexes_are_optional() -> None:
     assert registered_index_names() == {
         "idx__chronos_b_interval_facts_pk_hi",
         "idx__chronos_b_interval_facts_writer_segment",
+    }
+    assert registered_index_names(create_writer_segment_index=False) == {
+        "idx__chronos_b_interval_facts_pk_hi",
     }
     assert registered_index_names(create_secondary_indexes=False) == set()
 

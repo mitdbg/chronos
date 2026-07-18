@@ -238,6 +238,7 @@ class ChronosBranchContext:
         interval_child_width: int | None = None,
         interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
         interval_create_secondary_indexes: bool = True,
+        interval_create_writer_segment_index: bool = True,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
         enable_diff_merge_tracking: bool = False,
@@ -251,6 +252,7 @@ class ChronosBranchContext:
             interval_child_width=interval_child_width,
             interval_allocation_strategy=interval_allocation_strategy,
             interval_create_secondary_indexes=interval_create_secondary_indexes,
+            interval_create_writer_segment_index=interval_create_writer_segment_index,
             ensure_metadata=ensure_metadata,
             enable_schema_branching=enable_schema_branching,
             enable_diff_merge_tracking=enable_diff_merge_tracking,
@@ -267,6 +269,7 @@ class ChronosBranchContext:
         interval_child_width: int | None = None,
         interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
         interval_create_secondary_indexes: bool = True,
+        interval_create_writer_segment_index: bool = True,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
         enable_diff_merge_tracking: bool = False,
@@ -295,6 +298,7 @@ class ChronosBranchContext:
                     allocation_strategy=interval_allocation_strategy,
                     enable_schema_branching=enable_schema_branching,
                     create_secondary_indexes=interval_create_secondary_indexes,
+                    create_writer_segment_index=interval_create_writer_segment_index,
                 )
             if enable_schema_branching and backend not in {"copy", "orpheus"}:
                 raise ValueError("schema branching is currently supported only by the interval, copy, and orpheus backends")
@@ -334,6 +338,7 @@ class ChronosBranchContext:
         interval_child_width: int | None = None,
         interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
         interval_create_secondary_indexes: bool = True,
+        interval_create_writer_segment_index: bool = True,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
     ) -> ChronosBranchContext:
@@ -350,6 +355,7 @@ class ChronosBranchContext:
             interval_child_width=interval_child_width,
             interval_allocation_strategy=interval_allocation_strategy,
             interval_create_secondary_indexes=interval_create_secondary_indexes,
+            interval_create_writer_segment_index=interval_create_writer_segment_index,
             ensure_metadata=ensure_metadata,
             enable_schema_branching=enable_schema_branching,
         )

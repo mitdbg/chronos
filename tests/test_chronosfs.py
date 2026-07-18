@@ -76,6 +76,58 @@ def test_fixed_blocks_use_chronos_interval_cow(chronosfs: ChronosFSStore) -> Non
     assert counts[16] == 1
 
 
+def test_sqlite_fixed_block_private_rewrite_stops_at_child_branch(
+    chronosfs: ChronosFSStore,
+) -> None:
+    chronosfs.write_file("main", "/blob.bin", b"aaaaaaaabbbbbbbbcccccccc")
+
+    def block_count(byte_start: int) -> int:
+        return chronosfs.context.db.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM _chronos_b_interval_chronosfs_file_blocks
+            WHERE byte_start = ?
+            """,
+            (byte_start,),
+        ).fetchone()["count"]
+
+    base_count = block_count(8)
+    chronosfs.write_at("main", "/blob.bin", 8, b"BBBBBBBB")
+    after_private_rewrite = block_count(8)
+    assert after_private_rewrite == base_count
+    assert chronosfs.read_file("main", "/blob.bin") == b"aaaaaaaaBBBBBBBBcccccccc"
+
+    chronosfs.create_branch("child", from_branch="main")
+    assert chronosfs.read_file("child", "/blob.bin") == b"aaaaaaaaBBBBBBBBcccccccc"
+
+    chronosfs.write_at("main", "/blob.bin", 8, b"CCCCCCCC")
+    assert block_count(8) > after_private_rewrite
+    assert chronosfs.read_file("main", "/blob.bin") == b"aaaaaaaaCCCCCCCCcccccccc"
+    assert chronosfs.read_file("child", "/blob.bin") == b"aaaaaaaaBBBBBBBBcccccccc"
+
+
+def test_path_cache_invalidates_exact_file_and_subtree(
+    chronosfs: ChronosFSStore,
+) -> None:
+    chronosfs.mkdir("main", "/cached", parents=True)
+    chronosfs.write_file("main", "/cached/a.txt", b"a")
+    chronosfs.write_file("main", "/cached/b.txt", b"b")
+    assert chronosfs.listdir("main", "/cached") == ["a.txt", "b.txt"]
+
+    chronosfs.unlink("main", "/cached/a.txt")
+    assert not chronosfs.exists("main", "/cached/a.txt")
+    assert chronosfs.read_file("main", "/cached/b.txt") == b"b"
+
+    chronosfs.mkdir("main", "/old/sub", parents=True)
+    chronosfs.write_file("main", "/old/sub/file.txt", b"payload")
+    assert chronosfs.listdir("main", "/old") == ["sub"]
+    assert chronosfs.listdir("main", "/old/sub") == ["file.txt"]
+
+    chronosfs.rename("main", "/old", "/new")
+    assert not chronosfs.exists("main", "/old/sub/file.txt")
+    assert chronosfs.read_file("main", "/new/sub/file.txt") == b"payload"
+
+
 def test_lazy_import_records_external_extent_and_reads_source(
     chronosfs: ChronosFSStore,
     tmp_path: Path,
@@ -750,6 +802,56 @@ def test_multiple_local_mountpoints_share_daemon_cache(tmp_path: Path) -> None:
             assert result.stdout == "shared\n"
 
 
+def test_shared_daemon_serializes_writes_across_branch_mounts(tmp_path: Path) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mount_a = tmp_path / "mnt-a"
+    mount_b = tmp_path / "mnt-b"
+    mount_a.mkdir()
+    mount_b.mkdir()
+
+    store = _open_store(db_path)
+    try:
+        store.create_branch("attempt-a")
+        store.create_branch("attempt-b")
+    finally:
+        store.close()
+
+    with _mounted_chronosfs(db_path, mount_a, branch_id="attempt-a"):
+        with _mounted_chronosfs(db_path, mount_b, branch_id="attempt-b"):
+            writer_a = subprocess.Popen(
+                ["bash", "-lc", "for i in $(seq 1 100); do printf 'a-%s\\n' \"$i\" > a-$i.txt; done"],
+                cwd=mount_a,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            writer_b = subprocess.Popen(
+                ["bash", "-lc", "for i in $(seq 1 100); do printf 'b-%s\\n' \"$i\" > b-$i.txt; done"],
+                cwd=mount_b,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            control = _open_store(db_path)
+            try:
+                control.context.update_branch_metadata(
+                    "attempt-a", {"published_by": "coordinator"}
+                )
+            finally:
+                control.close()
+
+            for writer in (writer_a, writer_b):
+                _stdout, stderr = writer.communicate(timeout=30)
+                assert writer.returncode == 0, stderr
+
+            assert (mount_a / "a-100.txt").read_text() == "a-100\n"
+            assert not (mount_a / "b-100.txt").exists()
+            assert (mount_b / "b-100.txt").read_text() == "b-100\n"
+            assert not (mount_b / "a-100.txt").exists()
+
+
 def test_shared_daemon_identity_is_store_scoped() -> None:
     import inspect
 
@@ -860,9 +962,19 @@ def _redis_source(tmp_path: Path) -> Path:
 
 
 @contextmanager
-def _mounted_chronosfs(db_path: Path, mountpoint: Path) -> Iterator[None]:
+def _mounted_chronosfs(
+    db_path: Path,
+    mountpoint: Path,
+    *,
+    branch_id: str = "main",
+) -> Iterator[None]:
     database_url = "sqlite:///" + str(db_path)
-    with _mounted_chronosfs_database(database_url, mountpoint, script_dir=db_path.parent):
+    with _mounted_chronosfs_database(
+        database_url,
+        mountpoint,
+        script_dir=db_path.parent,
+        branch_id=branch_id,
+    ):
         yield
 
 
@@ -872,6 +984,7 @@ def _mounted_chronosfs_database(
     mountpoint: Path,
     *,
     script_dir: Path,
+    branch_id: str = "main",
 ) -> Iterator[None]:
     script = script_dir / "mount_chronosfs.py"
     script.write_text(
@@ -882,7 +995,12 @@ def _mounted_chronosfs_database(
             store = ChronosFSStore.connect({database_url!r}, backend="interval")
             store.ensure()
             try:
-                mount_chronosfs(store, {str(mountpoint)!r}, shutdown_daemon_on_unmount=True)
+                mount_chronosfs(
+                    store,
+                    {str(mountpoint)!r},
+                    branch_id={branch_id!r},
+                    shutdown_daemon_on_unmount=True,
+                )
             finally:
                 store.close()
             """

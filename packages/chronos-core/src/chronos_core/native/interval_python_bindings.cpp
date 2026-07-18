@@ -640,6 +640,14 @@ bool NativeBranchStore::create_secondary_indexes() const {
     return impl_->create_secondary_indexes();
 }
 
+void NativeBranchStore::set_create_writer_segment_index(bool enabled) {
+    impl_->set_create_writer_segment_index(enabled);
+}
+
+bool NativeBranchStore::create_writer_segment_index() const {
+    return impl_->create_writer_segment_index();
+}
+
 void NativeBranchStore::register_table(
     const std::string &table,
     const std::vector<std::string> &primary_key,
@@ -939,7 +947,11 @@ void bind_interval_data_plane(py::module_ &m) {
             "query",
             [](NativeBranchSession &session, const std::string &sql, const py::object &params) {
                 BoundSql bound = bind_sql_params(sql, params);
-                auto result = session.query(bound.sql, bound.positional_params);
+                IntervalQueryResult result;
+                {
+                    py::gil_scoped_release release;
+                    result = session.query(bound.sql, bound.positional_params);
+                }
                 py::list out;
                 for (const auto &row : result.rows) {
                     py::dict item;
@@ -957,7 +969,11 @@ void bind_interval_data_plane(py::module_ &m) {
             "explain",
             [](NativeBranchSession &session, const std::string &sql, const py::object &params) {
                 BoundSql bound = bind_sql_params(sql, params);
-                auto result = session.explain(bound.sql, bound.positional_params);
+                IntervalQueryResult result;
+                {
+                    py::gil_scoped_release release;
+                    result = session.explain(bound.sql, bound.positional_params);
+                }
                 py::list out;
                 for (const auto &row : result.rows) {
                     py::dict item;
@@ -975,6 +991,7 @@ void bind_interval_data_plane(py::module_ &m) {
             "rewrite_query",
             [](NativeBranchSession &session, const std::string &sql, const py::object &params) {
                 BoundSql bound = bind_sql_params(sql, params);
+                py::gil_scoped_release release;
                 return session.rewrite_query(bound.sql);
             },
             py::arg("sql"),
@@ -984,12 +1001,18 @@ void bind_interval_data_plane(py::module_ &m) {
             "execute",
             [](NativeBranchSession &session, const std::string &sql, const py::object &params) {
                 BoundSql bound = bind_sql_params(sql, params);
+                py::gil_scoped_release release;
                 return session.execute(bound.sql, bound.positional_params);
             },
             py::arg("sql"),
             py::arg("params") = py::dict()
         )
-        .def("execute_schema", &NativeBranchSession::execute_schema, py::arg("sql"))
+        .def(
+            "execute_schema",
+            &NativeBranchSession::execute_schema,
+            py::arg("sql"),
+            py::call_guard<py::gil_scoped_release>()
+        )
         .def(
             "query_visible",
             [](NativeBranchSession &session,
@@ -999,7 +1022,11 @@ void bind_interval_data_plane(py::module_ &m) {
                const py::object &params,
                const std::string &suffix_sql) {
                 std::vector<Value> bound = params_to_values(params);
-                auto rows = session.query_visible(logical_table, columns, where_sql, bound, suffix_sql);
+                std::vector<std::vector<IntervalValue>> rows;
+                {
+                    py::gil_scoped_release release;
+                    rows = session.query_visible(logical_table, columns, where_sql, bound, suffix_sql);
+                }
                 py::list out;
                 for (const auto &row : rows) {
                     py::dict item;
@@ -1023,7 +1050,9 @@ void bind_interval_data_plane(py::module_ &m) {
                const std::vector<std::string> &columns,
                const std::vector<std::string> &pk_columns,
                const py::list &rows) {
-                session.upsert_rows(logical_table, columns, pk_columns, rows_to_native_values(rows, columns));
+                NativeRows native_rows = rows_to_native_values(rows, columns);
+                py::gil_scoped_release release;
+                session.upsert_rows(logical_table, columns, pk_columns, native_rows);
             },
             py::arg("logical_table"),
             py::arg("columns"),
@@ -1037,16 +1066,18 @@ void bind_interval_data_plane(py::module_ &m) {
                const std::vector<std::string> &columns,
                const std::vector<std::string> &pk_columns,
                const py::list &rows) {
-                session.delete_rows(logical_table, columns, pk_columns, rows_to_native_values(rows, columns));
+                NativeRows native_rows = rows_to_native_values(rows, columns);
+                py::gil_scoped_release release;
+                session.delete_rows(logical_table, columns, pk_columns, native_rows);
             },
             py::arg("logical_table"),
             py::arg("columns"),
             py::arg("pk_columns"),
             py::arg("rows")
         )
-        .def("begin", &NativeBranchSession::begin)
-        .def("commit", &NativeBranchSession::commit)
-        .def("rollback", &NativeBranchSession::rollback)
+        .def("begin", &NativeBranchSession::begin, py::call_guard<py::gil_scoped_release>())
+        .def("commit", &NativeBranchSession::commit, py::call_guard<py::gil_scoped_release>())
+        .def("rollback", &NativeBranchSession::rollback, py::call_guard<py::gil_scoped_release>())
         .def("in_transaction", &NativeBranchSession::in_transaction);
 
     auto native_sql_connection_class = py::class_<NativeSqlConnection>(m, "NativeSqlConnection");
@@ -1113,7 +1144,15 @@ void bind_interval_data_plane(py::module_ &m) {
             py::keep_alive<1, 3>()
         )
         .def("dialect", &NativeBranchStore::dialect, py::return_value_policy::reference_internal)
-        .def("checkout", &NativeBranchStore::checkout, py::keep_alive<0, 1>())
+        .def(
+            "checkout",
+            [](NativeBranchStore &store, const std::string &branch_id) {
+                py::gil_scoped_release release;
+                return store.checkout(branch_id);
+            },
+            py::keep_alive<0, 1>(),
+            py::arg("branch_id")
+        )
         .def(
             "checkout_segment",
             &NativeBranchStore::checkout_segment,
@@ -1124,7 +1163,12 @@ void bind_interval_data_plane(py::module_ &m) {
             py::arg("live_hi"),
             py::arg("branch_point")
         )
-        .def("ensure", &NativeBranchStore::ensure, py::arg("enable_schema_branching") = false)
+        .def(
+            "ensure",
+            &NativeBranchStore::ensure,
+            py::arg("enable_schema_branching") = false,
+            py::call_guard<py::gil_scoped_release>()
+        )
         .def(
             "set_create_secondary_indexes",
             &NativeBranchStore::set_create_secondary_indexes,
@@ -1132,20 +1176,28 @@ void bind_interval_data_plane(py::module_ &m) {
         )
         .def("create_secondary_indexes", &NativeBranchStore::create_secondary_indexes)
         .def(
+            "set_create_writer_segment_index",
+            &NativeBranchStore::set_create_writer_segment_index,
+            py::arg("enabled")
+        )
+        .def("create_writer_segment_index", &NativeBranchStore::create_writer_segment_index)
+        .def(
             "register_table",
             &NativeBranchStore::register_table,
             py::arg("table"),
             py::arg("primary_key"),
-            py::arg("enable_schema_branching") = false
+            py::arg("enable_schema_branching") = false,
+            py::call_guard<py::gil_scoped_release>()
         )
         .def(
             "create_index",
             &NativeBranchStore::create_index,
             py::arg("table"),
             py::arg("columns"),
-            py::arg("name") = ""
+            py::arg("name") = "",
+            py::call_guard<py::gil_scoped_release>()
         )
-        .def("branches", &NativeBranchStore::branches)
+        .def("branches", &NativeBranchStore::branches, py::call_guard<py::gil_scoped_release>())
         .def(
             "create_branch",
             &NativeBranchStore::create_branch,
@@ -1155,19 +1207,31 @@ void bind_interval_data_plane(py::module_ &m) {
             py::arg("metadata_json") = "{}",
             py::arg("continuation_percent") = 5,
             py::arg("child_width") = 0,
-            py::arg("allocation_strategy") = "adaptive"
+            py::arg("allocation_strategy") = "adaptive",
+            py::call_guard<py::gil_scoped_release>()
         )
         .def(
             "create_branch_from_checkpoint",
             &NativeBranchStore::create_branch_from_checkpoint,
             py::arg("branch_id"),
-            py::arg("checkpoint")
+            py::arg("checkpoint"),
+            py::call_guard<py::gil_scoped_release>()
         )
-        .def("delete_branch", &NativeBranchStore::delete_branch, py::arg("branch_id"))
+        .def(
+            "delete_branch",
+            &NativeBranchStore::delete_branch,
+            py::arg("branch_id"),
+            py::call_guard<py::gil_scoped_release>()
+        )
         .def(
             "update_branch_metadata",
             [](NativeBranchStore &store, const std::string &branch_id, const std::string &metadata_json) {
-                return branch_info_to_py(store.update_branch_metadata(branch_id, metadata_json));
+                NativeBranchInfo info;
+                {
+                    py::gil_scoped_release release;
+                    info = store.update_branch_metadata(branch_id, metadata_json);
+                }
+                return branch_info_to_py(info);
             },
             py::arg("branch_id"),
             py::arg("metadata_json")
@@ -1175,15 +1239,25 @@ void bind_interval_data_plane(py::module_ &m) {
         .def(
             "get_branch_info",
             [](NativeBranchStore &store, const std::string &branch_id) {
-                return branch_info_to_py(store.get_branch(branch_id));
+                NativeBranchInfo info;
+                {
+                    py::gil_scoped_release release;
+                    info = store.get_branch(branch_id);
+                }
+                return branch_info_to_py(info);
             },
             py::arg("branch_id")
         )
         .def(
             "list_branch_infos",
             [](NativeBranchStore &store) {
+                std::vector<NativeBranchInfo> infos;
+                {
+                    py::gil_scoped_release release;
+                    infos = store.list_branches();
+                }
                 py::list out;
-                for (const auto &info : store.list_branches()) {
+                for (const auto &info : infos) {
                     out.append(branch_info_to_py(info));
                 }
                 return out;
@@ -1196,9 +1270,12 @@ void bind_interval_data_plane(py::module_ &m) {
                const std::string &branch,
                const std::string &metadata_json,
                int continuation_percent) {
-                return checkpoint_info_to_py(
-                    store.create_checkpoint(checkpoint, branch, metadata_json, continuation_percent)
-                );
+                NativeCheckpointInfo info;
+                {
+                    py::gil_scoped_release release;
+                    info = store.create_checkpoint(checkpoint, branch, metadata_json, continuation_percent);
+                }
+                return checkpoint_info_to_py(info);
             },
             py::arg("checkpoint"),
             py::arg("branch"),
@@ -1208,15 +1285,25 @@ void bind_interval_data_plane(py::module_ &m) {
         .def(
             "get_checkpoint_info",
             [](NativeBranchStore &store, const std::string &checkpoint) {
-                return checkpoint_info_to_py(store.get_checkpoint(checkpoint));
+                NativeCheckpointInfo info;
+                {
+                    py::gil_scoped_release release;
+                    info = store.get_checkpoint(checkpoint);
+                }
+                return checkpoint_info_to_py(info);
             },
             py::arg("checkpoint")
         )
         .def(
             "list_checkpoint_infos",
             [](NativeBranchStore &store, const std::string &branch) {
+                std::vector<NativeCheckpointInfo> infos;
+                {
+                    py::gil_scoped_release release;
+                    infos = store.list_checkpoints(branch);
+                }
                 py::list out;
-                for (const auto &info : store.list_checkpoints(branch)) {
+                for (const auto &info : infos) {
                     out.append(checkpoint_info_to_py(info));
                 }
                 return out;
@@ -1226,9 +1313,12 @@ void bind_interval_data_plane(py::module_ &m) {
         .def(
             "prepare_ref_info",
             [](NativeBranchStore &store, std::int64_t segment_id, bool enable_schema_branching) {
-                return prepared_ref_info_to_py(
-                    store.prepare_ref_info(segment_id, enable_schema_branching)
-                );
+                NativePreparedRefInfo info;
+                {
+                    py::gil_scoped_release release;
+                    info = store.prepare_ref_info(segment_id, enable_schema_branching);
+                }
+                return prepared_ref_info_to_py(info);
             },
             py::arg("segment_id"),
             py::arg("enable_schema_branching") = false
@@ -1240,7 +1330,12 @@ void bind_interval_data_plane(py::module_ &m) {
                const std::string &left,
                const std::string &right,
                const std::string &table) {
-                return row_diff_list_to_py(store.diff_rows(left, right, table));
+                std::vector<NativeRowDiff> diffs;
+                {
+                    py::gil_scoped_release release;
+                    diffs = store.diff_rows(left, right, table);
+                }
+                return row_diff_list_to_py(diffs);
             },
             py::arg("left"),
             py::arg("right"),
@@ -1251,7 +1346,12 @@ void bind_interval_data_plane(py::module_ &m) {
             [](NativeBranchStore &store,
                const std::string &source,
                const std::string &target) {
-                return merge_preview_to_py(store.merge_preview(source, target));
+                NativeMergePreview preview;
+                {
+                    py::gil_scoped_release release;
+                    preview = store.merge_preview(source, target);
+                }
+                return merge_preview_to_py(preview);
             },
             py::arg("source"),
             py::arg("target")
@@ -1262,29 +1362,31 @@ void bind_interval_data_plane(py::module_ &m) {
                const std::string &source,
                const std::string &target,
                const py::list &changes) {
-                return store.apply_merge_changes(
-                    source,
-                    target,
-                    merge_changes_from_py(changes)
-                );
+                auto native_changes = merge_changes_from_py(changes);
+                py::gil_scoped_release release;
+                return store.apply_merge_changes(source, target, native_changes);
             },
             py::arg("source"),
             py::arg("target"),
             py::arg("changes")
         )
-        .def("merge_apply", &NativeBranchStore::merge_apply)
-        .def("lock_branches_for_merge", &NativeBranchStore::lock_branches_for_merge)
-        .def("collect_interval_garbage", &NativeBranchStore::collect_interval_garbage)
-        .def("commit", &NativeBranchStore::commit)
-        .def("rollback", &NativeBranchStore::rollback)
+        .def("merge_apply", &NativeBranchStore::merge_apply, py::call_guard<py::gil_scoped_release>())
+        .def("lock_branches_for_merge", &NativeBranchStore::lock_branches_for_merge, py::call_guard<py::gil_scoped_release>())
+        .def("collect_interval_garbage", &NativeBranchStore::collect_interval_garbage, py::call_guard<py::gil_scoped_release>())
+        .def("commit", &NativeBranchStore::commit, py::call_guard<py::gil_scoped_release>())
+        .def("rollback", &NativeBranchStore::rollback, py::call_guard<py::gil_scoped_release>())
         .def("in_transaction", &NativeBranchStore::in_transaction)
-        .def("flush_deferred_schema_indexes", &NativeBranchStore::flush_deferred_schema_indexes)
-        .def("clear_deferred_schema_indexes", &NativeBranchStore::clear_deferred_schema_indexes)
+        .def("flush_deferred_schema_indexes", &NativeBranchStore::flush_deferred_schema_indexes, py::call_guard<py::gil_scoped_release>())
+        .def("clear_deferred_schema_indexes", &NativeBranchStore::clear_deferred_schema_indexes, py::call_guard<py::gil_scoped_release>())
         .def(
             "query_sql",
             [](NativeBranchStore &store, const std::string &sql, const py::object &params) {
                 std::vector<Value> bound = params_to_values(params);
-                auto rows = store.query_sql(sql, bound);
+                std::vector<std::vector<Value>> rows;
+                {
+                    py::gil_scoped_release release;
+                    rows = store.query_sql(sql, bound);
+                }
                 py::list out;
                 for (const auto &row : rows) {
                     py::list item;
@@ -1300,7 +1402,11 @@ void bind_interval_data_plane(py::module_ &m) {
             "query_sql_dict",
             [](NativeBranchStore &store, const std::string &sql, const py::object &params) {
                 std::vector<Value> bound = params_to_values(params);
-                auto result = store.query_sql_result(sql, bound);
+                IntervalQueryResult result;
+                {
+                    py::gil_scoped_release release;
+                    result = store.query_sql_result(sql, bound);
+                }
                 py::list out;
                 for (const auto &row : result.rows) {
                     py::dict item;
@@ -1318,6 +1424,7 @@ void bind_interval_data_plane(py::module_ &m) {
             "execute_sql",
             [](NativeBranchStore &store, const std::string &sql, const py::object &params) {
                 std::vector<Value> bound = params_to_values(params);
+                py::gil_scoped_release release;
                 store.execute_sql(sql, bound);
             },
             py::arg("sql"),
@@ -1327,15 +1434,19 @@ void bind_interval_data_plane(py::module_ &m) {
     native_sql_connection_class
         .def(py::init<const std::string &>())
         .def("dialect", &NativeSqlConnection::dialect, py::return_value_policy::reference_internal)
-        .def("commit", &NativeSqlConnection::commit)
-        .def("rollback", &NativeSqlConnection::rollback)
+        .def("commit", &NativeSqlConnection::commit, py::call_guard<py::gil_scoped_release>())
+        .def("rollback", &NativeSqlConnection::rollback, py::call_guard<py::gil_scoped_release>())
         .def("in_transaction", &NativeSqlConnection::in_transaction)
-        .def("refresh_catalog", &NativeSqlConnection::refresh_catalog)
+        .def("refresh_catalog", &NativeSqlConnection::refresh_catalog, py::call_guard<py::gil_scoped_release>())
         .def(
             "query_sql",
             [](NativeSqlConnection &conn, const std::string &sql, const py::object &params) {
                 std::vector<Value> bound = params_to_values(params);
-                auto rows = conn.query_sql(sql, bound);
+                std::vector<std::vector<Value>> rows;
+                {
+                    py::gil_scoped_release release;
+                    rows = conn.query_sql(sql, bound);
+                }
                 py::list out;
                 for (const auto &row : rows) {
                     py::list item;
@@ -1351,7 +1462,11 @@ void bind_interval_data_plane(py::module_ &m) {
             "query_sql_dict",
             [](NativeSqlConnection &conn, const std::string &sql, const py::object &params) {
                 std::vector<Value> bound = params_to_values(params);
-                auto result = conn.query_sql_result(sql, bound);
+                IntervalQueryResult result;
+                {
+                    py::gil_scoped_release release;
+                    result = conn.query_sql_result(sql, bound);
+                }
                 py::list out;
                 for (const auto &row : result.rows) {
                     py::dict item;
@@ -1369,6 +1484,7 @@ void bind_interval_data_plane(py::module_ &m) {
             "execute_sql",
             [](NativeSqlConnection &conn, const std::string &sql, const py::object &params) {
                 std::vector<Value> bound = params_to_values(params);
+                py::gil_scoped_release release;
                 conn.execute_sql(sql, bound);
             },
             py::arg("sql"),

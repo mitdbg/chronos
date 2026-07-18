@@ -108,6 +108,8 @@ class NativeBranchStore {
     void ensure(bool enable_schema_branching = false);
     void set_create_secondary_indexes(bool enabled);
     bool create_secondary_indexes() const;
+    void set_create_writer_segment_index(bool enabled);
+    bool create_writer_segment_index() const;
     void register_table(
         const std::string &table,
         const std::vector<std::string> &primary_key,

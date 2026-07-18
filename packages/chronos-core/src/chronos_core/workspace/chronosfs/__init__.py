@@ -13,6 +13,7 @@ from chronos_core.workspace.chronosfs.fuse import (
     ChronosFuseOperations,
     ChronosFSMountError,
     mount_chronosfs,
+    shutdown_chronosfs_daemon,
     start_chronosfs_mount,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "ChronosFuseOperations",
     "ChronosFSMountError",
     "mount_chronosfs",
+    "shutdown_chronosfs_daemon",
     "start_chronosfs_mount",
 ]

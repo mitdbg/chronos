@@ -122,6 +122,17 @@ def start_chronosfs_mount(
     return mount_path
 
 
+def shutdown_chronosfs_daemon(store: ChronosFSStore) -> None:
+    """Stop the shared local mount daemon for ``store``.
+
+    Callers must unmount every mount point first.  The daemon is otherwise
+    self-cleaning after its idle timeout, but run-scoped integrations use this
+    explicit hook so a completed job cannot leave a service behind.
+    """
+    database_url = _database_url_for_mount(store)
+    _shutdown_shared_chronosfs_daemon(database_url, store.block_size)
+
+
 def _database_url_for_mount(store: ChronosFSStore) -> str:
     database_url = getattr(store.context.db, "database_url", None)
     if not database_url:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from chronos_core.branching._common import *
 
 import time
+import threading
 from decimal import Decimal
 from typing import Mapping
 
@@ -10,7 +11,7 @@ _SQL_CACHE_MAX_ENTRIES = 4096
 
 
 def _wait_for_all_async_schema_index_jobs() -> None:
-    """Compatibility hook; native owns schema-index flushing now."""
+    """Compatibility hook; native secondary-index workers are fire-and-forget."""
 
 
 def _wait_for_all_interval_gc_jobs() -> None:
@@ -36,6 +37,7 @@ class _IntervalBackend(_SQLBranchBackend):
         allocation_strategy: IntervalAllocationStrategy = "adaptive",
         enable_schema_branching: bool = False,
         create_secondary_indexes: bool = True,
+        create_writer_segment_index: bool = True,
     ):
         super().__init__(db)
         self.continuation_percent = _validate_interval_continuation_percent(
@@ -47,7 +49,17 @@ class _IntervalBackend(_SQLBranchBackend):
         )
         self.enable_schema_branching = bool(enable_schema_branching)
         self.create_secondary_indexes = bool(create_secondary_indexes)
+        self.create_writer_segment_index = bool(create_writer_segment_index)
         self._interval_gc_requested = False
+        self._interval_gc_pending = False
+        self._interval_gc_running = False
+        self._interval_gc_shutdown = False
+        self._interval_gc_thread: threading.Thread | None = None
+        self._interval_gc_lock = threading.Lock()
+        self._interval_gc_condition = threading.Condition(self._interval_gc_lock)
+        self._interval_gc_ready = threading.Event()
+        self._interval_gc_error: BaseException | None = None
+        self._interval_gc_store = None
         self._native_branch_store = None
         self._native_branch_sessions: dict[tuple[str, int], Any] = {}
         self._native_branch_session_segment_hints: dict[str, int] = {}
@@ -59,6 +71,7 @@ class _IntervalBackend(_SQLBranchBackend):
                 self.db._chronos_after_rollback = self._rollback_native_branch_store  # type: ignore[attr-defined]
             except Exception:
                 pass
+            self._initialize_interval_gc_worker()
 
     def _initialize_native_branch_store(self) -> None:
         if self._native_branch_store is None:
@@ -70,6 +83,13 @@ class _IntervalBackend(_SQLBranchBackend):
             )
             if callable(set_create_secondary_indexes):
                 set_create_secondary_indexes(self.create_secondary_indexes)
+            set_create_writer_segment_index = getattr(
+                self._native_branch_store,
+                "set_create_writer_segment_index",
+                None,
+            )
+            if callable(set_create_writer_segment_index):
+                set_create_writer_segment_index(self.create_writer_segment_index)
 
     def refresh_native_connections(self) -> None:
         self._invalidate_native_branch_sessions()
@@ -88,9 +108,51 @@ class _IntervalBackend(_SQLBranchBackend):
                 pass
         self._invalidate_native_branch_sessions()
 
+    def _manage_native_autocommit(self) -> bool:
+        return (
+            self._native_branch_store is not None
+            and not self.db.in_transaction
+            and not self._native_branch_transaction_active
+        )
+
+    def _commit_native_autocommit(self, manage: bool) -> None:
+        if (
+            manage
+            and self._native_branch_store is not None
+            and self._native_branch_store.in_transaction()
+        ):
+            self._native_branch_store.commit()
+
+    def _rollback_native_autocommit(self, manage: bool) -> None:
+        if (
+            manage
+            and self._native_branch_store is not None
+            and self._native_branch_store.in_transaction()
+        ):
+            try:
+                self._native_branch_store.rollback()
+            except Exception:
+                pass
+            self._invalidate_native_branch_sessions()
+
     def close(self) -> None:
-        self._invalidate_native_branch_sessions()
-        self._native_branch_store = None
+        try:
+            self.wait_for_interval_gc()
+        finally:
+            self._shutdown_interval_gc_worker()
+            self._invalidate_native_branch_sessions()
+            self._native_branch_store = None
+
+    def _start_async_schema_indexes(self) -> None:
+        if self._native_branch_store is None:
+            return
+        flush_deferred = getattr(
+            self._native_branch_store,
+            "flush_deferred_schema_indexes",
+            None,
+        )
+        if callable(flush_deferred):
+            flush_deferred()
 
     def _invalidate_native_branch_sessions(self) -> None:
         self._native_branch_sessions.clear()
@@ -205,14 +267,7 @@ class _IntervalBackend(_SQLBranchBackend):
 
     def after_commit(self) -> None:
         self._commit_native_branch_store()
-        if self._native_branch_store is not None:
-            flush_deferred = getattr(
-                self._native_branch_store,
-                "flush_deferred_schema_indexes",
-                None,
-            )
-            if callable(flush_deferred):
-                flush_deferred()
+        self._start_async_schema_indexes()
         self._start_pending_interval_gc()
 
     def after_rollback(self) -> None:
@@ -228,27 +283,102 @@ class _IntervalBackend(_SQLBranchBackend):
         self._interval_gc_requested = False
 
     def wait_for_async_schema_indexes(self) -> None:
-        if self._native_branch_store is None:
-            return
-        flush_deferred = getattr(
-            self._native_branch_store,
-            "flush_deferred_schema_indexes",
-            None,
-        )
-        if callable(flush_deferred):
-            flush_deferred()
+        self._start_async_schema_indexes()
 
     def wait_for_interval_gc(self) -> None:
-        return None
+        if self.db.dialect != "postgres":
+            return
+        with self._interval_gc_condition:
+            while self._interval_gc_pending or self._interval_gc_running:
+                self._interval_gc_condition.wait()
+            error = self._interval_gc_error
+            self._interval_gc_error = None
+        if error is not None:
+            raise BranchingError("background interval GC failed") from error
 
     def _start_pending_interval_gc(self) -> None:
         if not self._interval_gc_requested:
             return
         self._interval_gc_requested = False
-        if self._native_branch_store is not None:
-            self._native_branch_store.collect_interval_garbage()
+        if self.db.dialect != "postgres":
+            if self._native_branch_store is not None:
+                self._native_branch_store.collect_interval_garbage()
+                return
+            raise BranchingError("native interval branch store is unavailable")
+
+        with self._interval_gc_condition:
+            self._interval_gc_pending = True
+            self._interval_gc_condition.notify()
+
+    def _initialize_interval_gc_worker(self) -> None:
+        thread = threading.Thread(
+            target=self._run_interval_gc_worker,
+            name="chronos-interval-gc",
+            daemon=True,
+        )
+        self._interval_gc_thread = thread
+        thread.start()
+        self._interval_gc_ready.wait()
+        with self._interval_gc_condition:
+            error = self._interval_gc_error
+        if error is not None:
+            self._shutdown_interval_gc_worker()
+            raise BranchingError("failed to initialize background interval GC") from error
+
+    def _shutdown_interval_gc_worker(self) -> None:
+        thread = self._interval_gc_thread
+        if thread is None:
             return
-        raise BranchingError("native interval branch store is unavailable")
+        with self._interval_gc_condition:
+            self._interval_gc_shutdown = True
+            self._interval_gc_condition.notify_all()
+        thread.join()
+        self._interval_gc_thread = None
+        self._interval_gc_store = None
+
+    def _run_interval_gc_worker(self) -> None:
+        try:
+            database_url = getattr(self.db, "database_url", None)
+            if not database_url:
+                raise BranchingError("PostgreSQL interval GC requires a database URL")
+            from chronos_core import _native_interval
+
+            self._interval_gc_store = _native_interval.NativeBranchStore(database_url)
+        except BaseException as exc:
+            with self._interval_gc_condition:
+                self._interval_gc_error = exc
+                self._interval_gc_shutdown = True
+                self._interval_gc_ready.set()
+                self._interval_gc_condition.notify_all()
+            return
+
+        self._interval_gc_ready.set()
+        while True:
+            with self._interval_gc_condition:
+                while not self._interval_gc_pending and not self._interval_gc_shutdown:
+                    self._interval_gc_condition.wait()
+                if self._interval_gc_shutdown and not self._interval_gc_pending:
+                    return
+                self._interval_gc_pending = False
+                self._interval_gc_running = True
+            try:
+                self._collect_interval_garbage_background()
+            except BaseException as exc:
+                with self._interval_gc_condition:
+                    self._interval_gc_error = exc
+                    self._interval_gc_pending = False
+                    self._interval_gc_running = False
+                    self._interval_gc_shutdown = True
+                    self._interval_gc_condition.notify_all()
+                return
+            with self._interval_gc_condition:
+                self._interval_gc_running = False
+                self._interval_gc_condition.notify_all()
+
+    def _collect_interval_garbage_background(self) -> None:
+        if self._interval_gc_store is None:
+            raise BranchingError("background interval GC store is unavailable")
+        self._interval_gc_store.collect_interval_garbage()
 
     def ensure(self) -> None:
         if self._native_branch_store is not None:
@@ -418,6 +548,13 @@ class _IntervalBackend(_SQLBranchBackend):
 
     def list_branches(self) -> list[BranchInfo]:
         if self._native_branch_store is not None:
+            manage_native_tx = self._manage_native_autocommit()
+            try:
+                rows = self._native_branch_store.list_branch_infos()
+            except Exception:
+                self._rollback_native_autocommit(manage_native_tx)
+                raise
+            self._commit_native_autocommit(manage_native_tx)
             return [
                 BranchInfo(
                     branch_id=row["branch_id"],
@@ -426,19 +563,22 @@ class _IntervalBackend(_SQLBranchBackend):
                     created_at=row["created_at"],
                     metadata=_json_loads(row["metadata_json"]),
                 )
-                for row in self._native_branch_store.list_branch_infos()
+                for row in rows
             ]
         raise BranchingError("native interval branch store is unavailable")
 
     def get_branch(self, branch_id: str) -> BranchInfo:
         if self._native_branch_store is None:
             self._initialize_native_branch_store()
+        manage_native_tx = self._manage_native_autocommit()
         try:
             row = self._native_branch_store.get_branch_info(branch_id)
         except Exception as exc:
+            self._rollback_native_autocommit(manage_native_tx)
             if "branch not found" in str(exc):
                 raise BranchNotFoundError(branch_id) from exc
             raise
+        self._commit_native_autocommit(manage_native_tx)
         return BranchInfo(
             branch_id=row["branch_id"],
             current_ref=row["current_ref"],
@@ -484,12 +624,15 @@ class _IntervalBackend(_SQLBranchBackend):
 
     def get_checkpoint(self, checkpoint: str) -> CheckpointInfo:
         if self._native_branch_store is not None:
+            manage_native_tx = self._manage_native_autocommit()
             try:
                 cp = self._native_branch_store.get_checkpoint_info(checkpoint)
             except Exception as exc:
+                self._rollback_native_autocommit(manage_native_tx)
                 if "branch not found" in str(exc):
                     raise BranchNotFoundError(f"checkpoint:{checkpoint}") from exc
                 raise
+            self._commit_native_autocommit(manage_native_tx)
             return CheckpointInfo(
                 cp["checkpoint_id"],
                 cp["branch_id"],
@@ -505,6 +648,13 @@ class _IntervalBackend(_SQLBranchBackend):
         metadata_filter: dict[str, Any] | None = None,
     ) -> list[CheckpointInfo]:
         if self._native_branch_store is not None:
+            manage_native_tx = self._manage_native_autocommit()
+            try:
+                rows = self._native_branch_store.list_checkpoint_infos(branch or "")
+            except Exception:
+                self._rollback_native_autocommit(manage_native_tx)
+                raise
+            self._commit_native_autocommit(manage_native_tx)
             infos = [
                 CheckpointInfo(
                     row["checkpoint_id"],
@@ -513,7 +663,7 @@ class _IntervalBackend(_SQLBranchBackend):
                     row["created_at"],
                     _json_loads(row["metadata_json"]),
                 )
-                for row in self._native_branch_store.list_checkpoint_infos(branch or "")
+                for row in rows
             ]
             if metadata_filter:
                 infos = [
@@ -557,16 +707,19 @@ class _IntervalBackend(_SQLBranchBackend):
     ) -> tuple[_IntervalSegment, dict[str, _TableMeta], set[str]]:
         if self._native_branch_store is None:
             raise BranchingError("native interval branch store is unavailable")
+        manage_native_tx = self._manage_native_autocommit()
         try:
             info = self._native_branch_store.prepare_ref_info(
                 int(segment_id),
                 self.enable_schema_branching,
             )
         except Exception as exc:
+            self._rollback_native_autocommit(manage_native_tx)
             message = str(exc)
             if "segment not found" in message:
                 raise BranchNotFoundError(f"segment:{segment_id}") from exc
             raise
+        self._commit_native_autocommit(manage_native_tx)
 
         segment = self._segment_from_native_dict(info["segment"])
         tables = {
@@ -630,9 +783,12 @@ class _IntervalBackend(_SQLBranchBackend):
         if self._native_branch_store is None:
             raise BranchingError("native interval branch store is unavailable")
         native_session = self._native_branch_session_for_segment(ref.branch_id, segment)
+        manage_native_tx = self._manage_native_autocommit()
         try:
             rows = native_session.query(sql, params)
+            rows = self._coerce_native_query_rows(ref, sql, rows)
         except Exception as exc:
+            self._rollback_native_autocommit(manage_native_tx)
             message = str(exc)
             if "chronos_table_not_registered:" in message:
                 table = message.rsplit("chronos_table_not_registered:", 1)[-1].strip()
@@ -640,16 +796,19 @@ class _IntervalBackend(_SQLBranchBackend):
             if "table is not registered for interval branching" in message:
                 raise TableNotRegisteredError(message) from exc
             raise
-        return self._coerce_native_query_rows(ref, sql, rows)
+        self._commit_native_autocommit(manage_native_tx)
+        return rows
 
     def explain(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         segment = self._prepared_segment(ref)
         if self._native_branch_store is None:
             raise BranchingError("native interval branch store is unavailable")
         native_session = self._native_branch_session_for_segment(ref.branch_id, segment)
+        manage_native_tx = self._manage_native_autocommit()
         try:
-            return native_session.explain(sql, params)
+            rows = native_session.explain(sql, params)
         except Exception as exc:
+            self._rollback_native_autocommit(manage_native_tx)
             message = str(exc)
             if "chronos_table_not_registered:" in message:
                 table = message.rsplit("chronos_table_not_registered:", 1)[-1].strip()
@@ -657,15 +816,19 @@ class _IntervalBackend(_SQLBranchBackend):
             if "table is not registered for interval branching" in message:
                 raise TableNotRegisteredError(message) from exc
             raise
+        self._commit_native_autocommit(manage_native_tx)
+        return rows
 
     def rewrite_query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> str:
         segment = self._prepared_segment(ref)
         if self._native_branch_store is None:
             raise BranchingError("native interval branch store is unavailable")
         native_session = self._native_branch_session_for_segment(ref.branch_id, segment)
+        manage_native_tx = self._manage_native_autocommit()
         try:
-            return native_session.rewrite_query(sql, params)
+            rewritten = native_session.rewrite_query(sql, params)
         except Exception as exc:
+            self._rollback_native_autocommit(manage_native_tx)
             message = str(exc)
             if "chronos_table_not_registered:" in message:
                 table = message.rsplit("chronos_table_not_registered:", 1)[-1].strip()
@@ -673,6 +836,8 @@ class _IntervalBackend(_SQLBranchBackend):
             if "table is not registered for interval branching" in message:
                 raise TableNotRegisteredError(message) from exc
             raise
+        self._commit_native_autocommit(manage_native_tx)
+        return rewritten
 
     def _coerce_native_query_rows(
         self,
@@ -707,11 +872,6 @@ class _IntervalBackend(_SQLBranchBackend):
         if self._is_schema_statement(sql):
             if not self.enable_schema_branching:
                 raise UnsupportedSQLError("branch-local schema changes are disabled")
-            # PostgreSQL's CREATE INDEX CONCURRENTLY still conflicts with
-            # later ALTER TABLE operations on the same physical table. Drain
-            # this context's deferred schema-version indexes before the next
-            # branch-local DDL so the DDL path stays deadlock-free.
-            self.wait_for_async_schema_indexes()
             if self._native_branch_store is None:
                 raise BranchingError("native interval branch store is unavailable")
             native_session = self._native_branch_session_for_segment(
@@ -736,13 +896,7 @@ class _IntervalBackend(_SQLBranchBackend):
                     raise TableNotRegisteredError(message) from exc
                 raise
             if not self.db.in_transaction and not self._native_branch_transaction_active:
-                flush_deferred = getattr(
-                    self._native_branch_store,
-                    "flush_deferred_schema_indexes",
-                    None,
-                )
-                if callable(flush_deferred):
-                    flush_deferred()
+                self._start_async_schema_indexes()
             ref.metadata.clear()
             ref.metadata.update(self.prepare_ref(_BranchRef(ref.branch_id, ref.ref, ref.readonly)).metadata)
             return result
@@ -808,16 +962,19 @@ class _IntervalBackend(_SQLBranchBackend):
     def diff_rows(self, left: str, right: str, table: str) -> list[RowDiff] | None:
         if self._native_branch_store is None:
             raise BranchingError("native interval branch store is unavailable")
+        manage_native_tx = self._manage_native_autocommit()
         try:
             native_diffs = self._native_branch_store.diff_rows(left, right, table)
-            return [self._native_row_diff(diff) for diff in native_diffs]
         except Exception as exc:
+            self._rollback_native_autocommit(manage_native_tx)
             message = str(exc)
             if "table is not registered for interval branching" in message:
                 return []
             if "chronos_native_diff_unsupported" in message:
                 raise UnsupportedSQLError(message) from exc
             raise
+        self._commit_native_autocommit(manage_native_tx)
+        return [self._native_row_diff(diff) for diff in native_diffs]
 
     def _native_row_diff(self, diff: Mapping[str, Any]) -> RowDiff:
         return RowDiff(
@@ -885,25 +1042,28 @@ class _IntervalBackend(_SQLBranchBackend):
     def merge_preview(self, source: str, target: str) -> MergePreview | None:
         if self._native_branch_store is None:
             raise BranchingError("native interval branch store is unavailable")
+        manage_native_tx = self._manage_native_autocommit()
         try:
             preview = self._native_branch_store.merge_preview(source, target)
-            return MergePreview(
-                source=source,
-                target=target,
-                changes=[
-                    self._native_row_diff(diff)
-                    for diff in preview["changes"]
-                ],
-                conflicts=[
-                    self._native_row_diff(diff)
-                    for diff in preview["conflicts"]
-                ],
-            )
         except Exception as exc:
+            self._rollback_native_autocommit(manage_native_tx)
             message = str(exc)
             if "chronos_native_merge_unsupported" in message:
                 raise UnsupportedSQLError(message) from exc
             raise
+        self._commit_native_autocommit(manage_native_tx)
+        return MergePreview(
+            source=source,
+            target=target,
+            changes=[
+                self._native_row_diff(diff)
+                for diff in preview["changes"]
+            ],
+            conflicts=[
+                self._native_row_diff(diff)
+                for diff in preview["conflicts"]
+            ],
+        )
 
     def merge_apply(
         self,
@@ -1176,7 +1336,14 @@ class _IntervalBackend(_SQLBranchBackend):
             return set(self.tables)
         if self._native_branch_store is None:
             raise BranchingError("native interval branch store is unavailable")
-        return set(self._native_branch_store.known_schema_tables())
+        manage_native_tx = self._manage_native_autocommit()
+        try:
+            tables = set(self._native_branch_store.known_schema_tables())
+        except Exception:
+            self._rollback_native_autocommit(manage_native_tx)
+            raise
+        self._commit_native_autocommit(manage_native_tx)
+        return tables
 
     def _key_tuple(self, meta: _TableMeta, key: dict[str, Any]) -> tuple[Any, ...]:
         return tuple(key[column] for column in meta.pk_columns)
@@ -1220,12 +1387,15 @@ class _IntervalBackend(_SQLBranchBackend):
             self._initialize_native_branch_store()
         if self._native_branch_store is None:
             raise BranchingError("native interval branch store is unavailable")
+        manage_native_tx = self._manage_native_autocommit()
         try:
             row = self._native_branch_store.get_branch_info(branch_id)
         except Exception as exc:
+            self._rollback_native_autocommit(manage_native_tx)
             if "branch not found" in str(exc):
                 raise BranchNotFoundError(branch_id) from exc
             raise
+        self._commit_native_autocommit(manage_native_tx)
         return int(row["current_ref"])
 
     def _segment(self, segment_id: int | str) -> _IntervalSegment:

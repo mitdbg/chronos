@@ -118,7 +118,6 @@
 //         created_at TEXT NOT NULL
 //         metadata TEXT NOT NULL
 //         PRIMARY KEY (backend, table_name, live_lo)
-//         CHECK (live_lo < live_hi)
 //       Interval-versioned logical table -> schema_version binding.  A tombstone
 //       binding represents branch-local DROP TABLE without deleting inherited
 //       rows for other branches.
@@ -141,10 +140,10 @@
 //         writer_segment_id INTEGER NOT NULL
 //         deleted BOOLEAN NOT NULL DEFAULT FALSE
 //         PRIMARY KEY (<pk columns...>, live_lo)
-//         CHECK (live_lo < live_hi)
 //       Secondary indexes:
 //         (<pk columns...>, live_hi)
-//         (writer_segment_id, <pk columns...>)
+//         (writer_segment_id, <pk columns...>) on non-Postgres backends
+//         (writer_segment_id) WHERE writer_segment_id > 1 on Postgres
 //       These optional data-plane indexes default to enabled. The physical
 //       table names are stored in _chronos_branch_tables and are created by
 //       this metadata/control layer.
@@ -473,7 +472,9 @@
                 }
                 if (create_secondary_indexes()) {
                     driver().execute(pk_hi_index_sql(meta.physical_name, meta.pk_columns));
-                    driver().execute(writer_segment_index_sql(meta.physical_name, meta.pk_columns));
+                    if (create_writer_segment_index()) {
+                        driver().execute(writer_segment_index_sql(meta.physical_name, meta.pk_columns));
+                    }
                 }
                 if (started_tx) driver_->execute("COMMIT");
                 return;
@@ -1042,25 +1043,47 @@
         std::int64_t child_id = 0;
         std::int64_t fork_base_id = 0;
         std::vector<std::vector<Value>> source_rows;
+        std::vector<Value> source_segment_row;
+        std::string source_branch_kind;
         if (metadata_dialect() == "postgres") {
-            // Branch creation is metadata-heavy, so keep the hot path to two
-            // SQL round trips inside the transaction: one locked source row
-            // read that also checks duplicate branch ids and allocates segment
-            // ids, followed by one data-modifying CTE below.
+            // Lock the source branch head first, then read its segment in a
+            // separate statement.  Under READ COMMITTED, a concurrent fork can
+            // update current_segment_id while inserting the continuation
+            // segment.  A single SELECT ... JOIN ... FOR UPDATE can recheck the
+            // locked branch row but still miss the just-committed segment in
+            // the statement snapshot, falsely reporting that the source branch
+            // does not exist.
             source_rows = driver_->query(
                 "SELECT b.current_segment_id, b.branch_kind, "
-                "       s.segment_id, COALESCE(s.parent_segment_id, 0), s.segment_kind, "
-                "       s.live_lo, s.live_hi, s.branch_point, "
                 "       (SELECT COUNT(*) FROM _chronos_branch_interval_branches WHERE branch_id = ?), "
                 "       nextval('_chronos_branch_interval_segment_id_seq')::bigint, "
                 "       nextval('_chronos_branch_interval_segment_id_seq')::bigint, "
                 "       nextval('_chronos_branch_interval_segment_id_seq')::bigint "
                 "FROM _chronos_branch_interval_branches b "
-                "JOIN _chronos_branch_interval_segments s "
-                "  ON s.segment_id = b.current_segment_id "
                 "WHERE b.branch_id = ?" + lock_suffix,
                 {branch_id, from_branch}
             );
+            if (source_rows.empty()) {
+                throw std::runtime_error("branch not found: " + from_branch);
+            }
+            if (native_as_int(source_rows[0][2]) > 0) {
+                throw std::runtime_error("branch already exists: " + branch_id);
+            }
+            continuation_id = native_as_int(source_rows[0][3]);
+            child_id = native_as_int(source_rows[0][4]);
+            fork_base_id = native_as_int(source_rows[0][5]);
+            source_branch_kind = native_as_string(source_rows[0][1]);
+            auto segment_rows = driver_->query(
+                "SELECT segment_id, COALESCE(parent_segment_id, 0), segment_kind, "
+                "       live_lo, live_hi, branch_point "
+                "FROM _chronos_branch_interval_segments "
+                "WHERE segment_id = ?",
+                {native_as_int(source_rows[0][0])}
+            );
+            if (segment_rows.empty()) {
+                throw std::runtime_error("branch segment not found: " + from_branch);
+            }
+            source_segment_row = std::move(segment_rows[0]);
         } else {
             auto existing = driver_->query(
                 "SELECT 1 FROM _chronos_branch_interval_branches WHERE branch_id = ? LIMIT 1",
@@ -1079,28 +1102,22 @@
                 "WHERE b.branch_id = ?" + lock_suffix,
                 {from_branch}
             );
+            if (source_rows.empty()) {
+                throw std::runtime_error("branch not found: " + from_branch);
+            }
+            source_branch_kind = native_as_string(source_rows[0][1]);
+            source_segment_row.assign(source_rows[0].begin() + 2, source_rows[0].begin() + 8);
         }
-        if (source_rows.empty()) {
-            throw std::runtime_error("branch not found: " + from_branch);
-        }
-        if (metadata_dialect() == "postgres" && native_as_int(source_rows[0][8]) > 0) {
-            throw std::runtime_error("branch already exists: " + branch_id);
-        }
-        if (metadata_dialect() == "postgres") {
-            continuation_id = native_as_int(source_rows[0][9]);
-            child_id = native_as_int(source_rows[0][10]);
-            fork_base_id = native_as_int(source_rows[0][11]);
-        }
-        if (native_as_string(source_rows[0][1]) == "terminal") {
+        if (source_branch_kind == "terminal") {
             throw std::runtime_error("terminal branch is not branchable: " + from_branch);
         }
         NativeDirectMergeSegment source_segment{
-            native_as_int(source_rows[0][2]),
-            native_as_int(source_rows[0][3]),
-            native_as_string(source_rows[0][4]),
-            native_as_string(source_rows[0][5]),
-            native_as_string(source_rows[0][6]),
-            native_as_string(source_rows[0][7]),
+            native_as_int(source_segment_row[0]),
+            native_as_int(source_segment_row[1]),
+            native_as_string(source_segment_row[2]),
+            native_as_string(source_segment_row[3]),
+            native_as_string(source_segment_row[4]),
+            native_as_string(source_segment_row[5]),
         };
 
         const cpp_int lo = cpp_int_from_decimal(source_segment.live_lo);
@@ -1619,8 +1636,7 @@
             "live_hi " + interval_type + " NOT NULL, "
             "created_at TEXT NOT NULL, "
             "metadata TEXT NOT NULL, "
-            "PRIMARY KEY (backend, table_name, live_lo), "
-            "CHECK (live_lo < live_hi))"
+            "PRIMARY KEY (backend, table_name, live_lo))"
         );
     }
 
@@ -1630,33 +1646,63 @@
     }
 
     std::string writer_segment_index_sql(const std::string &physical, const std::vector<std::string> &pk_columns) {
-        return "CREATE INDEX IF NOT EXISTS " + quote_ident("idx_" + physical + "_writer_segment") +
+        if (dialect() == "postgres") {
+            return "CREATE INDEX IF NOT EXISTS " + quote_ident("idx_" + physical + "_writer_segment") +
+                " ON " + quote_ident(physical) + " (writer_segment_id) WHERE writer_segment_id > 1";
+        }
+        std::string sql = "CREATE INDEX IF NOT EXISTS " + quote_ident("idx_" + physical + "_writer_segment") +
             " ON " + quote_ident(physical) + " (writer_segment_id, " + comma_join_quoted(pk_columns) + ")";
+        return sql;
+    }
+
+    std::string primary_key_sql(const std::string &physical, const std::vector<std::string> &pk_columns) {
+        return "ALTER TABLE " + quote_ident(physical) +
+            " ADD PRIMARY KEY (" + comma_join_quoted(pk_columns) + ", live_lo)";
+    }
+
+    void add_interval_primary_key(const std::string &physical, const std::vector<std::string> &pk_columns) {
+        driver().execute(primary_key_sql(physical, pk_columns));
+    }
+
+    int postgres_schema_copy_fillfactor() const {
+        // Schema-copy tables are commonly followed by a full-table backfill.
+        // Leaving heap room lets PostgreSQL use HOT updates and avoid rewriting
+        // interval indexes for every copied row.
+        return 50;
     }
 
     void create_interval_physical_table(
         const std::string &physical,
         const std::vector<std::string> &column_defs,
         const std::vector<std::string> &pk_columns,
-        bool create_secondary_indexes = true
+        bool create_secondary_indexes = true,
+        bool create_primary_key = true,
+        int postgres_fillfactor = 0
     ) {
         // Physical interval tables keep user columns unchanged and append the
         // four versioning columns used by every relational data plane:
         // live_lo/live_hi bound row visibility, writer_segment_id identifies
         // the writer for diff/merge, and deleted stores logical tombstones.
-        driver().execute(
+        std::string sql =
             "CREATE TABLE " + quote_ident(physical) + " ("
             + join_strings(column_defs, ", ") +
             ", live_lo " + interval_sql_type() + " NOT NULL"
             ", live_hi " + interval_sql_type() + " NOT NULL"
             ", writer_segment_id INTEGER NOT NULL"
-            ", deleted BOOLEAN NOT NULL DEFAULT FALSE"
-            ", PRIMARY KEY (" + comma_join_quoted(pk_columns) + ", live_lo)"
-            ", CHECK (live_lo < live_hi))"
-        );
+            ", deleted BOOLEAN NOT NULL DEFAULT FALSE";
+        if (create_primary_key) {
+            sql += ", PRIMARY KEY (" + comma_join_quoted(pk_columns) + ", live_lo)";
+        }
+        sql += ")";
+        if (dialect() == "postgres" && postgres_fillfactor > 0 && postgres_fillfactor < 100) {
+            sql += " WITH (fillfactor = " + std::to_string(postgres_fillfactor) + ")";
+        }
+        driver().execute(sql);
         if (create_secondary_indexes) {
             driver().execute(pk_hi_index_sql(physical, pk_columns));
-            driver().execute(writer_segment_index_sql(physical, pk_columns));
+            if (create_writer_segment_index()) {
+                driver().execute(writer_segment_index_sql(physical, pk_columns));
+            }
         }
     }
 
@@ -1894,7 +1940,7 @@
         }
         select_exprs.push_back("?");
         select_exprs.push_back("?");
-        select_exprs.push_back(quote_ident("writer_segment_id"));
+        select_exprs.push_back("?");
         select_exprs.push_back("FALSE");
         driver().execute(
             "INSERT INTO " + quote_ident(new_meta.physical_name) +
@@ -1902,7 +1948,7 @@
             "SELECT " + join_strings(select_exprs, ", ") +
             " FROM " + quote_ident(old_meta.physical_name) +
             " WHERE live_lo <= ? AND ? < live_hi AND deleted = FALSE",
-            {segment.live_lo, segment.live_hi, segment.branch_point, segment.branch_point}
+            {segment.live_lo, segment.live_hi, segment.segment_id, segment.branch_point, segment.branch_point}
         );
     }
 
@@ -2183,12 +2229,19 @@
             const std::size_t count = std::min<std::size_t>(1000, segment_ids.size() - start);
             std::vector<Value> params;
             params.reserve(count);
+            bool all_non_root = true;
             for (std::size_t i = 0; i < count; ++i) {
-                params.push_back(segment_ids[start + i]);
+                const std::int64_t segment_id = segment_ids[start + i];
+                if (segment_id <= 1) all_non_root = false;
+                params.push_back(segment_id);
+            }
+            std::string sql = "DELETE FROM " + quote_ident(physical) +
+                " WHERE writer_segment_id IN (" + placeholders(count) + ")";
+            if (dialect() == "postgres" && all_non_root) {
+                sql += " AND writer_segment_id > 1";
             }
             driver().execute(
-                "DELETE FROM " + quote_ident(physical) +
-                " WHERE writer_segment_id IN (" + placeholders(count) + ")",
+                sql,
                 params
             );
         }
@@ -2767,7 +2820,14 @@
             placeholders(writer_segment_ids.size()) + ")";
         std::vector<Value> params;
         params.reserve(writer_segment_ids.size());
-        for (std::int64_t id : writer_segment_ids) params.push_back(id);
+        bool all_non_root = true;
+        for (std::int64_t id : writer_segment_ids) {
+            if (id <= 1) all_non_root = false;
+            params.push_back(id);
+        }
+        if (dialect() == "postgres" && all_non_root) {
+            sql += " AND writer_segment_id > 1";
+        }
         auto rows = driver().query(sql, params);
         std::vector<NativeRowKey> keys;
         keys.reserve(rows.size());

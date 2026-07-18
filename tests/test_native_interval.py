@@ -278,6 +278,54 @@ def test_native_branch_session_executes_branch_aware_sql(tmp_path):
         ctx.close()
 
 
+def test_native_branch_session_supports_null_predicates(tmp_path):
+    db_path = tmp_path / "branch_null_predicate.sqlite"
+    ctx = ChronosBranchContext.connect(f"sqlite:///{db_path}", backend="interval")
+    try:
+        ctx.conn.execute(
+            "CREATE TABLE customer (c_id INTEGER PRIMARY KEY, c_balance INTEGER)"
+        )
+        ctx.conn.executemany(
+            "INSERT INTO customer VALUES (?, ?)",
+            [(1, None), (2, 5), (3, None), (4, 7)],
+        )
+        ctx.conn.commit()
+        ctx.register_table("customer", ["c_id"])
+        ctx.create_branch("child")
+
+        native_store = native_interval.NativeBranchStore("sqlite", ctx.db.raw_connection)
+        child = native_store.checkout("child")
+
+        assert child.execute(
+            "UPDATE customer SET c_balance = 0 WHERE c_balance IS NULL"
+        ) == 2
+        assert child.query("SELECT c_id, c_balance FROM customer ORDER BY c_id") == [
+            {"c_id": 1, "c_balance": 0},
+            {"c_id": 2, "c_balance": 5},
+            {"c_id": 3, "c_balance": 0},
+            {"c_id": 4, "c_balance": 7},
+        ]
+        assert child.execute(
+            "DELETE FROM customer WHERE c_balance IS NOT NULL AND c_balance >= :minimum",
+            {"minimum": 7},
+        ) == 1
+        assert child.query("SELECT c_id, c_balance FROM customer ORDER BY c_id") == [
+            {"c_id": 1, "c_balance": 0},
+            {"c_id": 2, "c_balance": 5},
+            {"c_id": 3, "c_balance": 0},
+        ]
+
+        main = native_store.checkout("main")
+        assert main.query("SELECT c_id, c_balance FROM customer ORDER BY c_id") == [
+            {"c_id": 1, "c_balance": None},
+            {"c_id": 2, "c_balance": 5},
+            {"c_id": 3, "c_balance": None},
+            {"c_id": 4, "c_balance": 7},
+        ]
+    finally:
+        ctx.close()
+
+
 def test_native_branch_session_updates_with_primary_key_prefix_predicate(tmp_path):
     db_path = tmp_path / "branch_prefix_update.sqlite"
     ctx = ChronosBranchContext.connect(f"sqlite:///{db_path}", backend="interval")

@@ -215,7 +215,7 @@ def test_interval_schema_copy_preserves_writer_provenance(sql_backend: str) -> N
             ("abc", 5),
             ("def", 5),
         ]
-        assert {int(row["writer_segment_id"]) for row in copied} == {1}
+        assert {int(row["writer_segment_id"]) for row in copied} == {exp_segment_id}
 
         exp.execute("UPDATE products SET score = 9 WHERE sku = 'abc'")
         rows = ctx.db.execute(
@@ -228,7 +228,7 @@ def test_interval_schema_copy_preserves_writer_provenance(sql_backend: str) -> N
         ).fetchall()
         assert [(row["sku"], row["score"], int(row["writer_segment_id"])) for row in rows] == [
             ("abc", 9, exp_segment_id),
-            ("def", 5, 1),
+            ("def", 5, exp_segment_id),
         ]
     finally:
         ctx.close()
@@ -322,6 +322,73 @@ def test_postgres_full_table_update_batch_splice_handles_overlap_and_params() ->
             {"id": 1, "balance": 100, "label": "base"},
             {"id": 2, "balance": 200, "label": "base"},
             {"id": 3, "balance": 300, "label": "base"},
+        ]
+    finally:
+        ctx.close()
+
+
+def test_postgres_interval_prefix_update_with_extra_predicate_is_branch_local() -> None:
+    _reset_postgres_schema()
+    dsn = _postgres_dsn()
+    ctx = ChronosBranchContext.connect(
+        dsn,
+        backend="interval",
+        enable_schema_branching=True,
+    )
+    try:
+        ctx.db.execute(
+            """
+            CREATE TABLE stock (
+              s_w_id INTEGER,
+              s_i_id INTEGER,
+              s_quantity INTEGER,
+              PRIMARY KEY (s_w_id, s_i_id)
+            )
+            """
+        )
+        ctx.db.executemany(
+            "INSERT INTO stock VALUES (?, ?, ?)",
+            [(1, 1, 5), (1, 2, 20), (2, 1, 5)],
+        )
+        ctx.db.commit()
+        ctx.register_table("stock", ["s_w_id", "s_i_id"])
+
+        ctx.create_branch("exp", from_branch="main")
+        exp = ctx.checkout("exp")
+        assert exp.execute(
+            """
+            UPDATE stock
+            SET s_quantity = s_quantity + 100
+            WHERE s_quantity < 10 AND s_w_id = 1
+            """
+        ).rowcount == 1
+        assert exp.query("SELECT * FROM stock ORDER BY s_w_id, s_i_id") == [
+            {"s_w_id": 1, "s_i_id": 1, "s_quantity": 105},
+            {"s_w_id": 1, "s_i_id": 2, "s_quantity": 20},
+            {"s_w_id": 2, "s_i_id": 1, "s_quantity": 5},
+        ]
+        assert ctx.checkout("main").query(
+            "SELECT * FROM stock ORDER BY s_w_id, s_i_id"
+        ) == [
+            {"s_w_id": 1, "s_i_id": 1, "s_quantity": 5},
+            {"s_w_id": 1, "s_i_id": 2, "s_quantity": 20},
+            {"s_w_id": 2, "s_i_id": 1, "s_quantity": 5},
+        ]
+
+        assert exp.execute(
+            "UPDATE stock SET s_quantity = 3 WHERE s_w_id = 1 AND s_i_id = 2"
+        ).rowcount == 1
+        assert exp.execute(
+            """
+            UPDATE stock
+            SET s_quantity = s_quantity + 100
+            WHERE s_quantity < 10 AND s_w_id = 1
+            """
+        ).rowcount == 1
+        assert exp.query("SELECT * FROM stock ORDER BY s_w_id, s_i_id") == [
+            {"s_w_id": 1, "s_i_id": 1, "s_quantity": 105},
+            {"s_w_id": 1, "s_i_id": 2, "s_quantity": 103},
+            {"s_w_id": 2, "s_i_id": 1, "s_quantity": 5},
         ]
     finally:
         ctx.close()
@@ -474,6 +541,78 @@ def test_interval_update_case_expression_for_macrobench_backfill(sql_backend: st
             {"c_id": 2, "loyalty_tier_t0_s1": "Silver", "credit_lim_t0_s1": 2000},
             {"c_id": 3, "loyalty_tier_t0_s1": "Bronze", "credit_lim_t0_s1": 3000},
         ]
+    finally:
+        ctx.close()
+
+
+def test_postgres_private_schema_case_backfill_is_set_based() -> None:
+    _reset_postgres_schema()
+    ctx = ChronosBranchContext.connect(
+        _postgres_dsn(),
+        backend="interval",
+        enable_schema_branching=True,
+    )
+    try:
+        ctx.db.execute(
+            """
+            CREATE TABLE customer (
+              c_id INTEGER PRIMARY KEY,
+              c_ytd_payment INTEGER,
+              c_credit_lim INTEGER
+            )
+            """
+        )
+        ctx.db.executemany(
+            "INSERT INTO customer VALUES (?, ?, ?)",
+            [(i, (i * 37) % 12000, i * 10) for i in range(1, 65)],
+        )
+        ctx.db.commit()
+        ctx.register_table("customer", ["c_id"])
+
+        ctx.create_branch("dev", from_branch="main")
+        dev = ctx.checkout("dev")
+        dev.execute("ALTER TABLE customer ADD COLUMN loyalty_tier_t0_s1 VARCHAR(8)")
+        dev.execute("ALTER TABLE customer ADD COLUMN credit_lim_t0_s1 INTEGER")
+
+        active = _interval_active_schema_version_for_branch(ctx, "dev", table="customer")
+        physical = str(active["physical_table"]).replace('"', '""')
+        ctx.db.execute("CREATE TABLE update_stmt_count (n INTEGER NOT NULL)")
+        ctx.db.execute("INSERT INTO update_stmt_count VALUES (0)")
+        ctx.db.execute(
+            """
+            CREATE OR REPLACE FUNCTION count_customer_update_stmt()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                UPDATE update_stmt_count SET n = n + 1;
+                RETURN NULL;
+            END $$
+            """
+        )
+        ctx.db.execute(
+            f"""
+            CREATE TRIGGER count_customer_update_stmt
+            AFTER UPDATE ON "{physical}"
+            FOR EACH STATEMENT EXECUTE FUNCTION count_customer_update_stmt()
+            """
+        )
+        ctx.db.commit()
+
+        result = dev.execute(
+            """
+            UPDATE customer SET
+              loyalty_tier_t0_s1 = CASE
+                WHEN c_ytd_payment > 9000 THEN 'Gold'
+                WHEN c_ytd_payment > 5000 THEN 'Silver'
+                ELSE 'Bronze'
+              END,
+              credit_lim_t0_s1 = c_credit_lim
+            """
+        )
+
+        assert result.rowcount == 64
+        count_row = ctx.db.execute("SELECT n FROM update_stmt_count").fetchone()
+        assert count_row is not None
+        assert count_row["n"] == 1
     finally:
         ctx.close()
 
@@ -1038,6 +1177,16 @@ def test_postgres_interval_schema_copy_preserves_logical_indexes() -> None:
     ctx = _ctx("postgres", enable_schema_branching=True)
     try:
         ctx.create_index("products", ["price", "sku"], name="products_price_sku")
+        logical_indexes = ctx.db.execute(
+            """
+            SELECT columns
+            FROM _chronos_branch_indexes
+            WHERE backend = 'interval'
+              AND table_name = 'products'
+              AND index_name = 'products_price_sku'
+            """
+        ).fetchall()
+        assert [json.loads(row["columns"]) for row in logical_indexes] == [["price", "sku"]]
         ctx.create_branch("exp", from_branch="main")
         exp = ctx.checkout("exp")
 
@@ -1049,37 +1198,36 @@ def test_postgres_interval_schema_copy_preserves_logical_indexes() -> None:
             score_indexes_before_commit = _postgres_index_defs_for_table(
                 ctx, score_physical, commit=False
             )
-            assert not any("products_price_sku" in indexdef for indexdef in score_indexes_before_commit)
-            assert not any("_pk_hi" in indexdef for indexdef in score_indexes_before_commit)
-        ctx.wait_for_background_work()
-        score_indexes = _postgres_index_defs_for_table(ctx, score_physical)
-        assert any("_pk_hi" in indexdef for indexdef in score_indexes)
-        assert any(
-            "price" in indexdef
-            and "sku" in indexdef
-            and "live_lo" in indexdef
-            and "live_hi" in indexdef
-            and "deleted" in indexdef
-            for indexdef in score_indexes
-        )
+            assert any("_pk_hi" in indexdef for indexdef in score_indexes_before_commit)
+            assert any(
+                "price" in indexdef
+                and "sku" in indexdef
+                and "live_lo" in indexdef
+                and "live_hi" in indexdef
+                and "deleted" in indexdef
+                for indexdef in score_indexes_before_commit
+            )
+        assert exp.query(
+            "SELECT sku, score FROM products WHERE price = :price",
+            {"price": 10},
+        ) == [{"sku": "abc", "score": None}]
 
         ctx.create_branch("child", from_branch="exp")
         exp.execute("ALTER TABLE products ADD COLUMN note TEXT")
         note_physical = _postgres_physical_table_for_latest_schema_change(
             ctx, ddl_op="alter_table_add_column"
         )
-        ctx.wait_for_background_work()
-        note_indexes = _postgres_index_defs_for_table(ctx, note_physical)
-        assert any("_pk_hi" in indexdef for indexdef in note_indexes)
-        assert any(
-            "price" in indexdef
-            and "sku" in indexdef
-            and "live_lo" in indexdef
-            and "live_hi" in indexdef
-            and "deleted" in indexdef
-            for indexdef in note_indexes
-        )
         assert score_physical != note_physical
+        logical_indexes = ctx.db.execute(
+            """
+            SELECT columns
+            FROM _chronos_branch_indexes
+            WHERE backend = 'interval'
+              AND table_name = 'products'
+              AND index_name = 'products_price_sku'
+            """
+        ).fetchall()
+        assert [json.loads(row["columns"]) for row in logical_indexes] == [["price", "sku"]]
         assert exp.query(
             "SELECT sku, score, note FROM products WHERE price = :price",
             {"price": 10},

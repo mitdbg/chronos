@@ -40,11 +40,17 @@ table, extent tree, refcount table, or filesystem-level block allocator.
 
 `mount_chronosfs(store, mountpoint, branch_id="main")` starts a blocking native
 libfuse mount. By default, same-machine mounts for the same
-`(database_url, branch_id, block_size, options)` are routed through one local
-ChronosFS daemon process. The daemon hosts multiple FUSE sessions in the same
-process, and the native layer shares one backend/cache object across those
-sessions. This avoids same-machine stale metadata caches when multiple mount
-points target the same PostgreSQL-backed filesystem data.
+`(database_url, block_size)` are routed through one local ChronosFS daemon
+process. The daemon owns one native branch store and a branch-session cache
+shared by every mount point. Native filesystem requests are coordinated by one
+database-level mutex; SQLite's immediate-write transactions queue external
+control-plane writers. This avoids lock races and stale same-machine metadata
+caches while allowing independent branches to stay mounted concurrently.
+
+`start_chronosfs_mount()` adds a mount point without starting another daemon.
+Run-scoped integrations can unmount their mount points and then call
+`shutdown_chronosfs_daemon()` for deterministic cleanup instead of waiting for
+the daemon's idle timeout.
 
 The current adapter supports:
 

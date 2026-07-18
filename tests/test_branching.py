@@ -6,6 +6,7 @@ import math
 import os
 import subprocess
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -3355,6 +3356,53 @@ def test_postgres_interval_delete_leaf_branch_from_wide_main_fanout() -> None:
         ctx.close()
 
 
+def test_postgres_interval_concurrent_terminal_branches_from_main() -> None:
+    _reset_postgres_schema()
+    dsn = _postgres_dsn()
+    ctx = ChronosBranchContext.connect(
+        dsn,
+        backend="interval",
+        enable_schema_branching=True,
+        interval_continuation_percent=98,
+    )
+    try:
+        ctx.db.execute(
+            "CREATE TABLE products (sku TEXT PRIMARY KEY, name TEXT, price INTEGER)"
+        )
+        ctx.db.executemany(
+            "INSERT INTO products VALUES (?, ?, ?)",
+            [("abc", "Alpha", 10), ("def", "Delta", 20)],
+        )
+        ctx.db.commit()
+        ctx.register_table("products", ["sku"])
+    finally:
+        ctx.close()
+
+    def create_and_read(index: int) -> int:
+        worker_ctx = ChronosBranchContext.connect(
+            dsn,
+            backend="interval",
+            enable_schema_branching=True,
+            interval_continuation_percent=98,
+            ensure_metadata=False,
+        )
+        try:
+            branch = f"txn_{index}"
+            worker_ctx.create_branch(branch, from_branch="main", terminal=True)
+            rows = worker_ctx.checkout(branch).query(
+                "SELECT price FROM products WHERE sku = :sku",
+                {"sku": "abc"},
+            )
+            return rows[0]["price"]
+        finally:
+            worker_ctx.close()
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        prices = list(executor.map(create_and_read, range(32)))
+
+    assert prices == [10] * 32
+
+
 def test_interval_delete_branch_gc_removes_unreachable_writer_rows_and_segments(
     sql_backend: str,
 ) -> None:
@@ -3397,6 +3445,42 @@ def test_interval_delete_branch_gc_removes_unreachable_writer_rows_and_segments(
         ).fetchone() is None
         assert _product(ctx.checkout("main"), "abc")["price"] == 10
     finally:
+        ctx.close()
+
+
+def test_interval_postgres_delete_branch_gc_runs_in_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _reset_postgres_schema()
+    ctx = _make_products_only_context("postgres", "interval")
+    release_gc = threading.Event()
+    gc_started = threading.Event()
+    backend = ctx._backend
+    collect = backend._collect_interval_garbage_background
+
+    def blocked_collect() -> None:
+        gc_started.set()
+        if not release_gc.wait(timeout=5):
+            raise TimeoutError("test did not release background interval GC")
+        collect()
+
+    monkeypatch.setattr(backend, "_collect_interval_garbage_background", blocked_collect)
+    try:
+        ctx.create_branch("agent", from_branch="main")
+        started = time.perf_counter()
+        ctx.delete_branch("agent")
+        delete_elapsed = time.perf_counter() - started
+
+        assert gc_started.wait(timeout=1)
+        assert delete_elapsed < 1
+        assert backend._interval_gc_thread is not None
+
+        release_gc.set()
+        ctx.wait_for_background_work()
+        assert not backend._interval_gc_pending
+        assert not backend._interval_gc_running
+    finally:
+        release_gc.set()
         ctx.close()
 
 
@@ -3757,6 +3841,82 @@ def test_postgres_interval_batch_update_assigns_writer_segments_for_diff() -> No
         ctx.close()
 
 
+def test_sqlite_interval_private_upsert_stops_at_child_branch() -> None:
+    ctx = _make_products_only_context("sqlite", "interval")
+    try:
+        main = ctx.checkout("main")
+
+        def abc_physical_count() -> int:
+            return ctx.db.execute(
+                "SELECT COUNT(*) AS count FROM _chronos_b_interval_products WHERE sku = 'abc'"
+            ).fetchone()["count"]
+
+        base_count = abc_physical_count()
+        main.upsert_rows("products", [{"sku": "abc", "name": "Alpha", "price": 11}])
+        after_first = abc_physical_count()
+        assert after_first == base_count
+        assert main.query("SELECT price FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+            {"price": 11}
+        ]
+
+        main.upsert_rows("products", [{"sku": "abc", "name": "Alpha", "price": 12}])
+        after_second = abc_physical_count()
+        assert after_second == after_first
+        assert main.query("SELECT price FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+            {"price": 12}
+        ]
+
+        ctx.create_branch("child", from_branch="main")
+        child = ctx.checkout("child")
+        assert child.query("SELECT price FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+            {"price": 12}
+        ]
+
+        main_after_child = ctx.checkout("main")
+        main_after_child.upsert_rows("products", [{"sku": "abc", "name": "Alpha", "price": 13}])
+        assert abc_physical_count() > after_second
+        assert main_after_child.query("SELECT price FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+            {"price": 13}
+        ]
+        assert child.query("SELECT price FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+            {"price": 12}
+        ]
+    finally:
+        ctx.close()
+
+
+def test_sqlite_interval_child_private_upsert_reuses_first_touch_row() -> None:
+    ctx = _make_products_only_context("sqlite", "interval")
+    try:
+        ctx.create_branch("work", from_branch="main")
+        work = ctx.checkout("work")
+
+        def abc_physical_count() -> int:
+            return ctx.db.execute(
+                "SELECT COUNT(*) AS count FROM _chronos_b_interval_products WHERE sku = 'abc'"
+            ).fetchone()["count"]
+
+        base_count = abc_physical_count()
+        work.upsert_rows("products", [{"sku": "abc", "name": "Alpha", "price": 11}])
+        after_first_touch = abc_physical_count()
+        assert after_first_touch > base_count
+        assert work.query("SELECT price FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+            {"price": 11}
+        ]
+
+        work.upsert_rows("products", [{"sku": "abc", "name": "Alpha", "price": 12}])
+        assert abc_physical_count() == after_first_touch
+        assert work.query("SELECT price FROM products WHERE sku = :sku", {"sku": "abc"}) == [
+            {"price": 12}
+        ]
+        assert ctx.checkout("main").query(
+            "SELECT price FROM products WHERE sku = :sku",
+            {"sku": "abc"},
+        ) == [{"price": 10}]
+    finally:
+        ctx.close()
+
+
 def test_postgres_interval_native_private_update_stops_at_child_branch() -> None:
     import chronos_core._native_interval as native_interval
 
@@ -3814,7 +3974,7 @@ def test_postgres_interval_native_private_update_stops_at_child_branch() -> None
         ctx.close()
 
 
-def test_postgres_interval_native_private_prefix_update_stops_at_child_branch() -> None:
+def test_postgres_interval_prefix_update_preserves_child_branch() -> None:
     import chronos_core._native_interval as native_interval
 
     _reset_postgres_schema()

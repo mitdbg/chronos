@@ -434,11 +434,55 @@ class PgError : public std::runtime_error {
 
 void chronos_pg_ignore_notice(void *, const char *) {}
 
+std::string pg_error_message(PGconn *conn, PGresult *result = nullptr) {
+    if (result) {
+        const char *message = PQresultErrorMessage(result);
+        if (message && *message) return message;
+    }
+    const char *message = conn ? PQerrorMessage(conn) : nullptr;
+    return (message && *message) ? message : "PostgreSQL operation failed";
+}
+
+void pg_drain_results(PGconn *conn) {
+    while (PGresult *raw = PQgetResult(conn)) {
+        PQclear(raw);
+    }
+}
+
+void pg_drain_pipeline_to_sync(PGconn *conn) {
+    while (PQpipelineStatus(conn) != PQ_PIPELINE_OFF) {
+        PGresult *raw = PQgetResult(conn);
+        if (!raw) continue;
+        const ExecStatusType status = PQresultStatus(raw);
+        PQclear(raw);
+        if (status == PGRES_PIPELINE_SYNC) break;
+    }
+    pg_drain_results(conn);
+}
+
+void pg_cleanup_pipeline_mode(PGconn *conn, bool sync_sent) noexcept {
+    if (!conn) return;
+    if (!sync_sent) {
+        sync_sent = PQpipelineSync(conn) == 1;
+        while (PQflush(conn) == 1) {
+        }
+    }
+    if (sync_sent) {
+        pg_drain_pipeline_to_sync(conn);
+    } else {
+        pg_drain_results(conn);
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        pg_drain_results(conn);
+        if (PQexitPipelineMode(conn) == 1) return;
+    }
+}
+
 class PgResult {
   public:
     PgResult(PGconn *conn, PGresult *result) : conn_(conn), result_(result) {
         if (!result_) {
-            throw PgError(PQerrorMessage(conn_));
+            throw PgError(pg_error_message(conn_));
         }
     }
 
@@ -472,14 +516,14 @@ class PgResult {
     void require(ExecStatusType expected) {
         ExecStatusType status = PQresultStatus(result_);
         if (status != expected) {
-            throw PgError(PQerrorMessage(conn_));
+            throw PgError(pg_error_message(conn_, result_));
         }
     }
 
     void require_query_or_command() {
         ExecStatusType status = PQresultStatus(result_);
         if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK) {
-            throw PgError(PQerrorMessage(conn_));
+            throw PgError(pg_error_message(conn_, result_));
         }
     }
 
@@ -1502,7 +1546,8 @@ BulkUpsertResult sqlite_adapter_bulk_upsert(
     bool manage_transaction,
     SQLiteStatementCache *statement_cache,
     IntervalWriteMode write_mode = IntervalWriteMode::Upsert,
-    std::int64_t branch_point = 0
+    std::int64_t branch_point = 0,
+    bool private_exact_key_upsert_allowed = false
 );
 
 BulkUpsertResult postgres_adapter_bulk_upsert(
@@ -1538,7 +1583,8 @@ BulkUpsertResult sqlite_adapter_bulk_upsert(
     bool manage_transaction,
     SQLiteStatementCache *statement_cache,
     IntervalWriteMode write_mode,
-    std::int64_t branch_point
+    std::int64_t branch_point,
+    bool private_exact_key_upsert_allowed
 ) {
     if (columns.empty()) {
         throw std::invalid_argument("columns must not be empty");
@@ -1672,6 +1718,28 @@ BulkUpsertResult sqlite_adapter_bulk_upsert(
         return sql;
     };
 
+    auto private_exact_update_sql = [&] {
+        std::string sql = "UPDATE " + quoted_table + " SET ";
+        for (std::size_t i = 0; i < columns.size(); ++i) {
+            if (i) {
+                sql += ", ";
+            }
+            sql += quote_ident(columns[i]) + " = ?";
+        }
+        sql += ", \"live_hi\" = ?, \"writer_segment_id\" = ?, \"deleted\" = FALSE WHERE ";
+        for (std::size_t i = 0; i < pk_columns.size(); ++i) {
+            if (i) {
+                sql += " AND ";
+            }
+            sql += quote_ident(pk_columns[i]) + " = ?";
+        }
+        sql += " AND \"writer_segment_id\" = ?"
+            " AND \"live_lo\" = ?"
+            " AND \"live_hi\" = ?"
+            " AND \"deleted\" = FALSE";
+        return sql;
+    };
+
     try {
         if (manage_transaction) {
             // Standalone calls own the SQLite transaction.  Calls from
@@ -1700,6 +1768,33 @@ BulkUpsertResult sqlite_adapter_bulk_upsert(
             }
             local_stmt = std::make_unique<SqliteStatement>(db, sql);
             return *local_stmt;
+        };
+
+        const bool can_private_exact_update =
+            private_exact_key_upsert_allowed &&
+            write_mode == IntervalWriteMode::Upsert &&
+            !replacement_deleted;
+        const std::string private_update_sql =
+            can_private_exact_update ? private_exact_update_sql() : std::string();
+        auto try_private_exact_update = [&](const std::vector<Value> &row) {
+            if (!can_private_exact_update) return false;
+            std::unique_ptr<SqliteStatement> local_stmt;
+            SqliteStatement &stmt = statement_for_sql(private_update_sql, local_stmt);
+            stmt.reset();
+            int bind_index = 1;
+            for (const auto &value : row) {
+                stmt.bind(bind_index++, value);
+            }
+            stmt.bind_int64(bind_index++, live_hi);
+            stmt.bind_int64(bind_index++, writer_segment_id);
+            for (std::size_t index : pk_indices) {
+                stmt.bind(bind_index++, row[index]);
+            }
+            stmt.bind_int64(bind_index++, writer_segment_id);
+            stmt.bind_int64(bind_index++, live_lo);
+            stmt.bind_int64(bind_index++, live_hi);
+            stmt.step_done();
+            return sqlite3_changes(db) == 1;
         };
 
         auto flush_live_hi_updates = [&] {
@@ -1873,6 +1968,10 @@ BulkUpsertResult sqlite_adapter_bulk_upsert(
             chunk.reserve(chunk_count);
             for (std::size_t offset = 0; offset < chunk_count; ++offset) {
                 const auto &row = (*splice_rows)[chunk_start + offset];
+                if (try_private_exact_update(row)) {
+                    ++result.logical_rows_written;
+                    continue;
+                }
                 std::vector<PhysicalRow> physical_rows = load_physical_rows(row);
                 if (insert_mode_checks_conflicts(write_mode) &&
                     physical_rows_contain_visible_live_conflict<PhysicalRow, std::int64_t, Int64IntervalBounds>(
@@ -2210,6 +2309,7 @@ BulkUpsertResult postgres_adapter_bulk_upsert(
             throw PgError(PQerrorMessage(conn));
         }
         bool pipeline_active = true;
+        bool sync_sent = false;
         try {
             for (const auto &command : pending) {
                 const int param_count = static_cast<int>(command.params.values.size());
@@ -2226,7 +2326,11 @@ BulkUpsertResult postgres_adapter_bulk_upsert(
                     throw PgError(PQerrorMessage(conn));
                 }
             }
-            if (PQpipelineSync(conn) != 1 || PQflush(conn) == -1) {
+            if (PQpipelineSync(conn) != 1) {
+                throw PgError(PQerrorMessage(conn));
+            }
+            sync_sent = true;
+            if (PQflush(conn) == -1) {
                 throw PgError(PQerrorMessage(conn));
             }
 
@@ -2244,6 +2348,7 @@ BulkUpsertResult postgres_adapter_bulk_upsert(
                 result.require(PGRES_COMMAND_OK);
                 ++command_results;
             }
+            pg_drain_results(conn);
             if (PQexitPipelineMode(conn) != 1) {
                 throw PgError(PQerrorMessage(conn));
             }
@@ -2274,11 +2379,8 @@ BulkUpsertResult postgres_adapter_bulk_upsert(
                 );
             }
         } catch (...) {
-            while (PGresult *raw = PQgetResult(conn)) {
-                PQclear(raw);
-            }
             if (pipeline_active) {
-                PQexitPipelineMode(conn);
+                pg_cleanup_pipeline_mode(conn, sync_sent);
             }
             throw;
         }
@@ -2564,7 +2666,8 @@ class NativeSqlDriver {
         bool replacement_deleted,
         bool manage_transaction,
         IntervalWriteMode write_mode,
-        const std::string &branch_point
+        const std::string &branch_point,
+        bool private_exact_key_upsert_allowed = false
     ) = 0;
 };
 
@@ -2685,13 +2788,14 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
         bool replacement_deleted,
         bool manage_transaction,
         IntervalWriteMode write_mode,
-        const std::string &branch_point
+        const std::string &branch_point,
+        bool private_exact_key_upsert_allowed
     ) override {
         return sqlite_adapter_bulk_upsert(
             db_, physical_name, columns, pk_columns, rows,
             std::stoll(live_lo), std::stoll(live_hi), writer_segment_id,
             replacement_deleted, manage_transaction, &interval_upsert_statements_,
-            write_mode, std::stoll(branch_point)
+            write_mode, std::stoll(branch_point), private_exact_key_upsert_allowed
         );
     }
 
@@ -2810,8 +2914,10 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
         bool replacement_deleted,
         bool manage_transaction,
         IntervalWriteMode write_mode,
-        const std::string &branch_point
+        const std::string &branch_point,
+        bool private_exact_key_upsert_allowed
     ) override {
+        (void)private_exact_key_upsert_allowed;
         return duckdb_interval_bulk_upsert(
             physical_name,
             columns,
@@ -3252,6 +3358,7 @@ class NativePostgresDriver final : public NativeSqlDriver {
             throw PgError(PQerrorMessage(conn_));
         }
         bool pipeline_active = true;
+        bool sync_sent = false;
         try {
             for (std::size_t i = 0; i < pending.size(); ++i) {
                 const PendingQuery &query = pending[i];
@@ -3269,7 +3376,11 @@ class NativePostgresDriver final : public NativeSqlDriver {
                     throw PgError(PQerrorMessage(conn_));
                 }
             }
-            if (PQpipelineSync(conn_) != 1 || PQflush(conn_) == -1) {
+            if (PQpipelineSync(conn_) != 1) {
+                throw PgError(PQerrorMessage(conn_));
+            }
+            sync_sent = true;
+            if (PQflush(conn_) == -1) {
                 throw PgError(PQerrorMessage(conn_));
             }
 
@@ -3293,6 +3404,7 @@ class NativePostgresDriver final : public NativeSqlDriver {
                 }
                 result.require(PGRES_TUPLES_OK);
             }
+            pg_drain_results(conn_);
             if (PQexitPipelineMode(conn_) != 1) {
                 throw PgError(PQerrorMessage(conn_));
             }
@@ -3324,11 +3436,8 @@ class NativePostgresDriver final : public NativeSqlDriver {
             }
             return results;
         } catch (...) {
-            while (PGresult *raw = PQgetResult(conn_)) {
-                PQclear(raw);
-            }
             if (pipeline_active) {
-                PQexitPipelineMode(conn_);
+                pg_cleanup_pipeline_mode(conn_, sync_sent);
             }
             throw;
         }
@@ -3382,8 +3491,10 @@ class NativePostgresDriver final : public NativeSqlDriver {
         bool replacement_deleted,
         bool manage_transaction,
         IntervalWriteMode write_mode,
-        const std::string &branch_point
+        const std::string &branch_point,
+        bool private_exact_key_upsert_allowed
     ) override {
+        (void)private_exact_key_upsert_allowed;
         return postgres_adapter_bulk_upsert(
             conn_, physical_name, columns, pk_columns, rows,
             live_lo, live_hi, writer_segment_id, replacement_deleted, manage_transaction,
@@ -3883,6 +3994,42 @@ int compare_row_values(const std::vector<Value> &left, const std::vector<Value> 
     return 0;
 }
 
+bool eval_ast_null_test(
+    const PgQuery__NullTest *test,
+    const std::unordered_map<std::string, Value> &row,
+    const std::vector<Value> &params,
+    const SubqueryEvaluator *subquery_evaluator = nullptr
+) {
+    if (!test || !test->arg) {
+        throw std::runtime_error("invalid NULL test in native branch executor");
+    }
+
+    bool is_null = false;
+    if (test->argisrow && is_row_constructor_node(test->arg)) {
+        const auto values = eval_ast_row_values(test->arg, row, params, subquery_evaluator);
+        is_null = true;
+        for (const auto &value : values) {
+            if (!std::holds_alternative<std::monostate>(value)) {
+                is_null = false;
+                break;
+            }
+        }
+    } else {
+        is_null = std::holds_alternative<std::monostate>(
+            eval_ast_value(test->arg, row, params, subquery_evaluator)
+        );
+    }
+
+    switch (test->nulltesttype) {
+    case PG_QUERY__NULL_TEST_TYPE__IS_NULL:
+        return is_null;
+    case PG_QUERY__NULL_TEST_TYPE__IS_NOT_NULL:
+        return !is_null;
+    default:
+        throw std::runtime_error("unsupported NULL test in native branch executor");
+    }
+}
+
 bool eval_ast_predicate(
     const PgQuery__Node *node,
     const std::unordered_map<std::string, Value> &row,
@@ -3911,6 +4058,8 @@ bool eval_ast_predicate(
         }
         break;
     }
+    case PG_QUERY__NODE__NODE_NULL_TEST:
+        return eval_ast_null_test(node->null_test, row, params, subquery_evaluator);
     case PG_QUERY__NODE__NODE_A_EXPR: {
         auto *expr = node->a_expr;
         const std::string op = operator_name(expr);
@@ -4020,6 +4169,10 @@ Value eval_ast_value(
         }
         return static_cast<std::int64_t>(eval_ast_predicate(node, row, params, subquery_evaluator) ? 1 : 0);
     }
+    case PG_QUERY__NODE__NODE_NULL_TEST:
+        return static_cast<std::int64_t>(
+            eval_ast_null_test(node->null_test, row, params, subquery_evaluator) ? 1 : 0
+        );
     case PG_QUERY__NODE__NODE_CASE_EXPR: {
         auto *expr = node->case_expr;
         if (!expr) return std::monostate{};

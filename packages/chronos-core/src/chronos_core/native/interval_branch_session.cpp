@@ -86,6 +86,8 @@ class NativeBranchSessionImpl {
         const bool started_data_tx = !store_.driver().in_transaction();
         if (started_data_tx) store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
         try {
+            const bool private_exact_key_upsert_allowed =
+                store_.dialect() == "sqlite" && branch_private_dml_allowed_for_transaction();
             store_.driver().interval_upsert(
                 physical_table_for(logical_table),
                 columns,
@@ -97,7 +99,8 @@ class NativeBranchSessionImpl {
                 deleted,
                 false,
                 IntervalWriteMode::Upsert,
-                segment_.branch_point
+                segment_.branch_point,
+                private_exact_key_upsert_allowed
             );
             commit_if_started(started_data_tx);
         } catch (...) {
@@ -128,7 +131,8 @@ class NativeBranchSessionImpl {
                 false,
                 false,
                 ignore_conflicts ? IntervalWriteMode::InsertIgnoreConflicts : IntervalWriteMode::Insert,
-                segment_.branch_point
+                segment_.branch_point,
+                false
             );
             commit_if_started(started_data_tx);
             return result.logical_rows_written;
@@ -414,11 +418,31 @@ class NativeBranchSessionImpl {
         const std::vector<Value> &params,
         const std::vector<std::string> &columns
     ) {
+        std::vector<Value> predicate_params;
+        std::optional<std::string> predicate_sql;
+        if (where != nullptr) {
+            predicate_sql = sql_value_expression_for_update(where, params, predicate_params, "");
+        }
         if (const auto point_key = point_key_values_from_predicate(where, meta, params)) {
-            return select_visible_rows(meta, key_where_sql(meta.pk_columns), *point_key, columns);
+            std::string where_sql = key_where_sql(meta.pk_columns);
+            std::vector<Value> bound = *point_key;
+            if (predicate_sql) {
+                where_sql = "(" + where_sql + ") AND (" + *predicate_sql + ")";
+                bound.insert(bound.end(), predicate_params.begin(), predicate_params.end());
+            }
+            return select_visible_rows(meta, where_sql, bound, columns);
         }
         if (const auto prefix = leading_key_prefix_from_predicate(where, meta, params)) {
-            return select_visible_rows(meta, key_where_sql(prefix->columns), prefix->values, columns);
+            std::string where_sql = key_where_sql(prefix->columns);
+            std::vector<Value> bound = prefix->values;
+            if (predicate_sql) {
+                where_sql = "(" + where_sql + ") AND (" + *predicate_sql + ")";
+                bound.insert(bound.end(), predicate_params.begin(), predicate_params.end());
+            }
+            return select_visible_rows(meta, where_sql, bound, columns);
+        }
+        if (predicate_sql) {
+            return select_visible_rows(meta, *predicate_sql, predicate_params, columns);
         }
         return select_visible_rows(meta, "", {}, columns);
     }
@@ -440,13 +464,15 @@ class NativeBranchSessionImpl {
     }
 
     bool branch_private_dml_allowed_locked() {
-        if (store_.dialect() != "postgres") return false;
-        auto rows = store_.driver().query(
+        if (store_.dialect() != "postgres" && store_.dialect() != "sqlite") return false;
+        std::string sql =
             "SELECT current_segment_id, child_count "
             "FROM _chronos_branch_interval_branches "
-            "WHERE branch_id = ? FOR SHARE",
-            {branch_id_}
-        );
+            "WHERE branch_id = ?";
+        if (store_.metadata_dialect() == "postgres") {
+            sql += " FOR SHARE";
+        }
+        auto rows = store_.metadata_driver().query(sql, {branch_id_});
         if (rows.empty()) {
             throw std::runtime_error("branch not found: " + branch_id_);
         }
@@ -455,7 +481,10 @@ class NativeBranchSessionImpl {
     }
 
     bool branch_private_dml_allowed_for_transaction() {
-        if (store_.dialect() != "postgres" || !store_.driver().in_transaction()) return false;
+        if ((store_.dialect() != "postgres" && store_.dialect() != "sqlite") ||
+            !store_.driver().in_transaction()) {
+            return false;
+        }
         if (!branch_private_guard_cache_) {
             branch_private_guard_cache_ = branch_private_dml_allowed_locked();
         }
@@ -520,11 +549,31 @@ class NativeBranchSessionImpl {
         const PgQuery__Node *where,
         const std::vector<Value> &params
     ) {
+        std::vector<Value> predicate_params;
+        std::optional<std::string> predicate_sql;
+        if (where != nullptr) {
+            predicate_sql = sql_value_expression_for_update(where, params, predicate_params, "");
+        }
         if (const auto point_key = point_key_values_from_predicate(where, meta, params)) {
-            return select_physical_rows(meta, key_where_sql(meta.pk_columns), *point_key);
+            std::string where_sql = key_where_sql(meta.pk_columns);
+            std::vector<Value> bound = *point_key;
+            if (predicate_sql) {
+                where_sql = "(" + where_sql + ") AND (" + *predicate_sql + ")";
+                bound.insert(bound.end(), predicate_params.begin(), predicate_params.end());
+            }
+            return select_physical_rows(meta, where_sql, bound);
         }
         if (const auto prefix = leading_key_prefix_from_predicate(where, meta, params)) {
-            return select_physical_rows(meta, key_where_sql(prefix->columns), prefix->values);
+            std::string where_sql = key_where_sql(prefix->columns);
+            std::vector<Value> bound = prefix->values;
+            if (predicate_sql) {
+                where_sql = "(" + where_sql + ") AND (" + *predicate_sql + ")";
+                bound.insert(bound.end(), predicate_params.begin(), predicate_params.end());
+            }
+            return select_physical_rows(meta, where_sql, bound);
+        }
+        if (predicate_sql) {
+            return select_physical_rows(meta, *predicate_sql, predicate_params);
         }
         return select_physical_rows(meta, "", {});
     }
@@ -957,7 +1006,17 @@ class NativeBranchSessionImpl {
         // to the new schema over its interval.
         const std::string physical = store_.physical_schema_table_name(table);
         new_meta.physical_name = physical;
-        store_.create_interval_physical_table(physical, new_meta.column_defs, new_meta.pk_columns, false);
+        const bool defer_primary_key = store_.dialect() == "postgres";
+        store_.create_interval_physical_table(
+            physical,
+            new_meta.column_defs,
+            new_meta.pk_columns,
+            false,
+            !defer_primary_key,
+            store_.postgres_schema_copy_fillfactor()
+        );
+        std::unordered_map<std::string, std::string> defaults;
+        if (!default_sql.empty()) defaults.emplace(column, default_sql);
         const std::string new_schema_id = store_.record_schema_version(
             table,
             physical,
@@ -967,9 +1026,8 @@ class NativeBranchSessionImpl {
             "alter_table_add_column",
             schema_version_id
         );
-        std::unordered_map<std::string, std::string> defaults;
-        if (!default_sql.empty()) defaults.emplace(column, default_sql);
         store_.copy_visible_rows_to_schema_version(old_meta, new_meta, segment_, defaults);
+        if (defer_primary_key) store_.add_interval_primary_key(physical, new_meta.pk_columns);
         store_.splice_table_binding(table, new_schema_id, false, segment_);
         create_schema_version_secondary_indexes(new_meta, table);
         return 0;
@@ -1009,7 +1067,15 @@ class NativeBranchSessionImpl {
         }
         const std::string physical = store_.physical_schema_table_name(table);
         new_meta.physical_name = physical;
-        store_.create_interval_physical_table(physical, new_meta.column_defs, new_meta.pk_columns, false);
+        const bool defer_primary_key = store_.dialect() == "postgres";
+        store_.create_interval_physical_table(
+            physical,
+            new_meta.column_defs,
+            new_meta.pk_columns,
+            false,
+            !defer_primary_key,
+            store_.postgres_schema_copy_fillfactor()
+        );
         const std::string new_schema_id = store_.record_schema_version(
             table,
             physical,
@@ -1020,6 +1086,7 @@ class NativeBranchSessionImpl {
             schema_version_id
         );
         store_.copy_visible_rows_to_schema_version(old_meta, new_meta, segment_);
+        if (defer_primary_key) store_.add_interval_primary_key(physical, new_meta.pk_columns);
         store_.splice_table_binding(table, new_schema_id, false, segment_);
         create_schema_version_secondary_indexes(new_meta, table);
         return 0;
@@ -1054,7 +1121,15 @@ class NativeBranchSessionImpl {
         }
         const std::string physical = store_.physical_schema_table_name(table);
         new_meta.physical_name = physical;
-        store_.create_interval_physical_table(physical, new_meta.column_defs, new_meta.pk_columns, false);
+        const bool defer_primary_key = store_.dialect() == "postgres";
+        store_.create_interval_physical_table(
+            physical,
+            new_meta.column_defs,
+            new_meta.pk_columns,
+            false,
+            !defer_primary_key,
+            store_.postgres_schema_copy_fillfactor()
+        );
         const std::string new_schema_id = store_.record_schema_version(
             table,
             physical,
@@ -1065,6 +1140,7 @@ class NativeBranchSessionImpl {
             schema_version_id
         );
         store_.copy_visible_rows_to_schema_version(old_meta, new_meta, segment_, {}, {{column, using_sql}});
+        if (defer_primary_key) store_.add_interval_primary_key(physical, new_meta.pk_columns);
         store_.splice_table_binding(table, new_schema_id, false, segment_);
         create_schema_version_secondary_indexes(new_meta, table);
         return 0;
@@ -1147,6 +1223,9 @@ class NativeBranchSessionImpl {
             return "?";
         }
         case PG_QUERY__NODE__NODE_COLUMN_REF:
+            if (row_alias.empty()) {
+                return quote_ident(column_ref_name(node->column_ref));
+            }
             return row_alias + "." + quote_ident(column_ref_name(node->column_ref));
         case PG_QUERY__NODE__NODE_A_CONST: {
             auto *c = node->a_const;
@@ -1171,6 +1250,94 @@ class NativeBranchSessionImpl {
             auto right = sql_value_expression_for_update(expr->rexpr, params, bound, row_alias);
             if (!left || !right) return std::nullopt;
             return "(" + *left + " " + operator_name(expr) + " " + *right + ")";
+        }
+        case PG_QUERY__NODE__NODE_BOOL_EXPR: {
+            auto *expr = node->bool_expr;
+            if (!expr) return std::nullopt;
+            if (expr->boolop == PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR ||
+                expr->boolop == PG_QUERY__BOOL_EXPR_TYPE__OR_EXPR) {
+                const std::string op =
+                    expr->boolop == PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR ? " AND " : " OR ";
+                std::vector<std::string> parts;
+                parts.reserve(expr->n_args);
+                for (std::size_t i = 0; i < expr->n_args; ++i) {
+                    auto part = sql_value_expression_for_update(expr->args[i], params, bound, row_alias);
+                    if (!part) return std::nullopt;
+                    parts.push_back(*part);
+                }
+                return "(" + join_strings(parts, op) + ")";
+            }
+            if (expr->boolop == PG_QUERY__BOOL_EXPR_TYPE__NOT_EXPR) {
+                if (expr->n_args != 1) return std::nullopt;
+                auto part = sql_value_expression_for_update(expr->args[0], params, bound, row_alias);
+                if (!part) return std::nullopt;
+                return "(NOT " + *part + ")";
+            }
+            return std::nullopt;
+        }
+        case PG_QUERY__NODE__NODE_NULL_TEST: {
+            auto *test = node->null_test;
+            if (!test || test->argisrow) return std::nullopt;
+            auto inner = sql_value_expression_for_update(test->arg, params, bound, row_alias);
+            if (!inner) return std::nullopt;
+            switch (test->nulltesttype) {
+            case PG_QUERY__NULL_TEST_TYPE__IS_NULL:
+                return "(" + *inner + " IS NULL)";
+            case PG_QUERY__NULL_TEST_TYPE__IS_NOT_NULL:
+                return "(" + *inner + " IS NOT NULL)";
+            default:
+                return std::nullopt;
+            }
+        }
+        case PG_QUERY__NODE__NODE_CASE_EXPR: {
+            auto *expr = node->case_expr;
+            if (!expr) return std::nullopt;
+            std::string sql = "CASE";
+            if (expr->arg) {
+                auto arg = sql_value_expression_for_update(expr->arg, params, bound, row_alias);
+                if (!arg) return std::nullopt;
+                sql += " " + *arg;
+            }
+            for (std::size_t i = 0; i < expr->n_args; ++i) {
+                PgQuery__Node *when_node = expr->args[i];
+                if (!when_node || when_node->node_case != PG_QUERY__NODE__NODE_CASE_WHEN ||
+                    !when_node->case_when) {
+                    return std::nullopt;
+                }
+                auto condition = sql_value_expression_for_update(
+                    when_node->case_when->expr,
+                    params,
+                    bound,
+                    row_alias
+                );
+                auto result = sql_value_expression_for_update(
+                    when_node->case_when->result,
+                    params,
+                    bound,
+                    row_alias
+                );
+                if (!condition || !result) return std::nullopt;
+                sql += " WHEN " + *condition + " THEN " + *result;
+            }
+            if (expr->defresult) {
+                auto result = sql_value_expression_for_update(expr->defresult, params, bound, row_alias);
+                if (!result) return std::nullopt;
+                sql += " ELSE " + *result;
+            }
+            sql += " END";
+            return sql;
+        }
+        case PG_QUERY__NODE__NODE_COALESCE_EXPR: {
+            auto *expr = node->coalesce_expr;
+            if (!expr) return std::nullopt;
+            std::vector<std::string> parts;
+            parts.reserve(expr->n_args);
+            for (std::size_t i = 0; i < expr->n_args; ++i) {
+                auto part = sql_value_expression_for_update(expr->args[i], params, bound, row_alias);
+                if (!part) return std::nullopt;
+                parts.push_back(*part);
+            }
+            return "COALESCE(" + join_strings(parts, ", ") + ")";
         }
         case PG_QUERY__NODE__NODE_TYPE_CAST: {
             auto inner = sql_value_expression_for_update(
@@ -1242,6 +1409,27 @@ class NativeBranchSessionImpl {
             " AND " + visible_where_sql(segment_.branch_point) +
             " LIMIT 1";
         QueryResult result = store_.driver().query_result(sql, prefix.values);
+        return !result.rows.empty();
+    }
+
+    bool visible_rows_exist_for_key_prefix_predicate(
+        const NativeTableMeta &meta,
+        const NativeKeyPrefixFilter &prefix,
+        const PgQuery__Node *where,
+        const std::vector<Value> &params
+    ) {
+        std::vector<Value> bound;
+        bound.reserve(prefix.values.size() + params.size());
+        std::string sql = "SELECT 1 FROM " + quote_ident(meta.physical_name) +
+            " AS t WHERE " + aliased_key_where_sql("t", prefix.columns);
+        append_values(bound, prefix.values);
+        if (where != nullptr) {
+            auto where_sql = sql_value_expression_for_update(where, params, bound, "t");
+            if (!where_sql) return true;
+            sql += " AND (" + *where_sql + ")";
+        }
+        sql += " AND " + visible_where_sql(segment_.branch_point) + " LIMIT 1";
+        QueryResult result = store_.driver().query_result(sql, bound);
         return !result.rows.empty();
     }
 
@@ -1337,68 +1525,16 @@ class NativeBranchSessionImpl {
         const NativeTableMeta &meta,
         const std::vector<Value> &params
     ) {
-        if (store_.dialect() != "postgres") return std::nullopt;
-        if (plan.assignments.empty()) return std::nullopt;
-        const auto prefix = exact_leading_key_prefix_from_predicate(plan.where, meta, params);
-        if (!prefix) return std::nullopt;
-        for (const auto &[column, _] : plan.assignments) {
-            if (std::find(meta.pk_columns.begin(), meta.pk_columns.end(), column) != meta.pk_columns.end()) {
-                return std::nullopt;
-            }
-            (void)column_index(meta.columns, column);
-        }
-
-        const bool started_tx = !store_.driver().in_transaction();
-        if (started_tx) store_.driver().execute("BEGIN");
-        try {
-            if (!branch_private_dml_allowed_for_transaction()) {
-                commit_if_started(started_tx);
-                return std::nullopt;
-            }
-
-            const std::string table = quote_ident(meta.physical_name);
-            std::string sql = "UPDATE " + table + " AS t SET ";
-            std::vector<Value> bound;
-            bound.reserve(params.size() + prefix->values.size() * 2 + plan.assignments.size() + 10);
-            for (std::size_t i = 0; i < plan.assignments.size(); ++i) {
-                if (i) sql += ", ";
-                const auto &[column, expr_node] = plan.assignments[i];
-                auto expr = sql_value_expression_for_update(expr_node, params, bound, "t");
-                if (!expr) {
-                    commit_if_started(started_tx);
-                    return std::nullopt;
-                }
-                sql += quote_ident(column) + " = " + *expr;
-            }
-            sql += ", " + quote_ident("writer_segment_id") + " = ?, " +
-                quote_ident("deleted") + " = FALSE WHERE " +
-                aliased_key_where_sql("t", prefix->columns);
-            bound.push_back(segment_.segment_id);
-            append_values(bound, prefix->values);
-            sql += " AND t." + quote_ident("writer_segment_id") + " = ?"
-                " AND t." + quote_ident("live_lo") + " = ?"
-                " AND t." + quote_ident("live_hi") + " = ?"
-                " AND t." + quote_ident("deleted") + " = FALSE"
-                " AND " + visible_non_private_absence_sql(meta, *prefix);
-            bound.push_back(segment_.segment_id);
-            bound.push_back(segment_.live_lo);
-            bound.push_back(segment_.live_hi);
-            append_values(bound, prefix->values);
-            bound.push_back(segment_.segment_id);
-            bound.push_back(segment_.live_lo);
-            bound.push_back(segment_.live_hi);
-
-            const std::int64_t changed = store_.driver().execute_changes(sql, bound);
-            if (changed > 0 || !visible_rows_exist_for_key_prefix(meta, *prefix)) {
-                commit_if_started(started_tx);
-                return changed;
-            }
-            commit_if_started(started_tx);
-            return std::nullopt;
-        } catch (...) {
-            rollback_if_started(started_tx);
-            throw;
-        }
+        (void)plan;
+        (void)meta;
+        (void)params;
+        // The broad prefix-private fast path speculatively probes inherited
+        // visibility before falling back.  For CH-benCHmark-style predicates
+        // such as (s_w_id = ? AND s_quantity < ?), that probe is the same
+        // warehouse-prefix scan as the generic path, so enabling it doubles the
+        // expensive work.  Keep exact point-key updates optimized below, but do
+        // not speculate on non-point prefixes.
+        return std::nullopt;
     }
 
     std::optional<std::int64_t> try_postgres_private_prefix_delete(
@@ -1615,7 +1751,9 @@ class NativeBranchSessionImpl {
         std::vector<std::string> sqls;
         if (store_.create_secondary_indexes()) {
             sqls.push_back(store_.pk_hi_index_sql(meta.physical_name, meta.pk_columns));
-            sqls.push_back(store_.writer_segment_index_sql(meta.physical_name, meta.pk_columns));
+            if (store_.create_writer_segment_index()) {
+                sqls.push_back(store_.writer_segment_index_sql(meta.physical_name, meta.pk_columns));
+            }
         }
         auto rows = store_.driver().query(
             "SELECT index_name, columns FROM _chronos_branch_indexes "
@@ -1645,6 +1783,47 @@ class NativeBranchSessionImpl {
         store_.defer_or_execute_schema_index_sqls(sqls);
     }
 
+    std::optional<std::int64_t> try_update_private_schema_table_set_based(
+        const NativeUpdatePlan &plan,
+        const NativeTableMeta &meta,
+        const std::vector<Value> &params
+    ) {
+        if (store_.dialect() != "postgres" && store_.dialect() != "sqlite") return std::nullopt;
+        if (!private_schema_table_is_canonical(meta)) return std::nullopt;
+        if (plan.assignments.empty()) return std::nullopt;
+
+        std::vector<Value> bound;
+        bound.reserve(params.size() + plan.assignments.size());
+        std::string sql = "UPDATE " + quote_ident(meta.physical_name) + " AS t SET ";
+        for (std::size_t i = 0; i < plan.assignments.size(); ++i) {
+            const auto &[column, expr_node] = plan.assignments[i];
+            if (std::find(meta.pk_columns.begin(), meta.pk_columns.end(), column) != meta.pk_columns.end()) {
+                return std::nullopt;
+            }
+            (void)column_index(meta.columns, column);
+            auto expr = sql_value_expression_for_update(expr_node, params, bound, "t");
+            if (!expr) return std::nullopt;
+            if (i) sql += ", ";
+            sql += quote_ident(column) + " = " + *expr;
+        }
+        if (plan.where) {
+            auto where = sql_value_expression_for_update(plan.where, params, bound, "t");
+            if (!where) return std::nullopt;
+            sql += " WHERE " + *where;
+        }
+
+        const bool started_tx = !store_.driver().in_transaction();
+        if (started_tx) store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+        try {
+            const std::int64_t changed = store_.driver().execute_changes(sql, bound);
+            commit_if_started(started_tx);
+            return changed;
+        } catch (...) {
+            rollback_if_started(started_tx);
+            throw;
+        }
+    }
+
     std::optional<std::int64_t> try_update_private_schema_table_in_place(
         const NativeUpdatePlan &plan,
         const NativeTableMeta &meta,
@@ -1653,49 +1832,14 @@ class NativeBranchSessionImpl {
         if (!private_schema_table_is_canonical(meta)) return std::nullopt;
         for (const auto &[column, _] : plan.assignments) {
             if (std::find(meta.pk_columns.begin(), meta.pk_columns.end(), column) != meta.pk_columns.end()) {
-                return std::nullopt;
+                throw std::runtime_error("private schema UPDATE cannot modify primary key columns");
             }
             (void)column_index(meta.columns, column);
         }
-        QueryResult current = select_candidate_rows_for_dml(
-            meta,
-            plan.where,
-            params,
-            meta.columns
-        );
-        SubqueryEvaluator evaluator = [this, &params](const PgQuery__SelectStmt *select) {
-            return this->evaluate_select_values(select, params);
-        };
-        std::int64_t count = 0;
-        const bool started_tx = !store_.driver().in_transaction();
-        if (started_tx) store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
-        try {
-            for (const auto &row : current.rows) {
-                auto row_map = row_map_for(meta.columns, row);
-                if (!eval_ast_predicate(plan.where, row_map, params, &evaluator)) continue;
-                std::string sql = "UPDATE " + quote_ident(meta.physical_name) + " SET ";
-                std::vector<Value> bound;
-                for (std::size_t i = 0; i < plan.assignments.size(); ++i) {
-                    if (i) sql += ", ";
-                    sql += quote_ident(plan.assignments[i].first) + " = ?";
-                    bound.push_back(eval_ast_value(plan.assignments[i].second, row_map, params, &evaluator));
-                }
-                if (!plan.assignments.empty()) sql += ", ";
-                sql += quote_ident("writer_segment_id") + " = ?, " + quote_ident("deleted") + " = FALSE WHERE ";
-                bound.push_back(segment_.segment_id);
-                for (std::size_t i = 0; i < meta.pk_columns.size(); ++i) {
-                    if (i) sql += " AND ";
-                    sql += quote_ident(meta.pk_columns[i]) + " = ?";
-                    bound.push_back(row[column_index(meta.columns, meta.pk_columns[i])]);
-                }
-                count += store_.driver().execute_changes(sql, bound);
-            }
-            commit_if_started(started_tx);
-        } catch (...) {
-            rollback_if_started(started_tx);
-            throw;
+        if (auto set_count = try_update_private_schema_table_set_based(plan, meta, params)) {
+            return *set_count;
         }
-        return count;
+        throw std::runtime_error("private schema UPDATE requires a set-based native executor path");
     }
 
     std::optional<std::int64_t> try_delete_private_schema_table_in_place(
@@ -1894,9 +2038,6 @@ class NativeBranchSessionImpl {
         }
         if (auto prefix_private_count = try_postgres_private_prefix_update(plan, meta, params)) {
             return *prefix_private_count;
-        }
-        if (auto branch_private_count = try_update_branch_private_rows_in_place(plan, meta, params)) {
-            return *branch_private_count;
         }
         if (auto point_count = try_postgres_point_update_cte(plan, meta, params)) {
             return *point_count;

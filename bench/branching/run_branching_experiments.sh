@@ -20,6 +20,18 @@ Environment:
   CHRONOS_BENCH_POSTGRES_PORT     Host port. Default: 55433.
   CHRONOS_BENCH_POSTGRES_DB       Database name. Default: chronos_branch_test.
   CHRONOS_BENCH_POSTGRES_PASSWORD Password. Default: postgres.
+  CHRONOS_BENCH_POSTGRES_MAINTENANCE_WORK_MEM
+                                  PostgreSQL maintenance_work_mem. Default: 512MB.
+  CHRONOS_BENCH_POSTGRES_MAX_PARALLEL_MAINTENANCE_WORKERS
+                                  PostgreSQL max_parallel_maintenance_workers. Default: 4.
+  CHRONOS_BENCH_POSTGRES_MAX_PARALLEL_WORKERS
+                                  PostgreSQL max_parallel_workers. Default: 8.
+  CHRONOS_BENCH_POSTGRES_MAX_WORKER_PROCESSES
+                                  PostgreSQL max_worker_processes. Default: 16.
+  CHRONOS_BENCH_POSTGRES_MIN_PARALLEL_TABLE_SCAN_SIZE
+                                  PostgreSQL min_parallel_table_scan_size. Default: 0.
+  CHRONOS_BENCH_POSTGRES_MIN_PARALLEL_INDEX_SCAN_SIZE
+                                  PostgreSQL min_parallel_index_scan_size. Default: 0.
   CHRONOS_BENCH_POSTGRES_KEEP     Set to 1 to leave a script-started container running.
   CHRONOS_BENCH_DOLTGRES_IMAGE    Docker image. Default: dolthub/doltgresql:latest.
   CHRONOS_BENCH_DOLTGRES_NAME     Docker container name. Default: chronos-branch-doltgres.
@@ -51,7 +63,7 @@ Examples:
 
   bench/branching/run_branching_experiments.sh doltgres --backends doltgres
 
-  bench/branching/run_branching_experiments.sh postgres-doltgres --backends copy,interval,doltgres
+  bench/branching/run_branching_experiments.sh postgres-doltgres --backends interval,doltgres,copy,orpheus
 
   bench/branching/run_branching_experiments.sh all
 
@@ -87,6 +99,12 @@ POSTGRES_STARTED_BY_SCRIPT=0
 DB_MEMORY="${CHRONOS_BENCH_DB_MEMORY:-10g}"
 DB_BUFFER="${CHRONOS_BENCH_DB_BUFFER:-5g}"
 POSTGRES_SHM_SIZE="${CHRONOS_BENCH_POSTGRES_SHM_SIZE:-${DB_MEMORY}}"
+POSTGRES_MAINTENANCE_WORK_MEM="${CHRONOS_BENCH_POSTGRES_MAINTENANCE_WORK_MEM:-512MB}"
+POSTGRES_MAX_PARALLEL_MAINTENANCE_WORKERS="${CHRONOS_BENCH_POSTGRES_MAX_PARALLEL_MAINTENANCE_WORKERS:-4}"
+POSTGRES_MAX_PARALLEL_WORKERS="${CHRONOS_BENCH_POSTGRES_MAX_PARALLEL_WORKERS:-8}"
+POSTGRES_MAX_WORKER_PROCESSES="${CHRONOS_BENCH_POSTGRES_MAX_WORKER_PROCESSES:-16}"
+POSTGRES_MIN_PARALLEL_TABLE_SCAN_SIZE="${CHRONOS_BENCH_POSTGRES_MIN_PARALLEL_TABLE_SCAN_SIZE:-0}"
+POSTGRES_MIN_PARALLEL_INDEX_SCAN_SIZE="${CHRONOS_BENCH_POSTGRES_MIN_PARALLEL_INDEX_SCAN_SIZE:-0}"
 DOLTGRES_CONTAINER="${CHRONOS_BENCH_DOLTGRES_NAME:-chronos-branch-doltgres}"
 DOLTGRES_IMAGE="${CHRONOS_BENCH_DOLTGRES_IMAGE:-dolthub/doltgresql:latest}"
 DOLTGRES_PORT="${CHRONOS_BENCH_DOLTGRES_PORT:-55437}"
@@ -264,6 +282,10 @@ start_postgres_container() {
   echo "==> Starting PostgreSQL container ${POSTGRES_CONTAINER} on port ${POSTGRES_PORT}"
   echo "    memory limit: ${DB_MEMORY}"
   echo "    shared_buffers: $(postgres_buffer_setting "${DB_BUFFER}")"
+  echo "    maintenance_work_mem: ${POSTGRES_MAINTENANCE_WORK_MEM}"
+  echo "    max_parallel_maintenance_workers: ${POSTGRES_MAX_PARALLEL_MAINTENANCE_WORKERS}"
+  echo "    max_parallel_workers: ${POSTGRES_MAX_PARALLEL_WORKERS}"
+  echo "    max_worker_processes: ${POSTGRES_MAX_WORKER_PROCESSES}"
   echo "    shm size: ${POSTGRES_SHM_SIZE}"
   docker run -d \
     --name "${POSTGRES_CONTAINER}" \
@@ -273,7 +295,14 @@ start_postgres_container() {
     -e POSTGRES_DB="${POSTGRES_DB}" \
     -p "${POSTGRES_PORT}:5432" \
     "${POSTGRES_IMAGE}" \
-    postgres -c "shared_buffers=$(postgres_buffer_setting "${DB_BUFFER}")" >/dev/null
+    postgres \
+      -c "shared_buffers=$(postgres_buffer_setting "${DB_BUFFER}")" \
+      -c "maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM}" \
+      -c "max_parallel_maintenance_workers=${POSTGRES_MAX_PARALLEL_MAINTENANCE_WORKERS}" \
+      -c "max_parallel_workers=${POSTGRES_MAX_PARALLEL_WORKERS}" \
+      -c "max_worker_processes=${POSTGRES_MAX_WORKER_PROCESSES}" \
+      -c "min_parallel_table_scan_size=${POSTGRES_MIN_PARALLEL_TABLE_SCAN_SIZE}" \
+      -c "min_parallel_index_scan_size=${POSTGRES_MIN_PARALLEL_INDEX_SCAN_SIZE}" >/dev/null
   POSTGRES_STARTED_BY_SCRIPT=1
   wait_for_postgres
 }
