@@ -641,6 +641,115 @@ def test_fuse_open_reader_sees_write_from_other_handle(tmp_path: Path) -> None:
         )
 
 
+def test_fuse_fsync_publishes_buffered_handle_writes(tmp_path: Path) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+
+    with _mounted_chronosfs(db_path, mountpoint):
+        _run_bash(
+            mountpoint,
+            "\n".join(
+                [
+                    "set -euo pipefail",
+                    "python3 - <<'PY'",
+                    "import os",
+                    "writer = os.open('buffered.txt', os.O_CREAT | os.O_RDWR, 0o644)",
+                    "try:",
+                    "    os.write(writer, b'buffered-write\\n')",
+                    "    os.fsync(writer)",
+                    "    reader = os.open('buffered.txt', os.O_RDONLY)",
+                    "    try:",
+                    "        assert os.read(reader, 15) == b'buffered-write\\n'",
+                    "    finally:",
+                    "        os.close(reader)",
+                    "finally:",
+                    "    os.close(writer)",
+                    "PY",
+                ]
+            ),
+        )
+
+
+def test_fuse_buffered_handles_merge_nonoverlapping_same_block_writes(
+    tmp_path: Path,
+) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+
+    with _mounted_chronosfs(db_path, mountpoint):
+        _run_bash(
+            mountpoint,
+            "\n".join(
+                [
+                    "set -euo pipefail",
+                    "python3 - <<'PY'",
+                    "import os",
+                    "with open('shared-block.bin', 'wb') as stream:",
+                    "    stream.write(b'00000000')",
+                    "left = os.open('shared-block.bin', os.O_RDWR)",
+                    "right = os.open('shared-block.bin', os.O_RDWR)",
+                    "try:",
+                    "    os.pwrite(left, b'AA', 0)",
+                    "    os.pwrite(right, b'BB', 2)",
+                    "    os.close(right)",
+                    "    right = -1",
+                    "    os.close(left)",
+                    "    left = -1",
+                    "    assert open('shared-block.bin', 'rb').read() == b'AABB0000'",
+                    "finally:",
+                    "    if right >= 0:",
+                    "        os.close(right)",
+                    "    if left >= 0:",
+                    "        os.close(left)",
+                    "PY",
+                ]
+            ),
+        )
+
+
+def test_fuse_buffered_handle_does_not_restore_concurrently_truncated_size(
+    tmp_path: Path,
+) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+
+    with _mounted_chronosfs(db_path, mountpoint):
+        _run_bash(
+            mountpoint,
+            "\n".join(
+                [
+                    "set -euo pipefail",
+                    "python3 - <<'PY'",
+                    "import os",
+                    "with open('truncate-race.bin', 'wb') as stream:",
+                    "    stream.write(b'12345678')",
+                    "stale = os.open('truncate-race.bin', os.O_RDWR)",
+                    "truncater = os.open('truncate-race.bin', os.O_RDWR)",
+                    "try:",
+                    "    os.ftruncate(truncater, 0)",
+                    "    os.close(truncater)",
+                    "    truncater = -1",
+                    "    os.pwrite(stale, b'Z', 0)",
+                    "    os.close(stale)",
+                    "    stale = -1",
+                    "    assert open('truncate-race.bin', 'rb').read() == b'Z'",
+                    "finally:",
+                    "    if truncater >= 0:",
+                    "        os.close(truncater)",
+                    "    if stale >= 0:",
+                    "        os.close(stale)",
+                    "PY",
+                ]
+            ),
+        )
+
+
 def test_fuse_mount_compiles_redis_smoke(tmp_path: Path) -> None:
     _require_fuse_tools()
     _require_tools("git", "make", "gcc")

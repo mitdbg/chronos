@@ -42,10 +42,13 @@ table, extent tree, refcount table, or filesystem-level block allocator.
 libfuse mount. By default, same-machine mounts for the same
 `(database_url, block_size)` are routed through one local ChronosFS daemon
 process. The daemon owns one native branch store and a branch-session cache
-shared by every mount point. Native filesystem requests are coordinated by one
-database-level mutex; SQLite's immediate-write transactions queue external
-control-plane writers. This avoids lock races and stale same-machine metadata
-caches while allowing independent branches to stay mounted concurrently.
+for each mounted branch. Mounts of the same branch share that branch state;
+different branches have independent caches, locks, and SQLite connections.
+Ordinary requests take a shared topology lock plus only their branch lock, so a
+write on one branch does not block reads and cache operations on another.
+SQLite still serializes write transactions, while WAL readers on other branch
+connections can proceed concurrently. Branch creation, checkout, and merge use
+the exclusive topology lock and invalidate affected in-process caches.
 
 `start_chronosfs_mount()` adds a mount point without starting another daemon.
 Run-scoped integrations can unmount their mount points and then call
@@ -55,17 +58,20 @@ the daemon's idle timeout.
 The current adapter supports:
 
 - `lookup`, `getattr`, `readdir`
-- `open`, `create`, `read`, `write`, `release`
+- `open`, `create`, `read`, `write`, `flush`, `fsync`, `release`
 - `mkdir`, `unlink`, `rmdir`, `rename`
 - `setattr` for truncate, chmod, and utimens
 - `symlink`, `readlink`
 
 Regular file reads are range reads: the FUSE `read()` handler computes the
 overlapping logical block indexes for the requested byte range and fetches only
-those block rows. Regular file writes are synchronous at the FUSE write-handler
-boundary: `write()` patches the affected logical blocks and upserts them through
-the current Chronos branch. ChronosFS does not buffer regular file data in the
-FUSE layer. The mount wrapper also sets FUSE `entry_timeout=0`,
+those block rows. Regular handle writes are accumulated in a per-handle dirty
+block map. Reads through that handle overlay dirty bytes on the currently
+persisted blocks. `flush`, `fsync`, or `release` rereads the latest block values,
+merges only bytes dirtied by that handle, and publishes all affected blocks in
+one branch transaction. This avoids one SQLite commit per FUSE `write()` while
+preserving nonoverlapping updates from other handles. The mount wrapper also
+sets FUSE `entry_timeout=0`,
 `attr_timeout=0`, and `negative_timeout=0` unless callers override them, so
 kernel dentry/attribute caches do not hide updates between local mount points.
 
