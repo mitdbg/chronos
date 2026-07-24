@@ -71,7 +71,8 @@ grace period. GC scans references in every live branch and conservatively does
 nothing while a Chronos checkpoint exists. Adopted objects are never deleted.
 
 Run the MinIO-backed protocol, branching, bootstrap, GC, and DuckDB TPC-H
-tests:
+tests. The lake integration creates all eight TPC-H tables at SF 1 and
+validates Q1 through Q22 against native DuckDB:
 
 ```bash
 scripts/test_chronos_lake.sh

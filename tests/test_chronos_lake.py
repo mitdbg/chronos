@@ -47,7 +47,7 @@ def _server(bucket: str) -> NativeChronosLakeServer:
         str(database),
         _upstream_endpoint(),
         warehouse_location=f"s3://{bucket}/iceberg",
-        worker_threads=8,
+        worker_threads=32,
     )
     server.create_bucket(bucket)
     server.start()
@@ -214,8 +214,8 @@ def test_duckdb_tpch_iceberg_end_to_end():
             connection.execute("LOAD tpch")
         except Exception as error:
             pytest.skip(f"DuckDB Iceberg/TPC-H extensions are unavailable: {error}")
-        connection.execute("CALL dbgen(sf=0.01)")
-        query_numbers = (1, 6, 12)
+        connection.execute("CALL dbgen(sf=1)")
+        query_numbers = tuple(range(1, 23))
         queries = {
             number: connection.execute(
                 "SELECT query FROM tpch_queries() WHERE query_nr = ?", [number]
@@ -270,7 +270,11 @@ def test_duckdb_tpch_iceberg_end_to_end():
         connection.execute("SET search_path = 'lake.tpch'")
 
         for number, query in queries.items():
-            assert connection.execute(query).fetchall() == expected[number]
+            try:
+                actual = connection.execute(query).fetchall()
+            except Exception as error:
+                pytest.fail(f"TPC-H Q{number} failed against Chronos Lake: {error}")
+            assert actual == expected[number], f"TPC-H Q{number} result mismatch"
         assert len(server.list_object_keys("main", bucket, "")) >= 40
 
         server.create_branch("trial", "main")

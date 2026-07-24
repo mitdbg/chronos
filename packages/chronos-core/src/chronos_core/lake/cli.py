@@ -54,7 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workers",
         type=int,
-        default=int(os.environ.get("CHRONOS_LAKE_WORKERS", "16")),
+        default=int(os.environ.get("CHRONOS_LAKE_WORKERS", "32")),
     )
     parser.add_argument(
         "--gc-interval-seconds",

@@ -27,6 +27,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
+#include <boost/beast/core/tcp_stream.hpp>
 #include <boost/beast/http.hpp>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -2700,7 +2701,8 @@ class ChronosLakeServer {
     }
 
     void handle(tcp::socket socket) {
-        const int descriptor = socket.native_handle();
+        beast::tcp_stream stream(std::move(socket));
+        const int descriptor = stream.socket().native_handle();
         {
             std::lock_guard<std::mutex> guard(active_sockets_mutex_);
             active_sockets_.insert(descriptor);
@@ -2715,10 +2717,12 @@ class ChronosLakeServer {
         beast::flat_buffer buffer;
         boost::system::error_code error;
         while (running_.load()) {
+            stream.expires_after(std::chrono::seconds(2));
             http::request_parser<http::string_body> parser;
             parser.body_limit(1024ULL * 1024ULL * 1024ULL);
-            http::read(socket, buffer, parser, error);
+            http::read(stream, buffer, parser, error);
             if (error == http::error::end_of_stream) break;
+            if (error == beast::error::timeout) break;
             if (error) return;
             auto request = parser.release();
 
@@ -2732,10 +2736,11 @@ class ChronosLakeServer {
             }
             const bool keep_alive = request.keep_alive();
             response.keep_alive(keep_alive);
-            http::write(socket, response, error);
+            stream.expires_after(std::chrono::seconds(120));
+            http::write(stream, response, error);
             if (error || !keep_alive) break;
         }
-        socket.shutdown(tcp::socket::shutdown_send, error);
+        stream.socket().shutdown(tcp::socket::shutdown_send, error);
     }
 
     std::string host_;
@@ -2807,7 +2812,7 @@ void bind_chronos_s3(pybind11::module_ &m) {
              pybind11::arg("client_access_key") = "",
              pybind11::arg("client_secret_key") = "",
              pybind11::arg("warehouse_location") = "s3://warehouse/iceberg",
-             pybind11::arg("worker_threads") = 16,
+             pybind11::arg("worker_threads") = 32,
              pybind11::arg("gc_interval_seconds") = 30,
              pybind11::arg("gc_grace_seconds") = 300)
         .def("start", &ChronosLakeServer::start, pybind11::call_guard<pybind11::gil_scoped_release>())
