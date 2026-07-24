@@ -23,6 +23,7 @@ mcp = [
   "tomli>=2.0; python_version < '3.11'",
 ]
 test = [
+  "boto3>=1.35",
   "duckdb>=1.0",
   "mcp[cli]>=1.9.0",
   "pytest>=7.0",
@@ -35,6 +36,7 @@ fuse = [
 [project.scripts]
 chronos-mcp = "chronos_core.mcp.cli:main"
 chronos-mcp-deploy-codex = "chronos_core.mcp.deploy_codex:main"
+chronos-lake = "chronos_core.lake.cli:main"
 
 [tool.scikit-build]
 wheel.packages = ["src/chronos_core"]
