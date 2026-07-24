@@ -8,3 +8,6 @@ members = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+  "chronos_lake: requires a local S3-compatible service",
+]
