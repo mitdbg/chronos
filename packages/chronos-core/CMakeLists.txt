@@ -7,6 +7,10 @@ find_package(pybind11 CONFIG REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(PostgreSQL REQUIRED)
 find_package(PkgConfig REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system)
+find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(pugixml REQUIRED)
 pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 
 include(FetchContent)
@@ -68,9 +72,21 @@ pybind11_add_module(_native_interval
   src/chronos_core/native/interval_module.cpp
   src/chronos_core/native/native_backends.cpp
   src/chronos_core/native/chronosfs_fuse.cpp
+  src/chronos_core/native/chronos_s3.cpp
 )
 target_compile_features(_native_interval PRIVATE cxx_std_17)
-target_link_libraries(_native_interval PRIVATE SQLite::SQLite3 PostgreSQL::PostgreSQL PkgConfig::FUSE3 libpg_query_static duckdb_shared nlohmann_json::nlohmann_json)
+target_link_libraries(_native_interval PRIVATE
+  SQLite::SQLite3
+  PostgreSQL::PostgreSQL
+  PkgConfig::FUSE3
+  Boost::system
+  CURL::libcurl
+  OpenSSL::Crypto
+  pugixml::pugixml
+  libpg_query_static
+  duckdb_shared
+  nlohmann_json::nlohmann_json
+)
 set_target_properties(_native_interval PROPERTIES
   BUILD_RPATH "${duckdb_lib_SOURCE_DIR}"
   INSTALL_RPATH "$ORIGIN"

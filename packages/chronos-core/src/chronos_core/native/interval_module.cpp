@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 
 #include "chronosfs_fuse.hpp"
+#include "chronos_s3.hpp"
 #include "copy_branch_store.hpp"
 #include "interval_data_plane.hpp"
 
@@ -11,4 +12,5 @@ PYBIND11_MODULE(_native_interval, m) {
     chronos::native::bind_interval_data_plane(m);
     chronos::native::bind_copy_branch_store(m);
     chronos::native::bind_chronosfs_fuse(m);
+    chronos::native::bind_chronos_s3(m);
 }

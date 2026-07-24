@@ -39,3 +39,4 @@ chronos-mcp-deploy-codex = "chronos_core.mcp.deploy_codex:main"
 [tool.scikit-build]
 wheel.packages = ["src/chronos_core"]
 cmake.source-dir = "."
+build-dir = "build/{wheel_tag}"
