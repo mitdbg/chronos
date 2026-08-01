@@ -1,0 +1,26 @@
+[Unit]
+Description=Chronos enterprise knowledge state-division benchmark
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/TAR-OS/chronos
+Environment=ENTERPRISE_RESUME=1
+Environment=ENTERPRISE_RUN_ID=state-division-v2-full
+Environment=ENTERPRISE_INGEST_BATCH_SIZE=512
+Environment=ENTERPRISE_SQLITE_BUFFER_KIB=4194304
+Environment=ENTERPRISE_DOLTGRES_MEMORY_LIMIT=4g
+Environment=ENTERPRISE_DOLTGRES_GO_MEMORY_LIMIT=4GiB
+Environment=ENTERPRISE_QDRANT_MEMORY_LIMIT=8g
+Environment=ENTERPRISE_QDRANT_MAX_OPTIMIZATION_THREADS=4
+Environment=ENTERPRISE_QDRANT_MAX_INDEXING_THREADS=4
+Environment=ENTERPRISE_QDRANT_UPLOAD_WORKERS=4
+Environment=ENTERPRISE_QDRANT_SERVICE_WORKERS=8
+Environment=ENTERPRISE_BM25_THREADS=4
+ExecStart=/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/scripts/run_state_division_v2_pipeline.sh
+Restart=no
+TimeoutStopSec=300
+
+[Install]
+WantedBy=default.target

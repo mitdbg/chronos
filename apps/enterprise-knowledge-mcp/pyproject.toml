@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chronos-enterprise-knowledge"
+version = "0.1.0"
+description = "Branch-aware enterprise knowledge and memory MCP for Chronos"
+requires-python = ">=3.10"
+dependencies = [
+  "chronos-core[qdrant,mcp]",
+  "fastembed>=0.8,<0.9",
+  "httpx>=0.27",
+  "mcp[cli]>=1.9.0",
+  "numpy>=1.26",
+  "pydantic>=2.7",
+  "pyyaml>=6.0",
+  "sentence-transformers[onnx]>=5.6,<6",
+  "tiktoken>=0.9",
+]
+
+[project.optional-dependencies]
+experiment = [
+  "matplotlib>=3.8",
+]
+test = [
+  "pytest>=7.0",
+  "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+chronos-enterprise-knowledge = "chronos_enterprise_knowledge.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chronos_enterprise_knowledge"]
+
+[tool.uv.sources]
+chronos-core = { workspace = true }
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: requires external data services or filesystem features",
+]

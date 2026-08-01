@@ -1,0 +1,236 @@
+{
+  "tasks": [
+    {
+      "id": "vllm-batch-api-contract",
+      "branch": "person/marcus-reed",
+      "role": "Senior Software Engineer, Runtime",
+      "objective": "Resolve vLLM issue #50026 so the batch chat endpoint rejects unsupported streaming and tool use instead of returning misleading successful responses.",
+      "evidence_scopes": [
+        "codebases/upstream-issues/vllm-50026.md",
+        "codebases/vllm/vllm/entrypoints/openai",
+        "codebases/vllm/tests",
+        "confluence/architecture-and-standards/api-standards",
+        "github/redwood-openai-compat",
+        "slack/eng-runtime"
+      ],
+      "updates": [
+        "Add focused request-validation tests and the smallest contract fix in an isolated branch",
+        "Write a source-backed review note beside the code",
+        "Promote the reviewed change and retain its compatibility decision as semantic memory"
+      ],
+      "upstream_repository": "vllm-project/vllm",
+      "upstream_issue": 50026,
+      "upstream_issue_url": "https://github.com/vllm-project/vllm/issues/50026",
+      "pinned_commit": "272abd5f486967f1fb9db7ca7504f8c34235ef50"
+    },
+    {
+      "id": "vllm-flashinfer-virtual-buffers",
+      "branch": "person/lena-fischer",
+      "role": "Staff Software Engineer, Scheduling",
+      "objective": "Evaluate two fixes for vLLM issue #49980, which lets chunked-local-attention virtual batches exceed FlashInfer metadata buffers.",
+      "evidence_scopes": [
+        "codebases/upstream-issues/vllm-49980.md",
+        "codebases/vllm/vllm/v1/attention",
+        "codebases/vllm/tests/v1/attention",
+        "confluence/eng-serving-runtime",
+        "github/benchmark-lab",
+        "slack/eng-runtime"
+      ],
+      "updates": [
+        "Implement capacity-planning and grow-on-demand candidates in sibling branches",
+        "Record validation evidence and tradeoffs for each candidate",
+        "Merge the selected implementation, delete the rejected branch, and consolidate the decision in memory"
+      ],
+      "upstream_repository": "vllm-project/vllm",
+      "upstream_issue": 49980,
+      "upstream_issue_url": "https://github.com/vllm-project/vllm/issues/49980",
+      "pinned_commit": "272abd5f486967f1fb9db7ca7504f8c34235ef50"
+    },
+    {
+      "id": "litellm-retry-after",
+      "branch": "person/kaitlyn-nguyen",
+      "role": "Senior Software Engineer, Platform",
+      "objective": "Resolve LiteLLM issue #34399 so explicit provider backoff is not discarded when deployments share a rate-limited upstream.",
+      "evidence_scopes": [
+        "codebases/upstream-issues/litellm-34399.md",
+        "codebases/litellm/litellm/router.py",
+        "codebases/litellm/tests",
+        "confluence/eng-platform",
+        "confluence/oncall-and-incident-response",
+        "jira/customer-support",
+        "slack/eng-platform"
+      ],
+      "updates": [
+        "Add a deterministic multi-deployment retry regression test",
+        "Patch retry policy and document its precedence rules",
+        "Merge the reviewed fix and store the operational contract as playbook memory"
+      ],
+      "upstream_repository": "BerriAI/litellm",
+      "upstream_issue": 34399,
+      "upstream_issue_url": "https://github.com/BerriAI/litellm/issues/34399",
+      "pinned_commit": "8f86c87f8e065343af6e74e0823ab8a8276b9528"
+    },
+    {
+      "id": "langfuse-rest-trace-metadata",
+      "branch": "person/jada-williams",
+      "role": "Staff Software Engineer, Console",
+      "objective": "Resolve Langfuse issue #12736 so the preview trace UI renders latency and tags for REST-ingested historical traces.",
+      "evidence_scopes": [
+        "codebases/upstream-issues/langfuse-12736.md",
+        "codebases/langfuse/web/src/components/trace",
+        "codebases/langfuse/web/src/features",
+        "confluence/product-docs",
+        "linear/design",
+        "slack/product",
+        "slack/eng-platform"
+      ],
+      "updates": [
+        "Add a regression fixture for the REST ingestion shape and patch the preview mapping",
+        "Create a review artifact linking the code change to product evidence",
+        "Leave the validated task branch isolated for browser review and store the compatibility finding as episodic memory"
+      ],
+      "upstream_repository": "langfuse/langfuse",
+      "upstream_issue": 12736,
+      "upstream_issue_url": "https://github.com/langfuse/langfuse/issues/12736",
+      "pinned_commit": "c4eaf1f4c0cd1851f0c9dbea2802c243cf787a09"
+    },
+    {
+      "id": "litellm-latency-routing-race",
+      "branch": "person/aisha-bello",
+      "role": "Senior Site Reliability Engineer",
+      "objective": "Reproduce and resolve LiteLLM issue #24720, where concurrent latency observations overwrite one another and corrupt routing decisions.",
+      "evidence_scopes": [
+        "codebases/upstream-issues/litellm-24720.md",
+        "codebases/litellm/litellm/router_strategy/lowest_latency.py",
+        "codebases/litellm/tests",
+        "confluence/eng-sre",
+        "confluence/oncall-and-incident-response",
+        "slack/incidents",
+        "jira/ops-requests"
+      ],
+      "updates": [
+        "Create concurrent reproduction and mitigation branches from one incident state",
+        "Add the selected regression test and code fix while preserving rejected evidence",
+        "Update the incident runbook and store the validated race signature as episodic memory"
+      ],
+      "upstream_repository": "BerriAI/litellm",
+      "upstream_issue": 24720,
+      "upstream_issue_url": "https://github.com/BerriAI/litellm/issues/24720",
+      "pinned_commit": "8f86c87f8e065343af6e74e0823ab8a8276b9528"
+    },
+    {
+      "id": "vllm-kv-cache-dtype",
+      "branch": "person/jamal-pierce",
+      "role": "Senior Infrastructure Engineer",
+      "objective": "Resolve vLLM issue #34752 by defining and enforcing the precedence between checkpoint KV-cache quantization metadata and deployment overrides.",
+      "evidence_scopes": [
+        "codebases/upstream-issues/vllm-34752.md",
+        "codebases/vllm/vllm/config",
+        "codebases/vllm/tests",
+        "confluence/eng-infra",
+        "confluence/eng-private-deployments",
+        "github/redwood-private-installer",
+        "slack/eng-infra"
+      ],
+      "updates": [
+        "Add CPU-level configuration cases and the smallest early validation or resolution fix",
+        "Write a private-deployment compatibility note with rollback guidance",
+        "Merge the reviewed state and store the deployment rule as playbook memory"
+      ],
+      "upstream_repository": "vllm-project/vllm",
+      "upstream_issue": 34752,
+      "upstream_issue_url": "https://github.com/vllm-project/vllm/issues/34752",
+      "pinned_commit": "272abd5f486967f1fb9db7ca7504f8c34235ef50"
+    },
+    {
+      "id": "langfuse-score-analytics",
+      "branch": "person/sana-farid",
+      "role": "Evals Data Scientist",
+      "objective": "Resolve both correctness defects in Langfuse issue #15208: rounded-value histogram binning and unweighted averages of aggregated pivot rows.",
+      "evidence_scopes": [
+        "codebases/upstream-issues/langfuse-15208.md",
+        "codebases/langfuse/web/src/features/dashboard",
+        "codebases/langfuse/web/src/features/widgets",
+        "codebases/langfuse/web/src/__tests__",
+        "confluence/applied-ml-and-evals",
+        "slack/eng-ml"
+      ],
+      "updates": [
+        "Implement each analytics correction in a separate sibling branch with focused tests",
+        "Compare both diffs and merge the orthogonal validated changes into a consolidation branch",
+        "Record the corrected statistical contracts as semantic memory and delete temporary candidates"
+      ],
+      "upstream_repository": "langfuse/langfuse",
+      "upstream_issue": 15208,
+      "upstream_issue_url": "https://github.com/langfuse/langfuse/issues/15208",
+      "pinned_commit": "c4eaf1f4c0cd1851f0c9dbea2802c243cf787a09"
+    },
+    {
+      "id": "vllm-context-aware-speculation",
+      "branch": "person/olivia-grant",
+      "role": "Senior Applied ML Engineer",
+      "objective": "Prototype the backward-compatible schema and lookup portion of vLLM RFC #48627 for context-length-aware speculative-token scheduling.",
+      "evidence_scopes": [
+        "codebases/upstream-issues/vllm-48627.md",
+        "codebases/vllm/vllm/config/speculative.py",
+        "codebases/vllm/vllm/v1/spec_decode",
+        "codebases/vllm/vllm/v1/core/sched",
+        "codebases/vllm/tests",
+        "confluence/applied-ml-and-evals",
+        "github/benchmark-lab",
+        "slack/eng-ml"
+      ],
+      "updates": [
+        "Separate schema-validation and scheduler-integration work into reviewable branches",
+        "Add CPU-only compatibility and invalid-grid tests plus a benchmark-analysis artifact",
+        "Merge only the validated prototype state and consolidate its assumptions as episodic memory"
+      ],
+      "upstream_repository": "vllm-project/vllm",
+      "upstream_issue": 48627,
+      "upstream_issue_url": "https://github.com/vllm-project/vllm/issues/48627",
+      "pinned_commit": "272abd5f486967f1fb9db7ca7504f8c34235ef50"
+    },
+    {
+      "id": "enterprise-rag-qa-with-memory",
+      "branch": "person/selene-huang",
+      "role": "Staff Applied Scientist",
+      "objective": "Answer ten EnterpriseRAG questions from company evidence, preserve citations in an artifact, and retain a reusable evidence-reconciliation procedure as memory.",
+      "evidence_scopes": [
+        "confluence",
+        "github",
+        "linear",
+        "jira",
+        "slack",
+        "gmail",
+        "fireflies",
+        "google_drive",
+        "hubspot"
+      ],
+      "updates": [
+        "Create a cited answer artifact in an isolated branch",
+        "Record the validated multi-source reconciliation procedure as playbook memory",
+        "Keep the answer branch isolated for benchmark evaluation"
+      ]
+    },
+    {
+      "id": "platform-engineer-onboarding",
+      "branch": "person/ethan-park",
+      "role": "Engineering Manager, Platform Control Plane",
+      "objective": "Add a new platform engineer's personal branch and create an evidence-backed onboarding package covering LiteLLM and Langfuse ownership, development setup, and first issue triage.",
+      "evidence_scopes": [
+        "employee_directory.yaml",
+        "codebases/litellm/AGENTS.md",
+        "codebases/langfuse/AGENTS.md",
+        "confluence/company-handbook",
+        "confluence/eng-platform",
+        "jira/internal-support",
+        "slack/new-hires"
+      ],
+      "updates": [
+        "Create the member branch from team/platform-console",
+        "Index a role-specific onboarding and code-ownership checklist",
+        "Store the reviewed onboarding procedure as playbook memory without retaining private employee details"
+      ]
+    }
+  ]
+}

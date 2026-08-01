@@ -1,0 +1,22 @@
+services:
+  doltgres:
+    image: dolthub/doltgresql@sha256:4e4872c3c3400c7918c84e57b71c191cfd6b2b46b65dda35e90c5ee64d396838
+    environment:
+      DOLTGRES_PASSWORD: ${DOLTGRES_PASSWORD:-password}
+    ports:
+      - "${DOLTGRES_PORT:-55439}:5432"
+    volumes:
+      - ${NATIVE_BASELINE_DATA:-./data}/doltgres:/var/lib/doltgres
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c
+    mem_limit: ${QDRANT_MEMORY_LIMIT:-8g}
+    memswap_limit: ${QDRANT_MEMORY_LIMIT:-8g}
+    environment:
+      QDRANT__SERVICE__MAX_WORKERS: ${QDRANT_SERVICE_WORKERS:-8}
+    ports:
+      - "${QDRANT_PORT:-6339}:6333"
+    volumes:
+      - ${NATIVE_BASELINE_DATA:-./data}/qdrant:/qdrant/storage
+    restart: unless-stopped

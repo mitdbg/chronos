@@ -23,6 +23,7 @@ dist/
 .chronos-code/
 .chronos-runtime/
 .chronos-overlay-test/
+.enterprise-knowledge/
 
 # Generated benchmark output
 .benchmarks/
@@ -36,4 +37,3 @@ dist/
 *.log
 .env
 .env.*
-

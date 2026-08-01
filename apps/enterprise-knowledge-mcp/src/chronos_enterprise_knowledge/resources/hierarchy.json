@@ -1,0 +1,221 @@
+{
+  "company": {
+    "branch_id": "main",
+    "name": "Redwood Inference",
+    "starting_knowledge": "The company branch contains Redwood's shared enterprise knowledge and the pinned source repositories used to build its inference platform. Department and team branches inherit that state, then add reviewed documents, code changes, generated artifacts, and durable agent memory without modifying sibling branches."
+  },
+  "departments": [
+    {
+      "branch_id": "department/engineering",
+      "name": "Engineering",
+      "source_scopes": [
+        "github/redwood",
+        "linear/engineering",
+        "confluence/architecture-and-standards",
+        "slack/eng",
+        "codebases/vllm",
+        "codebases/litellm",
+        "codebases/langfuse"
+      ],
+      "starting_knowledge": "Engineering owns the inference serving path from runtime scheduling through the API gateway and operations console. Its branch connects implementation state to design decisions, delivery work, incidents, and release evidence.",
+      "teams": [
+        {
+          "branch_id": "team/runtime-scheduling",
+          "name": "Runtime Scheduling",
+          "lead": "Sofia Ivanova",
+          "members": [
+            {
+              "name": "Lena Fischer",
+              "title": "Staff Software Engineer, Scheduling"
+            },
+            {
+              "name": "Marcus Reed",
+              "title": "Senior Software Engineer, Runtime"
+            }
+          ],
+          "source_scopes": [
+            "codebases/vllm",
+            "github/redwood",
+            "github/benchmark-lab",
+            "linear/engineering",
+            "confluence/eng-serving-runtime",
+            "slack/eng-runtime",
+            "slack/incidents"
+          ],
+          "starting_knowledge": "Runtime Scheduling owns continuous batching, prefill and decode scheduling, queue management, backpressure, and KV-cache-aware execution. The team works primarily in the vLLM source tree and validates changes against Redwood benchmark, incident, and rollout evidence."
+        },
+        {
+          "branch_id": "team/platform-console",
+          "name": "Platform & Console",
+          "lead": "Priya Natarajan",
+          "members": [
+            {
+              "name": "Ethan Park",
+              "title": "Engineering Manager, Platform Control Plane"
+            },
+            {
+              "name": "Jada Williams",
+              "title": "Staff Software Engineer, Console"
+            },
+            {
+              "name": "Kaitlyn Nguyen",
+              "title": "Senior Software Engineer, Platform"
+            }
+          ],
+          "source_scopes": [
+            "codebases/litellm",
+            "codebases/langfuse",
+            "github/rbac-policy-bundle",
+            "linear/engineering",
+            "linear/design",
+            "confluence/eng-platform",
+            "confluence/product-docs",
+            "slack/eng-platform",
+            "slack/product"
+          ],
+          "starting_knowledge": "Platform & Console owns inference gateway policy, tenant configuration, safe rollouts, telemetry workflows, and the operator-facing console. The team uses LiteLLM for gateway work and Langfuse for observability and console workflows, reconciling code changes with product, security, and operational requirements."
+        }
+      ]
+    },
+    {
+      "branch_id": "department/infrastructure-sre",
+      "name": "Infrastructure & SRE",
+      "source_scopes": [
+        "confluence/eng-infra",
+        "confluence/eng-sre",
+        "confluence/eng-private-deployments",
+        "confluence/oncall-and-incident-response",
+        "jira/ops-requests",
+        "slack/eng-infra",
+        "slack/eng-sre",
+        "slack/incidents",
+        "codebases/vllm",
+        "codebases/litellm",
+        "codebases/langfuse"
+      ],
+      "starting_knowledge": "Infrastructure & SRE operates Redwood's hosted, dedicated, and private inference environments. Its branch emphasizes current production behavior, reliability controls, capacity constraints, and validated incident learning while retaining the source code needed to reproduce and mitigate failures.",
+      "teams": [
+        {
+          "branch_id": "team/site-reliability",
+          "name": "Site Reliability Engineering",
+          "lead": "Rafael Mendes",
+          "members": [
+            {
+              "name": "Aisha Bello",
+              "title": "Senior Site Reliability Engineer"
+            },
+            {
+              "name": "Tomáš Novák",
+              "title": "Senior Site Reliability Engineer"
+            }
+          ],
+          "source_scopes": [
+            "codebases/litellm",
+            "codebases/langfuse",
+            "confluence/eng-sre",
+            "confluence/oncall-and-incident-response",
+            "github/incident-bot",
+            "github/slo-toolkit",
+            "jira/ops-requests",
+            "slack/incidents",
+            "slack/eng-sre",
+            "slack/eng-oncall"
+          ],
+          "starting_knowledge": "Site Reliability Engineering owns SLOs, error budgets, incident response, automated mitigation, and multi-region reliability. Its task branches combine operational evidence with gateway and observability code so an agent can reproduce a failure, stage a mitigation, and promote only validated findings."
+        },
+        {
+          "branch_id": "team/fleet-private-deployments",
+          "name": "GPU Fleet & Private Deployments",
+          "lead": "Vanessa Ortiz",
+          "members": [
+            {
+              "name": "Jamal Pierce",
+              "title": "Senior Infrastructure Engineer"
+            },
+            {
+              "name": "Keiko Yamamoto",
+              "title": "Senior Infrastructure Engineer"
+            }
+          ],
+          "source_scopes": [
+            "codebases/vllm",
+            "confluence/eng-infra",
+            "confluence/eng-private-deployments",
+            "github/redwood-terraform",
+            "github/redwood-helm-charts",
+            "github/redwood-private-installer",
+            "linear/engineering",
+            "slack/eng-infra"
+          ],
+          "starting_knowledge": "GPU Fleet & Private Deployments owns capacity planning, hardware profiles, private installation, upgrades, and rollback. Its work joins runtime configuration with infrastructure constraints and customer deployment requirements."
+        }
+      ]
+    },
+    {
+      "branch_id": "department/applied-ml-research",
+      "name": "Applied ML / Research",
+      "source_scopes": [
+        "codebases/vllm",
+        "codebases/langfuse",
+        "github/eval-harness",
+        "github/benchmark-lab",
+        "github/redwood-model-registry",
+        "confluence/applied-ml-and-evals",
+        "linear/engineering",
+        "slack/eng-ml"
+      ],
+      "starting_knowledge": "Applied ML / Research evaluates model quality and serving efficiency, onboards models, and defines the evidence required for safe optimization. Its branch connects experiments and eval results to the exact runtime and observability code under test.",
+      "teams": [
+        {
+          "branch_id": "team/performance-evals",
+          "name": "Performance & Evals",
+          "lead": "Jonas Weber",
+          "members": [
+            {
+              "name": "Selene Huang",
+              "title": "Staff Applied Scientist"
+            },
+            {
+              "name": "Sana Farid",
+              "title": "Evals Data Scientist"
+            }
+          ],
+          "source_scopes": [
+            "codebases/vllm",
+            "codebases/langfuse",
+            "github/eval-harness",
+            "github/benchmark-lab",
+            "confluence/applied-ml-and-evals",
+            "linear/engineering",
+            "slack/eng-ml"
+          ],
+          "starting_knowledge": "Performance & Evals defines representative workloads, latency and quality gates, regression triage, and release evidence. The team can stage benchmark and observability changes beside the source evidence that motivated them."
+        },
+        {
+          "branch_id": "team/model-optimization",
+          "name": "Model Optimization",
+          "lead": "Karthik Iyer",
+          "members": [
+            {
+              "name": "Olivia Grant",
+              "title": "Senior Applied ML Engineer"
+            },
+            {
+              "name": "Hassan Mirza",
+              "title": "Senior Applied ML Engineer"
+            }
+          ],
+          "source_scopes": [
+            "codebases/vllm",
+            "github/redwood-model-registry",
+            "github/benchmark-lab",
+            "confluence/applied-ml-and-evals",
+            "linear/engineering",
+            "slack/eng-ml"
+          ],
+          "starting_knowledge": "Model Optimization evaluates batching, caching, quantization, and model-specific serving profiles against quality, latency, cost, and deployment constraints. Sibling task branches hold competing implementations and results until the team selects and promotes one."
+        }
+      ]
+    }
+  ]
+}
