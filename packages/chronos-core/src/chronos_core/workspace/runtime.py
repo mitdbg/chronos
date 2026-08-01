@@ -494,6 +494,7 @@ class ChronosWorkspaceContext:
                     operation_id,
                     "noop",
                     self._atomic_result_dict(result),
+                    branch_id=target,
                 )
                 return result
 

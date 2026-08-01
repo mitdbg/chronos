@@ -462,6 +462,13 @@ row update. A checkout resolves the manifest once, so it observes either the
 old participant set or the new participant set, never a mixture. Unpublished
 successors are deleted during abort or restart recovery.
 
+The manifest does not have a separate workspace catalog. It is namespaced in
+the existing `metadata` JSON of the logical branch row in
+`_chronos_branch_interval_branches`. Active reservation and writer information,
+plus the bounded idempotency record, use that same metadata value. Atomic merge
+does not create `_chronos_workspace_*` tables; its publication point is the
+transactional update of this existing relational branch row.
+
 Atomic visibility is therefore a property of access through
 `ChronosWorkspaceContext`. Code that bypasses it and opens a private physical
 store branch directly is outside the protocol. Applications must also wrap

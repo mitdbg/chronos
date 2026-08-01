@@ -33,7 +33,7 @@ def _workspace(tmp_path: Path) -> ChronosWorkspaceContext:
     return ChronosWorkspaceContext(
         first=_context(tmp_path / "first.sqlite", "first_items", "a", "main-a"),
         second=_context(tmp_path / "second.sqlite", "second_items", "b", "main-b"),
-        atomic_metadata_url=f"sqlite:///{tmp_path / 'workspace.sqlite'}",
+        atomic_metadata_url=f"sqlite:///{tmp_path / 'first.sqlite'}",
         atomic_workspace_id="test",
         atomic_write_wait_timeout=2.0,
     )
@@ -49,10 +49,24 @@ def _reopen_workspace(tmp_path: Path) -> ChronosWorkspaceContext:
     return ChronosWorkspaceContext(
         first=_reopen_context(tmp_path / "first.sqlite", "first_items"),
         second=_reopen_context(tmp_path / "second.sqlite", "second_items"),
-        atomic_metadata_url=f"sqlite:///{tmp_path / 'workspace.sqlite'}",
+        atomic_metadata_url=f"sqlite:///{tmp_path / 'first.sqlite'}",
         atomic_workspace_id="test",
         atomic_write_wait_timeout=2.0,
     )
+
+
+def test_atomic_workspace_reuses_interval_branch_metadata(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    try:
+        rows = workspace._atomic.db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+        ).fetchall()
+        names = {str(row["name"]) for row in rows}
+        assert "_chronos_branch_interval_branches" in names
+        assert not any(name.startswith("_chronos_workspace_") for name in names)
+        assert not (tmp_path / "workspace.sqlite").exists()
+    finally:
+        workspace.close()
 
 
 def test_atomic_merge_selects_raw_changes_and_publishes_one_manifest(
@@ -384,13 +398,21 @@ def test_restart_aborts_unpublished_staging_and_keeps_old_target(
         "__crash_stage_first",
         from_branch=target.manifest["first"],
     )
-    workspace._atomic.db.execute(
-        """
-        UPDATE _chronos_workspace_atomic_merges
-        SET owner_pid = -1
-        WHERE workspace_id = ? AND operation_id = ?
-        """,
-        ("test", "crashed"),
+    row = workspace._atomic._branch_row("main")
+    metadata = workspace._atomic._metadata(row)
+    state = workspace._atomic._state(metadata)
+    state["active_merge"]["owner_pid"] = -1
+    workspace._atomic._write_metadata(
+        "main",
+        workspace._atomic._set_state(metadata, state),
+    )
+    row = workspace._atomic._branch_row("agent")
+    metadata = workspace._atomic._metadata(row)
+    state = workspace._atomic._state(metadata)
+    state["active_merge"]["owner_pid"] = -1
+    workspace._atomic._write_metadata(
+        "agent",
+        workspace._atomic._set_state(metadata, state),
     )
     workspace._atomic.db.commit()
     workspace.close()
@@ -453,8 +475,18 @@ def test_postgres_coordinator_publishes_manifest_with_one_cas(tmp_path: Path) ->
             if attempt == 4:
                 raise
             time.sleep(1)
+    first = ChronosBranchContext.connect(metadata_url)
+    first.db.execute(
+        "CREATE TABLE first_items (id TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    first.db.execute(
+        "INSERT INTO first_items(id, value) VALUES (?, ?)",
+        ("a", "main-a"),
+    )
+    first.db.commit()
+    first.register_table("first_items", ["id"])
     workspace = ChronosWorkspaceContext(
-        first=_context(tmp_path / "first.sqlite", "first_items", "a", "main-a"),
+        first=first,
         second=_context(tmp_path / "second.sqlite", "second_items", "b", "main-b"),
         atomic_metadata_url=metadata_url,
         atomic_workspace_id="postgres-coordinator-test",

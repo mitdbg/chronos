@@ -162,7 +162,7 @@ class ChronosKnowledgeBackend:
             qdrant=self.qdrant,
             atomic_metadata_url=(
                 workspace_metadata_url
-                or f"sqlite:///{self.state_dir / 'workspace.sqlite'}"
+                or f"sqlite:///{self.state_dir / 'knowledge.sqlite'}"
             ),
             atomic_workspace_id=namespace,
         )

@@ -422,6 +422,9 @@ The Chronos backend publishes a selected merge with one logical workspace-head
 change: readers see either the complete old three-store manifest or the
 complete new one. Generated reports and scratch files remain private unless
 their filesystem change IDs are explicitly selected.
+The workspace manifest and transient merge state are stored in the existing
+Chronos interval branch metadata inside `knowledge.sqlite`; the application
+does not create a separate workspace metadata database or workspace tables.
 `knowledge_merge` first performs a non-lazy unmount of the source and target
 workspaces because POSIX writes do not pass through the MCP writer lease. If a
 process still holds either mount busy, the merge fails closed; finish the tool

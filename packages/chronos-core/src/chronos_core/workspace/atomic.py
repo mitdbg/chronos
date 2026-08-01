@@ -1,9 +1,9 @@
-"""Atomic publication metadata and public types for Chronos workspaces.
+"""Atomic publication over the existing interval branch metadata.
 
-The coordinator deliberately owns only the workspace branch reference. Store
-branches remain ordinary Chronos branches and can therefore reuse the existing
-copy-on-write, diff, conflict, and merge machinery. An atomic merge prepares
-private successor branches and publishes their manifest with one SQL row CAS.
+Store branches remain ordinary Chronos branches.  The multi-store manifest and
+short-lived merge state live in the ``metadata`` column of the relational
+store's existing ``_chronos_branch_interval_branches`` row.  No parallel
+workspace branch, merge, result, or writer tables are created.
 """
 
 from __future__ import annotations
@@ -142,7 +142,11 @@ def atomic_change_id(store: str, change: RowDiff) -> str:
 
 
 class WorkspaceMergeCoordinator:
-    """SQLite/Postgres metadata coordinator for atomic workspace publication."""
+    """Coordinate publication through existing interval branch rows only."""
+
+    _BRANCHES_TABLE = "_chronos_branch_interval_branches"
+    _METADATA_KEY = "_chronos_workspace"
+    _RESULT_LIMIT = 128
 
     def __init__(
         self,
@@ -163,79 +167,12 @@ class WorkspaceMergeCoordinator:
         self.db = connect_sql_database(metadata_url)
         if self.db.dialect not in {"sqlite", "postgres"}:
             raise ValueError("atomic workspace metadata must use SQLite or Postgres")
-        self._ensure_schema()
-
-    def _ensure_schema(self) -> None:
-        statements = (
-            """
-            CREATE TABLE IF NOT EXISTS _chronos_workspace_branches (
-                workspace_id TEXT NOT NULL,
-                branch_id TEXT NOT NULL,
-                generation BIGINT NOT NULL,
-                manifest_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (workspace_id, branch_id)
+        columns, _ = self.db.table_defs(self._BRANCHES_TABLE)
+        if not {"branch_id", "metadata"} <= set(columns):
+            raise ValueError(
+                "atomic workspace metadata must point at an existing interval "
+                "branch database"
             )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS _chronos_workspace_atomic_merges (
-                workspace_id TEXT NOT NULL,
-                operation_id TEXT NOT NULL,
-                source_branch_id TEXT NOT NULL,
-                target_branch_id TEXT NOT NULL,
-                source_generation BIGINT NOT NULL,
-                target_generation BIGINT NOT NULL,
-                preview_token TEXT NOT NULL,
-                staging_manifest_json TEXT NOT NULL,
-                owner_host TEXT NOT NULL,
-                owner_pid BIGINT NOT NULL,
-                heartbeat_at BIGINT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (workspace_id, operation_id),
-                UNIQUE (workspace_id, target_branch_id)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS _chronos_workspace_atomic_results (
-                workspace_id TEXT NOT NULL,
-                operation_id TEXT NOT NULL,
-                status TEXT NOT NULL,
-                result_json TEXT NOT NULL,
-                completed_at TEXT NOT NULL,
-                PRIMARY KEY (workspace_id, operation_id)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS _chronos_workspace_writers (
-                workspace_id TEXT NOT NULL,
-                writer_id TEXT NOT NULL,
-                branch_id TEXT NOT NULL,
-                owner_host TEXT NOT NULL,
-                owner_pid BIGINT NOT NULL,
-                heartbeat_at BIGINT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (workspace_id, writer_id)
-            )
-            """,
-        )
-        with self._transaction(write=True):
-            for statement in statements:
-                self.db.execute(statement)
-            owner_columns = {
-                "owner_host": "TEXT NOT NULL DEFAULT ''",
-                "owner_pid": "BIGINT NOT NULL DEFAULT -1",
-                "heartbeat_at": "BIGINT NOT NULL DEFAULT 0",
-            }
-            for table in (
-                "_chronos_workspace_atomic_merges",
-                "_chronos_workspace_writers",
-            ):
-                columns, _ = self.db.table_defs(table)
-                for name, definition in owner_columns.items():
-                    if name not in columns:
-                        self.db.execute(
-                            f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
-                        )
 
     @contextlib.contextmanager
     def _transaction(self, *, write: bool) -> Iterator[None]:
@@ -257,84 +194,122 @@ class WorkspaceMergeCoordinator:
     def _branch_row(self, branch_id: str, *, lock: bool = False) -> Any:
         suffix = " FOR UPDATE" if lock and self.db.dialect == "postgres" else ""
         return self.db.execute(
-            """
-            SELECT branch_id, generation, manifest_json
-            FROM _chronos_workspace_branches
-            WHERE workspace_id = ? AND branch_id = ?
+            f"""
+            SELECT branch_id, current_segment_id, metadata
+            FROM {self._BRANCHES_TABLE}
+            WHERE branch_id = ?
             """
             + suffix,
-            (self.workspace_id, branch_id),
+            (branch_id,),
         ).fetchone()
 
-    @staticmethod
-    def _record(row: Mapping[str, Any]) -> WorkspaceBranchRecord:
+    def _metadata(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        raw = row["metadata"]
+        metadata = json.loads(str(raw)) if raw else {}
+        if not isinstance(metadata, dict):
+            raise AtomicMergeError("interval branch metadata must be a JSON object")
+        return metadata
+
+    def _state(self, metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+        workspaces = metadata.get(self._METADATA_KEY)
+        if not isinstance(workspaces, Mapping):
+            return None
+        value = workspaces.get(self.workspace_id)
+        return dict(value) if isinstance(value, Mapping) else None
+
+    def _set_state(
+        self,
+        metadata: Mapping[str, Any],
+        state: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        updated = dict(metadata)
+        workspaces = updated.get(self._METADATA_KEY)
+        workspace_values = dict(workspaces) if isinstance(workspaces, Mapping) else {}
+        if state is None:
+            workspace_values.pop(self.workspace_id, None)
+        else:
+            workspace_values[self.workspace_id] = dict(state)
+        if workspace_values:
+            updated[self._METADATA_KEY] = workspace_values
+        else:
+            updated.pop(self._METADATA_KEY, None)
+        return updated
+
+    def _write_metadata(self, branch_id: str, metadata: Mapping[str, Any]) -> None:
+        cursor = self.db.execute(
+            f"UPDATE {self._BRANCHES_TABLE} SET metadata = ? WHERE branch_id = ?",
+            (json.dumps(dict(metadata), sort_keys=True), branch_id),
+        )
+        if cursor.rowcount != 1:
+            raise AtomicMergeError(f"workspace branch does not exist: {branch_id}")
+
+    def _record(self, row: Mapping[str, Any]) -> WorkspaceBranchRecord:
+        state = self._state(self._metadata(row))
+        if state is None:
+            raise AtomicMergeError(
+                f"workspace branch does not exist: {row['branch_id']}"
+            )
         return WorkspaceBranchRecord(
             str(row["branch_id"]),
-            int(row["generation"]),
+            int(state.get("generation", 0)),
             {
                 str(name): str(branch)
-                for name, branch in json.loads(str(row["manifest_json"])).items()
+                for name, branch in dict(state.get("manifest") or {}).items()
             },
         )
 
+    @staticmethod
+    def _initial_state(manifest: Mapping[str, str]) -> dict[str, Any]:
+        return {
+            "generation": 0,
+            "manifest": dict(manifest),
+            "writers": {},
+            "results": {},
+        }
+
     def ensure_branch(self, branch_id: str, manifest: Mapping[str, str]) -> None:
         with self._transaction(write=True):
-            self.db.execute(
-                """
-                INSERT INTO _chronos_workspace_branches
-                    (workspace_id, branch_id, generation, manifest_json, updated_at)
-                VALUES (?, ?, 0, ?, ?)
-                ON CONFLICT (workspace_id, branch_id) DO NOTHING
-                """,
-                (
-                    self.workspace_id,
+            row = self._branch_row(branch_id, lock=True)
+            if row is None:
+                raise AtomicMergeError(
+                    f"relational branch metadata does not contain {branch_id!r}"
+                )
+            metadata = self._metadata(row)
+            if self._state(metadata) is None:
+                self._write_metadata(
                     branch_id,
-                    json.dumps(dict(manifest), sort_keys=True),
-                    self._now(),
-                ),
-            )
+                    self._set_state(metadata, self._initial_state(manifest)),
+                )
 
     def create_branch(self, branch_id: str, manifest: Mapping[str, str]) -> None:
         with self._transaction(write=True):
-            if self._branch_row(branch_id, lock=True) is not None:
+            row = self._branch_row(branch_id, lock=True)
+            if row is None:
+                raise AtomicMergeError(
+                    f"relational branch metadata does not contain {branch_id!r}"
+                )
+            metadata = self._metadata(row)
+            if self._state(metadata) is not None:
                 raise AtomicMergeError(f"workspace branch already exists: {branch_id}")
-            self.db.execute(
-                """
-                INSERT INTO _chronos_workspace_branches
-                    (workspace_id, branch_id, generation, manifest_json, updated_at)
-                VALUES (?, ?, 0, ?, ?)
-                """,
-                (
-                    self.workspace_id,
-                    branch_id,
-                    json.dumps(dict(manifest), sort_keys=True),
-                    self._now(),
-                ),
+            self._write_metadata(
+                branch_id,
+                self._set_state(metadata, self._initial_state(manifest)),
             )
 
     def delete_branch(self, branch_id: str) -> None:
         with self._transaction(write=True):
-            active = self.db.execute(
-                """
-                SELECT 1 FROM _chronos_workspace_atomic_merges
-                WHERE workspace_id = ?
-                  AND (source_branch_id = ? OR target_branch_id = ?)
-                """,
-                (self.workspace_id, branch_id, branch_id),
-            ).fetchone()
-            if active is not None:
+            row = self._branch_row(branch_id, lock=True)
+            if row is None:
+                return
+            metadata = self._metadata(row)
+            state = self._state(metadata)
+            if state is None:
+                return
+            if state.get("active_merge"):
                 raise AtomicMergeError(
                     f"atomic merge is active for branch: {branch_id}"
                 )
-            cursor = self.db.execute(
-                """
-                DELETE FROM _chronos_workspace_branches
-                WHERE workspace_id = ? AND branch_id = ?
-                """,
-                (self.workspace_id, branch_id),
-            )
-            if cursor.rowcount != 1:
-                raise AtomicMergeError(f"workspace branch does not exist: {branch_id}")
+            self._write_metadata(branch_id, self._set_state(metadata, None))
 
     def branch(self, branch_id: str) -> WorkspaceBranchRecord:
         with self._transaction(write=False):
@@ -346,55 +321,52 @@ class WorkspaceMergeCoordinator:
     def list_branches(self) -> list[str]:
         with self._transaction(write=False):
             rows = self.db.execute(
-                """
-                SELECT branch_id FROM _chronos_workspace_branches
-                WHERE workspace_id = ? ORDER BY branch_id
-                """,
-                (self.workspace_id,),
+                f"SELECT branch_id, metadata FROM {self._BRANCHES_TABLE} ORDER BY branch_id"
             ).fetchall()
-            return [str(row["branch_id"]) for row in rows]
+            return [
+                str(row["branch_id"])
+                for row in rows
+                if self._state(self._metadata(row)) is not None
+            ]
 
     def completed_result(self, operation_id: str) -> dict[str, Any] | None:
         with self._transaction(write=False):
-            row = self.db.execute(
-                """
-                SELECT result_json FROM _chronos_workspace_atomic_results
-                WHERE workspace_id = ? AND operation_id = ?
-                """,
-                (self.workspace_id, operation_id),
-            ).fetchone()
-            return None if row is None else json.loads(str(row["result_json"]))
+            rows = self.db.execute(
+                f"SELECT metadata FROM {self._BRANCHES_TABLE}"
+            ).fetchall()
+            for row in rows:
+                state = self._state(self._metadata(row))
+                results = state.get("results") if state else None
+                if isinstance(results, Mapping) and operation_id in results:
+                    value = results[operation_id]
+                    return dict(value) if isinstance(value, Mapping) else None
+            return None
 
     def record_result(
         self,
         operation_id: str,
         status: Literal["committed", "noop", "aborted"],
         result: Mapping[str, Any],
+        *,
+        branch_id: str,
     ) -> None:
         with self._transaction(write=True):
-            existing = self.db.execute(
-                """
-                SELECT 1 FROM _chronos_workspace_atomic_results
-                WHERE workspace_id = ? AND operation_id = ?
-                """,
-                (self.workspace_id, operation_id),
-            ).fetchone()
-            if existing is not None:
+            row = self._branch_row(branch_id, lock=True)
+            if row is None:
+                raise AtomicMergeError(f"workspace branch does not exist: {branch_id}")
+            metadata = self._metadata(row)
+            state = self._state(metadata)
+            if state is None:
+                raise AtomicMergeError(f"workspace branch does not exist: {branch_id}")
+            results = dict(state.get("results") or {})
+            if operation_id in results:
                 return
-            self.db.execute(
-                """
-                INSERT INTO _chronos_workspace_atomic_results
-                    (workspace_id, operation_id, status, result_json, completed_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    self.workspace_id,
-                    operation_id,
-                    status,
-                    json.dumps(dict(result), sort_keys=True),
-                    self._now(),
-                ),
-            )
+            stored = dict(result)
+            stored["status"] = status
+            stored["completed_at"] = self._now()
+            results[operation_id] = stored
+            state["results"] = self._trim_results(results)
+            self._write_metadata(branch_id, self._set_state(metadata, state))
 
     def reserve(
         self,
@@ -408,7 +380,6 @@ class WorkspaceMergeCoordinator:
         deadline = time.monotonic() + self.write_wait_timeout
         while True:
             with self._transaction(write=True):
-                self._delete_abandoned_writers()
                 current_source = self._branch_row(source.branch_id, lock=True)
                 current_target = self._branch_row(target.branch_id, lock=True)
                 if current_source is None or current_target is None:
@@ -421,44 +392,49 @@ class WorkspaceMergeCoordinator:
                     raise StaleAtomicMergePreviewError(
                         "source or target changed after atomic merge preview"
                     )
-                writers = self.db.execute(
-                    """
-                    SELECT 1 FROM _chronos_workspace_writers
-                    WHERE workspace_id = ? AND branch_id IN (?, ?) LIMIT 1
-                    """,
-                    (self.workspace_id, source.branch_id, target.branch_id),
-                ).fetchone()
-                if writers is None:
-                    try:
-                        self.db.execute(
-                            """
-                            INSERT INTO _chronos_workspace_atomic_merges
-                                (workspace_id, operation_id, source_branch_id,
-                                 target_branch_id, source_generation,
-                                 target_generation, preview_token,
-                                 staging_manifest_json, owner_host, owner_pid,
-                                 heartbeat_at, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                self.workspace_id,
-                                operation_id,
-                                source.branch_id,
-                                target.branch_id,
-                                source.generation,
-                                target.generation,
-                                preview_token,
-                                json.dumps(dict(staging_manifest), sort_keys=True),
-                                self.owner_host,
-                                self.owner_pid,
-                                int(time.time()),
-                                self._now(),
-                            ),
+                source_metadata = self._metadata(current_source)
+                target_metadata = self._metadata(current_target)
+                source_state = self._state(source_metadata)
+                target_state = self._state(target_metadata)
+                assert source_state is not None and target_state is not None
+                self._delete_abandoned_writers(source_state)
+                self._delete_abandoned_writers(target_state)
+                active = source_state.get("active_merge") or target_state.get(
+                    "active_merge"
+                )
+                writers = dict(source_state.get("writers") or {}) or dict(
+                    target_state.get("writers") or {}
+                )
+                if active:
+                    raise AtomicMergeError(
+                        f"another atomic merge is active for {target.branch_id}"
+                    )
+                if not writers:
+                    active_merge = {
+                        "operation_id": operation_id,
+                        "source_branch_id": source.branch_id,
+                        "target_branch_id": target.branch_id,
+                        "source_generation": source.generation,
+                        "target_generation": target.generation,
+                        "source_manifest": source.manifest,
+                        "target_manifest": target.manifest,
+                        "preview_token": preview_token,
+                        "staging_manifest": dict(staging_manifest),
+                        "owner_host": self.owner_host,
+                        "owner_pid": self.owner_pid,
+                        "heartbeat_at": int(time.time()),
+                    }
+                    source_state["active_merge"] = active_merge
+                    target_state["active_merge"] = active_merge
+                    self._write_metadata(
+                        source.branch_id,
+                        self._set_state(source_metadata, source_state),
+                    )
+                    if target.branch_id != source.branch_id:
+                        self._write_metadata(
+                            target.branch_id,
+                            self._set_state(target_metadata, target_state),
                         )
-                    except Exception as exc:
-                        raise AtomicMergeError(
-                            f"another atomic merge is active for {target.branch_id}"
-                        ) from exc
                     return AtomicMergeReservation(
                         operation_id,
                         source,
@@ -486,21 +462,13 @@ class WorkspaceMergeCoordinator:
                 raise StaleAtomicMergePreviewError(
                     "target changed before atomic merge publication"
                 )
-            active = self.db.execute(
-                """
-                SELECT preview_token FROM _chronos_workspace_atomic_merges
-                WHERE workspace_id = ? AND operation_id = ?
-                  AND target_branch_id = ?
-                """,
-                (
-                    self.workspace_id,
-                    reservation.operation_id,
-                    reservation.target.branch_id,
-                ),
-            ).fetchone()
-            if (
-                active is None
-                or str(active["preview_token"]) != reservation.preview_token
+            target_metadata = self._metadata(target_row)
+            target_state = self._state(target_metadata)
+            assert target_state is not None
+            active = target_state.get("active_merge")
+            if not isinstance(active, Mapping) or (
+                str(active.get("operation_id")) != reservation.operation_id
+                or str(active.get("preview_token")) != reservation.preview_token
             ):
                 raise AtomicMergeError("atomic merge reservation is missing or stale")
             next_generation = reservation.target.generation + 1
@@ -509,51 +477,38 @@ class WorkspaceMergeCoordinator:
                 next_generation,
                 dict(reservation.staging_manifest),
             )
-            cursor = self.db.execute(
-                """
-                UPDATE _chronos_workspace_branches
-                SET generation = ?, manifest_json = ?, updated_at = ?
-                WHERE workspace_id = ? AND branch_id = ? AND generation = ?
-                """,
-                (
-                    next_generation,
-                    json.dumps(reservation.staging_manifest, sort_keys=True),
-                    self._now(),
-                    self.workspace_id,
-                    reservation.target.branch_id,
-                    reservation.target.generation,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise StaleAtomicMergePreviewError(
-                    "target changed before atomic merge publication"
-                )
             stored_result = dict(result)
             stored_result["new_target_token"] = {
                 "branch_id": published_record.token.branch_id,
                 "generation": published_record.token.generation,
                 "manifest_digest": published_record.token.manifest_digest,
             }
-            self.db.execute(
-                """
-                INSERT INTO _chronos_workspace_atomic_results
-                    (workspace_id, operation_id, status, result_json, completed_at)
-                VALUES (?, ?, 'committed', ?, ?)
-                """,
-                (
-                    self.workspace_id,
-                    reservation.operation_id,
-                    json.dumps(stored_result, sort_keys=True),
-                    self._now(),
-                ),
+            stored_result["completed_at"] = self._now()
+            results = dict(target_state.get("results") or {})
+            results[reservation.operation_id] = stored_result
+            target_state.update(
+                {
+                    "generation": next_generation,
+                    "manifest": dict(reservation.staging_manifest),
+                    "results": self._trim_results(results),
+                }
             )
-            self.db.execute(
-                """
-                DELETE FROM _chronos_workspace_atomic_merges
-                WHERE workspace_id = ? AND operation_id = ?
-                """,
-                (self.workspace_id, reservation.operation_id),
+            target_state.pop("active_merge", None)
+            self._write_metadata(
+                reservation.target.branch_id,
+                self._set_state(target_metadata, target_state),
             )
+            if reservation.source.branch_id != reservation.target.branch_id:
+                source_row = self._branch_row(reservation.source.branch_id, lock=True)
+                if source_row is not None:
+                    source_metadata = self._metadata(source_row)
+                    source_state = self._state(source_metadata)
+                    if source_state is not None:
+                        source_state.pop("active_merge", None)
+                        self._write_metadata(
+                            reservation.source.branch_id,
+                            self._set_state(source_metadata, source_state),
+                        )
             return published_record
 
     def abort(
@@ -562,77 +517,78 @@ class WorkspaceMergeCoordinator:
         result: Mapping[str, Any],
     ) -> None:
         with self._transaction(write=True):
-            self.db.execute(
-                """
-                DELETE FROM _chronos_workspace_atomic_merges
-                WHERE workspace_id = ? AND operation_id = ?
-                """,
-                (self.workspace_id, reservation.operation_id),
-            )
-            existing = self.db.execute(
-                """
-                SELECT 1 FROM _chronos_workspace_atomic_results
-                WHERE workspace_id = ? AND operation_id = ?
-                """,
-                (self.workspace_id, reservation.operation_id),
-            ).fetchone()
-            if existing is None:
-                self.db.execute(
-                    """
-                    INSERT INTO _chronos_workspace_atomic_results
-                        (workspace_id, operation_id, status, result_json, completed_at)
-                    VALUES (?, ?, 'aborted', ?, ?)
-                    """,
-                    (
-                        self.workspace_id,
-                        reservation.operation_id,
-                        json.dumps(dict(result), sort_keys=True),
-                        self._now(),
-                    ),
-                )
+            for branch_id in {
+                reservation.source.branch_id,
+                reservation.target.branch_id,
+            }:
+                row = self._branch_row(branch_id, lock=True)
+                if row is None:
+                    continue
+                metadata = self._metadata(row)
+                state = self._state(metadata)
+                if state is None:
+                    continue
+                active = state.get("active_merge")
+                if (
+                    isinstance(active, Mapping)
+                    and str(active.get("operation_id")) == reservation.operation_id
+                ):
+                    state.pop("active_merge", None)
+                if branch_id == reservation.target.branch_id:
+                    results = dict(state.get("results") or {})
+                    if reservation.operation_id not in results:
+                        stored = dict(result)
+                        stored["completed_at"] = self._now()
+                        results[reservation.operation_id] = stored
+                        state["results"] = self._trim_results(results)
+                self._write_metadata(branch_id, self._set_state(metadata, state))
 
     def abandoned(self) -> list[AtomicMergeReservation]:
         with self._transaction(write=False):
             rows = self.db.execute(
-                """
-                SELECT operation_id, source_branch_id, target_branch_id,
-                       source_generation, target_generation, preview_token,
-                       staging_manifest_json, owner_host, owner_pid, heartbeat_at
-                FROM _chronos_workspace_atomic_merges
-                WHERE workspace_id = ? ORDER BY created_at
-                """,
-                (self.workspace_id,),
+                f"SELECT branch_id, metadata FROM {self._BRANCHES_TABLE} ORDER BY branch_id"
             ).fetchall()
         reservations: list[AtomicMergeReservation] = []
+        seen: set[str] = set()
         for row in rows:
+            state = self._state(self._metadata(row))
+            active = state.get("active_merge") if state else None
+            if not isinstance(active, Mapping):
+                continue
+            operation_id = str(active.get("operation_id", ""))
+            if not operation_id or operation_id in seen:
+                continue
+            seen.add(operation_id)
             if not self._owner_is_abandoned(
-                str(row["owner_host"]),
-                int(row["owner_pid"]),
-                int(row["heartbeat_at"]),
+                str(active.get("owner_host", "")),
+                int(active.get("owner_pid", -1)),
+                int(active.get("heartbeat_at", 0)),
             ):
                 continue
-            source = self.branch(str(row["source_branch_id"]))
-            target = self.branch(str(row["target_branch_id"]))
             reservations.append(
                 AtomicMergeReservation(
-                    str(row["operation_id"]),
+                    operation_id,
                     WorkspaceBranchRecord(
-                        source.branch_id,
-                        int(row["source_generation"]),
-                        source.manifest,
+                        str(active["source_branch_id"]),
+                        int(active["source_generation"]),
+                        {
+                            str(k): str(v)
+                            for k, v in dict(active["source_manifest"]).items()
+                        },
                     ),
                     WorkspaceBranchRecord(
-                        target.branch_id,
-                        int(row["target_generation"]),
-                        target.manifest,
+                        str(active["target_branch_id"]),
+                        int(active["target_generation"]),
+                        {
+                            str(k): str(v)
+                            for k, v in dict(active["target_manifest"]).items()
+                        },
                     ),
                     {
                         str(name): str(branch)
-                        for name, branch in json.loads(
-                            str(row["staging_manifest_json"])
-                        ).items()
+                        for name, branch in dict(active["staging_manifest"]).items()
                     },
-                    str(row["preview_token"]),
+                    str(active["preview_token"]),
                 )
             )
         return reservations
@@ -642,38 +598,27 @@ class WorkspaceMergeCoordinator:
         deadline = time.monotonic() + self.write_wait_timeout
         while True:
             with self._transaction(write=True):
-                self._delete_abandoned_writers()
-                if self._branch_row(branch_id, lock=True) is None:
+                row = self._branch_row(branch_id, lock=True)
+                if row is None:
                     raise AtomicMergeError(
                         f"workspace branch does not exist: {branch_id}"
                     )
-                active = self.db.execute(
-                    """
-                    SELECT 1 FROM _chronos_workspace_atomic_merges
-                    WHERE workspace_id = ?
-                      AND (source_branch_id = ? OR target_branch_id = ?)
-                    LIMIT 1
-                    """,
-                    (self.workspace_id, branch_id, branch_id),
-                ).fetchone()
-                if active is None:
-                    self.db.execute(
-                        """
-                        INSERT INTO _chronos_workspace_writers
-                            (workspace_id, writer_id, branch_id, owner_host,
-                             owner_pid, heartbeat_at, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            self.workspace_id,
-                            writer_id,
-                            branch_id,
-                            self.owner_host,
-                            self.owner_pid,
-                            int(time.time()),
-                            self._now(),
-                        ),
+                metadata = self._metadata(row)
+                state = self._state(metadata)
+                if state is None:
+                    raise AtomicMergeError(
+                        f"workspace branch does not exist: {branch_id}"
                     )
+                self._delete_abandoned_writers(state)
+                if not state.get("active_merge"):
+                    writers = dict(state.get("writers") or {})
+                    writers[writer_id] = {
+                        "owner_host": self.owner_host,
+                        "owner_pid": self.owner_pid,
+                        "heartbeat_at": int(time.time()),
+                    }
+                    state["writers"] = writers
+                    self._write_metadata(branch_id, self._set_state(metadata, state))
                     return writer_id
             if time.monotonic() >= deadline:
                 raise AtomicMergeWriteTimeoutError(
@@ -683,54 +628,48 @@ class WorkspaceMergeCoordinator:
 
     def release_writer(self, writer_id: str, branch_id: str, *, changed: bool) -> None:
         with self._transaction(write=True):
-            cursor = self.db.execute(
-                """
-                DELETE FROM _chronos_workspace_writers
-                WHERE workspace_id = ? AND writer_id = ? AND branch_id = ?
-                """,
-                (self.workspace_id, writer_id, branch_id),
-            )
-            if cursor.rowcount != 1:
+            row = self._branch_row(branch_id, lock=True)
+            if row is None:
+                # Branch deletion removes the relational anchor before its
+                # surrounding writer context exits; there is no lease left to
+                # release in that case.
+                return
+            metadata = self._metadata(row)
+            state = self._state(metadata)
+            if state is None:
+                return
+            writers = dict(state.get("writers") or {})
+            if writers.pop(writer_id, None) is None:
                 raise AtomicMergeError("workspace writer lease is missing")
+            state["writers"] = writers
             if changed:
-                self.db.execute(
-                    """
-                    UPDATE _chronos_workspace_branches
-                    SET generation = generation + 1, updated_at = ?
-                    WHERE workspace_id = ? AND branch_id = ?
-                    """,
-                    (self._now(), self.workspace_id, branch_id),
-                )
+                state["generation"] = int(state.get("generation", 0)) + 1
+            self._write_metadata(branch_id, self._set_state(metadata, state))
 
     def close(self) -> None:
         self.db.close()
 
-    def _delete_abandoned_writers(self) -> None:
-        rows = self.db.execute(
-            """
-            SELECT writer_id, owner_host, owner_pid, heartbeat_at
-            FROM _chronos_workspace_writers
-            WHERE workspace_id = ?
-            """,
-            (self.workspace_id,),
-        ).fetchall()
-        abandoned = [
-            str(row["writer_id"])
-            for row in rows
-            if self._owner_is_abandoned(
-                str(row["owner_host"]),
-                int(row["owner_pid"]),
-                int(row["heartbeat_at"]),
+    def _delete_abandoned_writers(self, state: dict[str, Any]) -> None:
+        writers = dict(state.get("writers") or {})
+        state["writers"] = {
+            writer_id: owner
+            for writer_id, owner in writers.items()
+            if not isinstance(owner, Mapping)
+            or not self._owner_is_abandoned(
+                str(owner.get("owner_host", "")),
+                int(owner.get("owner_pid", -1)),
+                int(owner.get("heartbeat_at", 0)),
             )
-        ]
-        for writer_id in abandoned:
-            self.db.execute(
-                """
-                DELETE FROM _chronos_workspace_writers
-                WHERE workspace_id = ? AND writer_id = ?
-                """,
-                (self.workspace_id, writer_id),
-            )
+        }
+
+    def _trim_results(self, results: Mapping[str, Any]) -> dict[str, Any]:
+        ordered = sorted(
+            results.items(),
+            key=lambda item: str(
+                item[1].get("completed_at", "") if isinstance(item[1], Mapping) else ""
+            ),
+        )
+        return dict(ordered[-self._RESULT_LIMIT :])
 
     def _owner_is_abandoned(
         self,
