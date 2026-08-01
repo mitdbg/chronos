@@ -128,6 +128,58 @@ def test_path_cache_invalidates_exact_file_and_subtree(
     assert chronosfs.read_file("main", "/new/sub/file.txt") == b"payload"
 
 
+def test_unlink_defers_leaf_branch_block_reclamation_until_branch_gc(
+    chronosfs: ChronosFSStore,
+) -> None:
+    chronosfs.create_branch("child", from_branch="main")
+    chronosfs.write_file("child", "/temporary.bin", b"temporary payload")
+    inode_id = chronosfs.stat("child", "/temporary.bin").inode_id
+    child_segment = int(chronosfs.context.get_branch("child").current_ref)
+
+    chronosfs.unlink("child", "/temporary.bin")
+
+    assert not chronosfs.exists("child", "/temporary.bin")
+    assert chronosfs.diff("main", "child").changes == []
+    chronosfs.merge_apply("child", "main")
+
+    # Dead extents are excluded from merge without synchronously rewriting a
+    # potentially large sandbox. They remain owned by the source segment until
+    # asynchronous branch garbage collection reclaims that segment.
+    assert chronosfs.context.db.execute(
+        """
+        SELECT 1
+        FROM _chronos_b_interval_chronosfs_file_blocks
+        WHERE inode_id = ?
+          AND writer_segment_id = ?
+        """,
+        (inode_id, child_segment),
+    ).fetchone() is not None
+
+    chronosfs.delete_branch("child")
+    chronosfs._native.wait_for_gc()
+    assert chronosfs.context.db.execute(
+        """
+        SELECT 1
+        FROM _chronos_b_interval_chronosfs_file_blocks
+        WHERE inode_id = ?
+          AND writer_segment_id = ?
+        """,
+        (inode_id, child_segment),
+    ).fetchone() is None
+
+
+def test_unlink_of_inherited_file_still_merges_deletion(
+    chronosfs: ChronosFSStore,
+) -> None:
+    chronosfs.write_file("main", "/inherited.bin", b"inherited payload")
+    chronosfs.create_branch("child", from_branch="main")
+
+    chronosfs.unlink("child", "/inherited.bin")
+    chronosfs.merge_apply("child", "main")
+
+    assert not chronosfs.exists("main", "/inherited.bin")
+
+
 def test_lazy_import_records_external_extent_and_reads_source(
     chronosfs: ChronosFSStore,
     tmp_path: Path,
@@ -606,6 +658,41 @@ def test_fuse_shell_redirection_truncates_existing_file(tmp_path: Path) -> None:
         store.close()
 
 
+def test_fuse_sequential_rewrites_observe_complete_inherited_file(
+    tmp_path: Path,
+) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+
+    store = _open_store(db_path)
+    try:
+        store.write_file("main", "/module.py", b"x" * 3838)
+        store.create_branch("agent", "main")
+    finally:
+        store.close()
+
+    payloads = [
+        b"a" * 5491,
+        b"b" * 5300,
+        b"c" * 5301,
+        b"d" * 5325,
+        b"e" * 5357,
+    ]
+    with _mounted_chronosfs(db_path, mountpoint, branch_id="agent"):
+        target = mountpoint / "module.py"
+        for payload in payloads:
+            target.write_bytes(payload)
+            assert target.read_bytes() == payload
+
+    store = _open_store(db_path)
+    try:
+        assert store.read_file("agent", "/module.py") == payloads[-1]
+    finally:
+        store.close()
+
+
 def test_fuse_open_reader_sees_write_from_other_handle(tmp_path: Path) -> None:
     _require_fuse_tools()
     db_path = tmp_path / "chronosfs.sqlite"
@@ -670,6 +757,103 @@ def test_fuse_fsync_publishes_buffered_handle_writes(tmp_path: Path) -> None:
                 ]
             ),
         )
+
+
+def test_fuse_write_batch_is_published_before_direct_branch_creation(
+    tmp_path: Path,
+) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+
+    with _mounted_chronosfs(db_path, mountpoint):
+        (mountpoint / "small.txt").write_bytes(b"small payload")
+        (mountpoint / "large.bin").write_bytes(b"x" * (128 * 1024))
+
+        store = _open_store(db_path)
+        try:
+            # create_branch crosses from the mount daemon to the direct
+            # control-plane connection. It must flush the daemon's short write
+            # batch before capturing the child's starting state.
+            store.create_branch("child", "main")
+            assert store.read_file("child", "/small.txt") == b"small payload"
+            assert store.read_file("child", "/large.bin") == b"x" * (128 * 1024)
+        finally:
+            store.close()
+
+
+def test_fuse_external_object_is_reclaimed_after_branch_deletion(
+    tmp_path: Path,
+) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+
+    store = _open_store(db_path)
+    try:
+        store.create_branch("child", "main")
+    finally:
+        store.close()
+
+    payload = b"x" * (128 * 1024)
+    with _mounted_chronosfs(
+        db_path,
+        mountpoint,
+        branch_id="child",
+    ):
+        (mountpoint / "temporary.bin").write_bytes(payload)
+
+    object_dir = Path(str(db_path) + ".chronosfs-objects")
+    objects = list(object_dir.glob("object-*"))
+    assert len(objects) == 1
+
+    store = _open_store(db_path)
+    try:
+        assert store.read_file("child", "/temporary.bin") == payload
+        store.delete_branch("child")
+        store.wait_for_gc()
+        assert list(object_dir.glob("object-*")) == []
+        assert (
+            store.context.db.execute(
+                "SELECT COUNT(*) AS count FROM _chronosfs_objects"
+            ).fetchone()["count"]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+def test_fuse_external_object_is_retained_while_parent_references_it(
+    tmp_path: Path,
+) -> None:
+    _require_fuse_tools()
+    db_path = tmp_path / "chronosfs.sqlite"
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+    payload = b"shared" * (24 * 1024)
+
+    with _mounted_chronosfs(db_path, mountpoint):
+        (mountpoint / "shared.bin").write_bytes(payload)
+        store = _open_store(db_path)
+        try:
+            store.create_branch("child", "main")
+        finally:
+            store.close()
+
+    object_dir = Path(str(db_path) + ".chronosfs-objects")
+    objects = list(object_dir.glob("object-*"))
+    assert len(objects) == 1
+
+    store = _open_store(db_path)
+    try:
+        store.delete_branch("child")
+        store.wait_for_gc()
+        assert list(object_dir.glob("object-*")) == objects
+        assert store.read_file("main", "/shared.bin") == payload
+    finally:
+        store.close()
 
 
 def test_fuse_buffered_handles_merge_nonoverlapping_same_block_writes(

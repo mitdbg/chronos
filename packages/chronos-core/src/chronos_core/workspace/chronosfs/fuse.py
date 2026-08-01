@@ -21,6 +21,9 @@ class ChronosFSMountError(Exception):
     """Raised when a ChronosFS FUSE mount cannot start."""
 
 
+_READY_POLL_INTERVAL_S = 0.001
+
+
 class ChronosFuseOperations:
     """Small compatibility shim for tests of store/FUSE dispatch policy.
 
@@ -122,6 +125,36 @@ def start_chronosfs_mount(
     return mount_path
 
 
+def start_chronosfs_daemon(
+    store: ChronosFSStore,
+    *,
+    options: set[str] | None = None,
+) -> None:
+    """Start and retain the shared daemon without mounting a branch.
+
+    Long-lived control planes call this during service startup so daemon
+    initialization is never charged to the first branch checkout.
+    """
+    database_url = _database_url_for_mount(store)
+    mount_options = _with_default_cache_options(options or set())
+    key = _daemon_key(database_url, store.block_size)
+    runtime = _runtime_dir()
+    socket_path = runtime / f"{key}.sock"
+    _ensure_shared_daemon(
+        socket_path=socket_path,
+        lock_path=runtime / f"{key}.lock",
+        log_path=runtime / f"{key}.log",
+        database_url=database_url,
+        block_size=store.block_size,
+        options=mount_options,
+    )
+    response = _socket_request(socket_path, {"keep_alive": True})
+    if response.get("status") != "ok":
+        raise ChronosFSMountError(
+            str(response.get("error", "failed to retain shared ChronosFS daemon"))
+        )
+
+
 def shutdown_chronosfs_daemon(store: ChronosFSStore) -> None:
     """Stop the shared local mount daemon for ``store``.
 
@@ -131,6 +164,23 @@ def shutdown_chronosfs_daemon(store: ChronosFSStore) -> None:
     """
     database_url = _database_url_for_mount(store)
     _shutdown_shared_chronosfs_daemon(database_url, store.block_size)
+
+
+def flush_chronosfs_daemon(store: ChronosFSStore) -> None:
+    """Publish pending FUSE metadata before a control-plane branch operation."""
+    database_url = _database_url_for_mount(store)
+    key = _daemon_key(database_url, store.block_size)
+    socket_path = _runtime_dir() / f"{key}.sock"
+    if not socket_path.exists():
+        return
+    try:
+        response = _socket_request(socket_path, {"flush": True}, timeout=5.0)
+    except (FileNotFoundError, ConnectionRefusedError):
+        return
+    if response.get("status") != "ok":
+        raise ChronosFSMountError(
+            str(response.get("error", "failed to flush ChronosFS writes"))
+        )
 
 
 def _database_url_for_mount(store: ChronosFSStore) -> str:
@@ -158,9 +208,25 @@ def _runtime_dir() -> Path:
 
 def _with_default_cache_options(options: set[str]) -> list[str]:
     merged = set(options)
+    # Separate /dev/fuse descriptors reduce contention among libfuse worker
+    # threads without serializing filesystem operations.
+    merged.add("clone_fd")
+    if not any(
+        option in {"auto_cache", "noauto_cache", "kernel_cache", "direct_io"}
+        for option in merged
+    ):
+        # Branch files are mutable and may be rewritten through another file
+        # handle.  libfuse's auto_cache can retain the previous EOF even after
+        # the write has been published, causing the next open to observe stale
+        # contents.  Invalidate file data on open by default; inode and dentry
+        # metadata remain cached through attr_timeout and entry_timeout.
+        merged.add("noauto_cache")
     defaults = {
-        "entry_timeout": "1",
-        "attr_timeout": "1",
+        # ChronosFS explicitly invalidates changed paths and their parent
+        # directories across local mounts. Keep stable positive entries in the
+        # kernel long enough for metadata-heavy traversals to reuse them.
+        "entry_timeout": "60",
+        "attr_timeout": "60",
         "negative_timeout": "0",
     }
     for name, value in defaults.items():
@@ -214,7 +280,7 @@ def _wait_for_daemon(socket_path: Path, *, deadline_s: float = 10.0) -> None:
             return
         except Exception as exc:  # pragma: no cover - host scheduling dependent.
             last_error = exc
-            time.sleep(0.05)
+            time.sleep(_READY_POLL_INTERVAL_S)
     raise ChronosFSMountError(f"timed out waiting for shared ChronosFS daemon: {last_error}")
 
 
@@ -229,7 +295,7 @@ def _wait_for_mount(mountpoint: Path, socket_path: Path, *, deadline_s: float = 
             return
         if not socket_path.exists():
             raise ChronosFSMountError("shared ChronosFS daemon exited before mounting")
-        time.sleep(0.05)
+        time.sleep(_READY_POLL_INTERVAL_S)
     raise ChronosFSMountError(f"timed out waiting for ChronosFS mount at {mountpoint}")
 
 
@@ -257,6 +323,15 @@ def _ensure_shared_daemon(
         except Exception:
             with suppress(FileNotFoundError):
                 socket_path.unlink()
+        daemon_environment = os.environ.copy()
+        # FUSE acknowledges ordinary writes before stable-storage durability,
+        # while fsync provides the explicit durability boundary. Apply that
+        # policy to every native SQLite connection opened inside the daemon;
+        # SQLite's synchronous setting is connection-local.
+        daemon_environment.setdefault(
+            "CHRONOS_NATIVE_SQLITE_SYNCHRONOUS",
+            "NORMAL",
+        )
         with log_path.open("ab") as log:
             subprocess.Popen(
                 [
@@ -277,6 +352,7 @@ def _ensure_shared_daemon(
                 stderr=log,
                 close_fds=True,
                 start_new_session=True,
+                env=daemon_environment,
             )
         _wait_for_daemon(socket_path)
 

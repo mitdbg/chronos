@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import socket
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -21,6 +22,8 @@ from chronos_core import _native_interval
 
 MOUNT_READY_TIMEOUT_S = 30.0
 MOUNT_START_ATTEMPTS = 3
+MOUNT_READY_POLL_INTERVAL_S = 0.001
+SQLITE_CHECKPOINT_INTERVAL_S = 1.0
 
 
 def _load_options(raw: str) -> list[str]:
@@ -71,9 +74,11 @@ class _DaemonState:
         self.active_mountpoints: set[str] = set()
         self.last_idle_at = time.monotonic()
         self.shutdown_requested = False
+        self.keep_alive = False
         self.unmounted_since: float | None = None
         self.last_mount_error: str | None = None
         self.active_guard = threading.Lock()
+        self.stop_maintenance = threading.Event()
 
     def should_exit(self, idle_timeout_s: float, stale_unmounted_timeout_s: float) -> bool:
         with self.active_guard:
@@ -82,6 +87,8 @@ class _DaemonState:
                 return True
             if self.active_mounts == 0:
                 self.unmounted_since = None
+                if self.keep_alive:
+                    return False
                 return now - self.last_idle_at >= idle_timeout_s
             any_mounted = any(os.path.ismount(path) for path in self.active_mountpoints)
             if any_mounted:
@@ -95,6 +102,57 @@ class _DaemonState:
     def request_shutdown(self) -> None:
         with self.active_guard:
             self.shutdown_requested = True
+        self.stop_maintenance.set()
+
+    def retain(self) -> None:
+        with self.active_guard:
+            self.keep_alive = True
+
+
+def _sqlite_database_path(database_url: str) -> str | None:
+    prefix = "sqlite:///"
+    if not database_url.startswith(prefix):
+        return None
+    return "/" + database_url[len(prefix) :]
+
+
+def _checkpoint_sqlite(database_url: str, state: _DaemonState) -> None:
+    database_path = _sqlite_database_path(database_url)
+    if database_path is None:
+        return
+    wal_path = Path(database_path + "-wal")
+    connection = sqlite3.connect(database_path, timeout=0.05)
+    try:
+        connection.execute("PRAGMA busy_timeout=50")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        previous_wal_state: tuple[int, int] | None = None
+        while not state.stop_maintenance.wait(SQLITE_CHECKPOINT_INTERVAL_S):
+            try:
+                wal_stat = wal_path.stat()
+            except FileNotFoundError:
+                previous_wal_state = None
+                continue
+            wal_state = (wal_stat.st_mtime_ns, wal_stat.st_size)
+            if wal_stat.st_size == 0 or wal_state != previous_wal_state:
+                previous_wal_state = wal_state
+                continue
+            try:
+                # Checkpoint only after the WAL has been unchanged for a full
+                # interval. This keeps page copying and fsync off sustained
+                # write bursts, then releases the temporary WAL space once the
+                # filesystem becomes idle.
+                # PASSIVE yields to a new writer instead of holding the write
+                # path behind a long TRUNCATE checkpoint. The WAL file can be
+                # reused after checkpointing; truncation is not required for
+                # foreground correctness.
+                connection.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            except sqlite3.OperationalError:
+                # A concurrent schema/branch transaction may briefly hold the
+                # database lock. The next periodic pass will make progress.
+                continue
+            previous_wal_state = None
+    finally:
+        connection.close()
 
 
 def _handle_client(
@@ -115,6 +173,14 @@ def _handle_client(
                 return
             if request.get("shutdown") is True:
                 state.request_shutdown()
+                conn.sendall(b'{"status":"ok"}\n')
+                return
+            if request.get("keep_alive") is True:
+                state.retain()
+                conn.sendall(b'{"status":"ok"}\n')
+                return
+            if request.get("flush") is True:
+                _native_interval.flush_chronosfs_native(database_url, block_size)
                 conn.sendall(b'{"status":"ok"}\n')
                 return
             mountpoint = request["mountpoint"]
@@ -149,7 +215,7 @@ def _handle_client(
                         if not last_error:
                             last_error = f"ChronosFS mount thread exited before mounting {mountpoint}"
                         break
-                    time.sleep(0.05)
+                    time.sleep(MOUNT_READY_POLL_INTERVAL_S)
                 else:
                     last_error = f"timed out waiting for ChronosFS mount at {mountpoint}"
                 if os.path.ismount(mountpoint):
@@ -174,6 +240,15 @@ def main() -> None:
     parser.add_argument("--idle-timeout", type=float, default=30.0)
     parser.add_argument("--stale-unmounted-timeout", type=float, default=5.0)
     args = parser.parse_args()
+
+    # FUSE writeback and close already define the filesystem's visibility
+    # boundary.  Requiring SQLite to fsync the WAL after every small close is
+    # stronger than the POSIX contract and turns package extraction into
+    # thousands of serial disk flushes.  NORMAL retains transactional crash
+    # consistency; explicit FUSE fsync requests force a full checkpoint in the
+    # native filesystem implementation.
+    os.environ.setdefault("CHRONOS_NATIVE_SQLITE_SYNCHRONOUS", "NORMAL")
+    os.environ.setdefault("CHRONOS_NATIVE_SQLITE_WAL_AUTOCHECKPOINT_PAGES", "0")
 
     socket_path = Path(args.socket)
     socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,6 +286,7 @@ def main() -> None:
                 daemon=True,
             ).start()
     finally:
+        state.stop_maintenance.set()
         server.close()
         try:
             socket_path.unlink()

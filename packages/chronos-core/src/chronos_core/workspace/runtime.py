@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import os
+import sys
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Iterator, Protocol
 
@@ -21,6 +25,35 @@ _GLOBAL_MERGE_LOCKS_GUARD = threading.Lock()
 _GLOBAL_MERGE_LOCKS: dict[tuple[tuple[tuple[str, str], ...], str], threading.Lock] = {}
 _GLOBAL_STORE_LOCKS_GUARD = threading.Lock()
 _GLOBAL_STORE_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+
+
+@contextlib.contextmanager
+def _profile_merge_stage(
+    stage: str,
+    source: str,
+    target: str,
+) -> Iterator[None]:
+    if os.environ.get("CHRONOS_WORKSPACE_PROFILE") != "1":
+        yield
+        return
+    started = time.perf_counter_ns()
+    try:
+        yield
+    finally:
+        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+        print(
+            json.dumps(
+                {
+                    "chronos_workspace_profile": stage,
+                    "source": source,
+                    "target": target,
+                    "elapsed_ms": elapsed_ms,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 class BranchStore(Protocol):
@@ -438,7 +471,12 @@ class ChronosWorkspaceContext:
         *,
         policy: MergePolicyInput = None,
     ) -> dict[str, Any]:
-        previews = self._preview_stores_for_merge(source, target, policy=policy)
+        previews = self._preview_stores_for_merge(
+            source,
+            target,
+            policy=policy,
+            resolution=resolution,
+        )
         self._prevalidate_store_previews(previews, resolution, policy=policy)
 
         result: dict[str, Any] = {}
@@ -449,20 +487,21 @@ class ChronosWorkspaceContext:
                 previews.get("filesystem"),
             )
             with self._filesystem_lock:
-                if filesystem_resolution is None and policy is None:
-                    result["filesystem"] = self.filesystem.merge_apply(source, target)
-                else:
-                    try:
-                        result["filesystem"] = self.filesystem.merge_apply(
-                            source,
-                            target,
-                            filesystem_resolution,
-                            policy=policy,
-                        )
-                    except TypeError as exc:
-                        raise BranchingError(
-                            "filesystem store does not support policy-aware merge"
-                        ) from exc
+                with _profile_merge_stage("apply:filesystem", source, target):
+                    if filesystem_resolution is None and policy is None:
+                        result["filesystem"] = self.filesystem.merge_apply(source, target)
+                    else:
+                        try:
+                            result["filesystem"] = self.filesystem.merge_apply(
+                                source,
+                                target,
+                                filesystem_resolution,
+                                policy=policy,
+                            )
+                        except TypeError as exc:
+                            raise BranchingError(
+                                "filesystem store does not support policy-aware merge"
+                            ) from exc
         for name, store in self.stores.items():
             store_resolution = self._resolution_for_store(
                 name,
@@ -471,20 +510,21 @@ class ChronosWorkspaceContext:
             )
             with self._store_locks[name]:
                 _refresh_workspace_store(store)
-                if store_resolution is None and policy is None:
-                    result[name] = store.merge_apply(source, target)
-                else:
-                    try:
-                        result[name] = store.merge_apply(
-                            source,
-                            target,
-                            store_resolution,
-                            policy=policy,
-                        )
-                    except TypeError as exc:
-                        raise BranchingError(
-                            f"workspace store does not support policy-aware merge: {name}"
-                        ) from exc
+                with _profile_merge_stage(f"apply:{name}", source, target):
+                    if store_resolution is None and policy is None:
+                        result[name] = store.merge_apply(source, target)
+                    else:
+                        try:
+                            result[name] = store.merge_apply(
+                                source,
+                                target,
+                                store_resolution,
+                                policy=policy,
+                            )
+                        except TypeError as exc:
+                            raise BranchingError(
+                                f"workspace store does not support policy-aware merge: {name}"
+                            ) from exc
         return result
 
     def _preview_stores_for_merge(
@@ -493,17 +533,33 @@ class ChronosWorkspaceContext:
         target: str,
         *,
         policy: MergePolicyInput,
+        resolution: MergeResolution | dict[str, MergeResolution] | None,
     ) -> dict[str, Any]:
         previews: dict[str, Any] = {}
         if self.filesystem is not None:
-            preview = getattr(self.filesystem, "merge_preview", None)
-            if callable(preview):
-                with self._filesystem_lock:
-                    previews["filesystem"] = preview(source, target, policy=policy)
-            elif policy is not None:
-                raise BranchingError(
-                    "filesystem store does not support policy-aware merge"
+            native_conflict_check = bool(
+                getattr(
+                    self.filesystem,
+                    "native_conflict_checked_merge",
+                    False,
                 )
+            )
+            if policy is not None or resolution is not None or not native_conflict_check:
+                preview = getattr(self.filesystem, "merge_preview", None)
+                if callable(preview):
+                    with self._filesystem_lock:
+                        with _profile_merge_stage(
+                            "preview:filesystem", source, target
+                        ):
+                            previews["filesystem"] = preview(
+                                source,
+                                target,
+                                policy=policy,
+                            )
+                elif policy is not None:
+                    raise BranchingError(
+                        "filesystem store does not support policy-aware merge"
+                    )
         for name, store in self.stores.items():
             preview = getattr(store, "merge_preview", None)
             if preview is None:
@@ -514,7 +570,8 @@ class ChronosWorkspaceContext:
                 continue
             with self._store_locks[name]:
                 _refresh_workspace_store(store)
-                previews[name] = preview(source, target, policy=policy)
+                with _profile_merge_stage(f"preview:{name}", source, target):
+                    previews[name] = preview(source, target, policy=policy)
         return previews
 
     def _prevalidate_store_previews(

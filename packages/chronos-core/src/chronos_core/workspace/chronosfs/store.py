@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import difflib
+import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -101,6 +102,20 @@ class ChronosFSBranchSession:
             parents=parents,
         )
 
+    def write_files(
+        self,
+        files: Sequence[tuple[str, bytes | str]],
+        *,
+        mode: int = 0o644,
+        parents: bool = False,
+    ) -> None:
+        self._store.write_files(
+            self.branch_id,
+            files,
+            mode=mode,
+            parents=parents,
+        )
+
     def import_tree(self, source: str | Path) -> None:
         self._store.import_tree(self.branch_id, source)
 
@@ -138,6 +153,11 @@ class ChronosFSBranchSession:
 class ChronosFSStore:
     """Filesystem state stored through the native C++ ChronosFS backend."""
 
+    # A plain native merge performs its own conflict check before applying any
+    # filesystem rows.  Workspace coordination can therefore prevalidate the
+    # other stores without materializing a second filesystem merge preview.
+    native_conflict_checked_merge = True
+
     def __init__(
         self,
         context: ChronosBranchContext,
@@ -170,6 +190,16 @@ class ChronosFSStore:
         refresh = getattr(self.context._backend, "refresh_registries", None)
         if callable(refresh):
             refresh()
+        index_name = "chronosfs_dirents_by_inode"
+        if index_name not in {
+            index.name
+            for index in self.context.list_indexes("chronosfs_dirents")
+        }:
+            self.context.create_index(
+                "chronosfs_dirents",
+                ["inode_id"],
+                index_name,
+            )
 
     def create_root_if_missing(self, branch: str = "main") -> None:
         self.ensure()
@@ -184,6 +214,7 @@ class ChronosFSStore:
         from_branch: str = "main",
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        self._flush_mount_writes()
         if metadata:
             self.context.create_branch(branch_id, from_branch=from_branch, metadata=metadata)
         else:
@@ -197,12 +228,14 @@ class ChronosFSStore:
         checkpoint: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        self._flush_mount_writes()
         self.context.create_branch_from_checkpoint(branch_id, checkpoint)
         if metadata:
             self.context.update_branch_metadata(branch_id, metadata)
         self._clear_cache(branch_id)
 
     def delete_branch(self, branch_id: str) -> None:
+        self._flush_mount_writes()
         self._native.delete_branch(branch_id)
         self._refresh_context_backend()
         self._clear_cache(branch_id)
@@ -227,8 +260,24 @@ class ChronosFSStore:
             self.create_branch_from_checkpoint(branch_id, checkpoint)
         return self.checkout(branch_id)
 
+    def refresh_branch(self, branch_id: str) -> None:
+        """Discard cached paths after writes made through a FUSE checkout."""
+        self._flush_mount_writes()
+        self._clear_cache(branch_id)
+
+    def _flush_mount_writes(self) -> None:
+        # Import lazily to avoid the store/fuse module cycle.
+        from chronos_core.workspace.chronosfs.fuse import flush_chronosfs_daemon
+
+        flush_chronosfs_daemon(self)
+
     def close(self) -> None:
+        self._native.wait_for_gc()
         self.context.close()
+
+    def wait_for_gc(self) -> None:
+        """Wait until asynchronous interval and object reclamation settles."""
+        self._native.wait_for_gc()
 
     def _refresh_context_backend(self) -> None:
         invalidate = getattr(self.context._backend, "_invalidate_native_branch_sessions", None)
@@ -399,6 +448,30 @@ class ChronosFSStore:
             )
         )
 
+    def write_files(
+        self,
+        branch_id: str,
+        files: Sequence[tuple[str, bytes | str]],
+        *,
+        mode: int = 0o644,
+        parents: bool = False,
+    ) -> None:
+        paths: list[str] = []
+        payloads: list[bytes] = []
+        for path, data in files:
+            paths.append(_normalize_path(path))
+            payloads.append(
+                data.encode("utf-8") if isinstance(data, str) else bytes(data)
+            )
+        if paths:
+            self._native.write_files(
+                branch_id,
+                paths,
+                payloads,
+                int(mode),
+                bool(parents),
+            )
+
     def import_tree(self, branch_id: str, source: str | Path) -> None:
         source_path = Path(source).expanduser().resolve()
         if not source_path.is_dir():
@@ -456,6 +529,7 @@ class ChronosFSStore:
         self._native.chmod(branch_id, _normalize_path(path), int(mode))
 
     def diff(self, left: str, right: str) -> ChronosFSDiff:
+        self._flush_mount_writes()
         left_manifest = self.manifest(left)
         right_manifest = self.manifest(right)
         changes: list[ChronosFSPathChange] = []
@@ -501,6 +575,7 @@ class ChronosFSStore:
         *,
         policy: MergePolicyInput = None,
     ) -> MergePreview:
+        self._flush_mount_writes()
         # ChronosFS stores file data in the normal interval backend tables:
         # chronosfs_inodes, chronosfs_dirents, and chronosfs_file_blocks.  The
         # native preview is therefore already conflict-checked at record
@@ -510,8 +585,11 @@ class ChronosFSStore:
         # indexes.  We preserve the internal conflict ids so merge_apply can
         # still route choices back to the native interval backend.
         internal = self.context.merge_preview(source, target)
-        source_manifest = self.manifest(source)
-        target_manifest = self.manifest(target)
+        source_manifest, target_manifest = self._changed_inode_manifests(
+            source,
+            target,
+            (*internal.changes, *internal.conflicts),
+        )
         preview = MergePreview(
             source=source,
             target=target,
@@ -526,6 +604,71 @@ class ChronosFSStore:
         )
         return _preview_with_merge_policy(preview, policy, backend="chronosfs")
 
+    def _changed_inode_manifests(
+        self,
+        source: str,
+        target: str,
+        diffs: Sequence[RowDiff],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        inode_ids: set[int] = set()
+        for diff in diffs:
+            for row in (diff.key, diff.before, diff.after):
+                if row is None:
+                    continue
+                for field in ("inode_id", "parent_inode_id"):
+                    inode_id = _optional_int(row.get(field))
+                    if inode_id is not None:
+                        inode_ids.add(inode_id)
+
+        source_manifest: dict[str, dict[str, Any]] = {}
+        target_manifest: dict[str, dict[str, Any]] = {}
+        for inode_id in inode_ids:
+            source_path = self._path_for_inode_in_branch(source, inode_id)
+            if source_path is not None:
+                source_manifest[source_path.lstrip("/")] = {
+                    "inode_id": inode_id
+                }
+            target_path = self._path_for_inode_in_branch(target, inode_id)
+            if target_path is not None:
+                target_manifest[target_path.lstrip("/")] = {
+                    "inode_id": inode_id
+                }
+        return source_manifest, target_manifest
+
+    def _path_for_inode_in_branch(
+        self,
+        branch_id: str,
+        inode_id: int,
+    ) -> str | None:
+        if inode_id == 1:
+            return "/"
+        session = self.context.checkout(branch_id)
+        parts: list[str] = []
+        current = inode_id
+        seen: set[int] = set()
+        while current != 1:
+            if current in seen:
+                raise ChronosFSError(
+                    f"cycle in ChronosFS directory entries at inode {current}"
+                )
+            seen.add(current)
+            rows = session.query(
+                """
+                SELECT parent_inode_id, name
+                FROM chronosfs_dirents
+                WHERE inode_id = :inode_id
+                ORDER BY parent_inode_id, name
+                LIMIT 1
+                """,
+                {"inode_id": current},
+            )
+            if not rows:
+                return None
+            row = rows[0]
+            parts.append(str(row["name"]))
+            current = int(row["parent_inode_id"])
+        return "/" + "/".join(reversed(parts))
+
     def merge_apply(
         self,
         source: str,
@@ -534,6 +677,7 @@ class ChronosFSStore:
         *,
         policy: MergePolicyInput = None,
     ) -> Any:
+        self._flush_mount_writes()
         if resolution is not None or policy is not None:
             preview = self.merge_preview(source, target, policy=policy)
             active_resolution = resolution

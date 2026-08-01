@@ -126,7 +126,7 @@ class NativeBranchStore {
         const std::string &from_branch,
         bool terminal = false,
         const std::string &metadata_json = "{}",
-        int continuation_percent = 5,
+        int continuation_percent = 95,
         int child_width = 0,
         const std::string &allocation_strategy = "adaptive"
     );
@@ -145,7 +145,7 @@ class NativeBranchStore {
         const std::string &checkpoint,
         const std::string &branch,
         const std::string &metadata_json = "{}",
-        int continuation_percent = 5
+        int continuation_percent = 95
     );
     NativeCheckpointInfo get_checkpoint(const std::string &checkpoint);
     std::vector<NativeCheckpointInfo> list_checkpoints(const std::string &branch = "");
@@ -169,6 +169,12 @@ class NativeBranchStore {
         const std::vector<NativeMergeChange> &changes
     );
     std::int64_t merge_apply(const std::string &source, const std::string &target);
+    std::int64_t merge_apply_excluding_first_key_values(
+        const std::string &source,
+        const std::string &target,
+        const std::string &table,
+        const std::vector<std::int64_t> &excluded_values
+    );
     void lock_branches_for_merge(const std::string &source, const std::string &target);
     std::int64_t collect_interval_garbage();
     void commit();

@@ -24,7 +24,7 @@ class ChronosPostgresStore:
     metadata_url: str | None = None
     autocommit: bool = True
     ensure_metadata: bool = True
-    interval_continuation_percent: int = 5
+    interval_continuation_percent: int = 95
     interval_child_width: int | None = None
     interval_allocation_strategy: str = "adaptive"
 
@@ -124,7 +124,7 @@ class ChronosDuckDBStore:
     metadata_url: str
     autocommit: bool = True
     ensure_metadata: bool = True
-    interval_continuation_percent: int = 5
+    interval_continuation_percent: int = 95
     interval_child_width: int | None = None
     interval_allocation_strategy: str = "adaptive"
 

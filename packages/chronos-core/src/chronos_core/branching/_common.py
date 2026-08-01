@@ -25,10 +25,11 @@ IntervalAllocationStrategy = Literal["adaptive", "percentage"]
 _MAX_INTERVAL = 9_000_000_000_000_000_000
 _POSTGRES_INTERVAL_PRECISION = 32
 _POSTGRES_MAX_INTERVAL = 10**31
-_INTERVAL_CONTINUATION_PERCENT = 5
+# Preserve most of the source branch's range for future siblings. The default
+# large-range split allocates 5% to the child and retains 95% for the source.
+_INTERVAL_CONTINUATION_PERCENT = 95
 _INTERVAL_PERCENT_DENOMINATOR = 100
 _MIN_SPLIT_WIDTH = 2
-_INTERVAL_ADAPTIVE_SQRT_THRESHOLD = 2**32
 _INTERVAL_TERMINAL_CHILD_WIDTH = 2
 _META_PREFIX = "_chronos_branch_"
 _CURRENT_TIMESTAMP_PARAM = "__chronos_current_timestamp"

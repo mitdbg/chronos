@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import atexit
 import glob
-import math
 import os
 import subprocess
 import tempfile
@@ -1092,18 +1091,18 @@ def test_postgres_interval_concurrent_wide_branch_creation_serializes_parent() -
         ctx.close()
 
 
-def test_interval_split_default_uses_adaptive_sqrt_before_percentage() -> None:
+def test_interval_split_default_allocates_five_percent_while_range_is_large() -> None:
     default_ctx = _make_products_only_context("sqlite", "interval")
     try:
         default_backend = default_ctx._backend  # type: ignore[attr-defined]
-        assert default_backend.continuation_percent == 5
+        assert default_backend.continuation_percent == 95
         assert default_backend.allocation_strategy == "adaptive"
         initial_main = default_backend._current_segment("main")
         default_ctx.create_branch("wide_child", from_branch="main")
         child = default_backend._current_segment("wide_child")
-        assert child.live_hi - child.live_lo == math.isqrt(
-            initial_main.live_hi - initial_main.live_lo - 1
-        )
+        available = initial_main.live_hi - initial_main.live_lo - 1
+        expected_continuation = available * 95 // 100
+        assert child.live_hi - child.live_lo == available - expected_continuation
     finally:
         default_ctx.close()
 
@@ -1137,6 +1136,25 @@ def test_interval_split_default_uses_adaptive_sqrt_before_percentage() -> None:
         assert _product(wide_ctx.checkout("main"), "abc")["price"] == 10
     finally:
         wide_ctx.close()
+
+
+def test_interval_split_default_supports_repeated_shallow_task_branches() -> None:
+    ctx = _make_products_only_context("sqlite", "interval")
+    try:
+        ctx.create_branch("department", from_branch="main")
+        ctx.create_branch("team", from_branch="department")
+        ctx.create_branch("person_a", from_branch="team")
+        ctx.create_branch("person_b", from_branch="team")
+
+        for index in range(128):
+            branch = f"task_{index}"
+            ctx.create_branch(branch, from_branch="team")
+            ctx.delete_branch(branch)
+
+        final = ctx._backend._current_segment("team")  # type: ignore[attr-defined]
+        assert final.live_hi - final.live_lo > 2
+    finally:
+        ctx.close()
 
 
 def test_interval_terminal_branch_uses_minimal_width_and_cannot_branch() -> None:
@@ -3484,6 +3502,61 @@ def test_interval_postgres_delete_branch_gc_runs_in_background(
         ctx.close()
 
 
+def test_interval_sqlite_delete_branch_gc_runs_in_background(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = ChronosBranchContext.connect(
+        f"sqlite:///{tmp_path / 'async-delete.sqlite'}",
+        backend="interval",
+    )
+    release_gc = threading.Event()
+    gc_started = threading.Event()
+    backend = ctx._backend
+    collect = backend._collect_interval_garbage_background
+
+    def blocked_collect() -> None:
+        gc_started.set()
+        if not release_gc.wait(timeout=5):
+            raise TimeoutError("test did not release background interval GC")
+        collect()
+
+    monkeypatch.setattr(
+        backend,
+        "_collect_interval_garbage_background",
+        blocked_collect,
+    )
+    try:
+        ctx.db.execute(
+            "CREATE TABLE products (sku TEXT PRIMARY KEY, price INTEGER)"
+        )
+        ctx.db.execute("INSERT INTO products VALUES (?, ?)", ("abc", 10))
+        ctx.db.commit()
+        ctx.register_table("products", ["sku"])
+        ctx.create_branch("agent", from_branch="main")
+        ctx.checkout("agent").execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"sku": "abc", "price": 99},
+        )
+
+        started = time.perf_counter()
+        ctx.delete_branch("agent")
+        delete_elapsed = time.perf_counter() - started
+
+        assert gc_started.wait(timeout=1)
+        assert delete_elapsed < 1
+        with pytest.raises(BranchNotFoundError):
+            ctx.get_branch("agent")
+
+        release_gc.set()
+        ctx.wait_for_background_work()
+        assert not backend._interval_gc_pending
+        assert not backend._interval_gc_running
+    finally:
+        release_gc.set()
+        ctx.close()
+
+
 def test_interval_delete_branch_gc_keeps_checkpoint_visible_rows(
     sql_backend: str,
 ) -> None:
@@ -3781,6 +3854,35 @@ def test_interval_diff_suppresses_update_revert_candidates(sql_backend: str) -> 
         assert int(ctx.get_branch("exp").current_ref) in {
             int(row["writer_segment_id"]) for row in rows
         }
+        assert ctx.diff_rows("main", "exp", "products") == []
+    finally:
+        ctx.close()
+
+
+def test_sqlite_interval_create_then_delete_removes_private_candidate() -> None:
+    ctx = _make_products_only_context("sqlite", "interval")
+    try:
+        ctx.create_branch("exp", from_branch="main")
+        exp = ctx.checkout("exp")
+        exp.execute(
+            "INSERT INTO products (sku, name, price) VALUES (:sku, :name, :price)",
+            {"sku": "temporary", "name": "Temporary", "price": 1},
+        )
+        exp.execute(
+            "DELETE FROM products WHERE sku = :sku",
+            {"sku": "temporary"},
+        )
+
+        exp_segment_id = int(ctx.get_branch("exp").current_ref)
+        assert ctx.db.execute(
+            """
+            SELECT 1
+            FROM _chronos_b_interval_products
+            WHERE sku = 'temporary'
+              AND writer_segment_id = ?
+            """,
+            (exp_segment_id,),
+        ).fetchone() is None
         assert ctx.diff_rows("main", "exp", "products") == []
     finally:
         ctx.close()

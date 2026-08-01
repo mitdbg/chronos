@@ -5,14 +5,20 @@
 #include "interval_data_plane.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <deque>
+#include <exception>
 #include <filesystem>
 #include <fcntl.h>
 #include <iomanip>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -20,11 +26,13 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include <ankerl/unordered_dense.h>
 #include <fuse3/fuse.h>
 #include <nlohmann/json.hpp>
 #include <pybind11/stl.h>
@@ -179,10 +187,15 @@ struct Inode {
     std::string mtime;
     std::string ctime;
     std::string source_path;
+    std::time_t cached_atime = 0;
+    std::time_t cached_mtime = 0;
+    std::time_t cached_ctime = 0;
+    bool timestamps_cached = false;
 };
 
 struct OpenHandle {
     Inode inode;
+    std::string path;
     struct DirtyBlock {
         IntervalBlob data;
         std::vector<unsigned char> dirty;
@@ -197,6 +210,11 @@ struct FileExtent {
     std::int64_t byte_end = 0;
     bool external = false;
     IntervalBlob data;
+};
+
+struct DirectoryEntry {
+    std::string name;
+    Inode inode;
 };
 
 std::string quote_ident(const std::string &identifier) {
@@ -414,21 +432,45 @@ std::string blob_sql_type(const chronos::native::NativeBranchStore &store) {
     return store.dialect() == "postgres" ? "BYTEA" : "BLOB";
 }
 
+std::string chronosfs_object_dir(const std::string &database_url) {
+    constexpr const char *prefix = "sqlite:///";
+    if (database_url.rfind(prefix, 0) != 0) return {};
+    std::string database_path = database_url.substr(std::strlen(prefix));
+    if (database_path.empty() || database_path == ":memory:") return {};
+    return database_path + ".chronosfs-objects";
+}
+
 class NativeChronosFS {
   public:
     NativeChronosFS(std::string database_url, std::string branch_id, std::int64_t block_size)
         : store_(std::make_shared<chronos::native::NativeBranchStore>(database_url)),
           branch_id_(std::move(branch_id)),
           session_(store_->checkout(branch_id_)),
-          block_size_(block_size) {
+          block_size_(block_size),
+          object_dir_(chronosfs_object_dir(database_url)) {
         if (block_size_ <= 0) throw FsError(EINVAL, "block size must be positive");
+        if (store_->dialect() == "sqlite") {
+            // A successful close publishes data to the filesystem but, like
+            // the Linux page cache, need not force it to stable storage.
+            // SQLite pragmas are connection-local, so configuring the daemon's
+            // checkpoint connection is insufficient: the actual FUSE writer
+            // must use NORMAL mode as well. op_fsync temporarily switches this
+            // connection to FULL and commits a durability barrier.
+            store_->execute_sql("PRAGMA synchronous=NORMAL", {});
+            store_->execute_sql("PRAGMA wal_autocheckpoint=0", {});
+        }
     }
 
-    NativeChronosFS(std::shared_ptr<chronos::native::NativeBranchStore> store, std::string branch_id, std::int64_t block_size)
+    NativeChronosFS(
+        std::shared_ptr<chronos::native::NativeBranchStore> store,
+        std::string branch_id,
+        std::int64_t block_size,
+        std::string object_dir = {})
         : store_(std::move(store)),
           branch_id_(std::move(branch_id)),
           session_(store_->checkout(branch_id_)),
-          block_size_(block_size) {
+          block_size_(block_size),
+          object_dir_(std::move(object_dir)) {
         if (block_size_ <= 0) throw FsError(EINVAL, "block size must be positive");
     }
 
@@ -480,6 +522,17 @@ class NativeChronosFS {
         store_->execute_sql(
             "CREATE TABLE IF NOT EXISTS _chronosfs_metadata "
             "(key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+        store_->execute_sql(
+            "CREATE TABLE IF NOT EXISTS _chronosfs_orphan_inodes "
+            "(branch_id TEXT NOT NULL, inode_id BIGINT NOT NULL, "
+            "PRIMARY KEY (branch_id, inode_id))");
+        store_->execute_sql(
+            "CREATE TABLE IF NOT EXISTS _chronosfs_private_orphan_inodes "
+            "(branch_id TEXT NOT NULL, inode_id BIGINT NOT NULL, "
+            "PRIMARY KEY (branch_id, inode_id))");
+        store_->execute_sql(
+            "CREATE TABLE IF NOT EXISTS _chronosfs_objects "
+            "(path TEXT PRIMARY KEY)");
         if (store_->dialect() == "postgres") {
             store_->execute_sql(
                 "INSERT INTO _chronosfs_inode_allocator (id, next_inode_id) "
@@ -521,30 +574,59 @@ class NativeChronosFS {
         }
     }
 
-    void getattr(const std::string &path, struct stat *st) {
-        if (is_control(path)) return control_stat(path, st);
-        fill_stat(inode_for_path(path), st);
+    bool getattr(const std::string &path, struct stat *st) {
+        if (is_control(path)) {
+            control_stat(path, st);
+            return true;
+        }
+        const Inode *inode = try_inode_ref_for_path(path);
+        if (inode == nullptr) return false;
+        fill_stat(*inode, st);
+        return true;
+    }
+
+    const std::vector<DirectoryEntry> &listdir_entries(const std::string &path) {
+        const Inode *dir = try_inode_ref_for_path(path);
+        if (dir == nullptr) throw FsError(ENOENT, "path not found");
+        if (dir->kind != "directory") throw FsError(ENOTDIR, "not a directory");
+        const std::int64_t dir_id = dir->id;
+        auto cached_children = directory_children_cache_.find(dir_id);
+        if (cached_children != directory_children_cache_.end()) {
+            return cached_children->second;
+        }
+        auto rows = visible("chronosfs_dirents", {"name", "inode_id"}, "parent_inode_id = ?", {dir_id}, "ORDER BY name");
+        std::vector<std::pair<std::string, std::int64_t>> children;
+        std::vector<std::int64_t> inode_ids;
+        children.reserve(rows.size());
+        inode_ids.reserve(rows.size());
+        for (auto &row : rows) {
+            std::string name = as_string(row[0]);
+            std::int64_t inode_id = as_int(row[1]);
+            children.emplace_back(name, inode_id);
+            inode_ids.push_back(inode_id);
+            dirent_cache_[dirent_key(dir_id, name)] = {true, inode_id};
+            cache_path(path == "/" ? "/" + name : path + "/" + name, inode_id);
+        }
+        loaded_dirents_.insert(dir_id);
+        cache_inodes_by_id(inode_ids);
+        std::vector<DirectoryEntry> entries;
+        entries.reserve(children.size());
+        for (const auto &[name, inode_id] : children) {
+            entries.push_back({name, inode_by_id(inode_id)});
+        }
+        auto inserted =
+            directory_children_cache_.emplace(dir_id, std::move(entries));
+        return inserted.first->second;
     }
 
     std::vector<std::string> listdir(const std::string &path) {
         if (path == "/.chronos") return {"branches", "current", "merge-preview", "merge-apply"};
         if (path == "/.chronos/branches") return branches();
         if (path == "/.chronos/merge-preview" || path == "/.chronos/merge-apply") return {};
-        Inode dir = inode_for_path(path);
-        if (dir.kind != "directory") throw FsError(ENOTDIR, "not a directory");
-        auto rows = visible("chronosfs_dirents", {"name", "inode_id"}, "parent_inode_id = ?", {dir.id}, "ORDER BY name");
+        const auto &entries = listdir_entries(path);
         std::vector<std::string> names;
-        std::vector<std::int64_t> inode_ids;
-        inode_ids.reserve(rows.size());
-        for (auto &row : rows) {
-            std::string name = as_string(row[0]);
-            std::int64_t inode_id = as_int(row[1]);
-            names.push_back(name);
-            inode_ids.push_back(inode_id);
-            dirent_cache_[dirent_key(dir.id, name)] = {true, inode_id};
-            cache_path(path == "/" ? "/" + name : path + "/" + name, inode_id);
-        }
-        cache_inodes_by_id(inode_ids);
+        names.reserve(entries.size());
+        for (const auto &entry : entries) names.push_back(entry.name);
         return names;
     }
 
@@ -561,8 +643,15 @@ class NativeChronosFS {
         const Inode &inode = handle->inode;
         if (inode.kind == "symlink") return IntervalBlob(inode.symlink_target.begin(), inode.symlink_target.end());
         if (inode.kind != "file") throw FsError(EISDIR, "not a file");
-        Inode persisted = inode_by_id(inode.id);
-        const std::int64_t logical_size = std::max(persisted.size, handle->max_dirty_end);
+        // The handle was opened after the kernel's lookup/getattr sequence and
+        // therefore carries the size for this open.  Re-reading the inode
+        // through a different parallel reader slot can resurrect that slot's
+        // pre-write size and expose zero padding or a stale EOF.  Extents are
+        // still read from the shared store, but the open handle is the
+        // authority for its logical size and external source.
+        const Inode &persisted = inode;
+        const std::int64_t logical_size =
+            std::max(persisted.size, handle->max_dirty_end);
         if (size <= 0 || offset >= logical_size) return {};
 
         const std::int64_t end = std::min<std::int64_t>(logical_size, offset + size);
@@ -637,43 +726,180 @@ class NativeChronosFS {
         if (!handle || handle->dirty_blocks.empty()) return;
         Inode persisted = inode_by_id(handle->inode.id);
         const std::int64_t final_size = std::max(persisted.size, handle->max_dirty_end);
+        const bool externalize =
+            can_externalize_complete_file(*handle, persisted, final_size);
+        std::string object_path;
+        if (externalize) {
+            object_path = materialize_complete_file(*handle, final_size);
+        }
 
-        transaction([&] {
-            for (const auto &[block_start, dirty_block] : handle->dirty_blocks) {
-                if (block_start >= final_size) continue;
-                const std::int64_t valid = std::min<std::int64_t>(
-                    block_size_,
-                    final_size - block_start);
-                IntervalBlob merged = read_inode_range(persisted, block_start, valid);
-                merged.resize(static_cast<std::size_t>(valid), 0);
-                for (std::int64_t i = 0; i < valid; ++i) {
-                    const std::size_t index = static_cast<std::size_t>(i);
-                    if (index < dirty_block.dirty.size() && dirty_block.dirty[index]) {
-                        merged[index] = dirty_block.data[index];
+        try {
+            transaction([&] {
+                if (externalize) {
+                    store_->execute_sql(
+                        "INSERT OR IGNORE INTO _chronosfs_objects (path) "
+                        "VALUES (?)",
+                        {object_path});
+                    upsert(
+                        "chronosfs_file_blocks",
+                        block_cols(),
+                        {"inode_id", "byte_start"},
+                        {persisted.id,
+                         std::int64_t{0},
+                         final_size,
+                         std::int64_t{1},
+                         std::monostate{}},
+                        false);
+                    persisted.source_path = object_path;
+                } else {
+                    IntervalRows replacement_blocks;
+                    if (persisted.source_path.empty()) {
+                        replacement_blocks.reserve(handle->dirty_blocks.size());
+                    }
+                    for (const auto &[block_start, dirty_block] :
+                         handle->dirty_blocks) {
+                        if (block_start >= final_size) continue;
+                        const std::int64_t valid = std::min<std::int64_t>(
+                            block_size_,
+                            final_size - block_start);
+                        IntervalBlob merged =
+                            read_inode_range(persisted, block_start, valid);
+                        merged.resize(static_cast<std::size_t>(valid), 0);
+                        for (std::int64_t i = 0; i < valid; ++i) {
+                            const std::size_t index =
+                                static_cast<std::size_t>(i);
+                            if (index < dirty_block.dirty.size() &&
+                                dirty_block.dirty[index]) {
+                                merged[index] = dirty_block.data[index];
+                            }
+                        }
+                        if (persisted.source_path.empty()) {
+                            replacement_blocks.push_back(
+                                {persisted.id,
+                                 block_start,
+                                 block_start + valid,
+                                 std::int64_t{0},
+                                 std::move(merged)});
+                        } else {
+                            replace_inode_bytes(
+                                persisted,
+                                block_start,
+                                merged);
+                        }
+                    }
+                    if (!replacement_blocks.empty()) {
+                        // Buffered writes already provide complete fixed blocks
+                        // here. Submit the file's blocks in one interval upsert.
+                        upsert_many(
+                            "chronosfs_file_blocks",
+                            block_cols(),
+                            {"inode_id", "byte_start"},
+                            replacement_blocks,
+                            false);
                     }
                 }
-                replace_inode_bytes(persisted, block_start, merged);
-            }
 
-            if (final_size != persisted.size) {
-                const std::string now = now_text();
-                persisted.size = final_size;
-                persisted.mtime = now;
-                persisted.ctime = now;
-                upsert(
-                    "chronosfs_inodes",
-                    inode_cols(),
-                    {"inode_id"},
-                    inode_values(persisted),
-                    false);
-            }
-        });
+                if (final_size != persisted.size || externalize) {
+                    const std::string now = now_text();
+                    persisted.size = final_size;
+                    persisted.mtime = now;
+                    persisted.ctime = now;
+                    upsert(
+                        "chronosfs_inodes",
+                        inode_cols(),
+                        {"inode_id"},
+                        inode_values(persisted),
+                        false);
+                }
+            });
+        } catch (...) {
+            if (!object_path.empty()) ::unlink(object_path.c_str());
+            throw;
+        }
+        if (!object_path.empty()) {
+            pending_object_paths_.insert(object_path);
+        }
 
         persisted.size = final_size;
         handle->inode = persisted;
         handle->dirty_blocks.clear();
         handle->max_dirty_end = -1;
         cache_inode(persisted);
+    }
+
+    void sync_storage() {
+        if (store_->dialect() == "sqlite") {
+            // File contents live in immutable ChronosFS objects. Make those
+            // objects durable before publishing a durable SQLite metadata
+            // prefix that references them.
+            for (const auto &path : pending_object_paths_) {
+                int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+                if (fd < 0) {
+                    if (errno == ENOENT) continue;
+                    throw FsError(errno, "could not open ChronosFS object");
+                }
+                if (::fsync(fd) != 0) {
+                    const int error = errno;
+                    ::close(fd);
+                    throw FsError(error, "could not sync ChronosFS object");
+                }
+                ::close(fd);
+            }
+            if (!pending_object_paths_.empty() && !object_dir_.empty()) {
+                int dir_fd =
+                    ::open(object_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                if (dir_fd >= 0) {
+                    if (::fsync(dir_fd) != 0) {
+                        const int error = errno;
+                        ::close(dir_fd);
+                        throw FsError(
+                            error,
+                            "could not sync ChronosFS object directory");
+                    }
+                    ::close(dir_fd);
+                }
+            }
+            // NORMAL mode may defer the WAL sync, but fsync only requires the
+            // committed WAL prefix to become durable; it does not require
+            // copying every dirty page back into the database file. Commit one
+            // metadata frame under FULL synchronous mode as a durability
+            // barrier for all preceding WAL frames, then return to NORMAL.
+            store_->execute_sql("PRAGMA synchronous=FULL", {});
+            try {
+                store_->execute_sql("BEGIN IMMEDIATE", {});
+                store_->execute_sql(
+                    "INSERT INTO _chronosfs_metadata (key, value) "
+                    "VALUES ('fsync_generation', '1') "
+                    "ON CONFLICT(key) DO UPDATE SET "
+                    "value = CAST(value AS INTEGER) + 1",
+                    {});
+                store_->execute_sql("COMMIT", {});
+            } catch (...) {
+                try {
+                    store_->execute_sql("ROLLBACK", {});
+                } catch (...) {
+                }
+                store_->execute_sql("PRAGMA synchronous=NORMAL", {});
+                throw;
+            }
+            store_->execute_sql("PRAGMA synchronous=NORMAL", {});
+            pending_object_paths_.clear();
+        }
+    }
+
+    std::vector<std::int64_t> orphan_inode_ids() {
+        auto rows = store_->query_sql(
+            "SELECT inode_id FROM _chronosfs_orphan_inodes "
+            "WHERE branch_id = ? UNION "
+            "SELECT inode_id FROM _chronosfs_private_orphan_inodes "
+            "WHERE branch_id = ? ORDER BY inode_id",
+            {branch_id_, branch_id_});
+        std::vector<std::int64_t> ids;
+        ids.reserve(rows.size());
+        for (const auto &row : rows) {
+            ids.push_back(as_int(row[0]));
+        }
+        return ids;
     }
 
     void truncate_handle(OpenHandle *handle, const std::string &path, std::int64_t size) {
@@ -728,12 +954,12 @@ class NativeChronosFS {
             inode.mtime = now_text();
             inode.ctime = inode.mtime;
         }
-        return new OpenHandle{std::move(inode), {}, -1};
+        return new OpenHandle{std::move(inode), path, {}, -1};
     }
 
     OpenHandle *create_handle(const std::string &path, mode_t mode) {
         if (is_control(path)) return nullptr;
-        return new OpenHandle{create(path, mode), {}, -1};
+        return new OpenHandle{create(path, mode), path, {}, -1};
     }
 
     void mkdir(const std::string &path, mode_t mode) {
@@ -792,6 +1018,7 @@ class NativeChronosFS {
             if (inode.kind == "directory" && !allow_dir) throw FsError(EISDIR, "is directory");
             if (inode.kind == "directory" && !listdir(path).empty()) throw FsError(ENOTEMPTY, "not empty");
             deleted_directory = inode.kind == "directory";
+            if (inode.kind == "file") queue_orphan_inode(inode.id);
             upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, entry.second, now_text()}, true);
             upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), true);
             touch(parent.id);
@@ -802,6 +1029,7 @@ class NativeChronosFS {
             forget_path(path);
         }
         inode_cache_.erase(inode_id);
+        invalidate_directory_cache(parent_id);
         dirent_cache_.erase(dirent_key(parent_id, name));
     }
 
@@ -825,6 +1053,8 @@ class NativeChronosFS {
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {new_parent.id, nn, source.second, now_text()}, false);
         touch(old_parent.id);
         touch(new_parent.id);
+        invalidate_directory_cache(old_parent.id);
+        invalidate_directory_cache(new_parent.id);
         forget_path_tree(from);
         forget_path_tree(to);
         dirent_cache_[dirent_key(old_parent.id, on)] = {false, 0};
@@ -931,6 +1161,10 @@ class NativeChronosFS {
         return inode_for_path(path);
     }
 
+    void fill_stat_public(const Inode &inode, struct stat *st) {
+        fill_stat(inode, st);
+    }
+
     Inode stat_inode_id(std::int64_t inode_id) {
         return inode_by_id(inode_id);
     }
@@ -986,6 +1220,21 @@ class NativeChronosFS {
                 inode.ctime = inode.mtime;
                 upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
                 cache_inode(inode);
+            }
+        });
+    }
+
+    void write_files_public(
+        const std::vector<std::string> &paths,
+        const std::vector<IntervalBlob> &payloads,
+        mode_t mode,
+        bool parents) {
+        if (paths.size() != payloads.size()) {
+            throw FsError(EINVAL, "path and payload counts differ");
+        }
+        transaction([&] {
+            for (std::size_t index = 0; index < paths.size(); ++index) {
+                write_file_path(paths[index], payloads[index], mode, parents);
             }
         });
     }
@@ -1046,11 +1295,13 @@ class NativeChronosFS {
             Inode inode = inode_by_id(entry.second);
             if (inode.kind == "directory" && !allow_dir) throw FsError(EISDIR, "is directory");
             if (inode.kind == "directory" && !listdir_inode_id(inode.id).empty()) throw FsError(ENOTEMPTY, "not empty");
+            if (inode.kind == "file") queue_orphan_inode(inode.id);
             upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, entry.second, now_text()}, true);
             upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), true);
             touch(parent.id);
         });
         inode_cache_.erase(inode_id);
+        invalidate_directory_cache(parent_inode_id);
         dirent_cache_[dirent_key(parent_inode_id, name)] = {false, 0};
     }
 
@@ -1077,6 +1328,8 @@ class NativeChronosFS {
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {new_parent.id, new_name, source.second, now_text()}, false);
         touch(old_parent.id);
         touch(new_parent.id);
+        invalidate_directory_cache(old_parent.id);
+        invalidate_directory_cache(new_parent.id);
         dirent_cache_[dirent_key(old_parent.id, old_name)] = {false, 0};
         dirent_cache_[dirent_key(new_parent.id, new_name)] = {true, source.second};
     }
@@ -1122,6 +1375,59 @@ class NativeChronosFS {
     void clear_cache_public() {
         session_ = store_->checkout(branch_id_);
         clear_metadata_cache();
+    }
+
+    void clear_private_inode_hints_public() {
+        private_created_inodes_.clear();
+    }
+
+    void begin_write_batch_public() {
+        if (!session_.in_transaction()) session_.begin();
+    }
+
+    void commit_write_batch_public() {
+        if (session_.in_transaction()) session_.commit();
+    }
+
+    void rollback_write_batch_public() {
+        if (session_.in_transaction()) session_.rollback();
+    }
+
+    void invalidate_cached_paths_public(const std::vector<std::string> &paths) {
+        for (const auto &path : paths) {
+            if (path.empty()) continue;
+            if (path == "/") {
+                clear_metadata_cache();
+                continue;
+            }
+
+            auto inode_it = path_inode_cache_.find(path);
+            if (inode_it != path_inode_cache_.end()) {
+                inode_cache_.erase(inode_it->second);
+            }
+
+            const std::string parent_path = cached_parent_path(path);
+            std::int64_t parent_inode_id = 0;
+            if (parent_path == "/") {
+                parent_inode_id = 1;
+            } else {
+                auto parent_it = path_inode_cache_.find(parent_path);
+                if (parent_it != path_inode_cache_.end()) {
+                    parent_inode_id = parent_it->second;
+                }
+            }
+
+            forget_path_tree(path);
+            if (parent_inode_id != 0) {
+                // Namespace mutations also update the parent timestamps.
+                inode_cache_.erase(parent_inode_id);
+                invalidate_directory_cache(parent_inode_id);
+                const auto slash = path.find_last_of('/');
+                const std::string name =
+                    slash == std::string::npos ? path : path.substr(slash + 1);
+                dirent_cache_.erase(dirent_key(parent_inode_id, name));
+            }
+        }
     }
 
     std::vector<std::string> branch_names_public() {
@@ -1175,6 +1481,110 @@ class NativeChronosFS {
     }
 
   private:
+    bool can_externalize_complete_file(
+        const OpenHandle &handle,
+        const Inode &persisted,
+        std::int64_t final_size) const {
+        constexpr std::int64_t kExternalObjectThreshold = 64 * 1024;
+        if (object_dir_.empty() ||
+            !persisted.source_path.empty() ||
+            handle.inode.size != 0 ||
+            final_size < kExternalObjectThreshold ||
+            handle.max_dirty_end != final_size) {
+            return false;
+        }
+
+        std::int64_t covered = 0;
+        for (const auto &[block_start, dirty_block] : handle.dirty_blocks) {
+            if (block_start != covered || block_start >= final_size) return false;
+            const std::int64_t valid = std::min<std::int64_t>(
+                block_size_,
+                final_size - block_start);
+            if (dirty_block.data.size() < static_cast<std::size_t>(valid) ||
+                dirty_block.dirty.size() < static_cast<std::size_t>(valid) ||
+                std::find(
+                    dirty_block.dirty.begin(),
+                    dirty_block.dirty.begin() + valid,
+                    static_cast<unsigned char>(0)) !=
+                    dirty_block.dirty.begin() + valid) {
+                return false;
+            }
+            covered += valid;
+        }
+        return covered == final_size;
+    }
+
+    std::string materialize_complete_file(
+        const OpenHandle &handle,
+        std::int64_t final_size) {
+        static std::atomic<std::uint64_t> next_object_id{1};
+        namespace fs = std::filesystem;
+        std::error_code error;
+        fs::create_directories(object_dir_, error);
+        if (error) {
+            throw FsError(
+                error.value(),
+                "could not create ChronosFS object directory");
+        }
+
+        const std::string basename =
+            "object-" + std::to_string(getpid()) + "-" +
+            std::to_string(
+                next_object_id.fetch_add(1, std::memory_order_relaxed)) +
+            "-" + std::to_string(handle.inode.id);
+        const fs::path final_path = fs::path(object_dir_) / basename;
+        const fs::path temporary_path =
+            fs::path(object_dir_) / ("." + basename + ".tmp");
+        int fd = ::open(
+            temporary_path.c_str(),
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+            0600);
+        if (fd < 0) {
+            throw FsError(errno, "could not create ChronosFS object");
+        }
+
+        try {
+            std::int64_t written = 0;
+            for (const auto &[block_start, dirty_block] : handle.dirty_blocks) {
+                const std::int64_t valid = std::min<std::int64_t>(
+                    block_size_,
+                    final_size - block_start);
+                std::int64_t block_written = 0;
+                while (block_written < valid) {
+                    const ssize_t result = ::write(
+                        fd,
+                        dirty_block.data.data() + block_written,
+                        static_cast<std::size_t>(valid - block_written));
+                    if (result < 0) {
+                        if (errno == EINTR) continue;
+                        throw FsError(
+                            errno,
+                            "could not write ChronosFS object");
+                    }
+                    block_written += result;
+                    written += result;
+                }
+            }
+            if (written != final_size) {
+                throw FsError(EIO, "incomplete ChronosFS object write");
+            }
+            if (::close(fd) != 0) {
+                fd = -1;
+                throw FsError(errno, "could not close ChronosFS object");
+            }
+            fd = -1;
+            if (::rename(temporary_path.c_str(), final_path.c_str()) != 0) {
+                throw FsError(errno, "could not publish ChronosFS object");
+            }
+        } catch (...) {
+            if (fd >= 0) ::close(fd);
+            ::unlink(temporary_path.c_str());
+            ::unlink(final_path.c_str());
+            throw;
+        }
+        return final_path.string();
+    }
+
     // chronosfs_inodes is the POSIX metadata table. It is interval-versioned by
     // inode_id, so chmod/truncate/link metadata changes are branch-local rows.
     static std::vector<std::string> inode_cols() {
@@ -1661,6 +2071,7 @@ class NativeChronosFS {
         upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
         touch(parent.id);
+        invalidate_directory_cache(parent.id);
         cache_inode(inode);
         dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
         return inode;
@@ -1675,6 +2086,7 @@ class NativeChronosFS {
         upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
         touch(parent.id);
+        invalidate_directory_cache(parent.id);
         cache_inode(inode);
         dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
         return inode;
@@ -1689,6 +2101,7 @@ class NativeChronosFS {
         upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
         touch(parent.id);
+        invalidate_directory_cache(parent.id);
         cache_inode(inode);
         dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
         return inode;
@@ -1730,6 +2143,7 @@ class NativeChronosFS {
             upsert("chronosfs_file_blocks", block_cols(), {"inode_id", "byte_start"}, extent_values(external), false);
         }
         touch(parent.id);
+        invalidate_directory_cache(parent.id);
         cache_inode(inode);
         dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
         return inode;
@@ -1798,6 +2212,40 @@ class NativeChronosFS {
         cache_inode(inode);
     }
 
+    void queue_orphan_inode(std::int64_t inode_id) {
+        const bool known_private =
+            private_created_inodes_.find(inode_id) !=
+            private_created_inodes_.end();
+        if (store_->dialect() == "postgres") {
+            if (known_private) {
+                store_->execute_sql(
+                    "INSERT INTO _chronosfs_private_orphan_inodes "
+                    "(branch_id, inode_id) VALUES (?, ?) "
+                    "ON CONFLICT DO NOTHING",
+                    {branch_id_, inode_id});
+            } else {
+                store_->execute_sql(
+                    "INSERT INTO _chronosfs_orphan_inodes "
+                    "(branch_id, inode_id) VALUES (?, ?) "
+                    "ON CONFLICT DO NOTHING",
+                    {branch_id_, inode_id});
+            }
+        } else {
+            if (known_private) {
+                store_->execute_sql(
+                    "INSERT OR IGNORE INTO "
+                    "_chronosfs_private_orphan_inodes "
+                    "(branch_id, inode_id) VALUES (?, ?)",
+                    {branch_id_, inode_id});
+            } else {
+                store_->execute_sql(
+                    "INSERT OR IGNORE INTO _chronosfs_orphan_inodes "
+                    "(branch_id, inode_id) VALUES (?, ?)",
+                    {branch_id_, inode_id});
+            }
+        }
+    }
+
     std::string resolve_symlink_target(const std::string &path, const std::string &target) {
         if (!target.empty() && target.front() == '/') return target;
         auto [parent, _name] = split_parent(path);
@@ -1851,7 +2299,25 @@ class NativeChronosFS {
     template <typename Fn>
     void transaction(Fn &&fn) {
         if (session_.in_transaction()) {
-            fn();
+            const std::string savepoint =
+                "chronosfs_operation_" +
+                std::to_string(++transaction_savepoint_id_);
+            store_->execute_sql("SAVEPOINT " + savepoint, {});
+            try {
+                fn();
+                store_->execute_sql("RELEASE SAVEPOINT " + savepoint, {});
+            } catch (...) {
+                try {
+                    store_->execute_sql(
+                        "ROLLBACK TO SAVEPOINT " + savepoint,
+                        {});
+                    store_->execute_sql(
+                        "RELEASE SAVEPOINT " + savepoint,
+                        {});
+                } catch (...) {
+                }
+                throw;
+            }
             return;
         }
         begin_tx();
@@ -1927,10 +2393,16 @@ class NativeChronosFS {
         };
     }
 
-    Inode inode_for_path(const std::string &path) {
-        if (path == "/" || path.empty()) return inode_by_id(1);
+    bool try_inode_for_path(const std::string &path, Inode &result) {
+        if (path == "/" || path.empty()) {
+            result = inode_by_id(1);
+            return true;
+        }
         auto cached = path_inode_cache_.find(path);
-        if (cached != path_inode_cache_.end()) return inode_by_id(cached->second);
+        if (cached != path_inode_cache_.end()) {
+            result = inode_by_id(cached->second);
+            return true;
+        }
         std::int64_t current = 1;
         std::string current_path;
         std::size_t start = 1;
@@ -1943,20 +2415,55 @@ class NativeChronosFS {
                 current = path_cached->second;
             } else {
                 auto entry = dirent(current, part);
-                if (!entry.first) throw FsError(ENOENT, "path not found");
+                if (!entry.first) return false;
                 current = entry.second;
                 cache_path(current_path, current);
             }
             if (slash == std::string::npos) break;
             start = slash + 1;
         }
-        return inode_by_id(current);
+        result = inode_by_id(current);
+        return true;
+    }
+
+    const Inode *try_inode_ref_for_path(const std::string &path) {
+        const std::int64_t inode_id = [&] {
+            if (path == "/" || path.empty()) return std::int64_t{1};
+            auto path_cached = path_inode_cache_.find(path);
+            return path_cached == path_inode_cache_.end()
+                ? std::int64_t{0}
+                : path_cached->second;
+        }();
+        if (inode_id != 0) {
+            auto inode_cached = inode_cache_.find(inode_id);
+            if (inode_cached != inode_cache_.end()) return &inode_cached->second;
+        }
+
+        Inode loaded;
+        if (!try_inode_for_path(path, loaded)) return nullptr;
+        auto inode_cached = inode_cache_.find(loaded.id);
+        if (inode_cached == inode_cache_.end()) {
+            cache_inode(loaded);
+            inode_cached = inode_cache_.find(loaded.id);
+        }
+        return &inode_cached->second;
+    }
+
+    Inode inode_for_path(const std::string &path) {
+        Inode inode;
+        if (!try_inode_for_path(path, inode)) {
+            throw FsError(ENOENT, "path not found");
+        }
+        return inode;
     }
 
     std::pair<bool, std::int64_t> dirent(std::int64_t parent, const std::string &name) {
         std::string key = dirent_key(parent, name);
         auto cached = dirent_cache_.find(key);
         if (cached != dirent_cache_.end()) return cached->second;
+        if (loaded_dirents_.find(parent) != loaded_dirents_.end()) {
+            return {false, 0};
+        }
         auto rows = visible("chronosfs_dirents", {"inode_id"}, "parent_inode_id = ? AND name = ?", {parent, name});
         auto resolved = rows.empty() ? std::pair<bool, std::int64_t>{false, 0} : std::pair<bool, std::int64_t>{true, as_int(rows[0][0])};
         dirent_cache_[std::move(key)] = resolved;
@@ -1974,10 +2481,16 @@ class NativeChronosFS {
     }
 
     void cache_inode(const Inode &inode) {
-        inode_cache_[inode.id] = inode;
+        Inode cached = inode;
+        cached.cached_atime = parse_time_text(cached.atime).tv_sec;
+        cached.cached_mtime = parse_time_text(cached.mtime).tv_sec;
+        cached.cached_ctime = parse_time_text(cached.ctime).tv_sec;
+        cached.timestamps_cached = true;
+        inode_cache_[cached.id] = std::move(cached);
     }
 
     void remember_created_path(const std::string &path, std::int64_t parent, const std::string &name, const Inode &inode) {
+        invalidate_directory_cache(parent);
         cache_inode(inode);
         cache_path(path, inode.id);
         dirent_cache_[dirent_key(parent, name)] = {true, inode.id};
@@ -2040,11 +2553,20 @@ class NativeChronosFS {
         path_inode_cache_.clear();
         path_children_cache_.clear();
         dirent_cache_.clear();
+        loaded_dirents_.clear();
+        directory_children_cache_.clear();
+    }
+
+    void invalidate_directory_cache(std::int64_t inode_id) {
+        loaded_dirents_.erase(inode_id);
+        directory_children_cache_.erase(inode_id);
     }
 
     std::int64_t allocate_inode() {
         if (next_reserved_inode_id_ < reserved_inode_id_end_) {
-            return next_reserved_inode_id_++;
+            const std::int64_t inode_id = next_reserved_inode_id_++;
+            private_created_inodes_.insert(inode_id);
+            return inode_id;
         }
         constexpr std::int64_t kInodeReservationBatch = 128;
         // Allocate inode ids in batches under the store transaction.  Unused ids
@@ -2059,7 +2581,9 @@ class NativeChronosFS {
         if (rows.empty()) throw FsError(EIO, "inode allocator is missing");
         next_reserved_inode_id_ = as_int(rows[0][0]);
         reserved_inode_id_end_ = next_reserved_inode_id_ + kInodeReservationBatch;
-        return next_reserved_inode_id_++;
+        const std::int64_t inode_id = next_reserved_inode_id_++;
+        private_created_inodes_.insert(inode_id);
+        return inode_id;
     }
 
     FileExtent extent_from_row(const std::vector<IntervalValue> &row) const {
@@ -2436,6 +2960,18 @@ class NativeChronosFS {
     void touch(std::int64_t inode) {
         Inode row = inode_by_id(inode);
         std::string now = now_text();
+        // FUSE currently reports second-resolution timestamps. Bulk file
+        // creation can touch the same parent directory thousands of times
+        // within one observable timestamp tick; rewriting that hot interval
+        // row for every child adds no visible information. Keep the cached
+        // inode current and persist at most one parent touch per second.
+        if (parse_time_text(row.mtime).tv_sec == parse_time_text(now).tv_sec &&
+            parse_time_text(row.ctime).tv_sec == parse_time_text(now).tv_sec) {
+            row.mtime = now;
+            row.ctime = now;
+            cache_inode(row);
+            return;
+        }
         row.mtime = now;
         row.ctime = now;
         upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(row), false);
@@ -2509,9 +3045,15 @@ class NativeChronosFS {
         st->st_nlink = inode.nlink;
         st->st_blksize = 4096;
         st->st_blocks = (inode.size + 511) / 512;
-        st->st_atim = parse_time_text(inode.atime);
-        st->st_mtim = parse_time_text(inode.mtime);
-        st->st_ctim = parse_time_text(inode.ctime);
+        if (inode.timestamps_cached) {
+            st->st_atim = {inode.cached_atime, 0};
+            st->st_mtim = {inode.cached_mtime, 0};
+            st->st_ctim = {inode.cached_ctime, 0};
+        } else {
+            st->st_atim = parse_time_text(inode.atime);
+            st->st_mtim = parse_time_text(inode.mtime);
+            st->st_ctim = parse_time_text(inode.ctime);
+        }
         if (inode.kind == "directory") st->st_mode = S_IFDIR | inode.mode;
         else if (inode.kind == "symlink") st->st_mode = S_IFLNK | inode.mode;
         else st->st_mode = S_IFREG | inode.mode;
@@ -2521,31 +3063,207 @@ class NativeChronosFS {
     std::string branch_id_;
     chronos::native::NativeBranchSession session_;
     std::int64_t block_size_;
+    std::string object_dir_;
+    std::unordered_set<std::string> pending_object_paths_;
+    std::uint64_t transaction_savepoint_id_ = 0;
     std::int64_t next_reserved_inode_id_ = 0;
     std::int64_t reserved_inode_id_end_ = 0;
-    std::unordered_map<std::int64_t, Inode> inode_cache_;
-    std::unordered_map<std::string, std::int64_t> path_inode_cache_;
+    ankerl::unordered_dense::map<std::int64_t, Inode> inode_cache_;
+    ankerl::unordered_dense::map<std::string, std::int64_t> path_inode_cache_;
     std::unordered_map<std::string, std::unordered_set<std::string>> path_children_cache_;
     std::unordered_map<std::string, std::pair<bool, std::int64_t>> dirent_cache_;
+    std::unordered_set<std::int64_t> loaded_dirents_;
+    std::unordered_map<std::int64_t, std::vector<DirectoryEntry>>
+        directory_children_cache_;
+    std::unordered_set<std::int64_t> private_created_inodes_;
 };
 
 struct SharedChronosFSBranch {
-    std::recursive_mutex mutex;
+    struct CacheInvalidation {
+        std::uint64_t generation;
+        bool clear_all;
+        std::vector<std::string> paths;
+    };
+
+    static constexpr std::size_t kMaxInvalidations = 4096;
+
+    std::shared_mutex mutex;
+    std::atomic<std::uint64_t> cache_generation{1};
+    std::deque<CacheInvalidation> cache_invalidations;
     std::unique_ptr<NativeChronosFS> filesystem;
+    std::mutex batch_mutex;
+    std::condition_variable batch_condition;
+    std::chrono::steady_clock::time_point last_batched_write;
+    std::size_t batched_operations = 0;
+    std::atomic<bool> batch_pending{false};
+    bool batch_shutdown = false;
+    std::exception_ptr batch_error;
+    std::thread batch_thread;
 
     SharedChronosFSBranch(
         const std::string &database_url,
         const std::string &branch_id,
         std::int64_t block_size)
-        : filesystem(std::make_unique<NativeChronosFS>(database_url, branch_id, block_size)) {}
+        : filesystem(std::make_unique<NativeChronosFS>(
+              database_url,
+              branch_id,
+              block_size)),
+          batch_thread(&SharedChronosFSBranch::run_batch_committer, this) {}
+
+    ~SharedChronosFSBranch() {
+        {
+            std::lock_guard<std::mutex> guard(batch_mutex);
+            batch_shutdown = true;
+        }
+        batch_condition.notify_all();
+        if (batch_thread.joinable()) batch_thread.join();
+        std::unique_lock<std::shared_mutex> guard(mutex);
+        try {
+            commit_write_batch_locked();
+        } catch (...) {
+        }
+    }
+
+    void begin_write_batch_locked() {
+        {
+            std::lock_guard<std::mutex> guard(batch_mutex);
+            if (batch_error) std::rethrow_exception(batch_error);
+        }
+        filesystem->begin_write_batch_public();
+        bool commit_now = false;
+        {
+            std::lock_guard<std::mutex> guard(batch_mutex);
+            batch_pending.store(true, std::memory_order_release);
+            last_batched_write = std::chrono::steady_clock::now();
+            commit_now = ++batched_operations >= 512;
+        }
+        if (commit_now) {
+            commit_write_batch_locked();
+        } else {
+            batch_condition.notify_one();
+        }
+    }
+
+    void commit_write_batch_locked() {
+        bool pending = false;
+        {
+            std::lock_guard<std::mutex> guard(batch_mutex);
+            if (batch_error) std::rethrow_exception(batch_error);
+            pending =
+                batch_pending.exchange(false, std::memory_order_acq_rel);
+            batched_operations = 0;
+        }
+        if (!pending) return;
+        try {
+            filesystem->commit_write_batch_public();
+        } catch (...) {
+            filesystem->rollback_write_batch_public();
+            throw;
+        }
+    }
+
+    void commit_write_batch() {
+        std::unique_lock<std::shared_mutex> guard(mutex);
+        commit_write_batch_locked();
+    }
+
+    void run_batch_committer() {
+        constexpr auto kWriteBatchIdle = std::chrono::milliseconds(2);
+        while (true) {
+            std::unique_lock<std::mutex> timer_lock(batch_mutex);
+            batch_condition.wait(timer_lock, [this] {
+                return batch_pending.load(std::memory_order_acquire) ||
+                    batch_shutdown;
+            });
+            if (batch_shutdown) {
+                timer_lock.unlock();
+                try {
+                    commit_write_batch();
+                } catch (...) {
+                }
+                return;
+            }
+            const auto observed_write = last_batched_write;
+            if (batch_condition.wait_until(
+                    timer_lock,
+                    observed_write + kWriteBatchIdle,
+                    [this, observed_write] {
+                        return batch_shutdown ||
+                            last_batched_write != observed_write;
+                    })) {
+                continue;
+            }
+            timer_lock.unlock();
+            try {
+                commit_write_batch();
+            } catch (...) {
+                std::lock_guard<std::mutex> guard(batch_mutex);
+                batch_error = std::current_exception();
+                batch_pending.store(false, std::memory_order_release);
+                batched_operations = 0;
+            }
+        }
+    }
+
+    bool has_pending_write_batch() const {
+        return batch_pending.load(std::memory_order_acquire);
+    }
+
+    void record_path_invalidation(std::vector<std::string> paths) {
+        const std::uint64_t generation =
+            cache_generation.fetch_add(1, std::memory_order_release) + 1;
+        cache_invalidations.push_back(
+            CacheInvalidation{generation, false, std::move(paths)});
+        while (cache_invalidations.size() > kMaxInvalidations) {
+            cache_invalidations.pop_front();
+        }
+    }
+
+    void record_full_invalidation() {
+        const std::uint64_t generation =
+            cache_generation.fetch_add(1, std::memory_order_release) + 1;
+        cache_invalidations.push_back(CacheInvalidation{generation, true, {}});
+        while (cache_invalidations.size() > kMaxInvalidations) {
+            cache_invalidations.pop_front();
+        }
+    }
+
+    void refresh_reader_cache(
+        NativeChronosFS &reader,
+        std::uint64_t &reader_generation) const {
+        const std::uint64_t current =
+            cache_generation.load(std::memory_order_acquire);
+        if (reader_generation == current) return;
+
+        if (cache_invalidations.empty() ||
+            reader_generation + 1 < cache_invalidations.front().generation) {
+            reader.clear_cache_public();
+            reader_generation = current;
+            return;
+        }
+
+        for (const auto &invalidation : cache_invalidations) {
+            if (invalidation.generation <= reader_generation) continue;
+            if (invalidation.clear_all) {
+                reader.clear_cache_public();
+            } else {
+                reader.invalidate_cached_paths_public(invalidation.paths);
+            }
+        }
+        reader_generation = current;
+    }
 };
+
+struct FuseState;
 
 struct SharedChronosFSBackend {
     std::string database_url;
     std::int64_t block_size;
     std::mutex registry_mutex;
+    std::mutex mounts_mutex;
     std::shared_mutex topology_mutex;
     std::unordered_map<std::string, std::weak_ptr<SharedChronosFSBranch>> branches;
+    std::unordered_set<FuseState *> mounts;
 
     std::shared_ptr<SharedChronosFSBranch> branch_for(const std::string &branch_id) {
         std::lock_guard<std::mutex> guard(registry_mutex);
@@ -2560,6 +3278,25 @@ struct SharedChronosFSBackend {
             block_size);
         branches.emplace(branch_id, state);
         return state;
+    }
+
+    void flush_all_write_batches() {
+        std::vector<std::shared_ptr<SharedChronosFSBranch>> snapshot;
+        {
+            std::lock_guard<std::mutex> guard(registry_mutex);
+            snapshot.reserve(branches.size());
+            for (auto it = branches.begin(); it != branches.end();) {
+                if (auto state = it->second.lock()) {
+                    snapshot.push_back(std::move(state));
+                    ++it;
+                } else {
+                    it = branches.erase(it);
+                }
+            }
+        }
+        for (const auto &state : snapshot) {
+            state->commit_write_batch();
+        }
     }
 
     void clear_all_caches() {
@@ -2577,17 +3314,65 @@ struct SharedChronosFSBackend {
             }
         }
         for (const auto &state : snapshot) {
-            std::lock_guard<std::recursive_mutex> guard(state->mutex);
+            std::unique_lock<std::shared_mutex> guard(state->mutex);
+            state->commit_write_batch_locked();
             state->filesystem->clear_cache_public();
+            state->filesystem->clear_private_inode_hints_public();
+            state->record_full_invalidation();
         }
     }
+
+    void register_mount(FuseState *state);
+    void unregister_mount(FuseState *state);
+    void invalidate_paths(
+        const std::string &branch_id,
+        const std::vector<std::string> &paths);
+};
+
+struct FuseReadSlot {
+    std::mutex mutex;
+    std::string branch_id;
+    std::uint64_t cache_generation = 0;
+    std::unique_ptr<NativeChronosFS> filesystem;
 };
 
 struct FuseState {
     std::shared_ptr<SharedChronosFSBackend> backend;
     std::string branch_id;
     std::shared_ptr<SharedChronosFSBranch> branch;
+    std::vector<std::unique_ptr<FuseReadSlot>> read_slots;
+    std::mutex mutable_paths_mutex;
+    std::unordered_set<std::string> mutable_paths;
+    struct fuse *fuse = nullptr;
 };
+
+void SharedChronosFSBackend::register_mount(FuseState *state) {
+    std::lock_guard<std::mutex> guard(mounts_mutex);
+    mounts.insert(state);
+}
+
+void SharedChronosFSBackend::unregister_mount(FuseState *state) {
+    std::lock_guard<std::mutex> guard(mounts_mutex);
+    mounts.erase(state);
+}
+
+void SharedChronosFSBackend::invalidate_paths(
+    const std::string &branch_id,
+    const std::vector<std::string> &paths) {
+    std::lock_guard<std::mutex> guard(mounts_mutex);
+    for (FuseState *state : mounts) {
+        if (state->branch_id != branch_id || state->fuse == nullptr) continue;
+        for (const auto &path : paths) {
+            if (path.empty()) continue;
+            {
+                std::lock_guard<std::mutex> mutable_guard(
+                    state->mutable_paths_mutex);
+                state->mutable_paths.insert(path);
+            }
+            fuse_invalidate_path(state->fuse, path.c_str());
+        }
+    }
+}
 
 std::unordered_map<std::string, std::weak_ptr<SharedChronosFSBackend>> &shared_backends() {
     static std::unordered_map<std::string, std::weak_ptr<SharedChronosFSBackend>> backends;
@@ -2617,6 +3402,21 @@ std::shared_ptr<SharedChronosFSBackend> shared_backend_for(
     backend->block_size = block_size;
     shared_backends()[std::move(key)] = backend;
     return backend;
+}
+
+void flush_chronosfs_native(
+    const std::string &database_url,
+    std::int64_t block_size) {
+    std::shared_ptr<SharedChronosFSBackend> backend;
+    {
+        std::lock_guard<std::mutex> guard(shared_backends_mutex());
+        auto found =
+            shared_backends().find(backend_key(database_url, block_size));
+        if (found != shared_backends().end()) {
+            backend = found->second.lock();
+        }
+    }
+    if (backend) backend->flush_all_write_batches();
 }
 
 py::dict inode_dict(const Inode &inode) {
@@ -2649,8 +3449,29 @@ IntervalBlob blob_from_py(const py::object &data) {
 class NativeChronosFSStoreApi {
   public:
     NativeChronosFSStoreApi(std::string database_url, std::int64_t block_size)
-        : store_(std::make_shared<chronos::native::NativeBranchStore>(std::move(database_url))),
-          block_size_(block_size) {}
+        : database_url_(std::move(database_url)),
+          store_(std::make_shared<chronos::native::NativeBranchStore>(database_url_)),
+          block_size_(block_size),
+          object_dir_(chronosfs_object_dir(database_url_)),
+          gc_thread_(&NativeChronosFSStoreApi::run_gc_worker, this) {
+        if (store_->dialect() == "sqlite") {
+            // ChronosFS writes one logical filesystem operation through many
+            // interval rows. SQLite's connection-local auto-checkpoint can
+            // otherwise make an unrelated later metadata write copy the
+            // entire accumulated WAL synchronously. Checkpoint lifecycle is
+            // managed outside the foreground operation path.
+            store_->execute_sql("PRAGMA wal_autocheckpoint=0", {});
+        }
+    }
+
+    ~NativeChronosFSStoreApi() {
+        {
+            std::lock_guard<std::mutex> guard(gc_mutex_);
+            gc_shutdown_ = true;
+        }
+        gc_condition_.notify_all();
+        if (gc_thread_.joinable()) gc_thread_.join();
+    }
 
     void ensure() {
         std::lock_guard<std::recursive_mutex> guard(mutex_);
@@ -2669,16 +3490,53 @@ class NativeChronosFSStoreApi {
     }
 
     void delete_branch(const std::string &branch_id) {
-        std::lock_guard<std::recursive_mutex> guard(mutex_);
-        store_->delete_branch(branch_id);
-        store_->collect_interval_garbage();
-        filesystems_.erase(branch_id);
-        clear_all_caches();
+        {
+            std::lock_guard<std::recursive_mutex> guard(mutex_);
+            store_->delete_branch(branch_id);
+            filesystems_.erase(branch_id);
+            clear_all_caches();
+        }
+        request_gc();
+    }
+
+    void wait_for_gc() {
+        std::unique_lock<std::mutex> lock(gc_mutex_);
+        gc_condition_.wait(lock, [this]() {
+            return gc_stopped_ || (!gc_pending_ && !gc_running_);
+        });
+        if (gc_error_) std::rethrow_exception(gc_error_);
     }
 
     std::int64_t merge_apply(const std::string &source, const std::string &target) {
         std::lock_guard<std::recursive_mutex> guard(mutex_);
-        std::int64_t applied = store_->merge_apply(source, target);
+        const auto started = std::chrono::steady_clock::now();
+        const std::vector<std::int64_t> orphan_inodes =
+            fs_for(source).orphan_inode_ids();
+        const auto collected = std::chrono::steady_clock::now();
+        std::int64_t applied =
+            store_->merge_apply_excluding_first_key_values(
+                source,
+                target,
+                "chronosfs_file_blocks",
+                orphan_inodes
+            );
+        const auto merged = std::chrono::steady_clock::now();
+        if (const char *profile = std::getenv("CHRONOS_WORKSPACE_PROFILE");
+            profile != nullptr && std::string(profile) == "1") {
+            const auto milliseconds = [](auto begin, auto end) {
+                return std::chrono::duration<double, std::milli>(
+                           end - begin)
+                    .count();
+            };
+            std::cerr
+                << "{\"chronosfs_merge_profile\":{\"collect_orphans_ms\":"
+                << milliseconds(started, collected)
+                << ",\"orphan_inodes\":" << orphan_inodes.size()
+                << ",\"interval_merge_ms\":"
+                << milliseconds(collected, merged)
+                << "},\"source\":\"" << source
+                << "\",\"target\":\"" << target << "\"}\n";
+        }
         clear_all_caches();
         return applied;
     }
@@ -2730,6 +3588,24 @@ class NativeChronosFSStoreApi {
         auto &fs = fs_for(branch);
         fs.write_file_path(path, blob_from_py(data), mode, parents);
         return fs.stat_path(path).id;
+    }
+
+    void write_files(
+        const std::string &branch,
+        const std::vector<std::string> &paths,
+        const py::list &data,
+        mode_t mode,
+        bool parents) {
+        if (paths.size() != data.size()) {
+            throw py::value_error("path and data counts differ");
+        }
+        std::vector<IntervalBlob> payloads;
+        payloads.reserve(paths.size());
+        for (const auto &item : data) {
+            payloads.push_back(blob_from_py(py::reinterpret_borrow<py::object>(item)));
+        }
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).write_files_public(paths, payloads, mode, parents);
     }
 
     void import_tree(const std::string &branch, const std::string &source_path) {
@@ -2839,6 +3715,136 @@ class NativeChronosFSStoreApi {
     }
 
   private:
+    void collect_unreferenced_objects(
+        chronos::native::NativeBranchStore &gc_store) {
+        if (object_dir_.empty()) return;
+
+        std::unordered_set<std::string> physical_tables;
+        auto current_tables = gc_store.query_sql(
+            "SELECT physical_table FROM _chronos_branch_tables "
+            "WHERE backend = 'interval' AND table_name = "
+            "'chronosfs_inodes'",
+            {});
+        for (const auto &row : current_tables) {
+            if (!row.empty()) physical_tables.insert(as_string(row[0]));
+        }
+        try {
+            auto version_tables = gc_store.query_sql(
+                "SELECT physical_table "
+                "FROM _chronos_branch_table_schema_versions "
+                "WHERE backend = 'interval' AND table_name = "
+                "'chronosfs_inodes'",
+                {});
+            for (const auto &row : version_tables) {
+                if (!row.empty()) physical_tables.insert(as_string(row[0]));
+            }
+        } catch (...) {
+            // Schema branching is optional, and older databases may not have
+            // its registry table.
+        }
+
+        std::unordered_set<std::string> referenced_paths;
+        for (const auto &table : physical_tables) {
+            if (table.empty()) continue;
+            auto rows = gc_store.query_sql(
+                "SELECT DISTINCT source_path FROM " + quote_ident(table) +
+                    " WHERE source_path IS NOT NULL AND source_path <> '' "
+                    "AND deleted = FALSE",
+                {});
+            for (const auto &row : rows) {
+                if (!row.empty()) referenced_paths.insert(as_string(row[0]));
+            }
+        }
+
+        const std::filesystem::path object_root =
+            std::filesystem::path(object_dir_).lexically_normal();
+        auto registered =
+            gc_store.query_sql("SELECT path FROM _chronosfs_objects", {});
+        for (const auto &row : registered) {
+            if (row.empty()) continue;
+            const std::string path = as_string(row[0]);
+            if (path.empty() ||
+                referenced_paths.find(path) != referenced_paths.end()) {
+                continue;
+            }
+
+            const std::filesystem::path candidate =
+                std::filesystem::path(path).lexically_normal();
+            if (candidate.parent_path() != object_root) {
+                // The registry is private to generated ChronosFS objects.
+                // Refuse to unlink an unexpected path even if the registry is
+                // corrupted.
+                continue;
+            }
+            if (::unlink(candidate.c_str()) != 0 && errno != ENOENT) {
+                throw FsError(
+                    errno,
+                    "could not remove unreferenced ChronosFS object");
+            }
+            gc_store.execute_sql(
+                "DELETE FROM _chronosfs_objects WHERE path = ?",
+                {path});
+        }
+    }
+
+    void request_gc() {
+        {
+            std::lock_guard<std::mutex> guard(gc_mutex_);
+            if (!gc_stopped_) gc_pending_ = true;
+        }
+        gc_condition_.notify_one();
+    }
+
+    void run_gc_worker() {
+        try {
+            chronos::native::NativeBranchStore gc_store(database_url_);
+            while (true) {
+                {
+                    std::unique_lock<std::mutex> lock(gc_mutex_);
+                    gc_condition_.wait(lock, [this]() {
+                        return gc_pending_ || gc_shutdown_;
+                    });
+                    if (gc_shutdown_ && !gc_pending_) return;
+                    gc_pending_ = false;
+                    gc_running_ = true;
+                }
+                try {
+                    gc_store.collect_interval_garbage();
+                    collect_unreferenced_objects(gc_store);
+                    gc_store.execute_sql(
+                        "DELETE FROM _chronosfs_orphan_inodes "
+                        "WHERE branch_id NOT IN ("
+                        "SELECT branch_id "
+                        "FROM _chronos_branch_interval_branches)",
+                        {});
+                    gc_store.execute_sql(
+                        "DELETE FROM _chronosfs_private_orphan_inodes "
+                        "WHERE branch_id NOT IN ("
+                        "SELECT branch_id "
+                        "FROM _chronos_branch_interval_branches)",
+                        {});
+                } catch (...) {
+                    std::lock_guard<std::mutex> guard(gc_mutex_);
+                    gc_error_ = std::current_exception();
+                }
+                {
+                    std::lock_guard<std::mutex> guard(gc_mutex_);
+                    gc_running_ = false;
+                }
+                gc_condition_.notify_all();
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> guard(gc_mutex_);
+                gc_error_ = std::current_exception();
+                gc_pending_ = false;
+                gc_running_ = false;
+                gc_stopped_ = true;
+            }
+            gc_condition_.notify_all();
+        }
+    }
+
     NativeChronosFS &fs_for(const std::string &branch) {
         auto found = filesystems_.find(branch);
         if (found != filesystems_.end()) return *found->second;
@@ -2852,6 +3858,7 @@ class NativeChronosFSStoreApi {
         for (auto it = filesystems_.begin(); it != filesystems_.end();) {
             try {
                 it->second->clear_cache_public();
+                it->second->clear_private_inode_hints_public();
                 ++it;
             } catch (const std::runtime_error &err) {
                 if (std::string(err.what()).find("branch not found") != std::string::npos) {
@@ -2863,23 +3870,107 @@ class NativeChronosFSStoreApi {
         }
     }
 
+    std::string database_url_;
     std::shared_ptr<chronos::native::NativeBranchStore> store_;
     std::int64_t block_size_;
+    std::string object_dir_;
     std::recursive_mutex mutex_;
     std::unordered_map<std::string, std::unique_ptr<NativeChronosFS>> filesystems_;
+    std::mutex gc_mutex_;
+    std::condition_variable gc_condition_;
+    bool gc_pending_ = false;
+    bool gc_running_ = false;
+    bool gc_shutdown_ = false;
+    bool gc_stopped_ = false;
+    std::exception_ptr gc_error_;
+    std::thread gc_thread_;
 };
 
-struct LockedFS {
+struct LockedReadFS {
     std::shared_lock<std::shared_mutex> topology_lock;
-    std::unique_lock<std::recursive_mutex> branch_lock;
+    std::shared_lock<std::shared_mutex> branch_lock;
+    std::unique_lock<std::shared_mutex> writer_branch_lock;
+    std::unique_lock<std::mutex> slot_lock;
     NativeChronosFS &fs;
 };
 
-LockedFS locked_fs() {
+LockedReadFS locked_read_fs_for_slot(std::size_t slot_index) {
     auto *state = static_cast<FuseState *>(fuse_get_context()->private_data);
     std::shared_lock<std::shared_mutex> topology_lock(state->backend->topology_mutex);
-    std::unique_lock<std::recursive_mutex> branch_lock(state->branch->mutex);
-    return LockedFS{
+    auto branch = state->branch;
+    std::shared_lock<std::shared_mutex> branch_lock(branch->mutex);
+    if (branch->has_pending_write_batch()) {
+        branch_lock.unlock();
+        std::unique_lock<std::shared_mutex> writer_branch_lock(branch->mutex);
+        if (branch->has_pending_write_batch()) {
+            return LockedReadFS{
+                std::move(topology_lock),
+                {},
+                std::move(writer_branch_lock),
+                {},
+                *branch->filesystem};
+        }
+        writer_branch_lock.unlock();
+        branch_lock.lock();
+    }
+    slot_index %= state->read_slots.size();
+    FuseReadSlot &slot = *state->read_slots[slot_index];
+    std::unique_lock<std::mutex> slot_lock(slot.mutex);
+    const std::uint64_t generation =
+        branch->cache_generation.load(std::memory_order_acquire);
+    if (!slot.filesystem || slot.branch_id != state->branch_id) {
+        slot.filesystem = std::make_unique<NativeChronosFS>(
+            state->backend->database_url,
+            state->branch_id,
+            state->backend->block_size);
+        slot.branch_id = state->branch_id;
+        slot.cache_generation = generation;
+    } else if (slot.cache_generation != generation) {
+        branch->refresh_reader_cache(*slot.filesystem, slot.cache_generation);
+    }
+    return LockedReadFS{
+        std::move(topology_lock),
+        std::move(branch_lock),
+        {},
+        std::move(slot_lock),
+        *slot.filesystem};
+}
+
+LockedReadFS locked_read_fs() {
+    return locked_read_fs_for_slot(
+        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+LockedReadFS locked_read_fs_for(const std::string &locality_key) {
+    return locked_read_fs_for_slot(std::hash<std::string>{}(locality_key));
+}
+
+struct LockedWriteFS {
+    std::shared_lock<std::shared_mutex> topology_lock;
+    std::unique_lock<std::shared_mutex> branch_lock;
+    NativeChronosFS &fs;
+};
+
+LockedWriteFS locked_write_fs(
+    std::vector<std::string> invalidated_paths,
+    bool begin_batch = true) {
+    auto *state = static_cast<FuseState *>(fuse_get_context()->private_data);
+    std::shared_lock<std::shared_mutex> topology_lock(state->backend->topology_mutex);
+    std::unique_lock<std::shared_mutex> branch_lock(state->branch->mutex);
+    if (begin_batch) state->branch->begin_write_batch_locked();
+    state->branch->record_path_invalidation(std::move(invalidated_paths));
+    return LockedWriteFS{
+        std::move(topology_lock),
+        std::move(branch_lock),
+        *state->branch->filesystem};
+}
+
+LockedWriteFS locked_sync_fs() {
+    auto *state = static_cast<FuseState *>(fuse_get_context()->private_data);
+    std::shared_lock<std::shared_mutex> topology_lock(state->backend->topology_mutex);
+    std::unique_lock<std::shared_mutex> branch_lock(state->branch->mutex);
+    state->branch->commit_write_batch_locked();
+    return LockedWriteFS{
         std::move(topology_lock),
         std::move(branch_lock),
         *state->branch->filesystem};
@@ -2887,7 +3978,7 @@ LockedFS locked_fs() {
 
 struct ExclusivelyLockedFS {
     std::unique_lock<std::shared_mutex> topology_lock;
-    std::unique_lock<std::recursive_mutex> branch_lock;
+    std::unique_lock<std::shared_mutex> branch_lock;
     SharedChronosFSBackend &backend;
     NativeChronosFS &fs;
 };
@@ -2895,7 +3986,9 @@ struct ExclusivelyLockedFS {
 ExclusivelyLockedFS exclusively_locked_fs() {
     auto *state = static_cast<FuseState *>(fuse_get_context()->private_data);
     std::unique_lock<std::shared_mutex> topology_lock(state->backend->topology_mutex);
-    std::unique_lock<std::recursive_mutex> branch_lock(state->branch->mutex);
+    std::unique_lock<std::shared_mutex> branch_lock(state->branch->mutex);
+    state->branch->commit_write_batch_locked();
+    state->branch->record_full_invalidation();
     return ExclusivelyLockedFS{
         std::move(topology_lock),
         std::move(branch_lock),
@@ -2904,6 +3997,16 @@ ExclusivelyLockedFS exclusively_locked_fs() {
 }
 int error_code(const FsError &err) { return -err.code; }
 std::string path_of(const char *path) { return path && *path ? std::string(path) : "/"; }
+std::string parent_path_of(const std::string &path) {
+    if (path.empty() || path == "/") return "/";
+    const auto slash = path.find_last_of('/');
+    if (slash == std::string::npos || slash == 0) return "/";
+    return path.substr(0, slash);
+}
+void invalidate_paths(const std::vector<std::string> &paths) {
+    auto *state = static_cast<FuseState *>(fuse_get_context()->private_data);
+    state->backend->invalidate_paths(state->branch_id, paths);
+}
 bool is_current_branch_control(const std::string &path) {
     return path == "/.chronos/current";
 }
@@ -2925,15 +4028,19 @@ OpenHandle *handle_of(struct fuse_file_info *fi) {
     if (!fi || fi->fh == 0) return nullptr;
     return reinterpret_cast<OpenHandle *>(static_cast<std::uintptr_t>(fi->fh));
 }
+std::string path_of_handle(const char *path, OpenHandle *handle) {
+    if (path && *path) return std::string(path);
+    return handle ? handle->path : std::string();
+}
 void set_handle(struct fuse_file_info *fi, OpenHandle *handle) {
     if (fi) fi->fh = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handle));
 }
 
 int op_getattr(const char *path, struct stat *st, struct fuse_file_info *) {
     try {
-        auto locked = locked_fs();
-        locked.fs.getattr(path_of(path), st);
-        return 0;
+        const std::string requested_path = path_of(path);
+        auto locked = locked_read_fs_for(parent_path_of(requested_path));
+        return locked.fs.getattr(requested_path, st) ? 0 : -ENOENT;
     } catch (const FsError &e) {
         return error_code(e);
     } catch (...) {
@@ -2943,8 +4050,34 @@ int op_getattr(const char *path, struct stat *st, struct fuse_file_info *) {
 
 int op_open(const char *path, struct fuse_file_info *fi) {
     try {
-        auto locked = locked_fs();
-        set_handle(fi, locked.fs.open_handle(path_of(path), fi ? fi->flags : 0));
+        const int flags = fi ? fi->flags : 0;
+        const std::string requested_path = path_of(path);
+        auto *state = static_cast<FuseState *>(
+            fuse_get_context()->private_data);
+        const bool writable =
+            (flags & O_ACCMODE) != O_RDONLY || (flags & O_TRUNC);
+        {
+            std::lock_guard<std::mutex> guard(state->mutable_paths_mutex);
+            if (writable) state->mutable_paths.insert(requested_path);
+            if (fi &&
+                state->mutable_paths.find(requested_path) !=
+                    state->mutable_paths.end()) {
+                // A changed file may still have pre-write pages or an old EOF
+                // in the kernel cache.  Bypass those pages for this path after
+                // its first mutation; unchanged inherited files retain normal
+                // page-cache behavior.
+                fi->direct_io = 1;
+            }
+        }
+        if (writable) {
+            auto locked = locked_write_fs(
+                {requested_path},
+                (flags & O_TRUNC) != 0);
+            set_handle(fi, locked.fs.open_handle(requested_path, flags));
+        } else {
+            auto locked = locked_read_fs_for(parent_path_of(requested_path));
+            set_handle(fi, locked.fs.open_handle(requested_path, flags));
+        }
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -2959,13 +4092,34 @@ int op_readdir(
     fuse_fill_dir_t filler,
     off_t,
     struct fuse_file_info *,
-    enum fuse_readdir_flags) {
+    enum fuse_readdir_flags flags) {
     try {
-        auto locked = locked_fs();
-        filler(buf, ".", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
-        filler(buf, "..", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
-        for (const auto &name : locked.fs.listdir(path_of(path))) {
-            filler(buf, name.c_str(), nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
+        const std::string requested_path = path_of(path);
+        auto locked = locked_read_fs_for(requested_path);
+        const auto fill_flags = static_cast<fuse_fill_dir_flags>(
+            (flags & FUSE_READDIR_PLUS) ? FUSE_FILL_DIR_PLUS : 0);
+        if (filler(buf, ".", nullptr, 0, static_cast<fuse_fill_dir_flags>(0)) != 0) return 0;
+        if (filler(buf, "..", nullptr, 0, static_cast<fuse_fill_dir_flags>(0)) != 0) return 0;
+        if (requested_path == "/.chronos" ||
+            requested_path == "/.chronos/branches" ||
+            requested_path == "/.chronos/merge-preview" ||
+            requested_path == "/.chronos/merge-apply") {
+            for (const auto &name : locked.fs.listdir(requested_path)) {
+                if (filler(
+                        buf,
+                        name.c_str(),
+                        nullptr,
+                        0,
+                        static_cast<fuse_fill_dir_flags>(0)) != 0) {
+                    break;
+                }
+            }
+            return 0;
+        }
+        for (const auto &entry : locked.fs.listdir_entries(requested_path)) {
+            struct stat st {};
+            locked.fs.fill_stat_public(entry.inode, &st);
+            if (filler(buf, entry.name.c_str(), &st, 0, fill_flags) != 0) break;
         }
         return 0;
     } catch (const FsError &e) {
@@ -2977,7 +4131,7 @@ int op_readdir(
 
 int op_read(const char *path, char *buf, size_t size, off_t off, struct fuse_file_info *fi) {
     try {
-        auto locked = locked_fs();
+        auto locked = locked_read_fs();
         auto data = locked.fs.read_handle(handle_of(fi), path_of(path), off, size);
         std::memcpy(buf, data.data(), data.size());
         return static_cast<int>(data.size());
@@ -2996,7 +4150,8 @@ int op_write(const char *path, const char *buf, size_t size, off_t off, struct f
             auto *state = static_cast<FuseState *>(fuse_get_context()->private_data);
             auto current_branch = state->branch;
             std::unique_lock<std::shared_mutex> topology_lock(state->backend->topology_mutex);
-            std::unique_lock<std::recursive_mutex> branch_lock(current_branch->mutex);
+            std::unique_lock<std::shared_mutex> branch_lock(current_branch->mutex);
+            current_branch->commit_write_batch_locked();
             const std::string next = branch_name_from_control_write(buf, size);
             const auto names = current_branch->filesystem->branch_names_public();
             if (std::find(names.begin(), names.end(), next) == names.end()) {
@@ -3008,13 +4163,20 @@ int op_write(const char *path, const char *buf, size_t size, off_t off, struct f
             return static_cast<int>(size);
         }
         if (is_merge_apply_control(requested_path)) {
-            auto locked = exclusively_locked_fs();
-            locked.fs.write_handle(handle_of(fi), requested_path, buf, size, off);
-            locked.backend.clear_all_caches();
+            auto *state = static_cast<FuseState *>(fuse_get_context()->private_data);
+            {
+                auto locked = exclusively_locked_fs();
+                locked.fs.write_handle(handle_of(fi), requested_path, buf, size, off);
+            }
+            state->backend->clear_all_caches();
             return static_cast<int>(size);
         }
-        auto locked = locked_fs();
-        locked.fs.write_handle(handle_of(fi), requested_path, buf, size, off);
+        const bool immediate = handle_of(fi) == nullptr;
+        {
+            auto locked = locked_write_fs({requested_path}, immediate);
+            locked.fs.write_handle(handle_of(fi), requested_path, buf, size, off);
+        }
+        if (immediate) invalidate_paths({requested_path});
         return static_cast<int>(size);
     } catch (const FsError &e) {
         return error_code(e);
@@ -3025,8 +4187,12 @@ int op_write(const char *path, const char *buf, size_t size, off_t off, struct f
 
 int op_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     try {
-        auto locked = locked_fs();
-        set_handle(fi, locked.fs.create_handle(path_of(path), mode));
+        const std::string requested_path = path_of(path);
+        {
+            auto locked = locked_write_fs({requested_path});
+            set_handle(fi, locked.fs.create_handle(requested_path, mode));
+        }
+        invalidate_paths({requested_path, parent_path_of(requested_path)});
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -3035,10 +4201,16 @@ int op_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     }
 }
 
-int op_flush(const char *, struct fuse_file_info *fi) {
+int op_flush(const char *path, struct fuse_file_info *fi) {
     try {
-        auto locked = locked_fs();
-        locked.fs.flush_handle(handle_of(fi));
+        OpenHandle *handle = handle_of(fi);
+        if (handle == nullptr || handle->dirty_blocks.empty()) return 0;
+        const std::string requested_path = path_of_handle(path, handle);
+        {
+            auto locked = locked_write_fs({requested_path});
+            locked.fs.flush_handle(handle);
+        }
+        invalidate_paths({requested_path});
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -3047,16 +4219,40 @@ int op_flush(const char *, struct fuse_file_info *fi) {
     }
 }
 
-int op_fsync(const char *, int, struct fuse_file_info *fi) {
-    return op_flush(nullptr, fi);
+int op_fsync(const char *path, int, struct fuse_file_info *fi) {
+    const int flush_result = op_flush(path, fi);
+    if (flush_result != 0) return flush_result;
+    try {
+        auto locked = locked_sync_fs();
+        locked.fs.sync_storage();
+        return 0;
+    } catch (const FsError &e) {
+        return error_code(e);
+    } catch (...) {
+        return -EIO;
+    }
 }
 
-int op_release(const char *, struct fuse_file_info *fi) {
+int op_release(const char *path, struct fuse_file_info *fi) {
     try {
-        auto locked = locked_fs();
         std::unique_ptr<OpenHandle> handle(handle_of(fi));
         if (fi) fi->fh = 0;
-        locked.fs.flush_handle(handle.get());
+        const bool writable =
+            fi != nullptr &&
+            ((fi->flags & O_ACCMODE) != O_RDONLY || (fi->flags & O_TRUNC));
+        const std::string requested_path =
+            path_of_handle(path, handle.get());
+        if (handle && !handle->dirty_blocks.empty()) {
+            {
+                auto locked = locked_write_fs({requested_path});
+                locked.fs.flush_handle(handle.get());
+            }
+        }
+        // Invalidation from FLUSH can race with the kernel's final close of
+        // the writable handle.  Invalidate again from RELEASE, after all
+        // buffered blocks are committed, so the next opener cannot reuse
+        // page-cache contents from the previous file version.
+        if (handle && writable) invalidate_paths({requested_path});
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -3067,8 +4263,12 @@ int op_release(const char *, struct fuse_file_info *fi) {
 
 int op_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
     try {
-        auto locked = locked_fs();
-        locked.fs.truncate_handle(handle_of(fi), path_of(path), size);
+        const std::string requested_path = path_of(path);
+        {
+            auto locked = locked_write_fs({requested_path});
+            locked.fs.truncate_handle(handle_of(fi), requested_path, size);
+        }
+        invalidate_paths({requested_path});
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -3081,13 +4281,19 @@ int op_mkdir(const char *path, mode_t mode) {
     try {
         const std::string requested_path = path_of(path);
         if (is_branch_create_control(requested_path)) {
-            auto locked = exclusively_locked_fs();
-            locked.fs.mkdir(requested_path, mode);
-            locked.backend.clear_all_caches();
+            auto *state = static_cast<FuseState *>(fuse_get_context()->private_data);
+            {
+                auto locked = exclusively_locked_fs();
+                locked.fs.mkdir(requested_path, mode);
+            }
+            state->backend->clear_all_caches();
             return 0;
         }
-        auto locked = locked_fs();
-        locked.fs.mkdir(requested_path, mode);
+        {
+            auto locked = locked_write_fs({requested_path});
+            locked.fs.mkdir(requested_path, mode);
+        }
+        invalidate_paths({requested_path, parent_path_of(requested_path)});
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -3098,8 +4304,12 @@ int op_mkdir(const char *path, mode_t mode) {
 
 int op_unlink(const char *path) {
     try {
-        auto locked = locked_fs();
-        locked.fs.unlink_path(path_of(path), false);
+        const std::string requested_path = path_of(path);
+        {
+            auto locked = locked_write_fs({requested_path});
+            locked.fs.unlink_path(requested_path, false);
+        }
+        invalidate_paths({requested_path, parent_path_of(requested_path)});
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -3110,8 +4320,12 @@ int op_unlink(const char *path) {
 
 int op_rmdir(const char *path) {
     try {
-        auto locked = locked_fs();
-        locked.fs.unlink_path(path_of(path), true);
+        const std::string requested_path = path_of(path);
+        {
+            auto locked = locked_write_fs({requested_path});
+            locked.fs.unlink_path(requested_path, true);
+        }
+        invalidate_paths({requested_path, parent_path_of(requested_path)});
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -3123,8 +4337,17 @@ int op_rmdir(const char *path) {
 int op_rename(const char *from, const char *to, unsigned int flags) {
     if (flags) return -EINVAL;
     try {
-        auto locked = locked_fs();
-        locked.fs.rename_path(path_of(from), path_of(to));
+        const std::string source_path = path_of(from);
+        const std::string target_path = path_of(to);
+        {
+            auto locked = locked_write_fs({source_path, target_path});
+            locked.fs.rename_path(source_path, target_path);
+        }
+        invalidate_paths(
+            {source_path,
+             target_path,
+             parent_path_of(source_path),
+             parent_path_of(target_path)});
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -3135,8 +4358,12 @@ int op_rename(const char *from, const char *to, unsigned int flags) {
 
 int op_chmod(const char *path, mode_t mode, struct fuse_file_info *) {
     try {
-        auto locked = locked_fs();
-        locked.fs.chmod_path(path_of(path), mode);
+        const std::string requested_path = path_of(path);
+        {
+            auto locked = locked_write_fs({requested_path});
+            locked.fs.chmod_path(requested_path, mode);
+        }
+        invalidate_paths({requested_path});
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -3147,8 +4374,12 @@ int op_chmod(const char *path, mode_t mode, struct fuse_file_info *) {
 
 int op_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *) {
     try {
-        auto locked = locked_fs();
-        locked.fs.utimens_path(path_of(path), tv);
+        const std::string requested_path = path_of(path);
+        {
+            auto locked = locked_write_fs({requested_path});
+            locked.fs.utimens_path(requested_path, tv);
+        }
+        invalidate_paths({requested_path});
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -3159,8 +4390,12 @@ int op_utimens(const char *path, const struct timespec tv[2], struct fuse_file_i
 
 int op_symlink(const char *target, const char *linkpath) {
     try {
-        auto locked = locked_fs();
-        locked.fs.symlink_path(target, path_of(linkpath));
+        const std::string requested_path = path_of(linkpath);
+        {
+            auto locked = locked_write_fs({requested_path});
+            locked.fs.symlink_path(target, requested_path);
+        }
+        invalidate_paths({requested_path, parent_path_of(requested_path)});
         return 0;
     } catch (const FsError &e) {
         return error_code(e);
@@ -3171,8 +4406,9 @@ int op_symlink(const char *target, const char *linkpath) {
 
 int op_readlink(const char *path, char *buf, size_t size) {
     try {
-        auto locked = locked_fs();
-        auto target = locked.fs.readlink_path(path_of(path));
+        const std::string requested_path = path_of(path);
+        auto locked = locked_read_fs_for(parent_path_of(requested_path));
+        auto target = locked.fs.readlink_path(requested_path);
         if (size) {
             auto take = std::min(size - 1, target.size());
             std::memcpy(buf, target.data(), take);
@@ -3184,6 +4420,19 @@ int op_readlink(const char *path, char *buf, size_t size) {
     } catch (...) {
         return -EIO;
     }
+}
+
+void *op_init(struct fuse_conn_info *, struct fuse_config *) {
+    auto *state = static_cast<FuseState *>(fuse_get_context()->private_data);
+    state->fuse = fuse_get_context()->fuse;
+    state->backend->register_mount(state);
+    return state;
+}
+
+void op_destroy(void *private_data) {
+    auto *state = static_cast<FuseState *>(private_data);
+    state->backend->unregister_mount(state);
+    state->fuse = nullptr;
 }
 
 int mount_chronosfs_native(
@@ -3212,11 +4461,39 @@ int mount_chronosfs_native(
         op.utimens = op_utimens;
         op.symlink = op_symlink;
         op.readlink = op_readlink;
+        op.init = op_init;
+        op.destroy = op_destroy;
         return op;
     }();
     auto backend = shared_backend_for(database_url, block_size);
-    FuseState state{backend, branch_id, backend->branch_for(branch_id)};
-    std::vector<std::string> args{"chronosfs", "-f", "-s", "-o"};
+    auto branch = backend->branch_for(branch_id);
+    {
+        // A branch name may have been deleted and recreated while another
+        // process kept the shared mount daemon alive. Refresh the captured
+        // branch session before attaching a new mount so it cannot continue
+        // writing through the retired branch interval.
+        std::unique_lock<std::shared_mutex> guard(branch->mutex);
+        branch->commit_write_batch_locked();
+        branch->filesystem->clear_cache_public();
+        branch->record_full_invalidation();
+    }
+    FuseState state{
+        backend,
+        branch_id,
+        std::move(branch),
+        {},
+        {},
+        {},
+        nullptr};
+    const std::size_t read_slots = std::clamp<std::size_t>(
+        std::thread::hardware_concurrency(),
+        2,
+        8);
+    state.read_slots.reserve(read_slots);
+    for (std::size_t index = 0; index < read_slots; ++index) {
+        state.read_slots.push_back(std::make_unique<FuseReadSlot>());
+    }
+    std::vector<std::string> args{"chronosfs", "-f", "-o"};
     std::string opts = "fsname=chronosfs";
     for (const auto &option : options) opts += "," + option;
     args.push_back(opts);
@@ -3238,6 +4515,7 @@ void bind_chronosfs_fuse(py::module_ &m) {
         .def("branches", &NativeChronosFSStoreApi::branches)
         .def("create_branch", &NativeChronosFSStoreApi::create_branch, py::arg("branch_id"), py::arg("from_branch"))
         .def("delete_branch", &NativeChronosFSStoreApi::delete_branch, py::arg("branch_id"))
+        .def("wait_for_gc", &NativeChronosFSStoreApi::wait_for_gc, py::call_guard<py::gil_scoped_release>())
         .def("merge_apply", &NativeChronosFSStoreApi::merge_apply, py::arg("source"), py::arg("target"))
         .def("stat", &NativeChronosFSStoreApi::stat, py::arg("branch"), py::arg("path"))
         .def("stat_inode", &NativeChronosFSStoreApi::stat_inode, py::arg("branch"), py::arg("inode_id"))
@@ -3248,6 +4526,7 @@ void bind_chronosfs_fuse(py::module_ &m) {
         .def("read_file", &NativeChronosFSStoreApi::read_file, py::arg("branch"), py::arg("path"))
         .def("read_inode_range", &NativeChronosFSStoreApi::read_inode_range, py::arg("branch"), py::arg("inode_id"), py::arg("offset"), py::arg("size"))
         .def("write_file", &NativeChronosFSStoreApi::write_file, py::arg("branch"), py::arg("path"), py::arg("data"), py::arg("mode") = 0644, py::arg("parents") = false)
+        .def("write_files", &NativeChronosFSStoreApi::write_files, py::arg("branch"), py::arg("paths"), py::arg("data"), py::arg("mode") = 0644, py::arg("parents") = false)
         .def("import_tree", &NativeChronosFSStoreApi::import_tree, py::arg("branch"), py::arg("source_path"))
         .def("write_at", &NativeChronosFSStoreApi::write_at, py::arg("branch"), py::arg("path"), py::arg("offset"), py::arg("data"))
         .def("write_inode_at", &NativeChronosFSStoreApi::write_inode_at, py::arg("branch"), py::arg("inode_id"), py::arg("offset"), py::arg("data"))
@@ -3269,6 +4548,11 @@ void bind_chronosfs_fuse(py::module_ &m) {
         .def("rename_at", &NativeChronosFSStoreApi::rename_at, py::arg("branch"), py::arg("old_parent_inode_id"), py::arg("old_name"), py::arg("new_parent_inode_id"), py::arg("new_name"))
         .def("clear_cache", &NativeChronosFSStoreApi::clear_cache, py::arg("branch"));
 
+    m.def(
+        "flush_chronosfs_native",
+        &flush_chronosfs_native,
+        py::arg("database_url"),
+        py::arg("block_size"));
     m.def(
         "mount_chronosfs_native",
         &mount_chronosfs_native,

@@ -104,9 +104,15 @@ class SQLDatabaseAdapter(ABC):
 class SQLiteDatabaseAdapter(SQLDatabaseAdapter):
     dialect = "sqlite"
 
-    def __init__(self, conn: sqlite3.Connection, database_path: str):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        database_path: str,
+        database_url: str | None = None,
+    ):
         self._conn = conn
         self.database_path = database_path
+        self.database_url = database_url
 
     @classmethod
     def connect(cls, database_url: str) -> SQLiteDatabaseAdapter:
@@ -147,7 +153,7 @@ class SQLiteDatabaseAdapter(SQLDatabaseAdapter):
         conn.execute("PRAGMA fullfsync=ON")
         conn.execute("PRAGMA checkpoint_fullfsync=ON")
         database_path = parsed.path if parsed.scheme == "file" else path
-        return cls(conn, database_path)
+        return cls(conn, database_path, database_url)
 
     def execute(
         self, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()

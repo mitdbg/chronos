@@ -597,6 +597,38 @@ def test_workspace_polystore_transaction_commits_chronosfs_with_sql_stores(tmp_p
         workspace.close()
 
 
+def test_workspace_plain_merge_uses_native_chronosfs_conflict_check(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    workspace = _make_polystore_workspace_with_chronosfs(tmp_path)
+    try:
+        workspace.create_branch("agent", from_branch="main")
+        agent = workspace.checkout("agent")
+        assert agent.fs is not None
+        agent.fs.write_file("/notes/private.txt", "private\n", parents=True)
+
+        assert workspace.filesystem is not None
+
+        def fail_if_previewed(*_args, **_kwargs):
+            raise AssertionError("plain workspace merge materialized a ChronosFS preview")
+
+        monkeypatch.setattr(
+            workspace.filesystem,
+            "merge_preview",
+            fail_if_previewed,
+        )
+
+        result = workspace.merge_apply("agent", "main")
+
+        assert result["filesystem"].applied >= 1
+        refreshed = workspace.checkout("main")
+        assert refreshed.fs is not None
+        assert refreshed.fs.read_text("/notes/private.txt") == "private\n"
+    finally:
+        workspace.close()
+
+
 def test_workspace_create_branch_from_checkpoint_with_chronosfs(tmp_path) -> None:
     workspace = _make_polystore_workspace_with_chronosfs(tmp_path)
     try:

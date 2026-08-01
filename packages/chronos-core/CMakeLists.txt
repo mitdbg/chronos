@@ -37,6 +37,11 @@ FetchContent_Declare(
   duckdb_lib
   URL https://github.com/duckdb/duckdb/releases/download/v1.5.4/libduckdb-linux-amd64.zip
 )
+FetchContent_Declare(
+  unordered_dense
+  URL https://github.com/martinus/unordered_dense/archive/refs/tags/v4.8.1.tar.gz
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
 FetchContent_GetProperties(libpg_query)
 if(NOT libpg_query_POPULATED)
   FetchContent_Populate(libpg_query)
@@ -45,6 +50,7 @@ FetchContent_GetProperties(duckdb_lib)
 if(NOT duckdb_lib_POPULATED)
   FetchContent_Populate(duckdb_lib)
 endif()
+FetchContent_MakeAvailable(unordered_dense)
 
 set(LIBPG_QUERY_A "${libpg_query_SOURCE_DIR}/libpg_query.a")
 add_custom_command(
@@ -86,6 +92,7 @@ target_link_libraries(_native_interval PRIVATE
   libpg_query_static
   duckdb_shared
   nlohmann_json::nlohmann_json
+  unordered_dense::unordered_dense
 )
 set_target_properties(_native_interval PROPERTIES
   BUILD_RPATH "${duckdb_lib_SOURCE_DIR}"

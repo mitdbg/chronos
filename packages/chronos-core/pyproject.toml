@@ -18,6 +18,9 @@ dependencies = [
 duckdb = [
   "duckdb>=1.0",
 ]
+qdrant = [
+  "qdrant-client>=1.18,<2",
+]
 mcp = [
   "mcp[cli]>=1.9.0",
   "tomli>=2.0; python_version < '3.11'",
@@ -28,6 +31,7 @@ test = [
   "mcp[cli]>=1.9.0",
   "pytest>=7.0",
   "pytest-asyncio>=0.21",
+  "qdrant-client>=1.18,<2",
   "tomli>=2.0; python_version < '3.11'",
 ]
 fuse = [

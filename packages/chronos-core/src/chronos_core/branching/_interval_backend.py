@@ -65,12 +65,22 @@ class _IntervalBackend(_SQLBranchBackend):
         self._native_branch_session_segment_hints: dict[str, int] = {}
         self._native_branch_transaction_active = False
         self._initialize_native_branch_store()
+        database_url = str(getattr(self.db, "database_url", "") or "")
+        self._interval_gc_async = (
+            self.db.dialect == "postgres"
+            or (
+                self.db.dialect == "sqlite"
+                and database_url
+                and ":memory:" not in database_url
+            )
+        )
         if self.db.dialect == "postgres":
             try:
                 self.db._chronos_after_commit = self._commit_native_branch_store  # type: ignore[attr-defined]
                 self.db._chronos_after_rollback = self._rollback_native_branch_store  # type: ignore[attr-defined]
             except Exception:
                 pass
+        if self._interval_gc_async:
             self._initialize_interval_gc_worker()
 
     def _initialize_native_branch_store(self) -> None:
@@ -286,7 +296,7 @@ class _IntervalBackend(_SQLBranchBackend):
         self._start_async_schema_indexes()
 
     def wait_for_interval_gc(self) -> None:
-        if self.db.dialect != "postgres":
+        if not self._interval_gc_async:
             return
         with self._interval_gc_condition:
             while self._interval_gc_pending or self._interval_gc_running:
@@ -300,7 +310,7 @@ class _IntervalBackend(_SQLBranchBackend):
         if not self._interval_gc_requested:
             return
         self._interval_gc_requested = False
-        if self.db.dialect != "postgres":
+        if not self._interval_gc_async:
             if self._native_branch_store is not None:
                 self._native_branch_store.collect_interval_garbage()
                 return

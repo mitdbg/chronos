@@ -31,6 +31,15 @@ from chronos_core.workspace.stores import (
     ChronosDuckDBStore,
     ChronosPostgresStore,
 )
+from chronos_core.workspace.qdrant import (
+    ChronosQdrantStore,
+    QdrantBranchSession,
+    QdrantCollectionInfo,
+    QdrantPoint,
+    QdrantSearchResult,
+    QdrantStoreError,
+    QdrantUpsert,
+)
 
 __all__ = [
     "BranchStore",
@@ -54,6 +63,13 @@ __all__ = [
     "start_chronosfs_mount",
     "ChronosDuckDBStore",
     "ChronosPostgresStore",
+    "ChronosQdrantStore",
     "ChronosWorkspaceContext",
+    "QdrantBranchSession",
+    "QdrantCollectionInfo",
+    "QdrantPoint",
+    "QdrantSearchResult",
+    "QdrantStoreError",
+    "QdrantUpsert",
     "WorkspaceBranchSession",
 ]

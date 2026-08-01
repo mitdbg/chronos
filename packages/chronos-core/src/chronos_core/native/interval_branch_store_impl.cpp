@@ -1139,8 +1139,18 @@
             native_child_width = 2;
         } else if (child_width > 0) {
             native_child_width = child_width;
-        } else if (allocation_strategy == "adaptive" && width > cpp_int(1ULL << 32)) {
-            native_child_width = cpp_int_isqrt(width);
+        } else if (allocation_strategy == "adaptive") {
+            if (width > cpp_int(1ULL << 32)) {
+                // Favor shallow fanout while the range is large: the default
+                // 95% continuation leaves 5% for the child.
+                cpp_int continuation_width = (width * continuation_percent) / 100;
+                native_child_width = width - continuation_width;
+            } else {
+                // Once the range is narrow, favor depth by giving the child
+                // the larger share. This prevents a deep spine from losing
+                // 95% of its remaining range at every level.
+                native_child_width = (width * continuation_percent) / 100;
+            }
         } else {
             cpp_int continuation_width = (width * continuation_percent) / 100;
             native_child_width = width - continuation_width;
@@ -1387,6 +1397,13 @@
     }
 
     std::int64_t collect_interval_garbage() {
+        if (
+            metadata_dialect() == "sqlite"
+            && dialect() == "sqlite"
+            && !in_transaction()
+        ) {
+            return collect_interval_garbage_sqlite_batched();
+        }
         const bool started_metadata_tx = !driver_->in_transaction();
         const bool started_data_tx = data_driver_ != nullptr && !data_driver_->in_transaction();
         if (started_metadata_tx) {
@@ -1957,6 +1974,19 @@
 // Source: interval_branch_store_direct_merge.cpp
 // -----------------------------------------------------------------------------
     std::int64_t merge_apply(const std::string &source, const std::string &target) {
+        return merge_apply_excluding_first_key_values(source, target, "", {});
+    }
+
+    std::int64_t merge_apply_excluding_first_key_values(
+        const std::string &source,
+        const std::string &target,
+        const std::string &excluded_table,
+        const std::vector<std::int64_t> &excluded_values
+    ) {
+        const std::unordered_set<std::int64_t> excluded_first_keys(
+            excluded_values.begin(),
+            excluded_values.end()
+        );
         const bool started_tx = !driver_->in_transaction();
         if (started_tx) driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
         bool metadata_tx_open = started_tx;
@@ -2008,10 +2038,26 @@
                     merge_plan.target_writer_segments.begin(),
                     merge_plan.target_writer_segments.end()
                 );
-                const std::vector<NativeRowKey> keys = candidate_keys_for_writer_segments(
+                std::vector<NativeRowKey> keys = candidate_keys_for_writer_segments(
                     meta,
                     candidate_writer_segments
                 );
+                if (meta.logical_name == excluded_table && !excluded_first_keys.empty()) {
+                    keys.erase(
+                        std::remove_if(
+                            keys.begin(),
+                            keys.end(),
+                            [&excluded_first_keys](const NativeRowKey &key) {
+                                if (key.values.empty()) return false;
+                                const auto *value =
+                                    std::get_if<std::int64_t>(&key.values.front());
+                                return value != nullptr &&
+                                    excluded_first_keys.find(*value) !=
+                                        excluded_first_keys.end();
+                            }),
+                        keys.end()
+                    );
+                }
                 if (keys.empty()) continue;
 
                 // Only keys touched by either side since the fork base can
@@ -2245,6 +2291,71 @@
                 params
             );
         }
+    }
+
+    std::int64_t collect_interval_garbage_sqlite_batched() {
+        const std::vector<std::int64_t> dead_segment_ids =
+            interval_dead_segment_ids();
+        if (dead_segment_ids.empty()) return 0;
+
+        constexpr std::size_t segment_batch_size = 500;
+        constexpr std::int64_t row_batch_size = 256;
+        for (const auto &physical : interval_physical_tables_for_gc()) {
+            for (
+                std::size_t start = 0;
+                start < dead_segment_ids.size();
+                start += segment_batch_size
+            ) {
+                const std::size_t count = std::min<std::size_t>(
+                    segment_batch_size,
+                    dead_segment_ids.size() - start
+                );
+                std::vector<Value> params;
+                params.reserve(count);
+                for (std::size_t offset = 0; offset < count; ++offset) {
+                    params.push_back(dead_segment_ids[start + offset]);
+                }
+                const std::string sql =
+                    "DELETE FROM " + quote_ident(physical) +
+                    " WHERE rowid IN ("
+                    "SELECT rowid FROM " + quote_ident(physical) +
+                    " WHERE writer_segment_id IN (" + placeholders(count) + ")"
+                    " LIMIT " + std::to_string(row_batch_size) +
+                    ")";
+                while (true) {
+                    driver().execute("BEGIN IMMEDIATE");
+                    std::int64_t deleted = 0;
+                    try {
+                        deleted = driver().execute_changes(sql, params);
+                        driver().execute("COMMIT");
+                    } catch (...) {
+                        try {
+                            driver().execute("ROLLBACK");
+                        } catch (...) {
+                        }
+                        throw;
+                    }
+                    if (deleted == 0) break;
+                    // Release the SQLite writer lock between small batches so
+                    // foreground branch operations can make progress while
+                    // physical reclamation continues in the background.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+        }
+
+        driver_->execute("BEGIN IMMEDIATE");
+        try {
+            delete_dead_interval_segments(dead_segment_ids);
+            driver_->execute("COMMIT");
+        } catch (...) {
+            try {
+                driver_->execute("ROLLBACK");
+            } catch (...) {
+            }
+            throw;
+        }
+        return static_cast<std::int64_t>(dead_segment_ids.size());
     }
 
     void delete_dead_interval_segments(const std::vector<std::int64_t> &segment_ids) {

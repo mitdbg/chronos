@@ -767,6 +767,20 @@ std::int64_t NativeBranchStore::merge_apply(const std::string &source, const std
     return impl_->merge_apply(source, target);
 }
 
+std::int64_t NativeBranchStore::merge_apply_excluding_first_key_values(
+    const std::string &source,
+    const std::string &target,
+    const std::string &table,
+    const std::vector<std::int64_t> &excluded_values
+) {
+    return impl_->merge_apply_excluding_first_key_values(
+        source,
+        target,
+        table,
+        excluded_values
+    );
+}
+
 void NativeBranchStore::lock_branches_for_merge(const std::string &source, const std::string &target) {
     impl_->lock_branches_for_merge(source, target);
 }
@@ -1205,7 +1219,7 @@ void bind_interval_data_plane(py::module_ &m) {
             py::arg("from_branch"),
             py::arg("terminal") = false,
             py::arg("metadata_json") = "{}",
-            py::arg("continuation_percent") = 5,
+            py::arg("continuation_percent") = 95,
             py::arg("child_width") = 0,
             py::arg("allocation_strategy") = "adaptive",
             py::call_guard<py::gil_scoped_release>()
@@ -1280,7 +1294,7 @@ void bind_interval_data_plane(py::module_ &m) {
             py::arg("checkpoint"),
             py::arg("branch"),
             py::arg("metadata_json") = "{}",
-            py::arg("continuation_percent") = 5
+            py::arg("continuation_percent") = 95
         )
         .def(
             "get_checkpoint_info",

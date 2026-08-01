@@ -1231,6 +1231,25 @@ std::optional<std::int64_t> native_sqlite_cache_size_kib_from_env() {
     return cache_size;
 }
 
+std::int64_t native_sqlite_mmap_size_bytes_from_env() {
+    constexpr std::int64_t kDefaultMmapSize = 256LL * 1024 * 1024;
+    const char *raw = std::getenv("CHRONOS_NATIVE_SQLITE_MMAP_SIZE_BYTES");
+    if (!raw || !*raw) return kDefaultMmapSize;
+    std::string value(raw);
+    std::int64_t mmap_size = 0;
+    try {
+        mmap_size = std::stoll(value);
+    } catch (const std::exception &) {
+        throw std::invalid_argument(
+            "invalid CHRONOS_NATIVE_SQLITE_MMAP_SIZE_BYTES: " + value);
+    }
+    if (mmap_size < 0) {
+        throw std::invalid_argument(
+            "CHRONOS_NATIVE_SQLITE_MMAP_SIZE_BYTES must be non-negative");
+    }
+    return mmap_size;
+}
+
 std::optional<std::int64_t> native_sqlite_wal_autocheckpoint_pages_from_env() {
     const char *raw = std::getenv("CHRONOS_NATIVE_SQLITE_WAL_AUTOCHECKPOINT_PAGES");
     if (!raw || !*raw) return std::nullopt;
@@ -1483,17 +1502,6 @@ std::string cpp_int_to_decimal(const cpp_int &value) {
     return value.convert_to<std::string>();
 }
 
-cpp_int cpp_int_isqrt(const cpp_int &value) {
-    if (value <= 0) return 0;
-    cpp_int x = value;
-    cpp_int y = (x + 1) / 2;
-    while (y < x) {
-        x = y;
-        y = (x + value / x) / 2;
-    }
-    return x;
-}
-
 Value pg_branch_value(PGresult *result, int row, int column) {
     if (PQgetisnull(result, row, column)) return std::monostate{};
     const Oid oid = PQftype(result, column);
@@ -1740,6 +1748,21 @@ BulkUpsertResult sqlite_adapter_bulk_upsert(
         return sql;
     };
 
+    auto private_exact_delete_sql = [&] {
+        std::string sql = "DELETE FROM " + quoted_table + " WHERE ";
+        for (std::size_t i = 0; i < pk_columns.size(); ++i) {
+            if (i) {
+                sql += " AND ";
+            }
+            sql += quote_ident(pk_columns[i]) + " = ?";
+        }
+        sql += " AND \"writer_segment_id\" = ?"
+            " AND \"live_lo\" = ?"
+            " AND \"live_hi\" = ?"
+            " AND \"deleted\" = FALSE";
+        return sql;
+    };
+
     try {
         if (manage_transaction) {
             // Standalone calls own the SQLite transaction.  Calls from
@@ -1774,8 +1797,14 @@ BulkUpsertResult sqlite_adapter_bulk_upsert(
             private_exact_key_upsert_allowed &&
             write_mode == IntervalWriteMode::Upsert &&
             !replacement_deleted;
+        const bool can_private_exact_delete =
+            private_exact_key_upsert_allowed &&
+            write_mode == IntervalWriteMode::Upsert &&
+            replacement_deleted;
         const std::string private_update_sql =
             can_private_exact_update ? private_exact_update_sql() : std::string();
+        const std::string private_delete_sql =
+            can_private_exact_delete ? private_exact_delete_sql() : std::string();
         auto try_private_exact_update = [&](const std::vector<Value> &row) {
             if (!can_private_exact_update) return false;
             std::unique_ptr<SqliteStatement> local_stmt;
@@ -1795,6 +1824,23 @@ BulkUpsertResult sqlite_adapter_bulk_upsert(
             stmt.bind_int64(bind_index++, live_hi);
             stmt.step_done();
             return sqlite3_changes(db) == 1;
+        };
+        auto try_private_exact_delete = [&](const std::vector<Value> &row) {
+            if (!can_private_exact_delete) return false;
+            std::unique_ptr<SqliteStatement> local_stmt;
+            SqliteStatement &stmt = statement_for_sql(private_delete_sql, local_stmt);
+            stmt.reset();
+            int bind_index = 1;
+            for (std::size_t index : pk_indices) {
+                stmt.bind(bind_index++, row[index]);
+            }
+            stmt.bind_int64(bind_index++, writer_segment_id);
+            stmt.bind_int64(bind_index++, live_lo);
+            stmt.bind_int64(bind_index++, live_hi);
+            stmt.step_done();
+            if (sqlite3_changes(db) != 1) return false;
+            ++stats.deleted_rows;
+            return true;
         };
 
         auto flush_live_hi_updates = [&] {
@@ -1968,6 +2014,16 @@ BulkUpsertResult sqlite_adapter_bulk_upsert(
             chunk.reserve(chunk_count);
             for (std::size_t offset = 0; offset < chunk_count; ++offset) {
                 const auto &row = (*splice_rows)[chunk_start + offset];
+                // A row created or replaced in a leaf branch occupies exactly
+                // that branch's writable interval. Removing it physically is
+                // equivalent to installing a tombstone: inherited fragments
+                // were already carved around the interval by the first write.
+                // Avoiding a branch-local tombstone also keeps create-then-
+                // delete build artifacts out of later diff and merge scans.
+                if (try_private_exact_delete(row)) {
+                    ++result.logical_rows_written;
+                    continue;
+                }
                 if (try_private_exact_update(row)) {
                     ++result.logical_rows_written;
                     continue;
@@ -2705,6 +2761,9 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
             execute("PRAGMA fullfsync=OFF");
             execute("PRAGMA checkpoint_fullfsync=OFF");
         }
+        execute(
+            "PRAGMA mmap_size=" +
+            std::to_string(native_sqlite_mmap_size_bytes_from_env()));
         if (auto cache_size = native_sqlite_cache_size_kib_from_env()) {
             // Negative cache_size values are KiB units in SQLite.  The benchmark
             // uses this to cap SQLite's page cache while direct I/O bypasses the
@@ -2721,6 +2780,9 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
             native_sqlite_wal_autocheckpoint_pages_from_env().value_or(
                 kDefaultNativeSqliteWalAutocheckpointPages);
         execute("PRAGMA wal_autocheckpoint=" + std::to_string(wal_autocheckpoint_pages));
+        execute(
+            "PRAGMA mmap_size=" +
+            std::to_string(native_sqlite_mmap_size_bytes_from_env()));
     }
     ~NativeSQLiteDriver() override {
         for (auto &[_, stmt] : statements_) sqlite3_finalize(stmt);
