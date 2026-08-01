@@ -18,6 +18,18 @@ class NativeBranchStoreImpl;
 class NativeSqlConnectionImpl;
 class NativeSqlConnection;
 
+struct NativeBranchTransaction {
+    std::int64_t merge_segment_id;
+    std::int64_t continuation_segment_id;
+    std::int64_t old_target_segment_id;
+    std::string merge_live_lo;
+    std::string merge_live_hi;
+    std::string merge_branch_point;
+    std::string continuation_live_lo;
+    std::string continuation_live_hi;
+    std::string continuation_branch_point;
+};
+
 class NativeBranchSession {
   public:
     // A checked-out branch view.  The session is bound to one branch segment
@@ -162,6 +174,29 @@ class NativeBranchStore {
     NativeMergePreview merge_preview(
         const std::string &source,
         const std::string &target
+    );
+    NativeMergePreview merge_preview_tables(
+        const std::string &source,
+        const std::string &target,
+        const std::vector<std::string> &tables
+    );
+    NativeBranchTransaction reserve_branch_transaction(
+        const std::string &source,
+        const std::string &target,
+        const std::string &participant_stores,
+        const std::string &metadata_json = "{}"
+    );
+    std::int64_t stage_branch_transaction_changes(
+        const NativeBranchTransaction &transaction,
+        const std::vector<NativeMergeChange> &changes
+    );
+    void publish_branch_transaction(
+        const std::string &target,
+        const NativeBranchTransaction &transaction
+    );
+    void abort_branch_transaction(
+        const std::string &target,
+        const NativeBranchTransaction &transaction
     );
     std::int64_t apply_merge_changes(
         const std::string &source,

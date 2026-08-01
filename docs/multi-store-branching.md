@@ -452,29 +452,20 @@ Multi-store branch operations use a branch transaction commit protocol. The
 guiding rule is: write new store state first, then commit one transactional
 branch reference.
 
-The current implementation represents that reference as a workspace manifest:
-each logical branch maps every participant name to a private physical store
-branch. `merge_atomic_preview()` returns a token and globally unique raw change
-IDs. `merge_atomic()` creates successor branches only for participants with
-selected changes, applies those changes with the existing store APIs, and
-publishes the complete successor manifest with one generation-checked metadata
-row update. A checkout resolves the manifest once, so it observes either the
-old participant set or the new participant set, never a mixture. Unpublished
-successors are deleted during abort or restart recovery.
+All participants use the same branch row, segment allocator, and interval
+lineage from the transactional metadata plane. `merge_atomic_preview()` returns
+the source and target `current_segment_id` values plus globally unique raw
+change IDs. `merge_atomic()` reserves one native merge segment and one
+continuation segment, writes selected changes from every participant into that
+same merge segment, and publishes with one compare-and-swap of the target
+branch's `current_segment_id`.
 
-The manifest does not have a separate workspace catalog. It is namespaced in
-the existing `metadata` JSON of the logical branch row in
-`_chronos_branch_interval_branches`. Active reservation and writer information,
-plus the bounded idempotency record, use that same metadata value. Atomic merge
-does not create `_chronos_workspace_*` tables; its publication point is the
-transactional update of this existing relational branch row.
-
-Atomic visibility is therefore a property of access through
-`ChronosWorkspaceContext`. Code that bypasses it and opens a private physical
-store branch directly is outside the protocol. Applications must also wrap
-ordinary logical branch mutations in `branch_write()`; a reserved merge waits
-for earlier writers and blocks new source or target writers until publication
-or abort.
+There is no workspace manifest, workspace generation, application writer
+lease, or logical-to-physical branch mapping. The existing
+`_chronos_branch_transaction_commits` row blocks ordinary Chronos writes to the
+source and target while staging is active. If staging fails, the unpublished
+segments and reservation are removed. Changes in stores with no selected rows
+remain inherited through interval ancestry.
 
 Chronos assumes that a polystore workspace has one transactional row store
 owning the branch metadata plane. That store is usually PostgreSQL, but SQLite
@@ -496,15 +487,13 @@ until the metadata store advances the target branch head.
 
 For `create_branch`:
 
-1. Ask each store to create branch-local metadata from the same parent branch.
-2. If every store succeeds, the workspace branch exists.
-3. If one store fails, best-effort cleanup deletes branches created in earlier
-   stores.
+1. Create the branch once in the shared metadata plane.
+2. Every participant immediately resolves the same new segment and branch point.
 
 For `create_checkpoint`:
 
-1. Ask each store to create a checkpoint for the same branch.
-2. Return a grouped checkpoint result keyed by store name.
+1. Create the checkpoint once in the shared metadata plane.
+2. Every participant resolves the same immutable checkpoint segment.
 
 For `merge_apply`:
 

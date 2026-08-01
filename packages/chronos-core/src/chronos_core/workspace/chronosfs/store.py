@@ -169,9 +169,18 @@ class ChronosFSStore:
         self.context = context
         self.block_size = int(block_size)
         self._database_url = _database_url_for_context(context)
-        self._native = _native_interval.NativeChronosFSStore(
-            self._database_url,
-            self.block_size,
+        metadata_url = _database_url_for_adapter(context.metadata_db)
+        self._native = (
+            _native_interval.NativeChronosFSStore(
+                self._database_url,
+                metadata_url,
+                self.block_size,
+            )
+            if metadata_url != self._database_url
+            else _native_interval.NativeChronosFSStore(
+                self._database_url,
+                self.block_size,
+            )
         )
 
     @classmethod
@@ -179,10 +188,22 @@ class ChronosFSStore:
         cls,
         database_url: str,
         *,
+        metadata_url: str | None = None,
         block_size: int = CHRONOSFS_BLOCK_SIZE,
         backend: str = "interval",
     ) -> "ChronosFSStore":
-        ctx = ChronosBranchContext.connect(database_url, backend=backend)  # type: ignore[arg-type]
+        ctx = (
+            ChronosBranchContext.connect_split(
+                database_url,
+                metadata_url,
+                backend=backend,  # type: ignore[arg-type]
+            )
+            if metadata_url is not None
+            else ChronosBranchContext.connect(
+                database_url,
+                backend=backend,  # type: ignore[arg-type]
+            )
+        )
         return cls(ctx, block_size=block_size)
 
     def ensure(self) -> None:
@@ -192,8 +213,7 @@ class ChronosFSStore:
             refresh()
         index_name = "chronosfs_dirents_by_inode"
         if index_name not in {
-            index.name
-            for index in self.context.list_indexes("chronosfs_dirents")
+            index.name for index in self.context.list_indexes("chronosfs_dirents")
         }:
             self.context.create_index(
                 "chronosfs_dirents",
@@ -216,7 +236,9 @@ class ChronosFSStore:
     ) -> None:
         self._flush_mount_writes()
         if metadata:
-            self.context.create_branch(branch_id, from_branch=from_branch, metadata=metadata)
+            self.context.create_branch(
+                branch_id, from_branch=from_branch, metadata=metadata
+            )
         else:
             self._native.create_branch(branch_id, from_branch)
             self._refresh_context_backend()
@@ -246,7 +268,9 @@ class ChronosFSStore:
         branch: str = "main",
         metadata: dict[str, Any] | None = None,
     ) -> Any:
-        result = self.context.create_checkpoint(checkpoint, branch=branch, metadata=metadata)
+        result = self.context.create_checkpoint(
+            checkpoint, branch=branch, metadata=metadata
+        )
         self._clear_cache(branch)
         return result
 
@@ -280,7 +304,9 @@ class ChronosFSStore:
         self._native.wait_for_gc()
 
     def _refresh_context_backend(self) -> None:
-        invalidate = getattr(self.context._backend, "_invalidate_native_branch_sessions", None)
+        invalidate = getattr(
+            self.context._backend, "_invalidate_native_branch_sessions", None
+        )
         if callable(invalidate):
             invalidate()
 
@@ -290,9 +316,13 @@ class ChronosFSStore:
     def stat_inode(self, branch_id: str, inode_id: int) -> ChronosFSStat:
         return _stat_from_native(self._native.stat_inode(branch_id, int(inode_id)))
 
-    def lookup_child(self, branch_id: str, parent_inode_id: int, name: str) -> ChronosFSStat:
+    def lookup_child(
+        self, branch_id: str, parent_inode_id: int, name: str
+    ) -> ChronosFSStat:
         return _stat_from_native(
-            self._native.lookup_child(branch_id, int(parent_inode_id), _check_name(name))
+            self._native.lookup_child(
+                branch_id, int(parent_inode_id), _check_name(name)
+            )
         )
 
     def exists(self, branch_id: str, path: str) -> bool:
@@ -328,9 +358,15 @@ class ChronosFSStore:
             raise ValueError("size must be non-negative")
         if size == 0:
             return b""
-        return bytes(self._native.read_inode_range(branch_id, int(inode_id), int(offset), int(size)))
+        return bytes(
+            self._native.read_inode_range(
+                branch_id, int(inode_id), int(offset), int(size)
+            )
+        )
 
-    def write_inode_at(self, branch_id: str, inode_id: int, offset: int, data: bytes | str) -> None:
+    def write_inode_at(
+        self, branch_id: str, inode_id: int, offset: int, data: bytes | str
+    ) -> None:
         if offset < 0:
             raise ValueError("offset must be non-negative")
         payload = data.encode("utf-8") if isinstance(data, str) else bytes(data)
@@ -379,7 +415,9 @@ class ChronosFSStore:
             )
         )
 
-    def symlink_at(self, branch_id: str, parent_inode_id: int, name: str, target: str) -> int:
+    def symlink_at(
+        self, branch_id: str, parent_inode_id: int, name: str, target: str
+    ) -> int:
         return int(
             self._native.symlink_at(
                 branch_id,
@@ -478,12 +516,16 @@ class ChronosFSStore:
             raise ChronosFSError(f"import source is not a directory: {source_path}")
         self._native.import_tree(branch_id, str(source_path))
 
-    def write_at(self, branch_id: str, path: str, offset: int, data: bytes | str) -> None:
+    def write_at(
+        self, branch_id: str, path: str, offset: int, data: bytes | str
+    ) -> None:
         if offset < 0:
             raise ValueError("offset must be non-negative")
         payload = data.encode("utf-8") if isinstance(data, str) else bytes(data)
         if payload:
-            self._native.write_at(branch_id, _normalize_path(path), int(offset), payload)
+            self._native.write_at(
+                branch_id, _normalize_path(path), int(offset), payload
+            )
 
     def read_file(self, branch_id: str, path: str) -> bytes:
         return bytes(self._native.read_file(branch_id, _normalize_path(path)))
@@ -503,7 +545,9 @@ class ChronosFSStore:
         self._native.rmdir(branch_id, _normalize_path(path))
 
     def rename(self, branch_id: str, old_path: str, new_path: str) -> None:
-        self._native.rename(branch_id, _normalize_path(old_path), _normalize_path(new_path))
+        self._native.rename(
+            branch_id, _normalize_path(old_path), _normalize_path(new_path)
+        )
 
     def symlink(
         self,
@@ -584,7 +628,15 @@ class ChronosFSStore:
         # paths, byte ranges, and text diffs rather than inode ids or block
         # indexes.  We preserve the internal conflict ids so merge_apply can
         # still route choices back to the native interval backend.
-        internal = self.context.merge_preview(source, target)
+        internal = self.context.merge_preview_tables(
+            source,
+            target,
+            [
+                "chronosfs_inodes",
+                "chronosfs_dirents",
+                "chronosfs_file_blocks",
+            ],
+        )
         source_manifest, target_manifest = self._changed_inode_manifests(
             source,
             target,
@@ -603,6 +655,56 @@ class ChronosFSStore:
             ],
         )
         return _preview_with_merge_policy(preview, policy, backend="chronosfs")
+
+    def stage_branch_transaction_changes(
+        self,
+        transaction: Any,
+        source: str,
+        target: str,
+        changes: list[RowDiff],
+    ) -> int:
+        """Write selected filesystem rows into Chronos's shared merge segment."""
+
+        selected_paths = {
+            str(change.key.get("path"))
+            for change in changes
+            if change.key.get("path") is not None
+        }
+        internal = self.context.merge_preview_tables(
+            source,
+            target,
+            [
+                "chronosfs_inodes",
+                "chronosfs_dirents",
+                "chronosfs_file_blocks",
+            ],
+        )
+        source_manifest, target_manifest = self._changed_inode_manifests(
+            source,
+            target,
+            (*internal.changes, *internal.conflicts),
+        )
+        selected_internal: list[RowDiff] = []
+        for change in (*internal.changes, *internal.conflicts):
+            public = self._public_row_diff(
+                change,
+                source_manifest,
+                target_manifest,
+            )
+            path = str(public.key.get("path"))
+            if path in selected_paths or any(
+                selected.startswith(path.rstrip("/") + "/")
+                for selected in selected_paths
+                if path not in {"", "/", "<unknown>", "<unlinked>"}
+            ):
+                selected_internal.append(change)
+        applied = self.context.stage_branch_transaction_changes(
+            transaction,
+            selected_internal,
+        )
+        self._clear_cache(source)
+        self._clear_cache(target)
+        return applied
 
     def _changed_inode_manifests(
         self,
@@ -625,14 +727,10 @@ class ChronosFSStore:
         for inode_id in inode_ids:
             source_path = self._path_for_inode_in_branch(source, inode_id)
             if source_path is not None:
-                source_manifest[source_path.lstrip("/")] = {
-                    "inode_id": inode_id
-                }
+                source_manifest[source_path.lstrip("/")] = {"inode_id": inode_id}
             target_path = self._path_for_inode_in_branch(target, inode_id)
             if target_path is not None:
-                target_manifest[target_path.lstrip("/")] = {
-                    "inode_id": inode_id
-                }
+                target_manifest[target_path.lstrip("/")] = {"inode_id": inode_id}
         return source_manifest, target_manifest
 
     def _path_for_inode_in_branch(
@@ -768,7 +866,11 @@ class ChronosFSStore:
         target_manifest: dict[str, dict[str, Any]],
     ) -> RowDiff:
         inode_id = _optional_int(diff.key.get("inode_id"))
-        path = _path_for_inode(inode_id, source_manifest, target_manifest) if inode_id else "<unknown>"
+        path = (
+            _path_for_inode(inode_id, source_manifest, target_manifest)
+            if inode_id
+            else "<unknown>"
+        )
         return RowDiff(
             table="chronosfs_inode",
             key={"path": path},
@@ -786,7 +888,9 @@ class ChronosFSStore:
     ) -> RowDiff:
         parent_inode_id = _optional_int(diff.key.get("parent_inode_id"))
         name = str(diff.key.get("name", ""))
-        path = _child_path_for_parent(parent_inode_id, name, source_manifest, target_manifest)
+        path = _child_path_for_parent(
+            parent_inode_id, name, source_manifest, target_manifest
+        )
         return RowDiff(
             table="chronosfs_dirent",
             key={"path": path},
@@ -810,7 +914,9 @@ class ChronosFSStore:
                     "target": stat.symlink_target,
                 }
                 if stat.kind == "file":
-                    entry["hash"] = hashlib.sha256(self.read_file(branch_id, "/" + path)).hexdigest()
+                    entry["hash"] = hashlib.sha256(
+                        self.read_file(branch_id, "/" + path)
+                    ).hexdigest()
                 result[path] = entry
             if stat.kind != "directory":
                 return
@@ -830,13 +936,19 @@ class ChronosFSStore:
 
 
 def _database_url_for_context(context: ChronosBranchContext) -> str:
-    database_url = getattr(context.db, "database_url", None)
+    return _database_url_for_adapter(context.db)
+
+
+def _database_url_for_adapter(adapter: Any) -> str:
+    database_url = getattr(adapter, "database_url", None)
     if database_url:
         return str(database_url)
-    database_path = getattr(context.db, "database_path", None)
+    database_path = getattr(adapter, "database_path", None)
     if database_path and str(database_path) != ":memory:":
         return f"sqlite:///{database_path}"
-    raise ChronosFSError("native ChronosFS requires a file-backed SQLite or PostgreSQL database")
+    raise ChronosFSError(
+        "native ChronosFS requires a file-backed SQLite or PostgreSQL database"
+    )
 
 
 def _stat_from_native(row: dict[str, Any]) -> ChronosFSStat:

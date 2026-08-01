@@ -1973,6 +1973,12 @@
 // Fast conflict-free merge apply path
 // Source: interval_branch_store_direct_merge.cpp
 // -----------------------------------------------------------------------------
+    struct NativeBranchCommitReservation {
+        NativeDirectMergeSegment merge_segment;
+        NativeDirectMergeSegment continuation_segment;
+        bool has_commit_record = false;
+    };
+
     std::int64_t merge_apply(const std::string &source, const std::string &target) {
         return merge_apply_excluding_first_key_values(source, target, "", {});
     }
@@ -2199,6 +2205,168 @@
         }
     }
 
+    chronos::native::NativeBranchTransaction reserve_external_branch_transaction(
+        const std::string &source,
+        const std::string &target,
+        const std::string &participant_stores,
+        const std::string &metadata_json
+    ) {
+        const bool started_tx = !driver_->in_transaction();
+        if (started_tx) {
+            driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+        }
+        try {
+            NativeMergePlan merge_plan = load_merge_plan(source, target, true);
+            NativeBranchCommitReservation reservation = reserve_branch_transaction_commit(
+                merge_plan.target,
+                source,
+                target,
+                true,
+                participant_stores,
+                metadata_json
+            );
+            if (started_tx) driver_->execute("COMMIT");
+            return {
+                reservation.merge_segment.segment_id,
+                reservation.continuation_segment.segment_id,
+                reservation.merge_segment.parent_segment_id,
+                reservation.merge_segment.live_lo,
+                reservation.merge_segment.live_hi,
+                reservation.merge_segment.branch_point,
+                reservation.continuation_segment.live_lo,
+                reservation.continuation_segment.live_hi,
+                reservation.continuation_segment.branch_point,
+            };
+        } catch (...) {
+            if (started_tx && driver_->in_transaction()) {
+                try { driver_->execute("ROLLBACK"); } catch (...) {}
+            }
+            throw;
+        }
+    }
+
+    NativeBranchCommitReservation external_reservation(
+        const chronos::native::NativeBranchTransaction &transaction
+    ) {
+        NativeDirectMergeSegment merge_segment{
+            transaction.merge_segment_id,
+            transaction.old_target_segment_id,
+            "merge",
+            transaction.merge_live_lo,
+            transaction.merge_live_hi,
+            transaction.merge_branch_point,
+        };
+        NativeDirectMergeSegment continuation_segment{
+            transaction.continuation_segment_id,
+            transaction.merge_segment_id,
+            "mutable",
+            transaction.continuation_live_lo,
+            transaction.continuation_live_hi,
+            transaction.continuation_branch_point,
+        };
+        return {merge_segment, continuation_segment, true};
+    }
+
+    std::int64_t stage_external_branch_transaction_changes(
+        const chronos::native::NativeBranchTransaction &transaction,
+        const std::vector<chronos::native::NativeMergeChange> &changes
+    ) {
+        if (changes.empty()) return 0;
+        const bool started_tx = !driver().in_transaction();
+        if (started_tx) {
+            driver().execute(dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+        }
+        try {
+            NativeBranchCommitReservation reservation = external_reservation(transaction);
+            NativeBranchSegment merge_segment{
+                reservation.merge_segment.segment_id,
+                reservation.merge_segment.live_lo,
+                reservation.merge_segment.live_hi,
+                reservation.merge_segment.branch_point,
+            };
+            std::unordered_map<std::string, std::vector<chronos::native::NativeMergeChange>> by_table;
+            for (const auto &change : changes) by_table[change.table].push_back(change);
+            std::int64_t applied = 0;
+            for (const auto &[table, table_changes] : by_table) {
+                NativeTableMeta meta = load_table_meta(table, merge_segment);
+                NativeRows upserts;
+                NativeRows deletes;
+                for (const auto &change : table_changes) {
+                    if (change.change == "deleted") {
+                        deletes.push_back(tombstone_values_for_key(meta, change));
+                    } else {
+                        if (!change.has_after) {
+                            throw std::runtime_error("merge change is missing source row");
+                        }
+                        upserts.push_back(values_for_columns(
+                            meta.columns,
+                            change.after_columns,
+                            change.after_values
+                        ));
+                    }
+                }
+                if (!deletes.empty()) {
+                    driver().interval_upsert(
+                        meta.physical_name, meta.columns, meta.pk_columns, deletes,
+                        reservation.merge_segment.live_lo,
+                        reservation.merge_segment.live_hi,
+                        reservation.merge_segment.segment_id,
+                        true, false, IntervalWriteMode::Upsert,
+                        reservation.merge_segment.branch_point
+                    );
+                    applied += static_cast<std::int64_t>(deletes.size());
+                }
+                if (!upserts.empty()) {
+                    driver().interval_upsert(
+                        meta.physical_name, meta.columns, meta.pk_columns, upserts,
+                        reservation.merge_segment.live_lo,
+                        reservation.merge_segment.live_hi,
+                        reservation.merge_segment.segment_id,
+                        false, false, IntervalWriteMode::Upsert,
+                        reservation.merge_segment.branch_point
+                    );
+                    applied += static_cast<std::int64_t>(upserts.size());
+                }
+            }
+            if (started_tx) driver().execute("COMMIT");
+            return applied;
+        } catch (...) {
+            if (started_tx && driver().in_transaction()) {
+                try { driver().execute("ROLLBACK"); } catch (...) {}
+            }
+            throw;
+        }
+    }
+
+    void publish_external_branch_transaction(
+        const std::string &target,
+        const chronos::native::NativeBranchTransaction &transaction
+    ) {
+        const bool started_tx = !driver_->in_transaction();
+        if (started_tx) {
+            driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+        }
+        try {
+            publish_branch_transaction_commit(external_reservation(transaction), target);
+            if (started_tx) driver_->execute("COMMIT");
+        } catch (...) {
+            if (started_tx && driver_->in_transaction()) {
+                try { driver_->execute("ROLLBACK"); } catch (...) {}
+            }
+            throw;
+        }
+    }
+
+    void abort_external_branch_transaction(
+        const std::string &target,
+        const chronos::native::NativeBranchTransaction &transaction
+    ) {
+        cleanup_branch_transaction_commit_reservation(
+            external_reservation(transaction),
+            target
+        );
+    }
+
   private:
 
 // -----------------------------------------------------------------------------
@@ -2250,7 +2418,8 @@
             "WHERE backend = 'interval'"
         );
         for (const auto &row : rows) {
-            tables.insert(native_as_string(row[0]));
+            const std::string physical = native_as_string(row[0]);
+            if (table_exists(physical)) tables.insert(physical);
         }
         if (table_exists("_chronos_branch_table_schema_versions")) {
             auto schema_rows = driver_->query(
@@ -2259,7 +2428,8 @@
                 "WHERE backend = 'interval'"
             );
             for (const auto &row : schema_rows) {
-                tables.insert(native_as_string(row[0]));
+                const std::string physical = native_as_string(row[0]);
+                if (table_exists(physical)) tables.insert(physical);
             }
         }
         std::vector<std::string> out(tables.begin(), tables.end());
@@ -2774,18 +2944,15 @@
         throw std::runtime_error("interval space exhausted");
     }
 
-    struct NativeBranchCommitReservation {
-        NativeDirectMergeSegment merge_segment;
-        NativeDirectMergeSegment continuation_segment;
-        bool has_commit_record = false;
-    };
-
     NativeBranchCommitReservation reserve_branch_transaction_commit(
         const NativeDirectMergeSegment &original_target_segment,
         const std::string &source,
-        const std::string &target
+        const std::string &target,
+        bool force_commit_record = false,
+        const std::string &participant_stores = "",
+        const std::string &metadata_json = "{}"
     ) {
-        const bool use_commit_record = split_store();
+        const bool use_commit_record = force_commit_record || split_store();
         if (use_commit_record) {
             auto active = driver_->query(
                 "SELECT merge_segment_id "
@@ -2801,12 +2968,14 @@
         NativeBranchCommitSegments segments = merge_commit_segments(original_target_segment);
         insert_branch_transaction_segments(segments, original_target_segment.segment_id, target);
         if (use_commit_record) {
-            const std::string participants = "[\"" + dialect() + "\"]";
+            const std::string participants = participant_stores.empty()
+                ? "[\"" + dialect() + "\"]"
+                : participant_stores;
             driver_->execute(
                 "INSERT INTO _chronos_branch_transaction_commits "
                 "(merge_segment_id, continuation_segment_id, target_branch_id, old_target_segment_id, "
                 " source_branch_id, participant_stores, created_at, metadata) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, '{}')",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 {
                     segments.merge_segment.segment_id,
                     segments.continuation_segment.segment_id,
@@ -2815,6 +2984,7 @@
                     source,
                     participants,
                     current_timestamp_string(),
+                    metadata_json,
                 }
             );
         }
@@ -3326,6 +3496,17 @@
         const std::string &source,
         const std::string &target
     ) {
+        return merge_preview_tables(source, target, {});
+    }
+
+    chronos::native::NativeMergePreview merge_preview_tables(
+        const std::string &source,
+        const std::string &target,
+        const std::vector<std::string> &tables
+    ) {
+        const std::unordered_set<std::string> selected_tables(
+            tables.begin(), tables.end()
+        );
         NativeMergePlan merge_plan = load_merge_plan(source, target, false);
         const NativeDirectMergeSegment &source_segment = merge_plan.source;
         const NativeDirectMergeSegment &target_segment = merge_plan.target;
@@ -3352,6 +3533,10 @@
 
         chronos::native::NativeMergePreview preview;
         for (const auto &meta : load_table_metas(target_read)) {
+            if (!selected_tables.empty() &&
+                selected_tables.find(meta.logical_name) == selected_tables.end()) {
+                continue;
+            }
             if (meta.has_schema_binding) {
                 throw std::runtime_error("chronos_native_merge_unsupported: schema-branching merge preview");
             }

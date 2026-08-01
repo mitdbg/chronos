@@ -54,7 +54,9 @@ class ChronosFuseOperations:
         entries = [(".", self.store.stat_inode(self.branch_id, inode_id))]
         entries.append(("..", self.store.stat_inode(self.branch_id, 1)))
         for name in self.store.listdir_inode(self.branch_id, inode_id):
-            entries.append((name, self.store.lookup_child(self.branch_id, inode_id, name)))
+            entries.append(
+                (name, self.store.lookup_child(self.branch_id, inode_id, name))
+            )
         return entries
 
 
@@ -70,13 +72,16 @@ def mount_chronosfs(
 ) -> None:
     """Mount ChronosFS with native libfuse and block until unmounted."""
     if not foreground:
-        raise ChronosFSMountError("native ChronosFS mounts currently run in foreground mode")
-    database_url = _database_url_for_mount(store)
+        raise ChronosFSMountError(
+            "native ChronosFS mounts currently run in foreground mode"
+        )
+    database_url, metadata_url = _database_urls_for_mount(store)
     mount_path = Path(mountpoint)
     mount_options = _with_default_cache_options(options or set())
     if shared_daemon:
         _mount_via_shared_daemon(
             database_url,
+            metadata_url,
             mount_path,
             branch_id=branch_id,
             block_size=store.block_size,
@@ -91,6 +96,7 @@ def mount_chronosfs(
             branch_id,
             store.block_size,
             mount_options,
+            metadata_url,
         )
     except Exception as exc:  # pragma: no cover - host FUSE setup dependent.
         raise ChronosFSMountError(str(exc)) from exc
@@ -113,10 +119,11 @@ def start_chronosfs_mount(
     the same shared local daemon used by ``mount_chronosfs(shared_daemon=True)``,
     so multiple mount points for one backing store share one native backend.
     """
-    database_url = _database_url_for_mount(store)
+    database_url, metadata_url = _database_urls_for_mount(store)
     mount_path = Path(mountpoint)
     _start_shared_chronosfs_mount(
         database_url,
+        metadata_url,
         mount_path,
         branch_id=branch_id,
         block_size=store.block_size,
@@ -135,9 +142,9 @@ def start_chronosfs_daemon(
     Long-lived control planes call this during service startup so daemon
     initialization is never charged to the first branch checkout.
     """
-    database_url = _database_url_for_mount(store)
+    database_url, metadata_url = _database_urls_for_mount(store)
     mount_options = _with_default_cache_options(options or set())
-    key = _daemon_key(database_url, store.block_size)
+    key = _daemon_key(_daemon_identity(database_url, metadata_url), store.block_size)
     runtime = _runtime_dir()
     socket_path = runtime / f"{key}.sock"
     _ensure_shared_daemon(
@@ -145,6 +152,7 @@ def start_chronosfs_daemon(
         lock_path=runtime / f"{key}.lock",
         log_path=runtime / f"{key}.log",
         database_url=database_url,
+        metadata_url=metadata_url,
         block_size=store.block_size,
         options=mount_options,
     )
@@ -162,14 +170,18 @@ def shutdown_chronosfs_daemon(store: ChronosFSStore) -> None:
     self-cleaning after its idle timeout, but run-scoped integrations use this
     explicit hook so a completed job cannot leave a service behind.
     """
-    database_url = _database_url_for_mount(store)
-    _shutdown_shared_chronosfs_daemon(database_url, store.block_size)
+    database_url, metadata_url = _database_urls_for_mount(store)
+    _shutdown_shared_chronosfs_daemon(
+        database_url,
+        metadata_url,
+        store.block_size,
+    )
 
 
 def flush_chronosfs_daemon(store: ChronosFSStore) -> None:
     """Publish pending FUSE metadata before a control-plane branch operation."""
-    database_url = _database_url_for_mount(store)
-    key = _daemon_key(database_url, store.block_size)
+    database_url, metadata_url = _database_urls_for_mount(store)
+    key = _daemon_key(_daemon_identity(database_url, metadata_url), store.block_size)
     socket_path = _runtime_dir() / f"{key}.sock"
     if not socket_path.exists():
         return
@@ -190,8 +202,20 @@ def _database_url_for_mount(store: ChronosFSStore) -> str:
         if database_path:
             database_url = f"sqlite:///{database_path}"
     if not database_url:
-        raise ChronosFSMountError("native ChronosFS FUSE requires a file-backed database URL")
+        raise ChronosFSMountError(
+            "native ChronosFS FUSE requires a file-backed database URL"
+        )
     return str(database_url)
+
+
+def _database_urls_for_mount(store: ChronosFSStore) -> tuple[str, str]:
+    database_url = _database_url_for_mount(store)
+    metadata_url = getattr(store.context.metadata_db, "database_url", None)
+    if not metadata_url:
+        metadata_path = getattr(store.context.metadata_db, "database_path", None)
+        if metadata_path:
+            metadata_url = f"sqlite:///{metadata_path}"
+    return database_url, str(metadata_url or database_url)
 
 
 def _runtime_dir() -> Path:
@@ -199,7 +223,10 @@ def _runtime_dir() -> Path:
     if base:
         root = Path(base)
     else:
-        root = Path("/tmp") / f"chronosfs-{os.getuid() if hasattr(os, 'getuid') else os.getpid()}"
+        root = (
+            Path("/tmp")
+            / f"chronosfs-{os.getuid() if hasattr(os, 'getuid') else os.getpid()}"
+        )
     path = root / "mount-daemons"
     path.mkdir(parents=True, exist_ok=True)
     os.chmod(path, 0o700)
@@ -230,9 +257,19 @@ def _with_default_cache_options(options: set[str]) -> list[str]:
         "negative_timeout": "0",
     }
     for name, value in defaults.items():
-        if not any(option == name or option.startswith(name + "=") for option in merged):
+        if not any(
+            option == name or option.startswith(name + "=") for option in merged
+        ):
             merged.add(f"{name}={value}")
     return sorted(merged)
+
+
+def _daemon_identity(database_url: str, metadata_url: str) -> str:
+    return json.dumps(
+        {"database_url": database_url, "metadata_url": metadata_url},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _daemon_key(database_url: str, block_size: int) -> str:
@@ -247,7 +284,9 @@ def _daemon_key(database_url: str, block_size: int) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
-def _socket_request(socket_path: Path, request: dict[str, object], *, timeout: float = 2.0) -> dict[str, object]:
+def _socket_request(
+    socket_path: Path, request: dict[str, object], *, timeout: float = 2.0
+) -> dict[str, object]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(timeout)
         client.connect(str(socket_path))
@@ -255,7 +294,9 @@ def _socket_request(socket_path: Path, request: dict[str, object], *, timeout: f
         raw = client.recv(65536)
     response = json.loads(raw.decode("utf-8"))
     if not isinstance(response, dict):
-        raise ChronosFSMountError("shared ChronosFS daemon returned an invalid response")
+        raise ChronosFSMountError(
+            "shared ChronosFS daemon returned an invalid response"
+        )
     return response
 
 
@@ -281,14 +322,18 @@ def _wait_for_daemon(socket_path: Path, *, deadline_s: float = 10.0) -> None:
         except Exception as exc:  # pragma: no cover - host scheduling dependent.
             last_error = exc
             time.sleep(_READY_POLL_INTERVAL_S)
-    raise ChronosFSMountError(f"timed out waiting for shared ChronosFS daemon: {last_error}")
+    raise ChronosFSMountError(
+        f"timed out waiting for shared ChronosFS daemon: {last_error}"
+    )
 
 
 def _is_mountpoint(path: Path) -> bool:
     return path.exists() and os.path.ismount(path)
 
 
-def _wait_for_mount(mountpoint: Path, socket_path: Path, *, deadline_s: float = 10.0) -> None:
+def _wait_for_mount(
+    mountpoint: Path, socket_path: Path, *, deadline_s: float = 10.0
+) -> None:
     deadline = time.monotonic() + deadline_s
     while time.monotonic() < deadline:
         if _is_mountpoint(mountpoint):
@@ -312,6 +357,7 @@ def _ensure_shared_daemon(
     lock_path: Path,
     log_path: Path,
     database_url: str,
+    metadata_url: str,
     block_size: int,
     options: list[str],
 ) -> None:
@@ -342,6 +388,8 @@ def _ensure_shared_daemon(
                     str(socket_path),
                     "--database-url",
                     database_url,
+                    "--metadata-url",
+                    metadata_url,
                     "--block-size",
                     str(block_size),
                     "--options-json",
@@ -359,6 +407,7 @@ def _ensure_shared_daemon(
 
 def _start_shared_chronosfs_mount(
     database_url: str,
+    metadata_url: str,
     mountpoint: Path,
     *,
     branch_id: str,
@@ -366,7 +415,7 @@ def _start_shared_chronosfs_mount(
     options: list[str],
 ) -> None:
     mountpoint.mkdir(parents=True, exist_ok=True)
-    key = _daemon_key(database_url, block_size)
+    key = _daemon_key(_daemon_identity(database_url, metadata_url), block_size)
     runtime = _runtime_dir()
     socket_path = runtime / f"{key}.sock"
     lock_path = runtime / f"{key}.lock"
@@ -376,6 +425,7 @@ def _start_shared_chronosfs_mount(
         lock_path=lock_path,
         log_path=log_path,
         database_url=database_url,
+        metadata_url=metadata_url,
         block_size=block_size,
         options=options,
     )
@@ -401,19 +451,26 @@ def _start_shared_chronosfs_mount(
                 lock_path=lock_path,
                 log_path=log_path,
                 database_url=database_url,
+                metadata_url=metadata_url,
                 block_size=block_size,
                 options=options,
             )
     if response is None:  # pragma: no cover - loop always raises or breaks.
         raise ChronosFSMountError(f"shared daemon mount failed: {last_error}")
     if response.get("status") != "ok":
-        raise ChronosFSMountError(str(response.get("error", "shared daemon mount failed")))
+        raise ChronosFSMountError(
+            str(response.get("error", "shared daemon mount failed"))
+        )
     _wait_for_mount(mountpoint, socket_path)
     return None
 
 
-def _shutdown_shared_chronosfs_daemon(database_url: str, block_size: int) -> None:
-    key = _daemon_key(database_url, block_size)
+def _shutdown_shared_chronosfs_daemon(
+    database_url: str,
+    metadata_url: str,
+    block_size: int,
+) -> None:
+    key = _daemon_key(_daemon_identity(database_url, metadata_url), block_size)
     socket_path = _runtime_dir() / f"{key}.sock"
     if not socket_path.exists():
         return
@@ -423,6 +480,7 @@ def _shutdown_shared_chronosfs_daemon(database_url: str, block_size: int) -> Non
 
 def _mount_via_shared_daemon(
     database_url: str,
+    metadata_url: str,
     mountpoint: Path,
     *,
     branch_id: str,
@@ -430,10 +488,11 @@ def _mount_via_shared_daemon(
     options: list[str],
     shutdown_daemon_on_unmount: bool = False,
 ) -> None:
-    key = _daemon_key(database_url, block_size)
+    key = _daemon_key(_daemon_identity(database_url, metadata_url), block_size)
     socket_path = _runtime_dir() / f"{key}.sock"
     _start_shared_chronosfs_mount(
         database_url,
+        metadata_url,
         mountpoint,
         branch_id=branch_id,
         block_size=block_size,
@@ -441,4 +500,4 @@ def _mount_via_shared_daemon(
     )
     _block_until_unmounted(mountpoint, socket_path)
     if shutdown_daemon_on_unmount:
-        _shutdown_shared_chronosfs_daemon(database_url, block_size)
+        _shutdown_shared_chronosfs_daemon(database_url, metadata_url, block_size)

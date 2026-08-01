@@ -226,6 +226,7 @@ class ChronosQdrantStore:
         metadata_url: str,
         *,
         client: Any,
+        context: ChronosBranchContext | None = None,
         collection_prefix: str = "chronos_",
         owns_client: bool = False,
         ensure_metadata: bool = True,
@@ -238,7 +239,8 @@ class ChronosQdrantStore:
         self.collection_prefix = collection_prefix
         self._owns_client = owns_client
         self._lock = threading.RLock()
-        self.context = ChronosBranchContext.connect(
+        self._owns_context = context is None
+        self.context = context or ChronosBranchContext.connect(
             metadata_url,
             backend="interval",
             ensure_metadata=ensure_metadata,
@@ -255,6 +257,7 @@ class ChronosQdrantStore:
         *,
         path: str | Path = ":memory:",
         collection_prefix: str = "chronos_",
+        context: ChronosBranchContext | None = None,
     ) -> ChronosQdrantStore:
         _require_qdrant()
         local_path = str(path)
@@ -266,6 +269,7 @@ class ChronosQdrantStore:
         return cls(
             metadata_url,
             client=client,
+            context=context,
             collection_prefix=collection_prefix,
             owns_client=True,
         )
@@ -280,12 +284,11 @@ class ChronosQdrantStore:
         collection_prefix: str = "chronos_",
         prefer_grpc: bool = False,
         timeout: float | None = None,
+        context: ChronosBranchContext | None = None,
     ) -> ChronosQdrantStore:
         _require_qdrant()
         grpc_port = _positive_int_environment("CHRONOS_QDRANT_GRPC_PORT")
-        use_grpc = prefer_grpc or _boolean_environment(
-            "CHRONOS_QDRANT_PREFER_GRPC"
-        )
+        use_grpc = prefer_grpc or _boolean_environment("CHRONOS_QDRANT_PREFER_GRPC")
         client = QdrantClient(
             url=url,
             api_key=api_key,
@@ -296,6 +299,7 @@ class ChronosQdrantStore:
         return cls(
             metadata_url,
             client=client,
+            context=context,
             collection_prefix=collection_prefix,
             owns_client=True,
         )
@@ -438,26 +442,18 @@ class ChronosQdrantStore:
         max_indexing_threads = _positive_int_environment(
             "CHRONOS_QDRANT_MAX_INDEXING_THREADS"
         )
-        hnsw_m = _nonnegative_int_environment(
-            "CHRONOS_QDRANT_HNSW_M"
-        )
+        hnsw_m = _nonnegative_int_environment("CHRONOS_QDRANT_HNSW_M")
         indexing_threshold = _nonnegative_int_environment(
             "CHRONOS_QDRANT_INDEXING_THRESHOLD_KB"
         )
-        shard_number = _positive_int_environment(
-            "CHRONOS_QDRANT_SHARD_NUMBER"
-        )
+        shard_number = _positive_int_environment("CHRONOS_QDRANT_SHARD_NUMBER")
         hnsw_config = (
             models.HnswConfigDiff(
                 m=hnsw_m,
                 on_disk=True if on_disk else None,
                 max_indexing_threads=max_indexing_threads,
             )
-            if (
-                on_disk
-                or max_indexing_threads is not None
-                or hnsw_m is not None
-            )
+            if (on_disk or max_indexing_threads is not None or hnsw_m is not None)
             else None
         )
         optimizers_config = (
@@ -465,10 +461,7 @@ class ChronosQdrantStore:
                 indexing_threshold=indexing_threshold,
                 max_optimization_threads=max_optimization_threads,
             )
-            if (
-                indexing_threshold is not None
-                or max_optimization_threads is not None
-            )
+            if (indexing_threshold is not None or max_optimization_threads is not None)
             else None
         )
         with self._lock:
@@ -487,10 +480,7 @@ class ChronosQdrantStore:
                         f"{existing.dimensions} dimensions and "
                         f"{existing.distance} distance"
                     )
-                if (
-                    hnsw_config is not None
-                    or optimizers_config is not None
-                ):
+                if hnsw_config is not None or optimizers_config is not None:
                     self.client.update_collection(
                         collection_name=physical_name,
                         hnsw_config=hnsw_config,
@@ -513,9 +503,7 @@ class ChronosQdrantStore:
                     sparse_vectors_config={
                         sparse_name: models.SparseVectorParams(
                             modifier=models.Modifier.IDF,
-                            index=models.SparseIndexParams(
-                                on_disk=bool(on_disk)
-                            ),
+                            index=models.SparseIndexParams(on_disk=bool(on_disk)),
                         )
                         for sparse_name in normalized_sparse_names
                     }
@@ -1063,8 +1051,7 @@ class ChronosQdrantStore:
                 wait=True,
             )
         point_batch_size = (
-            _positive_int_environment("CHRONOS_QDRANT_POINT_BATCH_SIZE")
-            or 256
+            _positive_int_environment("CHRONOS_QDRANT_POINT_BATCH_SIZE") or 256
         )
         batches = [
             desired[start : start + point_batch_size]
@@ -1254,7 +1241,11 @@ class ChronosQdrantStore:
         *,
         policy: MergePolicyInput = None,
     ) -> MergePreview:
-        shadow = self.context.merge_preview(source, target)
+        shadow = self.context.merge_preview_tables(
+            source,
+            target,
+            [_POINTS_TABLE],
+        )
         source_session = self.checkout(source)
         target_session = self.checkout(target)
         source_points, target_points = self._merge_points(
@@ -1290,6 +1281,41 @@ class ChronosQdrantStore:
             backend="qdrant",
         )
 
+    def stage_branch_transaction_changes(
+        self,
+        transaction: Any,
+        source: str,
+        target: str,
+        changes: list[RowDiff],
+    ) -> int:
+        """Stage selected shadow rows and their Qdrant interval payloads."""
+
+        selected = {(change.table, str(change.key["id"])) for change in changes}
+        shadow = self.context.merge_preview_tables(
+            source,
+            target,
+            [_POINTS_TABLE],
+        )
+        selected_shadow: list[RowDiff] = []
+        keys: dict[str, set[str]] = {}
+        for change in (*shadow.changes, *shadow.conflicts):
+            row = change.after or change.before
+            if row is None:
+                continue
+            collection = str(row["collection_name"])
+            point_id = str(row["point_id"])
+            if (collection, point_id) not in selected:
+                continue
+            selected_shadow.append(change)
+            keys.setdefault(collection, set()).add(point_id)
+        applied = self.context.stage_branch_transaction_changes(
+            transaction,
+            selected_shadow,
+        )
+        for collection, point_ids in keys.items():
+            self._reconcile_keys(collection, sorted(point_ids))
+        return applied
+
     @staticmethod
     def _merge_points(
         changes: Sequence[RowDiff],
@@ -1303,9 +1329,7 @@ class ChronosQdrantStore:
         for change in changes:
             row = change.after or change.before
             if row is None:
-                raise QdrantStoreError(
-                    "Qdrant merge change is missing its logical key"
-                )
+                raise QdrantStoreError("Qdrant merge change is missing its logical key")
             point_ids.setdefault(str(row["collection_name"]), set()).add(
                 str(row["point_id"])
             )
@@ -1405,7 +1429,8 @@ class ChronosQdrantStore:
         return MergeResult(source=source, target=target, applied=len(changes))
 
     def close(self) -> None:
-        self.context.close()
+        if self._owns_context:
+            self.context.close()
         if self._owns_client:
             close = getattr(self.client, "close", None)
             if callable(close):
@@ -1755,8 +1780,7 @@ class QdrantBranchSession:
             )
         if sparse_vector_name not in info.sparse_vector_names:
             raise QdrantStoreError(
-                f"collection {collection!r} has no sparse vector "
-                f"{sparse_vector_name!r}"
+                f"collection {collection!r} has no sparse vector {sparse_vector_name!r}"
             )
         if int(limit) <= 0:
             return []
@@ -1796,9 +1820,9 @@ class QdrantBranchSession:
                 )
             )
         if sparse_query is not None:
-            sparse = _coerce_vector(
-                {sparse_vector_name: sparse_query}
-            )[sparse_vector_name]
+            sparse = _coerce_vector({sparse_vector_name: sparse_query})[
+                sparse_vector_name
+            ]
             prefetch.append(
                 models.Prefetch(
                     query=sparse,

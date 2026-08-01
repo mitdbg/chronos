@@ -418,17 +418,19 @@ Each concurrent Codex session uses its own task branch.
 
 All MCP calls carry an explicit `branch_id`; the server never relies on
 process-global checkout state. This keeps concurrent agent sessions isolated.
-The Chronos backend publishes a selected merge with one logical workspace-head
-change: readers see either the complete old three-store manifest or the
-complete new one. Generated reports and scratch files remain private unless
-their filesystem change IDs are explicitly selected.
-The workspace manifest and transient merge state are stored in the existing
-Chronos interval branch metadata inside `knowledge.sqlite`; the application
-does not create a separate workspace metadata database or workspace tables.
+The Chronos backend publishes a selected merge with one native branch-head
+change: readers see either the old shared interval head or the continuation
+head containing the selected changes. Generated reports and scratch files
+remain private unless their filesystem change IDs are explicitly selected.
+`knowledge.sqlite` is the single Chronos metadata plane and relational
+application store. Relational rows, ChronosFS rows, and Qdrant interval payloads
+share its branch head and segment allocation. The application creates no
+workspace manifest, concurrency generation, or separate branch catalog.
 `knowledge_merge` first performs a non-lazy unmount of the source and target
-workspaces because POSIX writes do not pass through the MCP writer lease. If a
-process still holds either mount busy, the merge fails closed; finish the tool
-process and retry instead of publishing from a moving filesystem branch.
+workspaces so external tools cannot race the reviewed filesystem state. Native
+Chronos writes are also rejected while the branch transaction reservation is
+active. If a process still holds either mount busy, the merge fails closed;
+finish the tool process and retry.
 
 ## Evaluation hooks
 

@@ -54,11 +54,6 @@ class NativeBranchStoreImpl {
         if (driver_->dialect() == "duckdb") {
             throw std::invalid_argument("split interval metadata store must be SQLite/PostgreSQL");
         }
-        if (data_driver_->dialect() == "sqlite" && driver_->dialect() == "sqlite") {
-            // This is valid but not useful; callers should use the single-store
-            // constructor when metadata and data share one row-store connection.
-            throw std::invalid_argument("native split interval store requires distinct data and metadata drivers");
-        }
     }
     NativeBranchStoreImpl(const std::string &data_url, sqlite3 *metadata_db)
         : metadata_driver_(std::make_unique<NativeSQLiteDriver>(metadata_db)),

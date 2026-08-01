@@ -41,7 +41,9 @@ class BranchSession:
 
         return self._ref.ref
 
-    def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def query(
+        self, sql: str, params: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
         self._ensure_fresh()
         try:
             rows = self._context._backend.query(self._ref, sql, _ensure_params(params))
@@ -53,10 +55,14 @@ class BranchSession:
             self._context._commit_autocommit()
         return rows
 
-    def explain(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def explain(
+        self, sql: str, params: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
         self._ensure_fresh()
         try:
-            rows = self._context._backend.explain(self._ref, sql, _ensure_params(params))
+            rows = self._context._backend.explain(
+                self._ref, sql, _ensure_params(params)
+            )
         except Exception:
             if self._transaction_depth == 0:
                 self._context._rollback_autocommit()
@@ -68,25 +74,29 @@ class BranchSession:
     def rewrite_query(self, sql: str, params: dict[str, Any] | None = None) -> str:
         self._ensure_fresh()
         try:
-            return self._context._backend.rewrite_query(self._ref, sql, _ensure_params(params))
+            return self._context._backend.rewrite_query(
+                self._ref, sql, _ensure_params(params)
+            )
         except Exception:
             if self._transaction_depth == 0:
                 self._context._rollback_autocommit()
             raise
 
-    def execute(
-        self, sql: str, params: dict[str, Any] | None = None
-    ) -> ExecuteResult:
+    def execute(self, sql: str, params: dict[str, Any] | None = None) -> ExecuteResult:
         self._ensure_fresh()
         if self._transaction_depth == 0 and self._context._db.in_transaction:
             self._context._db.commit()
             self._context._backend.after_commit()
         if self._transaction_depth == 0 and not self._context._autocommit:
             self._context._db.begin()
-        retry_limit = _INTERVAL_UNIQUE_RETRY_LIMIT if self._transaction_depth == 0 else 1
+        retry_limit = (
+            _INTERVAL_UNIQUE_RETRY_LIMIT if self._transaction_depth == 0 else 1
+        )
         for attempt in range(retry_limit):
             try:
-                result = self._context._backend.execute(self._ref, sql, _ensure_params(params))
+                result = self._context._backend.execute(
+                    self._ref, sql, _ensure_params(params)
+                )
                 # Some backends mutate the branch head on write. Refresh the prepared
                 # metadata so later reads in the same session see their own writes.
                 self._ref = self._context._backend.refresh_ref_after_execute(self._ref)
@@ -94,7 +104,10 @@ class BranchSession:
             except Exception as exc:
                 if self._transaction_depth == 0:
                     self._context._rollback_autocommit()
-                    if attempt + 1 < retry_limit and _is_retryable_interval_unique_violation(exc):
+                    if (
+                        attempt + 1 < retry_limit
+                        and _is_retryable_interval_unique_violation(exc)
+                    ):
                         self._ensure_fresh()
                         continue
                 raise
@@ -108,8 +121,11 @@ class BranchSession:
         """Group several session writes in one underlying SQL transaction."""
 
         root = self._transaction_depth == 0
+        shared_root = root and self._context._shared_transaction_depth == 0
         use_adapter_transaction = True
-        if root:
+        if root and not shared_root:
+            self._ensure_fresh()
+        if shared_root:
             self._ensure_fresh()
             if self._context._db.in_transaction:
                 self._context._db.commit()
@@ -124,12 +140,18 @@ class BranchSession:
             self._context._backend.prepare_transaction(self._ref)
             if use_adapter_transaction:
                 self._context._db.begin()
+            self._context._shared_transaction_failed = False
+        if root:
+            self._context._shared_transaction_depth += 1
         self._transaction_depth += 1
         try:
             yield
         except Exception:
             self._transaction_depth -= 1
             if root:
+                self._context._shared_transaction_depth -= 1
+                self._context._shared_transaction_failed = True
+            if shared_root:
                 rollback = getattr(self._context._backend, "rollback_transaction", None)
                 if callable(rollback):
                     rollback(self._ref)
@@ -140,7 +162,11 @@ class BranchSession:
         else:
             self._transaction_depth -= 1
             if root:
+                self._context._shared_transaction_depth -= 1
+            if shared_root:
                 try:
+                    if self._context._shared_transaction_failed:
+                        raise BranchingError("nested branch transaction failed")
                     commit = getattr(self._context._backend, "commit_transaction", None)
                     if callable(commit):
                         self._ref = commit(self._ref)
@@ -149,7 +175,9 @@ class BranchSession:
                         self._context._db.commit()
                     self._context._backend.after_commit()
                 except Exception:
-                    rollback = getattr(self._context._backend, "rollback_transaction", None)
+                    rollback = getattr(
+                        self._context._backend, "rollback_transaction", None
+                    )
                     if callable(rollback):
                         rollback(self._ref)
                     if use_adapter_transaction:
@@ -227,6 +255,9 @@ class ChronosBranchContext:
         # Incremented whenever branch/table metadata changes. Checked-out
         # sessions compare against this to invalidate prepared metadata.
         self._metadata_epoch = 0
+        self._merge_table_scope: tuple[str, ...] | None = None
+        self._shared_transaction_depth = 0
+        self._shared_transaction_failed = False
 
     @classmethod
     def connect(
@@ -282,10 +313,16 @@ class ChronosBranchContext:
             )
         if metadata_db is not None:
             if backend != "interval":
-                raise ValueError("split metadata/data stores are supported only by the interval backend")
+                raise ValueError(
+                    "split metadata/data stores are supported only by the interval backend"
+                )
             if enable_schema_branching:
-                raise ValueError("schema branching is not supported for split metadata/data interval stores")
-            from chronos_core.branching.sql_adapters import RoutedIntervalDatabaseAdapter
+                raise ValueError(
+                    "schema branching is not supported for split metadata/data interval stores"
+                )
+            from chronos_core.branching.sql_adapters import (
+                RoutedIntervalDatabaseAdapter,
+            )
 
             db = RoutedIntervalDatabaseAdapter(db, metadata_db)
 
@@ -301,7 +338,9 @@ class ChronosBranchContext:
                     create_writer_segment_index=interval_create_writer_segment_index,
                 )
             if enable_schema_branching and backend not in {"copy", "orpheus"}:
-                raise ValueError("schema branching is currently supported only by the interval, copy, and orpheus backends")
+                raise ValueError(
+                    "schema branching is currently supported only by the interval, copy, and orpheus backends"
+                )
             if backend == "log":
                 return _LogBackend(db)
             if backend == "copy":
@@ -345,7 +384,9 @@ class ChronosBranchContext:
         data_db = connect_sql_database(data_url)
         metadata_db = connect_sql_database(metadata_url)
         if metadata_db.dialect not in {"postgres", "sqlite"}:
-            raise ValueError("split interval metadata store must be PostgreSQL or SQLite")
+            raise ValueError(
+                "split interval metadata store must be PostgreSQL or SQLite"
+            )
         return cls.from_database_adapter(
             data_db,
             backend=backend,
@@ -591,7 +632,12 @@ class ChronosBranchContext:
     def merge_preview(
         self, source: str, target: str, *, policy: MergePolicyInput = None
     ) -> MergePreview:
-        backend_preview = self._backend.merge_preview(source, target)
+        preview_tables = getattr(self._backend, "merge_preview_tables", None)
+        backend_preview = (
+            preview_tables(source, target, list(self._merge_table_scope))
+            if self._merge_table_scope is not None and callable(preview_tables)
+            else self._backend.merge_preview(source, target)
+        )
         if backend_preview is not None:
             return _preview_with_merge_policy(
                 backend_preview, policy, backend=self._backend.name
@@ -602,6 +648,11 @@ class ChronosBranchContext:
             policy,
             backend=self._backend.name,
         )
+
+    def set_merge_table_scope(self, tables: list[str]) -> None:
+        """Limit this context's merge surface within a shared metadata plane."""
+
+        self._merge_table_scope = tuple(dict.fromkeys(str(table) for table in tables))
 
     def merge_apply(
         self,
@@ -651,6 +702,73 @@ class ChronosBranchContext:
         self._metadata_epoch += 1
         return MergeResult(source=source, target=target, applied=applied)
 
+    def merge_preview_tables(
+        self,
+        source: str,
+        target: str,
+        tables: list[str],
+        *,
+        policy: MergePolicyInput = None,
+    ) -> MergePreview:
+        preview_tables = getattr(self._backend, "merge_preview_tables", None)
+        if not callable(preview_tables):
+            raise UnsupportedSQLError(
+                "table-scoped merge preview requires the interval backend"
+            )
+        preview = preview_tables(source, target, tables)
+        return _preview_with_merge_policy(
+            preview,
+            policy,
+            backend=self._backend.name,
+        )
+
+    def reserve_branch_transaction(
+        self,
+        source: str,
+        target: str,
+        participant_stores: list[str],
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> BranchTransaction:
+        reserve = getattr(self._backend, "reserve_branch_transaction", None)
+        if not callable(reserve):
+            raise UnsupportedSQLError(
+                "branch transactions require the interval backend"
+            )
+        transaction = reserve(source, target, participant_stores, metadata)
+        self._metadata_epoch += 1
+        return transaction
+
+    def stage_branch_transaction_changes(
+        self,
+        transaction: BranchTransaction,
+        changes: list[RowDiff],
+    ) -> int:
+        stage = getattr(self._backend, "stage_branch_transaction_changes", None)
+        if not callable(stage):
+            raise UnsupportedSQLError(
+                "branch transactions require the interval backend"
+            )
+        return int(stage(transaction, changes))
+
+    def publish_branch_transaction(self, transaction: BranchTransaction) -> None:
+        publish = getattr(self._backend, "publish_branch_transaction", None)
+        if not callable(publish):
+            raise UnsupportedSQLError(
+                "branch transactions require the interval backend"
+            )
+        publish(transaction)
+        self._metadata_epoch += 1
+
+    def abort_branch_transaction(self, transaction: BranchTransaction) -> None:
+        abort = getattr(self._backend, "abort_branch_transaction", None)
+        if not callable(abort):
+            raise UnsupportedSQLError(
+                "branch transactions require the interval backend"
+            )
+        abort(transaction)
+        self._metadata_epoch += 1
+
     def _apply_merge_changes(
         self, target_session: BranchSession, changes: list[RowDiff]
     ) -> int:
@@ -687,7 +805,4 @@ class ChronosBranchContext:
             rows = self._backend.visible_rows(branch_id, table)
         except TableNotRegisteredError:
             rows = []
-        return {
-            tuple(row[column] for column in meta.pk_columns): row
-            for row in rows
-        }
+        return {tuple(row[column] for column in meta.pk_columns): row for row in rows}

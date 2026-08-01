@@ -755,6 +755,46 @@ NativeMergePreview NativeBranchStore::merge_preview(
     return impl_->merge_preview(source, target);
 }
 
+NativeMergePreview NativeBranchStore::merge_preview_tables(
+    const std::string &source,
+    const std::string &target,
+    const std::vector<std::string> &tables
+) {
+    return impl_->merge_preview_tables(source, target, tables);
+}
+
+NativeBranchTransaction NativeBranchStore::reserve_branch_transaction(
+    const std::string &source,
+    const std::string &target,
+    const std::string &participant_stores,
+    const std::string &metadata_json
+) {
+    return impl_->reserve_external_branch_transaction(
+        source, target, participant_stores, metadata_json
+    );
+}
+
+std::int64_t NativeBranchStore::stage_branch_transaction_changes(
+    const NativeBranchTransaction &transaction,
+    const std::vector<NativeMergeChange> &changes
+) {
+    return impl_->stage_external_branch_transaction_changes(transaction, changes);
+}
+
+void NativeBranchStore::publish_branch_transaction(
+    const std::string &target,
+    const NativeBranchTransaction &transaction
+) {
+    impl_->publish_external_branch_transaction(target, transaction);
+}
+
+void NativeBranchStore::abort_branch_transaction(
+    const std::string &target,
+    const NativeBranchTransaction &transaction
+) {
+    impl_->abort_external_branch_transaction(target, transaction);
+}
+
 std::int64_t NativeBranchStore::apply_merge_changes(
     const std::string &source,
     const std::string &target,
@@ -1096,6 +1136,17 @@ void bind_interval_data_plane(py::module_ &m) {
 
     auto native_sql_connection_class = py::class_<NativeSqlConnection>(m, "NativeSqlConnection");
 
+    py::class_<NativeBranchTransaction>(m, "NativeBranchTransaction")
+        .def_readonly("merge_segment_id", &NativeBranchTransaction::merge_segment_id)
+        .def_readonly("continuation_segment_id", &NativeBranchTransaction::continuation_segment_id)
+        .def_readonly("old_target_segment_id", &NativeBranchTransaction::old_target_segment_id)
+        .def_readonly("merge_live_lo", &NativeBranchTransaction::merge_live_lo)
+        .def_readonly("merge_live_hi", &NativeBranchTransaction::merge_live_hi)
+        .def_readonly("merge_branch_point", &NativeBranchTransaction::merge_branch_point)
+        .def_readonly("continuation_live_lo", &NativeBranchTransaction::continuation_live_lo)
+        .def_readonly("continuation_live_hi", &NativeBranchTransaction::continuation_live_hi)
+        .def_readonly("continuation_branch_point", &NativeBranchTransaction::continuation_branch_point);
+
     py::class_<NativeBranchStore>(m, "NativeBranchStore")
         .def(py::init<const std::string &>())
         .def(py::init<const std::string &, const std::string &>())
@@ -1369,6 +1420,58 @@ void bind_interval_data_plane(py::module_ &m) {
             },
             py::arg("source"),
             py::arg("target")
+        )
+        .def(
+            "merge_preview_tables",
+            [](NativeBranchStore &store,
+               const std::string &source,
+               const std::string &target,
+               const std::vector<std::string> &tables) {
+                NativeMergePreview preview;
+                {
+                    py::gil_scoped_release release;
+                    preview = store.merge_preview_tables(source, target, tables);
+                }
+                return merge_preview_to_py(preview);
+            },
+            py::arg("source"),
+            py::arg("target"),
+            py::arg("tables")
+        )
+        .def(
+            "reserve_branch_transaction",
+            &NativeBranchStore::reserve_branch_transaction,
+            py::arg("source"),
+            py::arg("target"),
+            py::arg("participant_stores"),
+            py::arg("metadata_json") = "{}",
+            py::call_guard<py::gil_scoped_release>()
+        )
+        .def(
+            "stage_branch_transaction_changes",
+            [](NativeBranchStore &store,
+               const NativeBranchTransaction &transaction,
+               const py::list &changes) {
+                auto native_changes = merge_changes_from_py(changes);
+                py::gil_scoped_release release;
+                return store.stage_branch_transaction_changes(transaction, native_changes);
+            },
+            py::arg("transaction"),
+            py::arg("changes")
+        )
+        .def(
+            "publish_branch_transaction",
+            &NativeBranchStore::publish_branch_transaction,
+            py::arg("target"),
+            py::arg("transaction"),
+            py::call_guard<py::gil_scoped_release>()
+        )
+        .def(
+            "abort_branch_transaction",
+            &NativeBranchStore::abort_branch_transaction,
+            py::arg("target"),
+            py::arg("transaction"),
+            py::call_guard<py::gil_scoped_release>()
         )
         .def(
             "apply_merge_changes",

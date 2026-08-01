@@ -47,32 +47,54 @@ class NativeBranchSessionImpl {
     }
 
     std::int64_t execute(const std::string &sql, const std::vector<Value> &params) {
-        PgProtobufParseResult parsed(sql);
-        PgQuery__Node *stmt = parsed.single_statement();
-        switch (stmt->node_case) {
-        case PG_QUERY__NODE__NODE_CREATE_STMT:
-        case PG_QUERY__NODE__NODE_ALTER_TABLE_STMT:
-        case PG_QUERY__NODE__NODE_DROP_STMT:
-        case PG_QUERY__NODE__NODE_INDEX_STMT:
-            return execute_schema_statement(stmt);
-        default:
-            break;
+        const bool metadata_guard = begin_branch_write_guard();
+        try {
+            PgProtobufParseResult parsed(sql);
+            PgQuery__Node *stmt = parsed.single_statement();
+            std::int64_t result = 0;
+            switch (stmt->node_case) {
+            case PG_QUERY__NODE__NODE_CREATE_STMT:
+            case PG_QUERY__NODE__NODE_ALTER_TABLE_STMT:
+            case PG_QUERY__NODE__NODE_DROP_STMT:
+            case PG_QUERY__NODE__NODE_INDEX_STMT:
+                result = execute_schema_statement(stmt);
+                break;
+            default: {
+                const CachedNativeStatement &statement = cached_statement(sql);
+                switch (statement.kind) {
+                case NativeStatementKind::Insert:
+                    result = execute_insert(statement.insert, params);
+                    break;
+                case NativeStatementKind::Update:
+                    result = execute_update(statement.update, params);
+                    break;
+                case NativeStatementKind::Delete:
+                    result = execute_delete(statement.del, params);
+                    break;
+                default:
+                    throw std::runtime_error("unsupported native branch SQL statement");
+                }
+            }
+            }
+            commit_branch_write_guard(metadata_guard);
+            return result;
+        } catch (...) {
+            rollback_branch_write_guard(metadata_guard);
+            throw;
         }
-        const CachedNativeStatement &statement = cached_statement(sql);
-        switch (statement.kind) {
-        case NativeStatementKind::Insert:
-            return execute_insert(statement.insert, params);
-        case NativeStatementKind::Update:
-            return execute_update(statement.update, params);
-        case NativeStatementKind::Delete:
-            return execute_delete(statement.del, params);
-        }
-        throw std::runtime_error("unsupported native branch SQL statement");
     }
 
     std::int64_t execute_schema(const std::string &sql) {
-        PgProtobufParseResult parsed(sql);
-        return execute_schema_statement(parsed.single_statement());
+        const bool metadata_guard = begin_branch_write_guard();
+        try {
+            PgProtobufParseResult parsed(sql);
+            std::int64_t result = execute_schema_statement(parsed.single_statement());
+            commit_branch_write_guard(metadata_guard);
+            return result;
+        } catch (...) {
+            rollback_branch_write_guard(metadata_guard);
+            throw;
+        }
     }
 
     void upsert_rows(
@@ -83,6 +105,7 @@ class NativeBranchSessionImpl {
         bool deleted
     ) {
         if (rows.empty()) return;
+        const bool metadata_guard = begin_branch_write_guard();
         const bool started_data_tx = !store_.driver().in_transaction();
         if (started_data_tx) store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
         try {
@@ -103,8 +126,10 @@ class NativeBranchSessionImpl {
                 private_exact_key_upsert_allowed
             );
             commit_if_started(started_data_tx);
+            commit_branch_write_guard(metadata_guard);
         } catch (...) {
             rollback_if_started(started_data_tx);
+            rollback_branch_write_guard(metadata_guard);
             throw;
         }
     }
@@ -117,6 +142,7 @@ class NativeBranchSessionImpl {
         bool ignore_conflicts
     ) {
         if (rows.empty()) return 0;
+        const bool metadata_guard = begin_branch_write_guard();
         const bool started_data_tx = !store_.driver().in_transaction();
         if (started_data_tx) store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
         try {
@@ -135,9 +161,11 @@ class NativeBranchSessionImpl {
                 false
             );
             commit_if_started(started_data_tx);
+            commit_branch_write_guard(metadata_guard);
             return result.logical_rows_written;
         } catch (...) {
             rollback_if_started(started_data_tx);
+            rollback_branch_write_guard(metadata_guard);
             throw;
         }
     }
@@ -148,7 +176,12 @@ class NativeBranchSessionImpl {
             branch_private_guard_cache_.reset();
             return;
         }
-        store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+        metadata_guard_owned_ = begin_branch_write_guard();
+        if (!store_.driver().in_transaction()) {
+            store_.driver().execute(
+                store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN"
+            );
+        }
         in_transaction_ = true;
         branch_private_guard_cache_.reset();
     }
@@ -156,6 +189,8 @@ class NativeBranchSessionImpl {
         if (store_.driver().in_transaction()) {
             store_.driver().execute("COMMIT");
         }
+        commit_branch_write_guard(metadata_guard_owned_);
+        metadata_guard_owned_ = false;
         in_transaction_ = false;
         branch_private_guard_cache_.reset();
     }
@@ -164,6 +199,8 @@ class NativeBranchSessionImpl {
             store_.driver().execute("ROLLBACK");
         } catch (...) {
         }
+        rollback_branch_write_guard(metadata_guard_owned_);
+        metadata_guard_owned_ = false;
         in_transaction_ = false;
         branch_private_guard_cache_.reset();
     }
@@ -186,6 +223,54 @@ class NativeBranchSessionImpl {
     }
 
   private:
+    bool begin_branch_write_guard() {
+        const bool started = !store_.metadata_driver().in_transaction();
+        if (started) {
+            store_.metadata_driver().execute(
+                store_.metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN"
+            );
+        }
+        try {
+            std::string lock_sql =
+                "SELECT current_segment_id FROM _chronos_branch_interval_branches "
+                "WHERE branch_id = ?";
+            if (store_.metadata_dialect() == "postgres") lock_sql += " FOR SHARE";
+            auto branch = store_.metadata_driver().query(lock_sql, {branch_id_});
+            if (branch.empty()) {
+                throw std::runtime_error("branch not found: " + branch_id_);
+            }
+            assert_branch_has_no_active_transaction();
+            return started;
+        } catch (...) {
+            rollback_branch_write_guard(started);
+            throw;
+        }
+    }
+
+    void commit_branch_write_guard(bool owned) {
+        if (owned && store_.metadata_driver().in_transaction()) {
+            store_.metadata_driver().execute("COMMIT");
+        }
+    }
+
+    void rollback_branch_write_guard(bool owned) {
+        if (!owned || !store_.metadata_driver().in_transaction()) return;
+        try { store_.metadata_driver().execute("ROLLBACK"); } catch (...) {}
+    }
+
+    void assert_branch_has_no_active_transaction() {
+        auto rows = store_.metadata_driver().query(
+            "SELECT 1 FROM _chronos_branch_transaction_commits "
+            "WHERE target_branch_id = ? OR source_branch_id = ? LIMIT 1",
+            {branch_id_, branch_id_}
+        );
+        if (!rows.empty()) {
+            throw std::runtime_error(
+                "chronos_branch_transaction_in_progress: " + branch_id_
+            );
+        }
+    }
+
     void clear_schema_caches() {
         table_metas_cache_.reset();
         known_table_names_cache_.reset();
@@ -2131,6 +2216,7 @@ class NativeBranchSessionImpl {
     std::string branch_id_;
     NativeBranchSegment segment_;
     bool in_transaction_ = false;
+    bool metadata_guard_owned_ = false;
     std::optional<std::vector<NativeTableMeta>> table_metas_cache_;
     std::optional<std::unordered_set<std::string>> known_table_names_cache_;
     std::optional<bool> branch_private_guard_cache_;

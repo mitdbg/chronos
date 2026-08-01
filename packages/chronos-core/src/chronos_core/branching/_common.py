@@ -53,7 +53,9 @@ def _validate_interval_child_width(value: int | None) -> int | None:
 
 def _validate_interval_allocation_strategy(value: str) -> IntervalAllocationStrategy:
     if value not in {"adaptive", "percentage"}:
-        raise ValueError("interval_allocation_strategy must be 'adaptive' or 'percentage'")
+        raise ValueError(
+            "interval_allocation_strategy must be 'adaptive' or 'percentage'"
+        )
     return value  # type: ignore[return-value]
 
 
@@ -102,6 +104,24 @@ class CheckpointInfo:
     ref: str
     created_at: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BranchTransaction:
+    """An unpublished merge segment and its continuation in Chronos metadata."""
+
+    source: str
+    target: str
+    merge_segment_id: int
+    continuation_segment_id: int
+    old_target_segment_id: int
+    merge_live_lo: str
+    merge_live_hi: str
+    merge_branch_point: str
+    continuation_live_lo: str
+    continuation_live_hi: str
+    continuation_branch_point: str
+    _native: Any = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -169,13 +189,13 @@ class MergeValidationResult:
 class MergeValidator(Protocol):
     def validate(
         self, context: MergeContext, preview: MergePreview
-    ) -> MergeValidationResult:
-        ...
+    ) -> MergeValidationResult: ...
 
 
 class MergeResolver(Protocol):
-    def resolve(self, context: MergeContext, preview: MergePreview) -> MergeResolution:
-        ...
+    def resolve(
+        self, context: MergeContext, preview: MergePreview
+    ) -> MergeResolution: ...
 
 
 MergePolicyMode = Literal[
@@ -317,7 +337,9 @@ def _merge_conflict_id(diff: RowDiff) -> str:
 
 def _with_merge_conflict_ids(preview: MergePreview) -> MergePreview:
     conflicts = [
-        diff if diff.conflict_id else RowDiff(
+        diff
+        if diff.conflict_id
+        else RowDiff(
             diff.table,
             diff.key,
             diff.change,
@@ -428,8 +450,7 @@ def _resolve_merge_changes(
     stale_ids = set(active_resolution.conflict_choices) - set(current_conflicts)
     if stale_ids:
         raise BranchingError(
-            "merge resolution is stale for conflicts: "
-            + ", ".join(sorted(stale_ids))
+            "merge resolution is stale for conflicts: " + ", ".join(sorted(stale_ids))
         )
 
     if normalized.mode == "abort_on_conflict" and preview.conflicts:
@@ -446,7 +467,9 @@ def _resolve_merge_changes(
         assert conflict.conflict_id is not None
         choice = active_resolution.conflict_choices.get(conflict.conflict_id)
         if choice is None:
-            raise BranchingError(f"merge conflict is unresolved: {conflict.conflict_id}")
+            raise BranchingError(
+                f"merge conflict is unresolved: {conflict.conflict_id}"
+            )
         if choice in {"target", "ours", "skip"}:
             continue
         if choice in {"source", "theirs"}:
@@ -495,7 +518,9 @@ def _physical_table_suffix(table: str) -> str:
     return _identifier_token(table)
 
 
-def _table_defs(db: SQLDatabaseAdapter, table: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def _table_defs(
+    db: SQLDatabaseAdapter, table: str
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     columns, defs = db.table_defs(table)
     if not columns:
         raise TableNotRegisteredError(f"table does not exist: {table}")
@@ -547,7 +572,9 @@ def _relation_exists(db: SQLDatabaseAdapter, name: str) -> bool:
     return False
 
 
-def _parse_table_registry(db: SQLDatabaseAdapter, backend: str) -> dict[str, _TableMeta]:
+def _parse_table_registry(
+    db: SQLDatabaseAdapter, backend: str
+) -> dict[str, _TableMeta]:
     if not _relation_exists(db, "_chronos_branch_tables"):
         with _chronos_metadata_lock(db):
             if not _relation_exists(db, "_chronos_branch_tables"):
@@ -595,7 +622,9 @@ def _ensure_index_registry(db: SQLDatabaseAdapter) -> None:
                 )
 
 
-def _parse_index_registry(db: SQLDatabaseAdapter, backend: str) -> dict[str, _IndexMeta]:
+def _parse_index_registry(
+    db: SQLDatabaseAdapter, backend: str
+) -> dict[str, _IndexMeta]:
     _ensure_index_registry(db)
     indexes: dict[str, _IndexMeta] = {}
     for row in db.execute(
@@ -752,7 +781,9 @@ def _rewrite_tree_tables(
             alias = node.args.get("alias")
             replacement = replacements[_table_key(node)]
             replacement_sql = replacement.lstrip().upper()
-            if replacement_sql.startswith("SELECT") or replacement_sql.startswith("WITH"):
+            if replacement_sql.startswith("SELECT") or replacement_sql.startswith(
+                "WITH"
+            ):
                 parsed = sqlglot.parse_one(replacement, read=dialect)
                 return exp.Subquery(this=parsed, alias=alias)
             table = exp.Table(this=exp.to_identifier(replacement, quoted=True))
@@ -798,12 +829,16 @@ def _build_insert_plan(tree: exp.Insert) -> _InsertPlan:
     return _InsertPlan(table, tuple(columns), tuple(value_tuples), ignore_conflicts)
 
 
-def _insert_rows(tree: exp.Insert, params: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+def _insert_rows(
+    tree: exp.Insert, params: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]]]:
     plan = _build_insert_plan(tree)
     return plan.table, _insert_rows_from_plan(plan, params)
 
 
-def _insert_rows_from_plan(plan: _InsertPlan, params: dict[str, Any]) -> list[dict[str, Any]]:
+def _insert_rows_from_plan(
+    plan: _InsertPlan, params: dict[str, Any]
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for tup in plan.value_tuples:
         rows.append(
@@ -833,7 +868,9 @@ def _update_assignments(
     }
 
 
-def _update_assignment_expressions(tree: exp.Update) -> tuple[tuple[str, exp.Expression], ...]:
+def _update_assignment_expressions(
+    tree: exp.Update,
+) -> tuple[tuple[str, exp.Expression], ...]:
     assignments: list[tuple[str, exp.Expression]] = []
     for assignment in tree.expressions:
         if not isinstance(assignment, exp.EQ) or not isinstance(
@@ -859,8 +896,7 @@ def _update_assignments_from_plan(
     row: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
-        column: _expr_value(value, params, row)
-        for column, value in plan.assignments
+        column: _expr_value(value, params, row) for column, value in plan.assignments
     }
 
 
@@ -921,7 +957,9 @@ class _SQLBranchBackend:
     ) -> None:
         raise NotImplementedError
 
-    def update_branch_metadata(self, branch_id: str, metadata: dict[str, Any]) -> BranchInfo:
+    def update_branch_metadata(
+        self, branch_id: str, metadata: dict[str, Any]
+    ) -> BranchInfo:
         raise NotImplementedError
 
     def create_branch_from_checkpoint(self, branch_id: str, checkpoint: str) -> None:
@@ -979,16 +1017,24 @@ class _SQLBranchBackend:
 
         return None
 
-    def query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    def query(
+        self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
-    def explain(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    def explain(
+        self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
-    def rewrite_query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> str:
+    def rewrite_query(
+        self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]
+    ) -> str:
         raise NotImplementedError
 
-    def execute(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> ExecuteResult:
+    def execute(
+        self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]
+    ) -> ExecuteResult:
         raise NotImplementedError
 
     def visible_rows(self, branch_id: str, table: str) -> list[dict[str, Any]]:
@@ -1112,7 +1158,9 @@ class _SQLBranchBackend:
         existing = self.indexes.get(index_name)
         if existing is not None:
             if existing.table != table or existing.columns != tuple(columns):
-                raise BranchingError(f"index already exists with different definition: {index_name}")
+                raise BranchingError(
+                    f"index already exists with different definition: {index_name}"
+                )
             return meta, existing
         return meta, _IndexMeta(
             name=index_name,
@@ -1131,5 +1179,6 @@ class _SQLBranchBackend:
             (self.name, index.name, index.table, json.dumps(index.columns)),
         )
         self.indexes[index.name] = index
+
 
 __all__ = [name for name in globals() if not name.startswith("__")]

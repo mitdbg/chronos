@@ -95,8 +95,7 @@ class MergeDependencyError(ValueError):
         if self.stale_index_paths:
             messages.append(
                 "indexed document files changed without updated catalog and "
-                "embeddings; reindex before merge: "
-                + ", ".join(self.stale_index_paths)
+                "embeddings; reindex before merge: " + ", ".join(self.stale_index_paths)
             )
         super().__init__("; ".join(messages))
 
@@ -134,44 +133,43 @@ class ChronosKnowledgeBackend:
             else self.state_dir / "qdrant"
         )
 
-        self.sqlite = ChronosBranchContext.connect(
+        metadata_url = workspace_metadata_url or (
             f"sqlite:///{self.state_dir / 'knowledge.sqlite'}"
         )
+        self.sqlite = ChronosBranchContext.connect(metadata_url)
         self.filesystem = ChronosFSStore.connect(
-            f"sqlite:///{self.state_dir / 'chronosfs.sqlite'}"
+            f"sqlite:///{self.state_dir / 'chronosfs.sqlite'}",
+            metadata_url=metadata_url,
         )
         self.filesystem.ensure()
         self._ensure_filesystem_indexes()
         if qdrant_url:
             self.qdrant = ChronosQdrantStore.remote(
-                f"sqlite:///{self.state_dir / 'qdrant-metadata.sqlite'}",
+                metadata_url,
                 url=qdrant_url,
                 api_key=qdrant_api_key,
                 collection_prefix=collection_prefix,
                 timeout=600.0,
+                context=self.sqlite,
             )
         else:
             self.qdrant = ChronosQdrantStore.local(
-                f"sqlite:///{self.state_dir / 'qdrant-metadata.sqlite'}",
+                metadata_url,
                 path=self.state_dir / "qdrant",
                 collection_prefix=collection_prefix,
+                context=self.sqlite,
             )
         self.workspace = ChronosWorkspaceContext(
             filesystem=self.filesystem,
             sqlite=self.sqlite,
             qdrant=self.qdrant,
-            atomic_metadata_url=(
-                workspace_metadata_url
-                or f"sqlite:///{self.state_dir / 'knowledge.sqlite'}"
-            ),
-            atomic_workspace_id=namespace,
+            shared_metadata_url=metadata_url,
         )
         self._active_mounts: dict[str, Path] = {}
         self._ensure_search_schema()
         self._ensure_schema()
-        self._implicit_zero_vectors = self._state_flag(
-            "implicit_zero_vectors"
-        )
+        self.sqlite.set_merge_table_scope([_DOCUMENTS_TABLE, _CHUNKS_TABLE])
+        self._implicit_zero_vectors = self._state_flag("implicit_zero_vectors")
         self._bm25 = Bm25Encoder()
         self.qdrant.register_collection(
             _VECTOR_COLLECTION,
@@ -319,10 +317,7 @@ class ChronosKnowledgeBackend:
         db.commit()
         self.sqlite.register_table(_DOCUMENTS_TABLE, ["id"])
         self.sqlite.register_table(_CHUNKS_TABLE, ["id"])
-        index_names = {
-            index.name
-            for index in self.sqlite.list_indexes(_CHUNKS_TABLE)
-        }
+        index_names = {index.name for index in self.sqlite.list_indexes(_CHUNKS_TABLE)}
         if _CHUNKS_BY_DOCUMENT_INDEX not in index_names:
             self.sqlite.create_index(
                 _CHUNKS_TABLE,
@@ -333,9 +328,7 @@ class ChronosKnowledgeBackend:
     def _ensure_filesystem_indexes(self) -> None:
         index_names = {
             index.name
-            for index in self.filesystem.context.list_indexes(
-                "chronosfs_dirents"
-            )
+            for index in self.filesystem.context.list_indexes("chronosfs_dirents")
         }
         if _DIRENTS_BY_INODE_INDEX not in index_names:
             self.filesystem.context.create_index(
@@ -446,9 +439,7 @@ class ChronosKnowledgeBackend:
 
     @staticmethod
     def _snapshot_cursor_key(branch_id: str, snapshot_id: str) -> str:
-        digest = hashlib.sha256(
-            f"{branch_id}\0{snapshot_id}".encode()
-        ).hexdigest()
+        digest = hashlib.sha256(f"{branch_id}\0{snapshot_id}".encode()).hexdigest()
         return f"snapshot_ingestion:{digest}"
 
     def snapshot_ingestion_cursor(
@@ -500,14 +491,10 @@ class ChronosKnowledgeBackend:
     def _validate_document_batch(
         indexed_documents: Sequence[IndexedDocument],
     ) -> tuple[list[str], list[str], list[str]]:
-        document_ids = [
-            indexed.document.id for indexed in indexed_documents
-        ]
+        document_ids = [indexed.document.id for indexed in indexed_documents]
         paths = [indexed.document.path for indexed in indexed_documents]
         chunk_ids = [
-            chunk.id
-            for indexed in indexed_documents
-            for chunk in indexed.chunks
+            chunk.id for indexed in indexed_documents for chunk in indexed.chunks
         ]
         if len(document_ids) != len(set(document_ids)):
             raise ValueError("document batch contains duplicate document ids")
@@ -532,18 +519,10 @@ class ChronosKnowledgeBackend:
         started = time.monotonic()
         self._validate_document_batch(indexed_documents)
         branch = self.workspace.checkout(branch_id)
-        chunks = [
-            chunk
-            for indexed in indexed_documents
-            for chunk in indexed.chunks
-        ]
-        sparse_vectors = self._bm25.documents(
-            [chunk.text for chunk in chunks]
-        )
+        chunks = [chunk for indexed in indexed_documents for chunk in indexed.chunks]
+        sparse_vectors = self._bm25.documents([chunk.text for chunk in chunks])
         after_bm25 = time.monotonic()
-        written_paths = [
-            indexed.document.path for indexed in indexed_documents
-        ]
+        written_paths = [indexed.document.path for indexed in indexed_documents]
         try:
             branch.fs.write_files(
                 [
@@ -592,10 +571,7 @@ class ChronosKnowledgeBackend:
                                     content_hash=chunk.sha256,
                                     metadata=chunk.metadata,
                                 ),
-                                    revision=(
-                                        f"{operation_id}:{chunk.id}:"
-                                        f"{chunk.sha256}"
-                                    ),
+                                revision=(f"{operation_id}:{chunk.id}:{chunk.sha256}"),
                             )
                             for chunk, sparse in zip(
                                 chunks,
@@ -661,9 +637,7 @@ class ChronosKnowledgeBackend:
     ) -> None:
         if not indexed_documents:
             return
-        document_ids, _, _ = self._validate_document_batch(
-            indexed_documents
-        )
+        document_ids, _, _ = self._validate_document_batch(indexed_documents)
 
         branch = self.workspace.checkout(branch_id)
         existing_rows = self._rows_for_ids(
@@ -714,12 +688,8 @@ class ChronosKnowledgeBackend:
                 old_chunks_by_document.get(indexed.document.id, set())
                 - {chunk.id for chunk in indexed.chunks}
             )
-        chunks = [
-            chunk for indexed in indexed_documents for chunk in indexed.chunks
-        ]
-        sparse_vectors = self._bm25.documents(
-            [chunk.text for chunk in chunks]
-        )
+        chunks = [chunk for indexed in indexed_documents for chunk in indexed.chunks]
+        sparse_vectors = self._bm25.documents([chunk.text for chunk in chunks])
         try:
             with branch.transaction():
                 branch.sqlite.upsert_rows(
@@ -764,10 +734,7 @@ class ChronosKnowledgeBackend:
                                     content_hash=chunk.sha256,
                                     metadata=chunk.metadata,
                                 ),
-                                    revision=(
-                                        f"{operation_id}:{chunk.id}:"
-                                        f"{chunk.sha256}"
-                                    ),
+                                revision=(f"{operation_id}:{chunk.id}:{chunk.sha256}"),
                             )
                             for chunk, sparse in zip(
                                 chunks,
@@ -1026,12 +993,9 @@ class ChronosKnowledgeBackend:
         for start in range(0, len(chunk_ids), 300):
             batch = list(chunk_ids[start : start + 300])
             params = {
-                f"chunk_{index}": chunk_id
-                for index, chunk_id in enumerate(batch)
+                f"chunk_{index}": chunk_id for index, chunk_id in enumerate(batch)
             }
-            placeholders = ", ".join(
-                f":chunk_{index}" for index in range(len(batch))
-            )
+            placeholders = ", ".join(f":chunk_{index}" for index in range(len(batch)))
             rows = sqlite_session.query(
                 f"""
                 SELECT c.id AS chunk_id, c.document_id, c.content_hash,
@@ -1237,8 +1201,9 @@ class ChronosKnowledgeBackend:
         policy: Any = None,
         conflict_choices: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
-        # Mounted POSIX writes bypass the Python writer lease. A strict unmount
-        # makes the reviewed source and target quiescent before reservation.
+        # External POSIX processes cannot be paused by the caller. A strict
+        # unmount makes their reviewed filesystem state quiescent before the
+        # native Chronos branch transaction reserves source and target.
         self.unmount_branch(source_branch, force=False)
         self.unmount_branch(target_branch, force=False)
         effective_policy = (
@@ -1386,9 +1351,7 @@ class ChronosKnowledgeBackend:
             if document_id and change_id:
                 bundles.setdefault(document_id, set()).add(change_id)
                 if not filesystem:
-                    non_filesystem_changes.setdefault(document_id, set()).add(
-                        change_id
-                    )
+                    non_filesystem_changes.setdefault(document_id, set()).add(change_id)
 
         sqlite_preview = preview.stores.get("sqlite")
         if sqlite_preview is not None:
@@ -1402,15 +1365,15 @@ class ChronosKnowledgeBackend:
                         if path:
                             paths.setdefault(path, set()).add(document_id)
                 elif change.table == _CHUNKS_TABLE:
-                    document_ids = {
-                        str(row.get("document_id", "")) for row in rows
-                    }
+                    document_ids = {str(row.get("document_id", "")) for row in rows}
                     for document_id in document_ids:
                         add(document_id, change.change_id)
                     for row in rows:
                         point_id = str(row.get("point_id") or row.get("id") or "")
                         if point_id:
-                            point_documents.setdefault(point_id, set()).update(document_ids)
+                            point_documents.setdefault(point_id, set()).update(
+                                document_ids
+                            )
 
         qdrant_preview = preview.stores.get("qdrant")
         if qdrant_preview is not None:
@@ -1626,9 +1589,7 @@ def _directory_bytes(path: Path) -> int:
     if not path.exists():
         return 0
     return sum(
-        item.stat().st_blocks * 512
-        for item in path.rglob("*")
-        if item.is_file()
+        item.stat().st_blocks * 512 for item in path.rglob("*") if item.is_file()
     )
 
 

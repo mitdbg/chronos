@@ -35,6 +35,7 @@ def _load_options(raw: str) -> list[str]:
 
 def _serve_mount(
     database_url: str,
+    metadata_url: str,
     branch_id: str,
     block_size: int,
     options: list[str],
@@ -52,10 +53,13 @@ def _serve_mount(
             branch_id,
             block_size,
             options,
+            metadata_url,
         )
         if rc != 0:
             with state.active_guard:
-                state.last_mount_error = f"native ChronosFS mount exited with status {rc}"
+                state.last_mount_error = (
+                    f"native ChronosFS mount exited with status {rc}"
+                )
     except BaseException as exc:
         with state.active_guard:
             state.last_mount_error = repr(exc)
@@ -80,7 +84,9 @@ class _DaemonState:
         self.active_guard = threading.Lock()
         self.stop_maintenance = threading.Event()
 
-    def should_exit(self, idle_timeout_s: float, stale_unmounted_timeout_s: float) -> bool:
+    def should_exit(
+        self, idle_timeout_s: float, stale_unmounted_timeout_s: float
+    ) -> bool:
         with self.active_guard:
             now = time.monotonic()
             if self.shutdown_requested:
@@ -159,6 +165,7 @@ def _handle_client(
     conn: socket.socket,
     *,
     database_url: str,
+    metadata_url: str,
     default_branch_id: str,
     block_size: int,
     default_options: list[str],
@@ -180,7 +187,11 @@ def _handle_client(
                 conn.sendall(b'{"status":"ok"}\n')
                 return
             if request.get("flush") is True:
-                _native_interval.flush_chronosfs_native(database_url, block_size)
+                _native_interval.flush_chronosfs_native(
+                    database_url,
+                    block_size,
+                    metadata_url,
+                )
                 conn.sendall(b'{"status":"ok"}\n')
                 return
             mountpoint = request["mountpoint"]
@@ -190,9 +201,8 @@ def _handle_client(
             if not isinstance(branch_id, str):
                 raise ValueError("branch_id must be a string")
             options = request.get("options", default_options)
-            if (
-                not isinstance(options, list)
-                or not all(isinstance(item, str) for item in options)
+            if not isinstance(options, list) or not all(
+                isinstance(item, str) for item in options
             ):
                 raise ValueError("options must be a list of strings")
             last_error = ""
@@ -201,7 +211,15 @@ def _handle_client(
                     state.last_mount_error = None
                 thread = threading.Thread(
                     target=_serve_mount,
-                    args=(database_url, branch_id, block_size, options, mountpoint, state),
+                    args=(
+                        database_url,
+                        metadata_url,
+                        branch_id,
+                        block_size,
+                        options,
+                        mountpoint,
+                        state,
+                    ),
                     daemon=True,
                 )
                 thread.start()
@@ -217,13 +235,17 @@ def _handle_client(
                         break
                     time.sleep(MOUNT_READY_POLL_INTERVAL_S)
                 else:
-                    last_error = f"timed out waiting for ChronosFS mount at {mountpoint}"
+                    last_error = (
+                        f"timed out waiting for ChronosFS mount at {mountpoint}"
+                    )
                 if os.path.ismount(mountpoint):
                     break
                 if attempt < MOUNT_START_ATTEMPTS:
                     time.sleep(0.2)
             else:
-                raise RuntimeError(last_error or f"ChronosFS mount failed for {mountpoint}")
+                raise RuntimeError(
+                    last_error or f"ChronosFS mount failed for {mountpoint}"
+                )
             response: dict[str, Any] = {"status": "ok"}
         except Exception as exc:
             response = {"status": "error", "error": str(exc)}
@@ -231,9 +253,12 @@ def _handle_client(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a shared local ChronosFS mount daemon.")
+    parser = argparse.ArgumentParser(
+        description="Run a shared local ChronosFS mount daemon."
+    )
     parser.add_argument("--socket", required=True)
     parser.add_argument("--database-url", required=True)
+    parser.add_argument("--metadata-url", default="")
     parser.add_argument("--branch-id", default="main")
     parser.add_argument("--block-size", type=int, required=True)
     parser.add_argument("--options-json", default="[]")
@@ -278,6 +303,7 @@ def main() -> None:
                 kwargs={
                     "conn": conn,
                     "database_url": args.database_url,
+                    "metadata_url": args.metadata_url or args.database_url,
                     "default_branch_id": args.branch_id,
                     "block_size": args.block_size,
                     "default_options": options,

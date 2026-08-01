@@ -4,11 +4,9 @@ from chronos_core.workspace.atomic import (
     AtomicMergeError,
     AtomicMergePreview,
     AtomicMergeResult,
-    AtomicMergeWriteTimeoutError,
     MergeSelection,
     StaleAtomicMergePreviewError,
     WorkspaceBranchToken,
-    WorkspaceMergeCoordinator,
 )
 from chronos_core.workspace.chronosfs import (
     CHRONOSFS_BLOCK_SIZE,
@@ -56,7 +54,6 @@ __all__ = [
     "AtomicMergeError",
     "AtomicMergePreview",
     "AtomicMergeResult",
-    "AtomicMergeWriteTimeoutError",
     "BranchStore",
     "ChronosDuckDBStore",
     "ChronosFSBranchSession",
@@ -87,7 +84,6 @@ __all__ = [
     "StaleAtomicMergePreviewError",
     "WorkspaceBranchSession",
     "WorkspaceBranchToken",
-    "WorkspaceMergeCoordinator",
     "mount_chronosfs",
     "start_chronosfs_mount",
 ]

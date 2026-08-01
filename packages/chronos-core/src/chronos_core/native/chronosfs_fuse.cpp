@@ -3101,13 +3101,15 @@ struct SharedChronosFSBranch {
     std::thread batch_thread;
 
     SharedChronosFSBranch(
-        const std::string &database_url,
+        std::shared_ptr<chronos::native::NativeBranchStore> store,
         const std::string &branch_id,
-        std::int64_t block_size)
+        std::int64_t block_size,
+        const std::string &object_dir)
         : filesystem(std::make_unique<NativeChronosFS>(
-              database_url,
+              std::move(store),
               branch_id,
-              block_size)),
+              block_size,
+              object_dir)),
           batch_thread(&SharedChronosFSBranch::run_batch_committer, this) {}
 
     ~SharedChronosFSBranch() {
@@ -3258,12 +3260,24 @@ struct FuseState;
 
 struct SharedChronosFSBackend {
     std::string database_url;
+    std::string metadata_url;
+    std::string object_dir;
     std::int64_t block_size;
     std::mutex registry_mutex;
     std::mutex mounts_mutex;
     std::shared_mutex topology_mutex;
     std::unordered_map<std::string, std::weak_ptr<SharedChronosFSBranch>> branches;
     std::unordered_set<FuseState *> mounts;
+
+    std::shared_ptr<chronos::native::NativeBranchStore> open_store() const {
+        if (metadata_url.empty() || metadata_url == database_url) {
+            return std::make_shared<chronos::native::NativeBranchStore>(
+                database_url);
+        }
+        return std::make_shared<chronos::native::NativeBranchStore>(
+            database_url,
+            metadata_url);
+    }
 
     std::shared_ptr<SharedChronosFSBranch> branch_for(const std::string &branch_id) {
         std::lock_guard<std::mutex> guard(registry_mutex);
@@ -3273,9 +3287,10 @@ struct SharedChronosFSBackend {
             branches.erase(found);
         }
         auto state = std::make_shared<SharedChronosFSBranch>(
-            database_url,
+            open_store(),
             branch_id,
-            block_size);
+            block_size,
+            object_dir);
         branches.emplace(branch_id, state);
         return state;
     }
@@ -3324,6 +3339,7 @@ struct SharedChronosFSBackend {
 
     void register_mount(FuseState *state);
     void unregister_mount(FuseState *state);
+    void invalidate_all_mount_paths();
     void invalidate_paths(
         const std::string &branch_id,
         const std::vector<std::string> &paths);
@@ -3356,6 +3372,17 @@ void SharedChronosFSBackend::unregister_mount(FuseState *state) {
     mounts.erase(state);
 }
 
+void SharedChronosFSBackend::invalidate_all_mount_paths() {
+    std::lock_guard<std::mutex> guard(mounts_mutex);
+    for (FuseState *state : mounts) {
+        if (!state->fuse) continue;
+        std::lock_guard<std::mutex> mutable_guard(state->mutable_paths_mutex);
+        for (const auto &path : state->mutable_paths) {
+            fuse_invalidate_path(state->fuse, path.c_str());
+        }
+    }
+}
+
 void SharedChronosFSBackend::invalidate_paths(
     const std::string &branch_id,
     const std::vector<std::string> &paths) {
@@ -3384,21 +3411,27 @@ std::mutex &shared_backends_mutex() {
     return mutex;
 }
 
-std::string backend_key(const std::string &database_url, std::int64_t block_size) {
-    return database_url + '\0' + std::to_string(block_size);
+std::string backend_key(
+    const std::string &database_url,
+    const std::string &metadata_url,
+    std::int64_t block_size) {
+    return database_url + '\0' + metadata_url + '\0' + std::to_string(block_size);
 }
 
 std::shared_ptr<SharedChronosFSBackend> shared_backend_for(
     const std::string &database_url,
+    const std::string &metadata_url,
     std::int64_t block_size) {
     std::lock_guard<std::mutex> guard(shared_backends_mutex());
-    auto key = backend_key(database_url, block_size);
+    auto key = backend_key(database_url, metadata_url, block_size);
     auto found = shared_backends().find(key);
     if (found != shared_backends().end()) {
         if (auto existing = found->second.lock()) return existing;
     }
     auto backend = std::make_shared<SharedChronosFSBackend>();
     backend->database_url = database_url;
+    backend->metadata_url = metadata_url;
+    backend->object_dir = chronosfs_object_dir(database_url);
     backend->block_size = block_size;
     shared_backends()[std::move(key)] = backend;
     return backend;
@@ -3406,12 +3439,14 @@ std::shared_ptr<SharedChronosFSBackend> shared_backend_for(
 
 void flush_chronosfs_native(
     const std::string &database_url,
-    std::int64_t block_size) {
+    std::int64_t block_size,
+    const std::string &metadata_url) {
     std::shared_ptr<SharedChronosFSBackend> backend;
     {
         std::lock_guard<std::mutex> guard(shared_backends_mutex());
         auto found =
-            shared_backends().find(backend_key(database_url, block_size));
+            shared_backends().find(
+                backend_key(database_url, metadata_url, block_size));
         if (found != shared_backends().end()) {
             backend = found->second.lock();
         }
@@ -3460,6 +3495,23 @@ class NativeChronosFSStoreApi {
             // otherwise make an unrelated later metadata write copy the
             // entire accumulated WAL synchronously. Checkpoint lifecycle is
             // managed outside the foreground operation path.
+            store_->execute_sql("PRAGMA wal_autocheckpoint=0", {});
+        }
+    }
+
+    NativeChronosFSStoreApi(
+        std::string database_url,
+        std::string metadata_url,
+        std::int64_t block_size
+    )
+        : database_url_(std::move(database_url)),
+          metadata_url_(std::move(metadata_url)),
+          store_(std::make_shared<chronos::native::NativeBranchStore>(
+              database_url_, metadata_url_)),
+          block_size_(block_size),
+          object_dir_(chronosfs_object_dir(database_url_)),
+          gc_thread_(&NativeChronosFSStoreApi::run_gc_worker, this) {
+        if (store_->dialect() == "sqlite") {
             store_->execute_sql("PRAGMA wal_autocheckpoint=0", {});
         }
     }
@@ -3797,7 +3849,11 @@ class NativeChronosFSStoreApi {
 
     void run_gc_worker() {
         try {
-            chronos::native::NativeBranchStore gc_store(database_url_);
+            std::unique_ptr<chronos::native::NativeBranchStore> gc_store =
+                metadata_url_.empty()
+                ? std::make_unique<chronos::native::NativeBranchStore>(database_url_)
+                : std::make_unique<chronos::native::NativeBranchStore>(
+                    database_url_, metadata_url_);
             while (true) {
                 {
                     std::unique_lock<std::mutex> lock(gc_mutex_);
@@ -3809,15 +3865,15 @@ class NativeChronosFSStoreApi {
                     gc_running_ = true;
                 }
                 try {
-                    gc_store.collect_interval_garbage();
-                    collect_unreferenced_objects(gc_store);
-                    gc_store.execute_sql(
+                    gc_store->collect_interval_garbage();
+                    collect_unreferenced_objects(*gc_store);
+                    gc_store->execute_sql(
                         "DELETE FROM _chronosfs_orphan_inodes "
                         "WHERE branch_id NOT IN ("
                         "SELECT branch_id "
                         "FROM _chronos_branch_interval_branches)",
                         {});
-                    gc_store.execute_sql(
+                    gc_store->execute_sql(
                         "DELETE FROM _chronosfs_private_orphan_inodes "
                         "WHERE branch_id NOT IN ("
                         "SELECT branch_id "
@@ -3871,6 +3927,7 @@ class NativeChronosFSStoreApi {
     }
 
     std::string database_url_;
+    std::string metadata_url_;
     std::shared_ptr<chronos::native::NativeBranchStore> store_;
     std::int64_t block_size_;
     std::string object_dir_;
@@ -3920,9 +3977,10 @@ LockedReadFS locked_read_fs_for_slot(std::size_t slot_index) {
         branch->cache_generation.load(std::memory_order_acquire);
     if (!slot.filesystem || slot.branch_id != state->branch_id) {
         slot.filesystem = std::make_unique<NativeChronosFS>(
-            state->backend->database_url,
+            state->backend->open_store(),
             state->branch_id,
-            state->backend->block_size);
+            state->backend->block_size,
+            state->backend->object_dir);
         slot.branch_id = state->branch_id;
         slot.cache_generation = generation;
     } else if (slot.cache_generation != generation) {
@@ -4169,6 +4227,7 @@ int op_write(const char *path, const char *buf, size_t size, off_t off, struct f
                 locked.fs.write_handle(handle_of(fi), requested_path, buf, size, off);
             }
             state->backend->clear_all_caches();
+            state->backend->invalidate_all_mount_paths();
             return static_cast<int>(size);
         }
         const bool immediate = handle_of(fi) == nullptr;
@@ -4440,7 +4499,8 @@ int mount_chronosfs_native(
     const std::string &mountpoint,
     const std::string &branch_id,
     std::int64_t block_size,
-    const std::vector<std::string> &options) {
+    const std::vector<std::string> &options,
+    const std::string &metadata_url) {
     static fuse_operations ops = [] {
         fuse_operations op{};
         op.getattr = op_getattr;
@@ -4465,7 +4525,7 @@ int mount_chronosfs_native(
         op.destroy = op_destroy;
         return op;
     }();
-    auto backend = shared_backend_for(database_url, block_size);
+    auto backend = shared_backend_for(database_url, metadata_url, block_size);
     auto branch = backend->branch_for(branch_id);
     {
         // A branch name may have been deleted and recreated while another
@@ -4511,6 +4571,12 @@ namespace chronos::native {
 void bind_chronosfs_fuse(py::module_ &m) {
     py::class_<NativeChronosFSStoreApi>(m, "NativeChronosFSStore")
         .def(py::init<std::string, std::int64_t>(), py::arg("database_url"), py::arg("block_size"))
+        .def(
+            py::init<std::string, std::string, std::int64_t>(),
+            py::arg("database_url"),
+            py::arg("metadata_url"),
+            py::arg("block_size")
+        )
         .def("ensure", &NativeChronosFSStoreApi::ensure)
         .def("branches", &NativeChronosFSStoreApi::branches)
         .def("create_branch", &NativeChronosFSStoreApi::create_branch, py::arg("branch_id"), py::arg("from_branch"))
@@ -4552,7 +4618,8 @@ void bind_chronosfs_fuse(py::module_ &m) {
         "flush_chronosfs_native",
         &flush_chronosfs_native,
         py::arg("database_url"),
-        py::arg("block_size"));
+        py::arg("block_size"),
+        py::arg("metadata_url") = "");
     m.def(
         "mount_chronosfs_native",
         &mount_chronosfs_native,
@@ -4560,7 +4627,8 @@ void bind_chronosfs_fuse(py::module_ &m) {
         py::arg("mountpoint"),
         py::arg("branch_id"),
         py::arg("block_size"),
-        py::arg("options") = std::vector<std::string>{});
+        py::arg("options") = std::vector<std::string>{},
+        py::arg("metadata_url") = "");
 }
 
 } // namespace chronos::native
