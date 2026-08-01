@@ -1,0 +1,38 @@
+Resolved vLLM issue #34752 against the pinned company source. No GitHub contact, commits, or upstream PR actions were performed.
+
+Precedence rule:
+
+1. Supported checkpoint `kv_cache_quant_algo` defines the required cache format.
+2. Implicit or explicit `kv_cache_dtype=auto` resolves to that format.
+3. Compatible explicit aliases are accepted and canonicalized: `fp8` and `fp8_e4m3` → `fp8_e4m3`.
+4. Conflicting overrides, such as `bfloat16` for an FP8 checkpoint, fail during configuration with requested/required values and safe alternatives.
+5. Without supported metadata, the requested value remains unchanged.
+
+Changed and indexed:
+
+- `/code/vllm/vllm/utils/torch_utils.py`
+- `/code/vllm/tests/utils_/test_torch_utils.py`
+- `/knowledge/runbooks/kv-cache-dtype-rollout.md`
+
+Checks:
+
+- Focused CPU pytest: **33 passed, 1 CUDA-only skipped**
+- Ruff lint: passed
+- Ruff format check: passed
+
+Chronos result:
+
+- Merged `task/jamal-pierce/vllm-kv-cache-dtype-v2` into `person/jamal-pierce`
+- Merge confirmed: `merged: true`
+- Task branch deleted
+- Playbook memory: `memory_23e2fd8403b7ddf9bd09021f`
+
+Evidence:
+
+- Issue snapshot: `/code/upstream-issues/vllm-34752.md` — `enterprise_2a55f685a336b0c76f99aa99`
+- Compatibility standard: `quantization-profile-compatibility-and-fallbacks.json` — `dsid_a6efecc786c9436499eb000b8489ae52`
+- Private rollback standard: `private-deployment-optimization-config-rollback.json` — `dsid_0a6c6e67d89c4cb4b053a7c04d780d97`
+- Offline update toolkit: `secure-offline-update-operator-toolkit-2026.json` — `dsid_ac95fcc92a424c6584336e7ba0aa8c4`
+- Indexed implementation: `workspace_2b2770015da6d480bc4bdc75`
+- Indexed tests: `workspace_25956b2d9276b256026016b0`
+- Indexed runbook: `workspace_101071d82d702ddff3249333`

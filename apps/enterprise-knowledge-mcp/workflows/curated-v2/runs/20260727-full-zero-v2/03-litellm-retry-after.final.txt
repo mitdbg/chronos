@@ -1,0 +1,34 @@
+Resolved LiteLLM #34399 against the pinned company source.
+
+Changed paths:
+
+- [router.py](/tmp/chronos-enterprise-curated-v2-capture-workdir/code/litellm/litellm/router.py)
+- [test_router_retries.py](/tmp/chronos-enterprise-curated-v2-capture-workdir/code/litellm/tests/local_testing/test_router_retries.py)
+- [litellm-34399.md](/tmp/chronos-enterprise-curated-v2-capture-workdir/artifacts/reviews/litellm-34399.md)
+
+Result:
+
+- Explicit upstream `Retry-After` now takes precedence over sibling-deployment failover.
+- Immediate failover remains unchanged when no upstream backoff is supplied.
+- Added shared-upstream and no-backoff regression coverage.
+- No paid provider calls were made.
+
+Checks:
+
+- Python syntax compilation: passed.
+- Focused pytest: unavailable because pytest is not installed in the mounted environment.
+- All three changed files were re-indexed.
+- Reviewed branch diff contained only the two modified files and review artifact.
+
+Chronos:
+
+- Merged into `person/kaitlyn-nguyen`: `merged: true`
+- Deleted task branch: `deleted: true`
+- Playbook memory: `memory_814bdc91d9785aaa0eefa3bf`
+
+Primary evidence:
+
+- Issue snapshot: `/code/upstream-issues/litellm-34399.md` — `enterprise_2034a8245bcfb88af6beb9e8`
+- SRE retry-storm review: `/knowledge/company/sources/google_drive/shared_drives/engineering/platform-engineering/sre-incident-review-retry-storm-emergency-quota-policy.json` — `dsid_071db3dff7ca4a8db1f1f0f01bb8853c`
+- Support incident: `/knowledge/company/sources/jira/customer-support/SUP-201992-client-retry-amplification-and-hidden-quota-throttles.json` — `dsid_205c62f1ace8402abf9820662d82ccef`
+- Support playbook: `/knowledge/company/sources/linear/engineering/ENG-5132-support-playbook-sdk-retry-timeout.json` — `dsid_41d3e4179d7c4312baf67b9a6801ac9`

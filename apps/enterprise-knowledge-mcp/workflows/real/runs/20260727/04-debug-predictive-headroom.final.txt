@@ -1,0 +1,19 @@
+Diagnosis: the predictive controller is using a 60-second lookahead, versus the 300-second design default—an 80% reduction in advance warning. A separate allocator 90-second smoothing/decay window and one-tick burst-credit skew further delay effective headroom.
+
+The reversible mitigation is to restore the affected deployments to 300 seconds behind per-deployment gates, preserving hard bounds and safety limits. Validate in shadow mode, replay the recorded burst, then canary at ≤5% for 72 hours. Roll back via the predictive gate or global kill switch within 60 seconds.
+
+Evidence:
+
+- Design default: `dsid_d921e1d4282b45a7b4990e2366bedc05`
+  `/knowledge/company/sources/linear/business-ops/ENG-62670-workload-forecast-headroom-controller.json`
+- Incident configuration and allocator mismatch: `dsid_fa6744f09ed34014a2cb2c8f2fb979f2`
+  `/knowledge/company/sources/linear/engineering/ENG-777345-predictive-scale-window-desync-customer-facing.json`
+- Capacity gates and safety invariants: `dsid_747bd6fada5d46c7a5021901a98769ba`
+  `/knowledge/company/sources/confluence/architecture-and-standards/decision-records/adr-autoscaling-bounds-precedence-and-safety-invariants.json`
+- Rollout and rollback controls: `dsid_eef5c665b55d45bcb5e8c799f4f6c039`
+  `/knowledge/company/sources/linear/engineering/ENG-22148-feature-flag-rollout-per-account.json`
+
+Report: `/artifacts/debug/predictive-headroom.md`
+Episodic memory: `memory_57382a0e4f094981b33b5a5d`
+
+The task branch remains unmerged and undeleted.

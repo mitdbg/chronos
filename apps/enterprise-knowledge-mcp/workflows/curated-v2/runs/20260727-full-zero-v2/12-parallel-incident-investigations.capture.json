@@ -1,0 +1,19 @@
+{
+  "workflow": "12-parallel-incident-investigations",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/12-parallel-incident-investigations.md",
+  "prompt_sha256": "0d877a9e43fcbc862cdfbba751972b285073c559570479da8450f665b9d62961",
+  "session_id": "019fa6ca-ad92-7983-be32-6bae014e4bc0",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T03-35-28-019fa6ca-ad92-7983-be32-6bae014e4bc0.jsonl",
+  "rollout_sha256": "d7d0976063807b1f7e3c70819bc5257d4a327b312db6d368817c1a502a00967f",
+  "events": 61,
+  "mcp_events": 61,
+  "shell_events": 0,
+  "patch_events": 0,
+  "memory_timestamps_resolved": 6,
+  "memory_timestamps_from_event": 6,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/12-parallel-incident-investigations.jsonl",
+  "trace_sha256": "a6dbcfa42068347c8f0ea45a967fe8ca536f456a012c4cf098d851086ceed8d4",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/12-parallel-incident-investigations.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/12-parallel-incident-investigations.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/12-parallel-incident-investigations.final.txt"
+}

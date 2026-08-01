@@ -1,0 +1,20 @@
+Created and left isolated; no merge or deletion performed.
+
+- Branch: `person/maya-desai-v2`, based on `team/platform-console`
+- Onboarding plan: `workspace_cbe95ce565c09faba676695f` — `/knowledge/people/maya-desai/onboarding-plan.md`
+- Codebase map: `workspace_e05ea799be50113d3adf3c55` — `/knowledge/teams/platform-console/codebase-map.md`
+- Team playbook memory: `memory_f00e1240d6ff10fbfb3ed501`
+- Diff: two documents added on Maya’s branch; the team playbook exists only on `team/platform-console`, as requested.
+
+Approval gaps remain for Maya’s actual core-tool grants, repository/team membership, protected-branch and CI-secret rights, staging access, production/customer-data access, on-call placement, and Security approval. These are explicitly marked pending.
+
+Primary evidence included:
+
+- Published access and turnaround policy: `dsid_7754cd5d7b4d4a7ea217f1c09c28ef3c`
+- Platform & Console scope: `curated_024986ded9ae947c8913f2eb`
+- LiteLLM contribution/E2E guides: `enterprise_b9e03890a22cfc276b5468d4`, `enterprise_ffc0390514a198a0f0bb9f75`
+- Langfuse contribution guide: `enterprise_30981ba0dc3b4760e378333b`
+- Fork and branch-safety workflow: `dsid_4ae8b9d4ba5a4003b3d1ca812544c86e`
+- Team review ownership: `dsid_bda5fd8434594774ad119e061549a717`
+- Open console support follow-up: `dsid_3518922f85074831b0d0201264294dd1`
+- Current telemetry/operator roadmap: `dsid_4a5f521dd19f40b3b9d680a1b7776280`

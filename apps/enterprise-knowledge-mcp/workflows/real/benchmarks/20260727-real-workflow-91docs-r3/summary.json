@@ -1,0 +1,152 @@
+{
+  "source_results": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/real/benchmarks/20260727-real-workflow-91docs-r3/results.json",
+  "matched": true,
+  "summary": [
+    {
+      "backend": "chronos",
+      "repetitions": 3,
+      "seed_ms_median": 6758.117582,
+      "replay_ms_median": 20352.591793,
+      "replay_ms_min": 20259.831087,
+      "replay_ms_max": 20357.337083,
+      "baseline_bytes_median": 23218160.0,
+      "final_bytes_median": 26370888.0,
+      "added_bytes_median": 3152728.0,
+      "state_size_ratio_median": 1.1357871597060232,
+      "bytes_per_added_branch_median": 450389.71428571426
+    },
+    {
+      "backend": "app-managed",
+      "repetitions": 3,
+      "seed_ms_median": 25104.721047,
+      "replay_ms_median": 59652.807145,
+      "replay_ms_min": 58887.188962,
+      "replay_ms_max": 59696.751648,
+      "baseline_bytes_median": 34832937.0,
+      "final_bytes_median": 36450857.0,
+      "added_bytes_median": 1617920.0,
+      "state_size_ratio_median": 1.046447992599648,
+      "bytes_per_added_branch_median": 231131.42857142858
+    },
+    {
+      "backend": "physical-clone",
+      "repetitions": 3,
+      "seed_ms_median": 25188.072961,
+      "replay_ms_median": 241412.425708,
+      "replay_ms_min": 241395.856244,
+      "replay_ms_max": 243483.083949,
+      "baseline_bytes_median": 34832940.0,
+      "final_bytes_median": 296157740.0,
+      "added_bytes_median": 261320704.0,
+      "state_size_ratio_median": 8.50211449277609,
+      "bytes_per_added_branch_median": 37331529.14285714
+    }
+  ],
+  "operation_latency": [
+    {
+      "backend": "chronos",
+      "operation": "mcp:knowledge_checkout",
+      "p50_ms_median": 62.648448,
+      "p50_ms_min": 62.586189,
+      "p50_ms_max": 62.674477
+    },
+    {
+      "backend": "chronos",
+      "operation": "mcp:knowledge_search",
+      "p50_ms_median": 114.209905,
+      "p50_ms_min": 113.72408,
+      "p50_ms_max": 114.602118
+    },
+    {
+      "backend": "chronos",
+      "operation": "mcp:knowledge_get_document",
+      "p50_ms_median": 228.104015,
+      "p50_ms_min": 226.874654,
+      "p50_ms_max": 228.769101
+    },
+    {
+      "backend": "chronos",
+      "operation": "mcp:knowledge_remember",
+      "p50_ms_median": 37.480808,
+      "p50_ms_min": 36.801705,
+      "p50_ms_max": 38.187264
+    },
+    {
+      "backend": "chronos",
+      "operation": "mcp:knowledge_index_workspace_file",
+      "p50_ms_median": 84.696366,
+      "p50_ms_min": 83.720739,
+      "p50_ms_max": 88.102922
+    },
+    {
+      "backend": "app-managed",
+      "operation": "mcp:knowledge_checkout",
+      "p50_ms_median": 39.617593,
+      "p50_ms_min": 39.472542,
+      "p50_ms_max": 39.751491
+    },
+    {
+      "backend": "app-managed",
+      "operation": "mcp:knowledge_search",
+      "p50_ms_median": 507.640817,
+      "p50_ms_min": 501.674454,
+      "p50_ms_max": 508.847614
+    },
+    {
+      "backend": "app-managed",
+      "operation": "mcp:knowledge_get_document",
+      "p50_ms_median": 395.083105,
+      "p50_ms_min": 391.245538,
+      "p50_ms_max": 396.125356
+    },
+    {
+      "backend": "app-managed",
+      "operation": "mcp:knowledge_remember",
+      "p50_ms_median": 415.386106,
+      "p50_ms_min": 411.566187,
+      "p50_ms_max": 418.138107
+    },
+    {
+      "backend": "app-managed",
+      "operation": "mcp:knowledge_index_workspace_file",
+      "p50_ms_median": 458.685385,
+      "p50_ms_min": 452.842504,
+      "p50_ms_max": 461.016951
+    },
+    {
+      "backend": "physical-clone",
+      "operation": "mcp:knowledge_checkout",
+      "p50_ms_median": 25849.215466,
+      "p50_ms_min": 25783.918634,
+      "p50_ms_max": 26174.767629
+    },
+    {
+      "backend": "physical-clone",
+      "operation": "mcp:knowledge_search",
+      "p50_ms_median": 542.814962,
+      "p50_ms_min": 539.704858,
+      "p50_ms_max": 543.355088
+    },
+    {
+      "backend": "physical-clone",
+      "operation": "mcp:knowledge_get_document",
+      "p50_ms_median": 393.632453,
+      "p50_ms_min": 391.622879,
+      "p50_ms_max": 394.121718
+    },
+    {
+      "backend": "physical-clone",
+      "operation": "mcp:knowledge_remember",
+      "p50_ms_median": 419.578074,
+      "p50_ms_min": 415.160409,
+      "p50_ms_max": 420.288265
+    },
+    {
+      "backend": "physical-clone",
+      "operation": "mcp:knowledge_index_workspace_file",
+      "p50_ms_median": 462.512505,
+      "p50_ms_min": 462.370017,
+      "p50_ms_max": 467.413689
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "workflow": "07-langfuse-score-analytics",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/07-langfuse-score-analytics.md",
+  "prompt_sha256": "45575d22ef05fe4a8d29a25ddcf09808e71d07fc48a116f0d056325e6a57de4e",
+  "session_id": "019fa6b0-564b-7ff3-95b5-3f7eec59985c",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T03-06-42-019fa6b0-564b-7ff3-95b5-3f7eec59985c.jsonl",
+  "rollout_sha256": "cd4194b17b10a5de902858272343c316879928de1e3609253f1d2d62a041111f",
+  "events": 51,
+  "mcp_events": 42,
+  "shell_events": 0,
+  "patch_events": 9,
+  "memory_timestamps_resolved": 0,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/07-langfuse-score-analytics.jsonl",
+  "trace_sha256": "612e4425dc997cf2f5c66db9404d75306c29bb1f6b6a0bef01d5ce85a69b20e5",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/07-langfuse-score-analytics.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/07-langfuse-score-analytics.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/07-langfuse-score-analytics.final.txt"
+}

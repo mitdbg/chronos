@@ -1,0 +1,65 @@
+Completed on isolated branch `task/selene-huang/enterprise-rag-qa-v2`; it was not merged or deleted.
+
+```json
+[
+  {
+    "question_id": "qst_0006",
+    "answer": "The proposed canonical priority is: (1) authoritative Reachability DOWN; (2) high-severity fast 5xx error burn; (3) p99/p95 tail-latency burn; (4) capacity exhaustion/hard gate; and (5) control-plane degradation. Reachability can force failover; 5xx can force failover or a partial shift; latency starts with a partial shift and escalates only if sustained and corroborated; capacity and control-plane signals produce HOLD-oriented safety actions.",
+    "citations": [{"document_id":"dsid_184be937d34a412ab5e61366d54d8ed6","path":"/knowledge/company/sources/google_drive/shared_drives/policy-engine-failover-extensions-draft.json"}]
+  },
+  {
+    "question_id": "qst_0012",
+    "answer": "A firmware 1.2.3 bug on the SF2 rack-7 edge switch enabled proxy ARP under high multicast/mDNS load. The switch advertised VPN-assigned addresses onto the local L2 domain, creating ephemeral duplicate-IP ownership and forwarding packets to the wrong MAC; that caused the 30–90 second VPN routing blackholes and rekeys.",
+    "citations": [{"document_id":"dsid_59cb294da8964683bb165a3bb615df71","path":"/knowledge/company/sources/jira/ops-requests/INT-460811-edge-switch-arp-proxy-ip-duplication.json"}]
+  },
+  {
+    "question_id": "qst_0028",
+    "answer": "Update the release branch with `git checkout release/v1.14` and `git pull --ff-only origin release/v1.14`; create the v1.14.0 annotated tag with the release message and GPG-sign it with the GitHub-registered key (`git tag -s v1.14.0 -m \"Release v1.14.0\"`; the thread also showed `git tag -a ...` as the annotation step), then `git push origin v1.14.0`. Create the draft with `gh release create v1.14.0 dist/* --notes-file CHANGELOG.md --draft`. Generate `checksums.txt` using `shasum -a 256 dist/* > checksums.txt`, upload artifacts/checksums, include a SHA-256 `manifest.json` in the draft assets, and run smoke tests before publishing.",
+    "citations": [{"document_id":"dsid_7c0157af909c4a6190e00e1fc6b92b73","path":"/knowledge/company/sources/slack/1729999999-tagging-handoff-ops-checkin.json"}]
+  },
+  {
+    "question_id": "qst_0030",
+    "answer": "Selected Dedicated and Hosted customers can enter the opt-in, feature-flagged beta; it is not limited to only one of those tiers.",
+    "citations": [{"document_id":"dsid_54525a33e2d44d4a9b665feaf8fab624","path":"/knowledge/company/sources/linear/product-management/PM-24680-cohort-comparator-and-trace-linker-for-deployment-health.json"}]
+  },
+  {
+    "question_id": "qst_0077",
+    "answer": "The three startup steps are `CLIENT_HELLO` → `SERVER_ACK` (optionally carrying a resume token) → `CLIENT_STREAM_START`. After startup, `KEEPALIVE` frames maintain the stream. If the ACK has no resume token, the client checkpoints locally and only permits idempotent retry for non-side-effecting tools.",
+    "citations": [{"document_id":"dsid_169dca195c96410b80ff166803a50512","path":"/knowledge/company/sources/linear/engineering/ENG-77120-fn-schema-mapper-compatibility-and-streaming-handshake.json"}]
+  },
+  {
+    "question_id": "qst_0138",
+    "answer": "The CTO's non-negotiable was guaranteed isolation plus an auditable trail before legal would sign—specifically SOC 2 evidence and SAML SSO for the dedicated/VPC deployment.",
+    "citations": [{"document_id":"dsid_db931dec10bf4b10829175533605aa0f","path":"/knowledge/company/sources/hubspot/company-cobalt-brookline-analytics.json"}]
+  },
+  {
+    "question_id": "qst_0165",
+    "answer": "The freeze exception authorized sourcing and interviews immediately, but any final offer was conditional on Marcus, the budget owner, signing off on total compensation within the posted band and confirming runway. If no viable candidate appeared within three weeks of the live posting, the team had to escalate to Lauren to consider an interim contractor or backlog reprioritization.",
+    "citations": [{"document_id":"dsid_2d58cc0f0a074241a91a072f5f5624d6","path":"/knowledge/company/sources/gmail/soojin_lee/20261028-senior-infra-freeze-exception-and-sourcing-ask.json"}]
+  },
+  {
+    "question_id": "qst_0174",
+    "answer": "Each ledger row requires: `timestamp`, `service_a`, `service_a_version`, `service_b`, `service_b_version`, `endpoint`, `dcts_version`, `test_case_id`, `result` (`pass` or `fail`), `failure_reason`, and `run_id`.",
+    "citations": [{"document_id":"dsid_04b24bf957c047f4b7d8ceefdfde8290","path":"/knowledge/company/sources/confluence/architecture-and-standards/decision-records/adr-declarative-contract-tests-and-schema-fencing-2026.json"}]
+  },
+  {
+    "question_id": "qst_0210",
+    "answer": "Compute `SS = 100 × Σp[w_p × failure_count_p / max(1,total_calls_p)] / Σp(w_p)`, `LP = min(30, 10 × max(0, (median_latency_ms − latency_slo_ms) / latency_slo_ms))`, and `DF = 50 × embedding_drift_score_95pct_quantile normalized against baseline drift`; then `DS = clamp(SS + LP + DF, 0, 100)`. Actions are: `DS ≤ 15` GO; `15 < DS ≤ 35` CAUTION (cap/slow rollout to 10% and obtain targeted human review within four hours); `35 < DS ≤ 60` HOLD (pause and trigger automated bisect/focused probes); and `DS > 60` ROLLBACK (automatic baseline revert plus incident). A critical-tenant slice with failure rate over 0.5% and severity at least 3.0 hard-overrides the score to rollback.",
+    "citations": [{"document_id":"dsid_b4bd83b46612452e858bc02b380082e2","path":"/knowledge/company/sources/confluence/applied-ml-and-evals/regression-triage/probe-heatmap-rollout-decision-protocol-2024.json"}]
+  },
+  {
+    "question_id": "qst_0460",
+    "answer": "Leah would send Priya the take-home assignment, which Priya committed to return within 48 hours, and the recruiting team would schedule the panel interview.",
+    "citations": [{"document_id":"dsid_2c9dcc3afa3249f39c725884e5be5c72","path":"/knowledge/company/sources/fireflies/interviews/2025-02-11-candidate-interview-senior-se.json"}]
+  }
+]
+```
+
+Artifacts:
+
+- [answers.json](/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/task-selene-huang-enterprise-rag-qa-v2/artifacts/enterprise-rag/answers.json) — indexed as `workspace_917834d63facf61b2ed3acb3`
+- [evidence-reconciliation.md](/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/task-selene-huang-enterprise-rag-qa-v2/artifacts/enterprise-rag/evidence-reconciliation.md) — indexed as `workspace_07ba2cb6f7a8cbcd5787738c`
+
+Playbook memory: `memory_821d669cc1232e4be48127f7`
+
+The memory’s evidence spans Google Drive, Jira, Slack, Confluence, Gmail, HubSpot, and Fireflies. Only the reusable identifier-resolution and contradiction-handling procedure was stored; none of the answer text was persisted as durable memory.

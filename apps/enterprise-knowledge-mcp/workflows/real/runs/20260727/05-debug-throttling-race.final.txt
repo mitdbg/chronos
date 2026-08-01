@@ -1,0 +1,28 @@
+Investigation complete. The task branch remains intact, unmerged, and undeleted.
+
+Diagnosis: shard reassignment copied an in-memory burst-credit pointer while policy hot-reload mutated its route/priority indices. The fast path validated the pointer by shard ID but not tenant ID, allowing a stale pointer to reference another tenant’s bucket. Misapplied credits then produced a 10–30 second above-quota allow window.
+
+Evidence was strong:
+
+- No failure occurred without policy reload.
+- Over-allow reproduced consistently when reload overlapped reassignment.
+- Stronger pointer validation eliminated the failure in staging.
+
+Primary source:
+
+- Document ID: `dsid_a3fdfc45905f46f3988ad13f55ecce93`
+- Path: `/knowledge/company/sources/linear/engineering/ENG-428317-conditional-multitenant-ratelimiter-priority-skew.json`
+
+Related atomic-policy safeguard precedent:
+
+- Document ID: `dsid_3e413744bfcb4f2082871da734e6f96b`
+- Path: `/knowledge/company/sources/linear/engineering/ENG-76012-atomic-policy-evaluation-race-leading-to-region-mismatch.json`
+
+Mitigation: validate tenant identity before applying cached credits, extend shard-handoff grace, and fail closed to validated enforcement when bindings mismatch. Long-term safeguards are immutable tenant+shard+route bindings, versioned validation tokens, and atomic policy-snapshot publication. The source confirms the canary completed; later rollout stages remain unverified.
+
+Report: `/artifacts/debug/throttling-race.md`
+
+Episodic memory:
+
+- ID: `memory_dbb8566365505de5cb37c085`
+- Path: `/memory/episodic_memory/diagnosed-throttling-under-enforcement-during-shard-reassignment-cb37c085.md`

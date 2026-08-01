@@ -1,0 +1,18 @@
+{
+  "workflow": "02-vllm-flashinfer-virtual-buffers",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/02-vllm-flashinfer-virtual-buffers.md",
+  "prompt_sha256": "bb4ed613f776b31ea3b5107850943046ca03b661ee6bd48dd2e88d72aff395c8",
+  "session_id": "019fa677-997e-7093-9428-7e1138dfb0c6",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T02-04-43-019fa677-997e-7093-9428-7e1138dfb0c6.jsonl",
+  "rollout_sha256": "5afaba0575f03edd4422ccfa4817b2c5421dcea5d089f7584cd4decf7df18510",
+  "events": 38,
+  "mcp_events": 23,
+  "shell_events": 9,
+  "patch_events": 6,
+  "memory_timestamps_resolved": 1,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/02-vllm-flashinfer-virtual-buffers.jsonl",
+  "trace_sha256": "a9e4a6ee5d29b009205a6c20d9da178f76efc4ad4f4abd58428ac4f7a31d2f84",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/incomplete/02-vllm-flashinfer-virtual-buffers-1785204872626992950/02-vllm-flashinfer-virtual-buffers.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/incomplete/02-vllm-flashinfer-virtual-buffers-1785204872626992950/02-vllm-flashinfer-virtual-buffers.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/incomplete/02-vllm-flashinfer-virtual-buffers-1785204872626992950/02-vllm-flashinfer-virtual-buffers.final.txt"
+}

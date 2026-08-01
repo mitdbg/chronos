@@ -1,0 +1,21 @@
+Diagnosis: the canonical startup and reconnect sequence is:
+
+`CLIENT_HELLO → AUTH_OK → SERVER_READY`
+
+A current-runtime client that waits for `SERVER_READY` before consuming `AUTH_OK`, activates streaming early, or incorrectly enters legacy fallback after receiving `AUTH_OK` can remain stuck in startup. The exact affected language/build still requires a sanitized control-frame capture.
+
+Compatibility baselines are Python `0.12.0`, TypeScript `1.9.0`, and Go `0.8.3`. Older servers that genuinely omit `AUTH_OK` should trigger legacy fallback with one warning—not hang. Authentication retries must use jittered exponential backoff, one refresh per logical request, and single-flight refresh per token.
+
+Evidence:
+
+- Document ID: `dsid_88b39d13bd584ef8b1422d76994808c7`
+- Path: `/knowledge/company/sources/github/pr-95312-unify-handshake-consumer-ux-and-retry-bump.json`
+- Merged cross-SDK implementation, CI passed.
+
+Outputs:
+
+- Report: `/artifacts/debug/streaming-handshake.md`
+- Episodic memory: `memory_37411c65c4b897c5a80a42cf`
+- Memory path: `/memory/episodic_memory/diagnosed-cross-sdk-streaming-startup-hang-as-handshake-state-or-a80a42cf.md`
+
+The task branch remains intact and unmerged. The Chronos source repository was not modified.

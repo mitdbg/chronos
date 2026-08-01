@@ -1,0 +1,18 @@
+{
+  "workflow": "01-vllm-batch-api-contract",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/01-vllm-batch-api-contract.md",
+  "prompt_sha256": "b147e89579c346de84781fd33b13c9ca966080fad20fcbcbbce30261f388ab1d",
+  "session_id": "019fa642-d092-74e0-aef5-e2ba2ffb65ad",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T01-07-04-019fa642-d092-74e0-aef5-e2ba2ffb65ad.jsonl",
+  "rollout_sha256": "5a92bd76759c96d2c441de66b1ceb235e2b9492d7324a992c3782ca75dea0f2d",
+  "events": 21,
+  "mcp_events": 19,
+  "shell_events": 0,
+  "patch_events": 2,
+  "memory_timestamps_resolved": 1,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/01-vllm-batch-api-contract.jsonl",
+  "trace_sha256": "8c0c40a8bf564142bab8f7dd687dbbbaada7f726f9daa2f07102a2e810e82cdb",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/incomplete/01-vllm-batch-api-contract-1785201185152255234/01-vllm-batch-api-contract.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/incomplete/01-vllm-batch-api-contract-1785201185152255234/01-vllm-batch-api-contract.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/incomplete/01-vllm-batch-api-contract-1785201185152255234/01-vllm-batch-api-contract.final.txt"
+}

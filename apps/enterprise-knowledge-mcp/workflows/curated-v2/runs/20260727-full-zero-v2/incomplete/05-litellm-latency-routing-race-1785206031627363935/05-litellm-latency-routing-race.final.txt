@@ -1,0 +1,19 @@
+Resolved LiteLLM issue #24720 and merged the result into `person/aisha-bello`.
+
+- Reproduction: deterministic two-callback test forces both callbacks to read the same prior map and demonstrates one deployment update being overwritten.
+- Fix: handler-scoped `asyncio.Lock` protects only the local read/mutate/write sequence. Redis propagation occurs after lock release.
+- Preserved behavior: latency/TTFT windows, TTL, TPM/RPM accounting, selection, and expiration logic.
+- Checks: Python compilation and AST parsing passed. Focused pytest could not run because the mounted environment lacked both `uv` and `pytest`.
+- Diff reviewed against both reproduction and personal branches; only the implementation, regression test, incident timeline, and runbook were promoted.
+- Merge: `task/aisha-bello/latency-routing-fix-v2` → `person/aisha-bello` succeeded.
+- Cleanup: both requested task branches were deleted successfully.
+- Episodic memory: `memory_0a6a24c67c2a673545d45182`.
+
+Evidence:
+
+- Issue: `/code/upstream-issues/litellm-24720.md` — `enterprise_32709678ecf513e6b78b3e11`
+- Incident timeline: `/artifacts/incidents/latency-routing-race.md` — `workspace_8282300a0a3db14b212d3e9f`
+- Fix: `/code/litellm/litellm/router_strategy/lowest_latency.py` — `workspace_4705f375b7bbd0c701aae6aa`
+- Regression test: `/code/litellm/tests/local_testing/test_lowest_latency_routing.py` — `workspace_ac300b572071d7d192b325aa`
+- Runbook: `/knowledge/runbooks/latency-routing-concurrency.md` — `workspace_510abe9ba69ea51fabb25d9c`
+- Concurrency standard: `/knowledge/company/sources/confluence/architecture-and-standards/coding-standards/concurrency-primitives-and-affinity-guidelines-2026.json` — `dsid_cd133e76dd62456d9182217e280e2cb3`

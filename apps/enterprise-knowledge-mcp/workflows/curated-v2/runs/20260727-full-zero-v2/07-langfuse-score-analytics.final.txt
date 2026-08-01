@@ -1,0 +1,25 @@
+Resolved both Langfuse #15208 correctness bugs on `person/sana-farid`.
+
+- Histogram: bins now use raw values and raw edges. Only labels are rounded, with adaptive precision ensuring distinct edges. Added the seven-bin `[0,1]` regression placing `0.857` in bin 6.
+- Pivot: `avg_*` subtotals and totals now use count-weighted averages when a positive count metric is available. The tested fallback remains the legacy unweighted mean when it is unavailable. Non-average aggregations remain unchanged.
+
+All six changed files were indexed: two implementations, two regression-test files, and both candidate notes. Individual branch diffs and the combined mounted personal-branch contents were verified.
+
+Checks attempted:
+
+- Histogram focused test: blocked before collection — `/bin/bash: pnpm: command not found`
+- Pivot focused test: blocked before collection — `/bin/bash: pnpm: command not found`
+- The environment also lacks Node/Corepack, so no executable test result is claimed.
+
+Both task branches merged successfully. Chronos initially rejected the pivot merge after the histogram merge due to workspace conflict validation; recreating the pivot branch from the updated personal branch produced the same reviewed pivot-only diff and merged cleanly. Both task branches were then deleted, confirmed absent from branch status.
+
+Semantic memory: `memory_048880a0524bc8ac5711c4c0`
+
+Key evidence:
+
+- Issue: `/code/upstream-issues/langfuse-15208.md` — `enterprise_452a1a7f3eb80e14cfc4d7a0`
+- Histogram note: `/artifacts/langfuse-15208-histogram-candidate.md` — `workspace_2c17d5076e8cecc9ab224925`
+- Pivot note: `/artifacts/langfuse-15208-pivot-candidate.md` — `workspace_39843e31e4054795e4488eb4`
+- Histogram dashboard evidence: `dsid_4d4a2a3844fa43d699b22e89b3433ea0`
+- Eval-dashboard requirements: `dsid_1cfc068a56c7480b84f2e569590c0519`
+- Statistical-validation guidance: `dsid_055e17a2e9ad484b9aaef11f95ed2eeb`

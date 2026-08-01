@@ -1,0 +1,18 @@
+{
+  "workflow": "03-litellm-retry-after",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/03-litellm-retry-after.md",
+  "prompt_sha256": "613d131d05359ea4dd7dd76ee61ead2ad0fdb67ab60929f3e9d19ce5dab53f19",
+  "session_id": "019fa684-3bbf-7fa0-bf99-8ed7497d897d",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T02-18-31-019fa684-3bbf-7fa0-bf99-8ed7497d897d.jsonl",
+  "rollout_sha256": "eab8fdacc30238aa8b8d7f63cdb2b986350a14bfbc62f34f40777530ec648316",
+  "events": 29,
+  "mcp_events": 17,
+  "shell_events": 9,
+  "patch_events": 3,
+  "memory_timestamps_resolved": 0,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/03-litellm-retry-after.jsonl",
+  "trace_sha256": "49cd2deb7f6c7ad84df9c43615ad5693be074ca64c5a1c455f1ace616f2ad0a7",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/03-litellm-retry-after.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/03-litellm-retry-after.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/03-litellm-retry-after.final.txt"
+}

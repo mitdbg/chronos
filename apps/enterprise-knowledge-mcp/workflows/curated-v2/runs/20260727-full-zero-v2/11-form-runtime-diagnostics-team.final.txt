@@ -1,0 +1,44 @@
+Completed the approved organizational change. Both branches remain isolated, mounted, and unmerged.
+
+- Created `team/runtime-diagnostics-v2` from `department/infrastructure-sre`.
+  - Mount: `/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/team-runtime-diagnostics-v2`
+- Created `person/priya-shah-v2` from `team/runtime-diagnostics-v2`.
+  - Mount: `/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/person-priya-shah-v2`
+
+Documents indexed:
+
+- Runtime Diagnostics charter: `workspace_2f45b5996eb8413c361464ae`
+  - Path: `/knowledge/teams/runtime-diagnostics/operating-charter.md`
+  - Initially indexed with SHA-256 `faa704c...`
+  - Revised in place with measurable release, failover, investigation, and promotion criteria.
+  - Re-indexed under the same document ID and path with final SHA-256 `d1448bba...`
+  - No second charter was created.
+- Priya Shah onboarding plan: `workspace_90138731027c9aaab2a740b5`
+  - Path: `/knowledge/people/priya-shah/onboarding-plan.md`
+  - SHA-256: `da3c6725...`
+
+Memories stored:
+
+- Team playbook: `memory_0bcb263d8e593c009f44105d`
+  - Reviewed runtime investigation, validation, and promotion procedure.
+- Priya semantic memory: `memory_72d804e4b2c10a56012d86c2`
+  - Validated 48-hour standard-access rule, four-hour audited P1 emergency target, and separate approval for privileged access.
+
+Diffs:
+
+- Team versus `department/infrastructure-sre`:
+  - Added charter document and playbook memory.
+  - No deletions or modifications to inherited documents.
+- Priya versus `team/runtime-diagnostics-v2`:
+  - Added onboarding plan and semantic memory.
+  - No deletions or modifications to inherited documents.
+
+Key evidence came from four source systems:
+
+- Confluence, `dsid_bce6ec1b34a044d694dda5607a184d31`: five H1 customer-impacting capacity/quota incidents, split ownership, and one initial runtime-memory misdiagnosis.
+- Jira, `dsid_1e0c6d99da584a5888bfbb38afe2ed60`: regional failover caused roughly 90 minutes of impact, approximately 35% elevated 5xx, sixfold runtime restarts, and p95 latency increasing from 180 ms to 900 ms.
+- GitHub, `dsid_74d03b5f76ca4372b83e879803b9a573`: tightened Runtime LTS p95 regression gates and documented waiver workflow.
+- Slack, `dsid_27ef80109fea4f64878c5c239b7874c7`: explicit remediation ownership, rollback verification, action tracking, two-hour public-summary target, and recurrence review.
+- Published Confluence access policy, `dsid_36d7605113204cdca94405cb30fc2c10`: 90% of standard access within 48 hours and audited emergency access within four hours.
+
+Neither branch was merged or deleted.

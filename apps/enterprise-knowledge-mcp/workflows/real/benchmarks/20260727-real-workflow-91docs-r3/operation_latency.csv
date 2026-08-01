@@ -1,0 +1,16 @@
+backend,operation,p50_ms_median,p50_ms_min,p50_ms_max
+chronos,mcp:knowledge_checkout,62.648448,62.586189,62.674477
+chronos,mcp:knowledge_search,114.209905,113.72408,114.602118
+chronos,mcp:knowledge_get_document,228.104015,226.874654,228.769101
+chronos,mcp:knowledge_remember,37.480808,36.801705,38.187264
+chronos,mcp:knowledge_index_workspace_file,84.696366,83.720739,88.102922
+app-managed,mcp:knowledge_checkout,39.617593,39.472542,39.751491
+app-managed,mcp:knowledge_search,507.640817,501.674454,508.847614
+app-managed,mcp:knowledge_get_document,395.083105,391.245538,396.125356
+app-managed,mcp:knowledge_remember,415.386106,411.566187,418.138107
+app-managed,mcp:knowledge_index_workspace_file,458.685385,452.842504,461.016951
+physical-clone,mcp:knowledge_checkout,25849.215466,25783.918634,26174.767629
+physical-clone,mcp:knowledge_search,542.814962,539.704858,543.355088
+physical-clone,mcp:knowledge_get_document,393.632453,391.622879,394.121718
+physical-clone,mcp:knowledge_remember,419.578074,415.160409,420.288265
+physical-clone,mcp:knowledge_index_workspace_file,462.512505,462.370017,467.413689

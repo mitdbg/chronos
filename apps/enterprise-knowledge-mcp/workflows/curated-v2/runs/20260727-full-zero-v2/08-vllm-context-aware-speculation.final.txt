@@ -1,0 +1,11 @@
+Implemented and promoted the CPU-testable RFC #48627 prototype into `person/olivia-grant`.
+
+- Schema: preserved three-field schedules; added five-field batch/context rectangles, dense 2D lookup, range validation, and gap/overlap rejection.
+- Scheduler: selects K at the existing final scheduling boundary using scheduled batch size and maximum current context. GPU graph and buffer policies remain unchanged.
+- Checks: compilation, Ruff, and direct CPU schema behavior checks passed. Pytest could not run because pytest is absent from the mounted environment.
+- Evidence report: `/artifacts/experiments/context-aware-speculation.md`, indexed as `workspace_40ff7605167df1aa4bcec22c`.
+- Promotion: scheduler descendant merged successfully; post-merge diff against `person/olivia-grant` was empty.
+- Cleanup: both temporary branches were deleted and confirmed absent.
+- Memory: `memory_8c5c6b975c3988a61a10cb9f`.
+
+Primary evidence included RFC snapshot `enterprise_a251a0a0364578007031aba8`, acceptance gates `dsid_b218fd2b04a041df876e8d57571ecc98`, workload-distribution gates `dsid_bf69afe8fe964eb8af7032530bac7c72`, and LTS performance constraints `dsid_cd22e1d3a7324c4fb8987cb2afdc947f`. No GitHub or upstream actions were performed.

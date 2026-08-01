@@ -1,0 +1,23 @@
+Completed entirely in Chronos enterprise knowledge; the Chronos source repository was not modified.
+
+- Branch: `person/priya-shah-capture-20260727`
+- Parent: `team/runtime-diagnostics-capture-20260727`
+- Status: isolated, not merged or deleted
+- Indexed plan: [onboarding-plan.md](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-10pct/state-v2/checkouts/person-priya-shah-capture-20260727/knowledge/people/priya-shah/onboarding-plan.md)
+- Document ID: `workspace_90138731027c9aaab2a740b5`
+- Indexed chunks: 11
+- Semantic memory: `memory_f911a768b62e4f04fac05763`
+- Memory path: `/memory/semantic_memory/redwood-engineering-onboarding-access-turnaround-targets-fac05763.md`
+- Memory confidence: `0.99`
+
+The memory records baseline provisioning five business days before start—or two business days after a late request—with item-level targets of 1 day for SSO/security assignment, 2 days for GitHub and PagerDuty/Datadog, 3 days for Console sandbox, and 3–7 days for a laptop.
+
+Evidence used:
+
+- `workspace_38ac45fbb6664b5d678f5410` — `/knowledge/teams/runtime-diagnostics/operating-plan.md`
+- `workspace_594675f335939dce30b8f76a` — `/knowledge/departments/reliability-engineering/charter.md`
+- `dsid_426645772b534ac4a6af358830cf7982` — canonical onboarding/tooling guide
+- `dsid_60f6461978c149b597fe8894d9da2bd1` — cohort onboarding and provisioning targets
+- `dsid_363b6658e9524c3cbadeb4579d4ac7e0` — incident ownership and escalation practices
+- `dsid_8cff0d2004fc4c58b2391a0e3cc71556` — runtime incident metrics and postmortem timing
+- `dsid_62bd575d44e5409abddcf9836f6f8f6a` — staged rollout gates, rollback, and validation expectations

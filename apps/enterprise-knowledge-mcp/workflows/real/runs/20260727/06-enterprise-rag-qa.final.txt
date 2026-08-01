@@ -1,0 +1,102 @@
+[
+  {
+    "question_id": "qst_0006",
+    "answer": "The proposed canonical evaluation order is: (1) authoritative reachability DOWN, which yields FAILOVER unless no healthy fallback exists; (2) high-severity/fast 5xx error burn, which yields FAILOVER or PARTIAL_SHIFT depending on blast radius and destination capacity; (3) p99/p95 tail-latency burn, which starts with PARTIAL_SHIFT and escalates to FAILOVER only when sustained and corroborated; and (4) capacity exhaustion/hard gate, which yields HOLD plus load shedding and explicitly avoids shifting traffic into the constrained region. Reachability DOWN overrides hold-down, and 5xx burn wins over latency burn when both fire.",
+    "evidence": [
+      {
+        "document_id": "dsid_184be937d34a412ab5e61366d54d8ed6",
+        "path": "/knowledge/company/sources/google_drive/shared_drives/policy-engine-failover-extensions-draft.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0012",
+    "answer": "The root cause was a bug in edge-sw-7's switch firmware 1.2.3: under high multicast load, proxy ARP incorrectly advertised VPN-assigned addresses (including addresses outside the local subnet). Those bogus ARP replies introduced a second MAC/IP mapping on the campus L2 network, creating ephemeral duplicate-IP conflicts, misrouting, VPN rekeys, and 30–90 second traffic blackholes.",
+    "evidence": [
+      {
+        "document_id": "dsid_59cb294da8964683bb165a3bb615df71",
+        "path": "/knowledge/company/sources/jira/ops-requests/INT-460811-edge-switch-arp-proxy-ip-duplication.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0028",
+    "answer": "The checklist was to update the release branch with `git checkout release/v1.14` and `git pull --ff-only origin release/v1.14`; create the annotated tag with `git tag -a v1.14.0 -m \"Release v1.14.0 — runtime + CLI: perf improvements, bugfixes\"`, using the required GPG-signed form `git tag -s v1.14.0 -m \"Release v1.14.0\"` so the tag is signed and annotated; push it with `git push origin v1.14.0`; then create the draft release with `gh release create v1.14.0 dist/* --notes-file CHANGELOG.md --draft`. The signer was also told to verify that the signing key matched the GPG key uploaded to GitHub, and the draft was to include the built assets, checksums, and manifest.",
+    "evidence": [
+      {
+        "document_id": "dsid_7c0157af909c4a6190e00e1fc6b92b73",
+        "path": "/knowledge/company/sources/slack/1729999999-tagging-handoff-ops-checkin.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0030",
+    "answer": "The beta gate allows selected Dedicated and Hosted customers, with opt-in, behind the Console feature flag. Internal Redwood tenants are the alpha cohort; GA later expands to all Console users.",
+    "evidence": [
+      {
+        "document_id": "dsid_54525a33e2d44d4a9b665feaf8fab624",
+        "path": "/knowledge/company/sources/linear/product-management/PM-24680-cohort-comparator-and-trace-linker-for-deployment-health.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0077",
+    "answer": "The three-way startup handshake is `CLIENT_HELLO -> AUTH_OK -> SERVER_READY`. It is shared across the Python, TypeScript, and Go SDKs for both new stream starts and reconnects, with a legacy fallback when an older server does not return `AUTH_OK`.",
+    "evidence": [
+      {
+        "document_id": "dsid_88b39d13bd584ef8b1422d76994808c7",
+        "path": "/knowledge/company/sources/github/pr-95312-unify-handshake-consumer-ux-and-retry-bump.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0138",
+    "answer": "The CTO's non-negotiable was guaranteed isolation plus an auditable trail before legal would sign—specifically, SOC 2 plus SAML. The account notes quote the CTO saying: \"We need guaranteed isolation + audit trail before legal will sign — SOC2 plus SAML is non-negotiable.\"",
+    "evidence": [
+      {
+        "document_id": "dsid_db931dec10bf4b10829175533605aa0f",
+        "path": "/knowledge/company/sources/hubspot/company-cobalt-brookline-analytics.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0165",
+    "answer": "The additional senior infrastructure hire received gated, not immediate, approval: after a six-week review, the team had to demonstrate P95 latency improvement and an incident reduction of more than 20% before the role could be unfrozen. If the gate was met, Finance would greenlight the hire for Q4; the critical Platform infrastructure backfill was approved immediately.",
+    "evidence": [
+      {
+        "document_id": "dsid_614b42d654ba42e1abaa5163da75bc13",
+        "path": "/knowledge/company/sources/gmail/michael_grant/20270530-executive-okrs-headcount-allocation-checklist.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0174",
+    "answer": "Every conformance-ledger row must contain: `timestamp`, `service_a`, `service_a_version`, `service_b`, `service_b_version`, `endpoint`, `dcts_version`, `test_case_id`, `result` (`pass|fail`), `failure_reason`, and `run_id`.",
+    "evidence": [
+      {
+        "document_id": "dsid_04b24bf957c047f4b7d8ceefdfde8290",
+        "path": "/knowledge/company/sources/confluence/architecture-and-standards/decision-records/adr-declarative-contract-tests-and-schema-fencing-2026.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0210",
+    "answer": "Compute `SS = 100 * sum_p(w_p * (failure_count_p / max(1,total_calls_p))) / sum_p(w_p)` for priority-weighted test-slice failure density; `LP = 10 * max(0, (median_latency_ms - latency_slo_ms) / latency_slo_ms)`, clipped at 30; and `DF = 50 * embedding_drift_score_95pct_quantile`, normalized against baseline drift. Then `DS = clamp(SS + LP + DF, 0, 100)`. Bands: `DS <= 15` means GO/proceed; `15 < DS <= 35` means CAUTION/slow to 10% and conduct targeted human review within four hours; `35 < DS <= 60` means HOLD/pause and run automated bisect plus focused probes; and `DS > 60` means ROLLBACK/revert automatically to the baseline and open an incident.",
+    "evidence": [
+      {
+        "document_id": "dsid_b4bd83b46612452e858bc02b380082e2",
+        "path": "/knowledge/company/sources/confluence/applied-ml-and-evals/regression-triage/probe-heatmap-rollout-decision-protocol-2024.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0460",
+    "answer": "The agreed next steps were: Sophie would send Priya the take-home assignment by 2025-02-12; Leah/recruiting would confirm Priya's availability; Evan would prepare the technical rubric and notes by 2025-02-14; and a panel interview with Product and Engineering would be scheduled by 2025-02-18.",
+    "evidence": [
+      {
+        "document_id": "dsid_2c9dcc3afa3249f39c725884e5be5c72",
+        "path": "/knowledge/company/sources/fireflies/interviews/2025-02-11-candidate-interview-senior-se.json"
+      }
+    ]
+  }
+]

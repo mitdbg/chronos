@@ -1,0 +1,18 @@
+{
+  "workflow": "06-vllm-kv-cache-dtype",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/06-vllm-kv-cache-dtype.md",
+  "prompt_sha256": "3833e77f060cd8b21660904bc0fd2aebfb08594f21a98a5f42902c861a6c1cec",
+  "session_id": "019fa69a-88c0-7891-acef-5da9e5cd29a7",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T02-42-53-019fa69a-88c0-7891-acef-5da9e5cd29a7.jsonl",
+  "rollout_sha256": "fdd9e6a5739f837af227befa462d7a386cb8b422f4f7d72543e3fc13200ffee2",
+  "events": 56,
+  "mcp_events": 22,
+  "shell_events": 28,
+  "patch_events": 6,
+  "memory_timestamps_resolved": 0,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/06-vllm-kv-cache-dtype.jsonl",
+  "trace_sha256": "0d6a5ec81edd337738c80db5022986572cdc16815dec46186316c98eedbb7382",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/06-vllm-kv-cache-dtype.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/06-vllm-kv-cache-dtype.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/06-vllm-kv-cache-dtype.final.txt"
+}

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "status": "main-benchmark-suite",
+  "capture_policy": "real-codex-rollout-only",
+  "starting_state": {
+    "organization": "3 departments, 2 teams per department, and personal branches",
+    "company_corpus": "100% of EnterpriseRAG-Bench generated_data",
+    "code_corpus": "Pinned vLLM, LiteLLM, and Langfuse source trees",
+    "embedding_mode": "zero-vector staging until the shared MiniLM backfill completes"
+  },
+  "workflows": [
+    {"id": "01", "prompt": "01-vllm-batch-api-contract.md", "category": "coding"},
+    {"id": "02", "prompt": "02-vllm-flashinfer-virtual-buffers.md", "category": "coding-branch-comparison"},
+    {"id": "03", "prompt": "03-litellm-retry-after.md", "category": "coding"},
+    {"id": "04", "prompt": "04-langfuse-rest-trace-metadata.md", "category": "coding-review"},
+    {"id": "05", "prompt": "05-litellm-latency-routing-race.md", "category": "coding-deep-branch"},
+    {"id": "06", "prompt": "06-vllm-kv-cache-dtype.md", "category": "coding"},
+    {"id": "07", "prompt": "07-langfuse-score-analytics.md", "category": "coding-branch-comparison"},
+    {"id": "08", "prompt": "08-vllm-context-aware-speculation.md", "category": "coding-deep-branch"},
+    {"id": "09", "prompt": "09-enterprise-rag-qa-memory.md", "category": "knowledge-qa-memory"},
+    {"id": "10", "prompt": "10-platform-engineer-onboarding.md", "category": "organizational-branching"},
+    {"id": "11", "prompt": "11-form-runtime-diagnostics-team.md", "category": "hierarchy-and-document-update"},
+    {"id": "12", "prompt": "12-parallel-incident-investigations.md", "category": "branch-lifecycle"},
+    {"id": "13", "prompt": "13-launch-readiness-revision-cycle.md", "category": "document-update"}
+  ]
+}

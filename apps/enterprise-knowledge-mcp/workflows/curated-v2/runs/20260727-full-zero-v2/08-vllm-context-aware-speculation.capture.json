@@ -1,0 +1,18 @@
+{
+  "workflow": "08-vllm-context-aware-speculation",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/08-vllm-context-aware-speculation.md",
+  "prompt_sha256": "7efe96c990dae9d8f6b09449426c25ee35230cef5d46d70f9e0e5d6936084bc8",
+  "session_id": "019fa6b6-4d9d-75c2-a9ca-09b32ff10dd8",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T03-13-13-019fa6b6-4d9d-75c2-a9ca-09b32ff10dd8.jsonl",
+  "rollout_sha256": "7610a3f8af8726b81981d66e7782db99f7edce6c97ec000bc5baeb28fe0bdc4d",
+  "events": 61,
+  "mcp_events": 35,
+  "shell_events": 19,
+  "patch_events": 7,
+  "memory_timestamps_resolved": 0,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/08-vllm-context-aware-speculation.jsonl",
+  "trace_sha256": "e091b44c2ee3371bfe6fd341931a71c7a3d8dcb95c79c0640e88241ba9aca33d",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/08-vllm-context-aware-speculation.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/08-vllm-context-aware-speculation.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/08-vllm-context-aware-speculation.final.txt"
+}

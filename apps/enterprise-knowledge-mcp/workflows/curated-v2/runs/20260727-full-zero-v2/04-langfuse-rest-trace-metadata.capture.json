@@ -1,0 +1,18 @@
+{
+  "workflow": "04-langfuse-rest-trace-metadata",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/04-langfuse-rest-trace-metadata.md",
+  "prompt_sha256": "ad1adc16dd446999f6c5d3cfc08ea12f4055612ccb7bdd1846e3956f665af487",
+  "session_id": "019fa687-c414-7f63-99c4-378eceafaa6f",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T02-22-23-019fa687-c414-7f63-99c4-378eceafaa6f.jsonl",
+  "rollout_sha256": "9aaacfd62fa5fe3804ef971a0c23a399d45ab0080eb2270a3b081f40afb749ab",
+  "events": 25,
+  "mcp_events": 14,
+  "shell_events": 9,
+  "patch_events": 2,
+  "memory_timestamps_resolved": 0,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/04-langfuse-rest-trace-metadata.jsonl",
+  "trace_sha256": "acaf85a9c2a80852bb77e676c353b1577a3a79e032ddd7aeb00f913f52486d9c",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/04-langfuse-rest-trace-metadata.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/04-langfuse-rest-trace-metadata.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/04-langfuse-rest-trace-metadata.final.txt"
+}

@@ -1,0 +1,7 @@
+Benchmark starting point is clean:
+
+- Deleted `team/runtime-diagnostics-real-20260727` first.
+- Deleted `department/reliability-engineering-real-20260727` second.
+- Verified both exact branch IDs are absent.
+- No other branches were deleted.
+- Chronos source repository was not modified.

@@ -1,0 +1,40 @@
+Completed the operational capture. Both branches remain mounted, unmerged, and undeleted.
+
+### Created branches
+
+- `department/reliability-engineering-capture-20260727`
+  - Parent: `main`
+- `team/runtime-diagnostics-capture-20260727`
+  - Parent: `department/reliability-engineering-capture-20260727`
+
+### Documents
+
+- [Reliability Engineering Department Charter](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-full-zero-v1/state/checkouts/department-reliability-engineering-capture-20260727/knowledge/departments/reliability-engineering/charter.md)
+  - Indexed ID: `reliability-engineering-charter-20260727`
+  - Covers mission, responsibilities, SRE/Runtime interfaces, and evidence-backed first-quarter priorities.
+
+- [Runtime Diagnostics Team Operating Plan](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-full-zero-v1/state/checkouts/team-runtime-diagnostics-capture-20260727/knowledge/teams/runtime-diagnostics/operating-plan.md)
+  - Indexed ID: `runtime-diagnostics-operating-plan-20260727`
+  - Covers intake, evidence bundles, validation states, escalation, closure, and durable promotion.
+
+### Memories
+
+- Semantic memory: `reliability-engineering-mission-scope-20260727`
+  - Title: “Reliability Engineering mission and operating scope”
+  - Path: `/memory/semantic_memory/reliability-engineering-mission-and-operating-scope-20260727.md`
+
+- Team playbook: `runtime-diagnostics-investigation-promotion-playbook-20260727`
+  - Title: “Runtime diagnostics investigation and durable-promotion procedure”
+  - Path: `/memory/playbook/runtime-diagnostics-investigation-and-durable-promotion-procedur-20260727.md`
+
+### Principal evidence used
+
+- `dsid_f7e06746cbe9460fb64e394c08cc2f4a` — `/knowledge/company/sources/confluence/oncall-and-incident-response/incident-command-playbook-and-escalation-matrix-2024.json`
+- `dsid_9d5d013a9922422393b35123f0ae6e6e` — `/knowledge/company/sources/confluence/eng-sre/reliability-initiatives/stability-acceptance-and-capacity-fingerprint-guidelines-2024.json`
+- `dsid_c02fa8f0acc54c8ca2d5066f88cec9e1` — `/knowledge/company/sources/confluence/eng-serving-runtime/kernel-and-scheduling/scheduling-feedback-loop-operator-handbook-2026.json`
+- `dsid_94def0ce27f34496989dbd82ae7fd912` — `/knowledge/company/sources/confluence/eng-serving-runtime/team-wiki/cross-layer-diagnostics-and-observability-playbook-2026.json`
+- `dsid_e31d964a022d4e628d5de9eb850777a3` — `/knowledge/company/sources/confluence/eng-sre/slo-and-error-budgets/hosted-api-slo-overload-exceptions-and-budget-policy.json`
+- `dsid_28ce166717374044ac1b2b370809df17` — `/knowledge/company/sources/confluence/eng-infra/ci-cd-and-build/canary-gpu-provisioning-safety-net-pipeline.json`
+- `dsid_d809def9e72b4dedb5d7a38f9031c463` — `/knowledge/company/sources/linear/engineering/ENG-128450-regional-readiness-orchestrator-fallback-selector.json`
+
+The regional orchestrator source is marked in progress, so it was used to establish an operational validation priority—not to claim failover capability is already complete.

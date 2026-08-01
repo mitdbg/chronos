@@ -1,0 +1,18 @@
+{
+  "workflow": "11-form-runtime-diagnostics-team",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/11-form-runtime-diagnostics-team.md",
+  "prompt_sha256": "46b678d877f9045cb4999a97e23acb8a5427928a713a29cc1ad604150f0e161c",
+  "session_id": "019fa6c7-2c08-7a72-9da9-19ea1b103097",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T03-31-38-019fa6c7-2c08-7a72-9da9-19ea1b103097.jsonl",
+  "rollout_sha256": "1df0981d81ad32431999d303cb80ce748049b5a196d8b2740c9ff8455fe0cf10",
+  "events": 28,
+  "mcp_events": 24,
+  "shell_events": 1,
+  "patch_events": 3,
+  "memory_timestamps_resolved": 0,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/11-form-runtime-diagnostics-team.jsonl",
+  "trace_sha256": "e50af2eec7b181dfa4a31b903522b5a3c7fe1581c65055503a7e6dcab8a52d34",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/11-form-runtime-diagnostics-team.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/11-form-runtime-diagnostics-team.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/11-form-runtime-diagnostics-team.final.txt"
+}

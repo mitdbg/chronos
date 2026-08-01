@@ -1,0 +1,33 @@
+Resolved vLLM #50026 and merged the reviewed changes into `person/marcus-reed`.
+
+Changed paths:
+
+- [protocol.py](/tmp/chronos-enterprise-curated-v2-capture-workdir/code/vllm/vllm/entrypoints/openai/chat_completion/protocol.py) — rejects `stream: true` and non-null `tools`.
+- [test_chat_error.py](/tmp/chronos-enterprise-curated-v2-capture-workdir/code/vllm/tests/entrypoints/openai/chat_completion/test_chat_error.py) — regressions for streaming, tools, and a supported request.
+- [vllm-50026.md](/tmp/chronos-enterprise-curated-v2-capture-workdir/artifacts/reviews/vllm-50026.md) — contract, evidence, checks, and residual validation.
+
+Checks:
+
+- Focused pytest attempted with the required `uv` workflow.
+- Not run: `uv` was unavailable (`/bin/bash: uv: command not found`, exit 127).
+- Static line-length scan found no newly introduced violations.
+- GPU/HTTP integration validation remains documented; no test is falsely reported as passing.
+
+Branch result:
+
+- Diff contained only the two reviewed file modifications and review artifact.
+- Merge into `person/marcus-reed`: successful.
+- Task branch deleted: successful.
+- No repository commits, GitHub access, push, or PR creation occurred.
+
+Memory:
+
+- ID: `memory_290b995314ce89b042df5ecd`
+- Stored on `person/marcus-reed`.
+
+Key evidence:
+
+- Issue snapshot: `/code/upstream-issues/vllm-50026.md` — `enterprise_4a5b9ac74f2c790896a71b6d`
+- Redwood validation contract: `/knowledge/company/sources/slack/eng-platform/1978645123-compatibility-check-request-body-semantics.json` — `dsid_f5c42b6b5adb4139b72f5a061e42a2f1`
+- Support evidence concerning misleading blank 200 responses: `/knowledge/company/sources/gmail/jasmine_liu/20270514-aldercare-claimed-empty-completions-review.json` — `dsid_32a0025938544727808025e00aacbd34`
+- Function-validation requirements: `ENG-9461` — `dsid_d826bbd328f14dfe97d15a3e01d42e3b`

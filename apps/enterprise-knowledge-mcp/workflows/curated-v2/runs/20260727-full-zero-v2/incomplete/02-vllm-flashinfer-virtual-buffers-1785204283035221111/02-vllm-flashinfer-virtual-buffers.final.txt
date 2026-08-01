@@ -1,0 +1,33 @@
+Selected and merged the initialization-time capacity candidate into `person/lena-fischer`.
+
+Candidate comparison:
+
+- Capacity: computes a tight virtual-batch bound from `max_num_seqs`, `max_num_batched_tokens`, and attention chunk size. All three buffers are allocated once with stable addresses.
+- Grow-on-demand: guards the common path and grows geometrically only on chunked-local overflow. Rejected because exceptional-step allocation changes buffer addresses, increases fragmentation risk, and adds complexity.
+- CUDA graphs: chunked-local attention currently declares `AttentionCGSupport.NEVER`; capacity sizing is additionally robust because addresses remain stable.
+- Acceptance criteria: both candidates include identical CPU-level source coverage reproducing one request expanding into four virtual batches and checking request/page capacity.
+
+Validation:
+
+- Source-level diffs were limited to the intended three code/test files and candidate note.
+- No merge markers or trailing whitespace found.
+- Pytest/lint could not run: the checkout lacks `.venv`, `uv`, pytest, ruff, mypy, and pre-commit; `AGENTS.md` prohibits system Python.
+- GPU, FlashInfer runtime, and CUDA-graph execution were not available and remain unvalidated.
+
+Results:
+
+- Capacity candidate merged successfully into `person/lena-fischer`.
+- Post-merge Chronos diff was empty.
+- Both temporary branches were deleted successfully.
+- Semantic memory: `memory_46c29707bab3a2c1fc0c9ea4`.
+
+Evidence:
+
+- Capacity note: `/artifacts/candidates/flashinfer-capacity.md` (`workspace_08539a2e7bd4f73860b7851e`)
+- Grow note: `/artifacts/candidates/flashinfer-grow.md` (`workspace_390c3ee82bb0fa98112744bb`, cited durably in memory before branch deletion)
+- Issue snapshot: `/code/upstream-issues/vllm-49980.md` (`enterprise_1273061e2e9eafa6a2016560`)
+- Virtual-batch logic: `/code/vllm/vllm/v1/attention/backends/utils.py`
+- FlashInfer allocation: `/code/vllm/vllm/v1/attention/backends/flashinfer.py`
+- Regression: `/code/vllm/tests/v1/attention/test_chunked_local_attention.py`
+- Graph policy: `/code/vllm/vllm/model_executor/layers/attention/chunked_local_attention.py` (`enterprise_1fe68aa55ee7178bde07830c`)
+- Allocation incident and microbenchmark: `/knowledge/company/sources/slack/eng-oncall/1930005123-allocation-frag-recovery-plan.json` (`dsid_322d08eb8d4e46ee97550059472ba804`)

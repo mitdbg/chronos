@@ -1,0 +1,18 @@
+{
+  "workflow": "05-litellm-latency-routing-race",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/05-litellm-latency-routing-race.md",
+  "prompt_sha256": "2a6888be12a5a1e869cbe1e0b8f240409da49447672da3e9aa7f2e79807643be",
+  "session_id": "019fa68b-5e3d-7ad0-8b7c-a94b95799f0b",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T02-26-19-019fa68b-5e3d-7ad0-8b7c-a94b95799f0b.jsonl",
+  "rollout_sha256": "d10c12ef11dc6d8a00322cd186474c8752cec0d59c9d4b0f4183803ed0bf6185",
+  "events": 48,
+  "mcp_events": 27,
+  "shell_events": 18,
+  "patch_events": 3,
+  "memory_timestamps_resolved": 0,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/05-litellm-latency-routing-race.jsonl",
+  "trace_sha256": "d38ed24de4a09c979e3bcb2ee2a31aab9d4e7607223f1f4d2995cb7c5037aed9",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/05-litellm-latency-routing-race.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/05-litellm-latency-routing-race.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/05-litellm-latency-routing-race.final.txt"
+}

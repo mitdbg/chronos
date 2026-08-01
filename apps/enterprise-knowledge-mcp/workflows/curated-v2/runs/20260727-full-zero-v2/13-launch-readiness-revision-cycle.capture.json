@@ -1,0 +1,18 @@
+{
+  "workflow": "13-launch-readiness-revision-cycle",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/13-launch-readiness-revision-cycle.md",
+  "prompt_sha256": "43189b0838158a64392a446678daffd1d4b5d5035434d728f2698fb11fa55cef",
+  "session_id": "019fa6d1-3609-74f1-befa-e1e7543c1895",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T03-42-36-019fa6d1-3609-74f1-befa-e1e7543c1895.jsonl",
+  "rollout_sha256": "17c3e7c81868775399fca80ec29557da01010e09b91a484c3f4aa848b2497554",
+  "events": 39,
+  "mcp_events": 39,
+  "shell_events": 0,
+  "patch_events": 0,
+  "memory_timestamps_resolved": 1,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/13-launch-readiness-revision-cycle.jsonl",
+  "trace_sha256": "f28afc09c1b97218ca332be5f3a52570613ee6ff046a9cc5aff1b9e06fc51735",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/13-launch-readiness-revision-cycle.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/13-launch-readiness-revision-cycle.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/13-launch-readiness-revision-cycle.final.txt"
+}

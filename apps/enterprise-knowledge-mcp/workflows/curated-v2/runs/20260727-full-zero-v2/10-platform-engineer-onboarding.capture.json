@@ -1,0 +1,18 @@
+{
+  "workflow": "10-platform-engineer-onboarding",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/10-platform-engineer-onboarding.md",
+  "prompt_sha256": "a40ff0afb3313f248c8f9e825535eb8798d79688f52e0722c47c441c44401d90",
+  "session_id": "019fa6c3-286c-7763-8fc0-682ce21a353f",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T03-27-15-019fa6c3-286c-7763-8fc0-682ce21a353f.jsonl",
+  "rollout_sha256": "6f46b0e4474949f241b1badcd674c12f5e8d841e527961c49f31da3f5f4af400",
+  "events": 40,
+  "mcp_events": 36,
+  "shell_events": 3,
+  "patch_events": 1,
+  "memory_timestamps_resolved": 0,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/10-platform-engineer-onboarding.jsonl",
+  "trace_sha256": "e5180ee28ef55de5216fc8458364917a137ef3aa0e5b369607a9ab8009838b3a",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/10-platform-engineer-onboarding.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/10-platform-engineer-onboarding.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/10-platform-engineer-onboarding.final.txt"
+}

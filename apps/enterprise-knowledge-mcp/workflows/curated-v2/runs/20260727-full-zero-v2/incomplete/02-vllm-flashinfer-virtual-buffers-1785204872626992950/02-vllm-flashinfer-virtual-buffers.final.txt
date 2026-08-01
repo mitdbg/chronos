@@ -1,0 +1,47 @@
+Selected and merged the initialization-capacity candidate into `person/lena-fischer`. Both temporary branches were deleted.
+
+### Candidate comparison
+
+| Area | Initialization capacity | Grow on demand |
+|---|---|---|
+| Correctness | Bounds virtual requests by `max_num_batched_tokens`; covers all three buffers | Computes exact observed request/page requirements |
+| CUDA graphs | No runtime pointer replacement; safest | Preserves base buffers and rejects growth during capture, but adds pointer-state transitions |
+| Allocation frequency | Initialization only | No common-path allocation; geometric allocation on overflow |
+| Complexity | Small helper plus initialization change | Additional base/overflow state and switching logic |
+| Acceptance criteria | Best fit | Meets coverage intent, but GPU overflow behavior remains unvalidated |
+
+The initialization bound is justified because every virtual batch contains at least one scheduled query token. Page storage uses the larger of the legacy full-context bound and the virtual-batch chunk-page bound.
+
+### Changed and merged
+
+- [flashinfer.py](/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/person-lena-fischer/code/vllm/vllm/v1/attention/backends/flashinfer.py)
+- [utils.py](/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/person-lena-fischer/code/vllm/vllm/v1/attention/backends/utils.py)
+- [test_chunked_local_attention.py](/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/person-lena-fischer/code/vllm/tests/v1/attention/test_chunked_local_attention.py)
+- [flashinfer-capacity.md](/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/person-lena-fischer/artifacts/candidates/flashinfer-capacity.md)
+
+The regression expands one 17-token logical request into five virtual requests despite `max_num_seqs=1`, then verifies request and page capacities without loading model weights.
+
+### Validation
+
+- Source-level allocation, bounds, imports, and line-length inspection: completed.
+- Post-merge file and memory presence: verified.
+- Narrow pytest: not run because the pinned workspace contains no `.venv` and `uv` is unavailable. Repository instructions prohibit system Python.
+- GPU kernels, overflow allocation, and CUDA-graph capture/replay: not available in this CPU environment and remain required GPU validation.
+- No benchmark result was fabricated; the available harness documents relevant FlashInfer mixed/prefill coverage but contains no captured result for this change.
+
+### Chronos results
+
+- Capacity branch merged: confirmed.
+- Capacity temporary branch deleted: confirmed.
+- Grow temporary branch deleted: confirmed.
+- Semantic memory: `memory_0d76f015db6585900ccae364`
+- Memory file: [selected-design memory](/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/person-lena-fischer/memory/semantic_memory/select-initialization-time-flashinfer-virtual-batch-metadata-cap-0ccae364.md)
+
+Primary evidence:
+
+- `/code/upstream-issues/vllm-49980.md` — `enterprise_1273061e2e9eafa6a2016560`
+- `/code/vllm/vllm/v1/attention/backends/utils.py` — `enterprise_10235a940e32bd21f8918783`
+- `/code/vllm/vllm/v1/attention/backends/flashinfer.py` — `enterprise_be47da834cb7824cfee8dd82`
+- `/code/vllm/tests/v1/attention/test_chunked_local_attention.py` — `enterprise_8edf4519c715c3551c19f70e`
+- Long-prefill incident — `dsid_e72db0d66bf9451b975d55b9a0f83413`
+- Benchmark documentation — `enterprise_084bd77930dcd1d025065471`

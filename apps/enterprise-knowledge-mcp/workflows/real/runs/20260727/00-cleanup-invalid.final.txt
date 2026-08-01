@@ -1,0 +1,6 @@
+Deleted exactly these Chronos branches:
+
+- `team/runtime-diagnostics-real-20260727`
+- `department/reliability-engineering-real-20260727`
+
+Verified both are absent. No other branches were modified.

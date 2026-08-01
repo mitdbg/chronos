@@ -1,0 +1,33 @@
+Resolved on isolated branch `task/jada-williams/langfuse-rest-trace-v2`; it remains unmerged and mounted for review.
+
+Changed paths:
+
+- [eventsToTraceAdapter.ts](/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/task-jada-williams-langfuse-rest-trace-v2/code/langfuse/web/src/features/events/lib/eventsToTraceAdapter.ts)
+- [eventsToTraceAdapter.fixtures.ts](/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/task-jada-williams-langfuse-rest-trace-v2/code/langfuse/web/src/features/events/lib/eventsToTraceAdapter.fixtures.ts)
+- [eventsToTraceAdapter.clienttest.ts](/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/task-jada-williams-langfuse-rest-trace-v2/code/langfuse/web/src/features/events/lib/eventsToTraceAdapter.clienttest.ts)
+- [langfuse-12736.md](/tmp/chronos-enterprise-full-bench/capture-chronos-curated-v2/checkouts/task-jada-williams-langfuse-rest-trace-v2/artifacts/reviews/langfuse-12736.md)
+
+The regression fixture models normalized historical REST data with start/end times and tags, with an OpenTelemetry control fixture. Tests assert both produce 2.75-second latency and preserve their tags. The adapter also correctly distinguishes an epoch-valued end timestamp from a missing end time.
+
+Checks:
+
+- Client test attempted, but not executed: `/bin/bash: pnpm: command not found`.
+- Lint could not run for the same reason. The checkout lacks Node.js, Corepack, pnpm, and `node_modules`.
+- No server contract changed, so no server-targeted test applies.
+- Real browser review could not run. The exact remaining REST/OTel preview checks are documented in the review artifact.
+
+Diff against `person/jada-williams`:
+
+- Added files: review artifact, regression fixture, episodic-memory file.
+- Modified files: adapter and client test.
+- Added indexed documents: 5.
+- Deleted files/documents: none.
+
+Memory: `memory_a893a647d64a0297b9335496`.
+
+Primary evidence:
+
+- Issue snapshot: `/code/upstream-issues/langfuse-12736.md` — `enterprise_98d847b52246775cfd590be6`
+- Redwood product evidence: `/knowledge/company/sources/slack/product/1757772468-observability-console-cost-trace-rca.json` — `dsid_86fcd33085124e609126aca84d3ea521`
+- Console observability evidence: `/knowledge/company/sources/slack/product/1745001234-console-observability-pilot-scope-negotiation.json` — `dsid_7cb5942072734609a48b8fb057accd9`
+- Customer evidence: `/knowledge/company/sources/jira/customer-support/SUP-781409-trace-links-missing-after-retention-prune.json` — `dsid_50432aa019f247f2bbe6d1f4477c80b3`

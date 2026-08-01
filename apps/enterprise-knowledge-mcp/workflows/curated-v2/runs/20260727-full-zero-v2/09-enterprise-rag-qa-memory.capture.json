@@ -1,0 +1,18 @@
+{
+  "workflow": "09-enterprise-rag-qa-memory",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/09-enterprise-rag-qa-memory.md",
+  "prompt_sha256": "bc64442ad0a90d6e392efa94032563bb84ac10e313ce303588b8af31696ab103",
+  "session_id": "019fa6bd-ddd1-7dd2-b76a-05df3a066a99",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-home/sessions/2026/07/28/rollout-2026-07-28T03-21-28-019fa6bd-ddd1-7dd2-b76a-05df3a066a99.jsonl",
+  "rollout_sha256": "f31aafbd4e9f8b55731a2ac684d333153a81cc23cf531253f3d0390e5a478f7e",
+  "events": 75,
+  "mcp_events": 74,
+  "shell_events": 0,
+  "patch_events": 1,
+  "memory_timestamps_resolved": 1,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/full-zero-v2/09-enterprise-rag-qa-memory.jsonl",
+  "trace_sha256": "bd2fe87d489456fdc49a8b4bee926f43047ff8a47592fad17eeae744f48418e7",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/09-enterprise-rag-qa-memory.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/09-enterprise-rag-qa-memory.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260727-full-zero-v2/09-enterprise-rag-qa-memory.final.txt"
+}
