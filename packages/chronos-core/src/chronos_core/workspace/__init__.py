@@ -1,13 +1,14 @@
 """Multi-store Chronos workspace branching."""
 
-from chronos_core.workspace.filesystem import (
-    FilesystemBranchSession,
-    FilesystemCheckpointInfo,
-    FilesystemDiff,
-    FilesystemMergeResult,
-    FilesystemPathChange,
-    ChronosFilesystemStore,
-    FilesystemStoreError,
+from chronos_core.workspace.atomic import (
+    AtomicMergeError,
+    AtomicMergePreview,
+    AtomicMergeResult,
+    AtomicMergeWriteTimeoutError,
+    MergeSelection,
+    StaleAtomicMergePreviewError,
+    WorkspaceBranchToken,
+    WorkspaceMergeCoordinator,
 )
 from chronos_core.workspace.chronosfs import (
     CHRONOSFS_BLOCK_SIZE,
@@ -22,14 +23,14 @@ from chronos_core.workspace.chronosfs import (
     mount_chronosfs,
     start_chronosfs_mount,
 )
-from chronos_core.workspace.runtime import (
-    BranchStore,
-    ChronosWorkspaceContext,
-    WorkspaceBranchSession,
-)
-from chronos_core.workspace.stores import (
-    ChronosDuckDBStore,
-    ChronosPostgresStore,
+from chronos_core.workspace.filesystem import (
+    ChronosFilesystemStore,
+    FilesystemBranchSession,
+    FilesystemCheckpointInfo,
+    FilesystemDiff,
+    FilesystemMergeResult,
+    FilesystemPathChange,
+    FilesystemStoreError,
 )
 from chronos_core.workspace.qdrant import (
     ChronosQdrantStore,
@@ -40,17 +41,24 @@ from chronos_core.workspace.qdrant import (
     QdrantStoreError,
     QdrantUpsert,
 )
+from chronos_core.workspace.runtime import (
+    BranchStore,
+    ChronosWorkspaceContext,
+    WorkspaceBranchSession,
+)
+from chronos_core.workspace.stores import (
+    ChronosDuckDBStore,
+    ChronosPostgresStore,
+)
 
 __all__ = [
-    "BranchStore",
-    "FilesystemBranchSession",
-    "FilesystemCheckpointInfo",
-    "FilesystemDiff",
-    "FilesystemMergeResult",
-    "FilesystemPathChange",
-    "ChronosFilesystemStore",
-    "FilesystemStoreError",
     "CHRONOSFS_BLOCK_SIZE",
+    "AtomicMergeError",
+    "AtomicMergePreview",
+    "AtomicMergeResult",
+    "AtomicMergeWriteTimeoutError",
+    "BranchStore",
+    "ChronosDuckDBStore",
     "ChronosFSBranchSession",
     "ChronosFSDiff",
     "ChronosFSError",
@@ -58,18 +66,28 @@ __all__ = [
     "ChronosFSPathChange",
     "ChronosFSStat",
     "ChronosFSStore",
+    "ChronosFilesystemStore",
     "ChronosFuseOperations",
-    "mount_chronosfs",
-    "start_chronosfs_mount",
-    "ChronosDuckDBStore",
     "ChronosPostgresStore",
     "ChronosQdrantStore",
     "ChronosWorkspaceContext",
+    "FilesystemBranchSession",
+    "FilesystemCheckpointInfo",
+    "FilesystemDiff",
+    "FilesystemMergeResult",
+    "FilesystemPathChange",
+    "FilesystemStoreError",
+    "MergeSelection",
     "QdrantBranchSession",
     "QdrantCollectionInfo",
     "QdrantPoint",
     "QdrantSearchResult",
     "QdrantStoreError",
     "QdrantUpsert",
+    "StaleAtomicMergePreviewError",
     "WorkspaceBranchSession",
+    "WorkspaceBranchToken",
+    "WorkspaceMergeCoordinator",
+    "mount_chronosfs",
+    "start_chronosfs_mount",
 ]

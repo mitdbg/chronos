@@ -452,6 +452,23 @@ Multi-store branch operations use a branch transaction commit protocol. The
 guiding rule is: write new store state first, then commit one transactional
 branch reference.
 
+The current implementation represents that reference as a workspace manifest:
+each logical branch maps every participant name to a private physical store
+branch. `merge_atomic_preview()` returns a token and globally unique raw change
+IDs. `merge_atomic()` creates successor branches only for participants with
+selected changes, applies those changes with the existing store APIs, and
+publishes the complete successor manifest with one generation-checked metadata
+row update. A checkout resolves the manifest once, so it observes either the
+old participant set or the new participant set, never a mixture. Unpublished
+successors are deleted during abort or restart recovery.
+
+Atomic visibility is therefore a property of access through
+`ChronosWorkspaceContext`. Code that bypasses it and opens a private physical
+store branch directly is outside the protocol. Applications must also wrap
+ordinary logical branch mutations in `branch_write()`; a reserved merge waits
+for earlier writers and blocks new source or target writers until publication
+or abort.
+
 Chronos assumes that a polystore workspace has one transactional row store
 owning the branch metadata plane. That store is usually PostgreSQL, but SQLite
 is also valid for local deployments. Additional stores such as DuckDB,

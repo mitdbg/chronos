@@ -112,6 +112,7 @@ class RowDiff:
     before: dict[str, Any] | None
     after: dict[str, Any] | None
     conflict_id: str | None = None
+    change_id: str | None = None
 
 
 @dataclass(frozen=True)
