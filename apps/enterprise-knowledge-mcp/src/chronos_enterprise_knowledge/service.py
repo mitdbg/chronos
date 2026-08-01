@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -285,21 +286,78 @@ class KnowledgeService:
             arguments={"source_branch": source, "target_branch": target},
         )
 
-    def merge(self, source: str, target: str) -> dict[str, Any]:
+    def merge_preview(
+        self,
+        source: str,
+        target: str,
+        *,
+        policy: Any = None,
+    ) -> dict[str, Any]:
+        preview = getattr(self.backend, "merge_preview", None)
+        if not callable(preview):
+            raise NotImplementedError(
+                f"backend {self.backend.backend_name!r} does not support "
+                "selective merge previews"
+            )
+        return preview(source, target, policy=policy)
+
+    def merge(
+        self,
+        source: str,
+        target: str,
+        *,
+        selected_change_ids: Sequence[str] | None = None,
+        preview_token: str | None = None,
+        policy: Any = None,
+        conflict_choices: Mapping[str, str] | None = None,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        if (
+            selected_change_ids is not None
+            or preview_token is not None
+            or policy is not None
+            or conflict_choices is not None
+        ) and not callable(getattr(self.backend, "merge_preview", None)):
+            raise NotImplementedError(
+                f"backend {self.backend.backend_name!r} does not support "
+                "selective atomic merges"
+            )
+        merge_operation_id = operation_id or (
+            f"merge:{source}:{target}:{uuid.uuid4().hex}"
+        )
+        arguments: dict[str, Any] = {
+            "source_branch": source,
+            "target_branch": target,
+        }
+        if selected_change_ids is not None:
+            arguments["selected_change_ids"] = list(selected_change_ids)
+        if preview_token is not None:
+            arguments["preview_token"] = preview_token
+        if policy is not None:
+            arguments["policy"] = policy
+        if conflict_choices is not None:
+            arguments["conflict_choices"] = dict(conflict_choices)
         if self.recorder is None:
-            self.backend.merge(
+            result = self.backend.merge(
                 source,
                 target,
-                operation_id=f"merge:{source}:{target}",
+                operation_id=merge_operation_id,
+                **{
+                    key: value
+                    for key, value in arguments.items()
+                    if key not in {"source_branch", "target_branch"}
+                },
             )
             return {
+                **result,
                 "source_branch": source,
                 "target_branch": target,
                 "merged": True,
             }
         return self.recorder.execute(
             "branch_merge",
-            arguments={"source_branch": source, "target_branch": target},
+            arguments=arguments,
+            operation_id=operation_id,
         )
 
     def delete_branch(self, branch_id: str) -> None:

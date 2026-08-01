@@ -1414,10 +1414,38 @@ def dispatch_knowledge_tool(
             str(args["source_branch"]),
             str(args["target_branch"]),
         )
+    if name == "knowledge_merge_preview":
+        return service.merge_preview(
+            str(args["source_branch"]),
+            str(args["target_branch"]),
+        )
     if name == "knowledge_merge":
         return service.merge(
             str(args["source_branch"]),
             str(args["target_branch"]),
+            selected_change_ids=(
+                [str(value) for value in args["selected_change_ids"]]
+                if args.get("selected_change_ids") is not None
+                else None
+            ),
+            preview_token=(
+                str(args["preview_token"])
+                if args.get("preview_token") is not None
+                else None
+            ),
+            conflict_choices=(
+                {
+                    str(key): str(value)
+                    for key, value in args["conflict_choices"].items()
+                }
+                if args.get("conflict_choices") is not None
+                else None
+            ),
+            operation_id=(
+                str(args["operation_id"])
+                if args.get("operation_id") is not None
+                else None
+            ),
         )
     if name == "knowledge_delete_branch":
         branch_id = str(args["branch_id"])

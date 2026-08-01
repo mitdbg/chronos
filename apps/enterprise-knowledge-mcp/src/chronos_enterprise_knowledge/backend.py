@@ -233,10 +233,21 @@ class OperationExecutor:
         if operation.kind == "branch_merge":
             source_branch = str(args["source_branch"])
             target_branch = str(args["target_branch"])
+            optional = {
+                key: args[key]
+                for key in (
+                    "selected_change_ids",
+                    "preview_token",
+                    "policy",
+                    "conflict_choices",
+                )
+                if key in args
+            }
             self.backend.merge(
                 source_branch,
                 target_branch,
                 operation_id=operation.operation_id,
+                **optional,
             )
             return {
                 "source_branch": source_branch,

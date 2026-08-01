@@ -408,10 +408,24 @@ Each concurrent Codex session uses its own task branch.
    searchable.
 5. Save a validated fact, task outcome, or procedure with
    `knowledge_remember`.
-6. Review `knowledge_diff`, then merge the result or delete the task branch.
+6. Call `knowledge_merge_preview` to review stable change IDs across SQLite,
+   ChronosFS, and Qdrant.
+7. Call `knowledge_merge` with the preview token and only the approved change
+   IDs, or omit the allow-list to promote everything. An empty allow-list is a
+   no-op. The server rejects incomplete indexed-document bundles, so document
+   metadata, chunks, embeddings, and the authoritative file cannot diverge.
+8. Delete the task branch after promotion or rejection.
 
 All MCP calls carry an explicit `branch_id`; the server never relies on
 process-global checkout state. This keeps concurrent agent sessions isolated.
+The Chronos backend publishes a selected merge with one logical workspace-head
+change: readers see either the complete old three-store manifest or the
+complete new one. Generated reports and scratch files remain private unless
+their filesystem change IDs are explicitly selected.
+`knowledge_merge` first performs a non-lazy unmount of the source and target
+workspaces because POSIX writes do not pass through the MCP writer lease. If a
+process still holds either mount busy, the merge fails closed; finish the tool
+process and retry instead of publishing from a moving filesystem branch.
 
 ## Evaluation hooks
 

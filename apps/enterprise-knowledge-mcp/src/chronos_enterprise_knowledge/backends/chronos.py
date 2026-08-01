@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import errno
+import functools
 import hashlib
 import json
 import os
@@ -17,11 +18,13 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from chronos_core.branching import ChronosBranchContext
+from chronos_core.branching import ChronosBranchContext, MergeResolution
 from chronos_core.workspace import (
+    AtomicMergePreview,
     ChronosFSStore,
     ChronosQdrantStore,
     ChronosWorkspaceContext,
+    MergeSelection,
     QdrantUpsert,
 )
 from chronos_core.workspace.chronosfs import (
@@ -55,7 +58,47 @@ _BACKEND_STATE_TABLE = "knowledge_backend_state"
 _VECTOR_COLLECTION = "knowledge"
 _CHUNKS_BY_DOCUMENT_INDEX = "knowledge_chunks_by_document"
 _DIRENTS_BY_INODE_INDEX = "chronosfs_dirents_by_inode"
-_STORAGE_SCHEMA_VERSION = 2
+_STORAGE_SCHEMA_VERSION = 3
+
+
+def _coordinated_write(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(
+        self: ChronosKnowledgeBackend,
+        branch_id: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        with self.workspace.branch_write(branch_id):
+            return method(self, branch_id, *args, **kwargs)
+
+    return wrapped
+
+
+class MergeDependencyError(ValueError):
+    """A raw selection would publish an inconsistent indexed document."""
+
+    def __init__(
+        self,
+        missing_change_ids: Sequence[str] = (),
+        *,
+        stale_index_paths: Sequence[str] = (),
+    ):
+        self.missing_change_ids = tuple(sorted(set(missing_change_ids)))
+        self.stale_index_paths = tuple(sorted(set(stale_index_paths)))
+        messages = []
+        if self.missing_change_ids:
+            messages.append(
+                "atomic merge selection is missing dependent changes: "
+                + ", ".join(self.missing_change_ids)
+            )
+        if self.stale_index_paths:
+            messages.append(
+                "indexed document files changed without updated catalog and "
+                "embeddings; reindex before merge: "
+                + ", ".join(self.stale_index_paths)
+            )
+        super().__init__("; ".join(messages))
 
 
 class ChronosKnowledgeBackend:
@@ -69,6 +112,7 @@ class ChronosKnowledgeBackend:
         qdrant_url: str | None = None,
         qdrant_api_key: str | None = None,
         qdrant_storage_dir: str | Path | None = None,
+        workspace_metadata_url: str | None = None,
     ):
         self.state_dir = Path(state_dir).expanduser().resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -116,6 +160,11 @@ class ChronosKnowledgeBackend:
             filesystem=self.filesystem,
             sqlite=self.sqlite,
             qdrant=self.qdrant,
+            atomic_metadata_url=(
+                workspace_metadata_url
+                or f"sqlite:///{self.state_dir / 'workspace.sqlite'}"
+            ),
+            atomic_workspace_id=namespace,
         )
         self._active_mounts: dict[str, Path] = {}
         self._ensure_search_schema()
@@ -146,7 +195,7 @@ class ChronosKnowledgeBackend:
         start_chronosfs_daemon(self.filesystem)
 
     def list_branches(self) -> list[str]:
-        return sorted(self.filesystem.branches)
+        return self.workspace.list_branches()
 
     def mount_branch(
         self,
@@ -165,10 +214,11 @@ class ChronosKnowledgeBackend:
             return path
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            filesystem_branch = self.workspace.resolve_branch("filesystem", branch_id)
             start_chronosfs_mount(
                 self.filesystem,
                 path,
-                branch_id=branch_id,
+                branch_id=filesystem_branch,
             )
         except OSError as exc:
             if exc.errno != errno.ENOTCONN:
@@ -177,14 +227,17 @@ class ChronosKnowledgeBackend:
             start_chronosfs_mount(
                 self.filesystem,
                 path,
-                branch_id=branch_id,
+                branch_id=filesystem_branch,
             )
         self._active_mounts[branch_id] = path
         return path
 
-    def unmount_branch(self, branch_id: str) -> None:
-        path = self._active_mounts.pop(branch_id, None)
-        if path is None or not os.path.ismount(path):
+    def unmount_branch(self, branch_id: str, *, force: bool = True) -> None:
+        path = self._active_mounts.get(branch_id)
+        if path is None:
+            return
+        if not os.path.ismount(path):
+            self._active_mounts.pop(branch_id, None)
             return
         errors = []
         for command in (
@@ -201,10 +254,19 @@ class ChronosKnowledgeBackend:
                     capture_output=True,
                     text=True,
                 )
+                self._active_mounts.pop(branch_id, None)
                 return
             except subprocess.CalledProcessError as exc:
                 errors.append(exc)
+        if not force:
+            error = RuntimeError(
+                f"cannot merge while branch workspace is busy: {branch_id}"
+            )
+            if errors:
+                raise error from errors[-1]
+            raise error
         if errors:
+            self._active_mounts.pop(branch_id, None)
             self._detach_mount_path(path)
 
     @staticmethod
@@ -455,6 +517,7 @@ class ChronosKnowledgeBackend:
             raise ValueError("document batch contains duplicate chunk ids")
         return document_ids, paths, chunk_ids
 
+    @_coordinated_write
     def load_documents(
         self,
         branch_id: str,
@@ -588,6 +651,7 @@ class ChronosKnowledgeBackend:
                     branch.fs.unlink(path)
             raise
 
+    @_coordinated_write
     def put_documents(
         self,
         branch_id: str,
@@ -769,6 +833,7 @@ class ChronosKnowledgeBackend:
             "metadata_json": canonical_json(chunk.metadata),
         }
 
+    @_coordinated_write
     def delete_document(
         self,
         branch_id: str,
@@ -982,6 +1047,7 @@ class ChronosKnowledgeBackend:
             result.update({str(row["chunk_id"]): row for row in rows})
         return result
 
+    @_coordinated_write
     def write_file(
         self,
         branch_id: str,
@@ -998,6 +1064,7 @@ class ChronosKnowledgeBackend:
             parents=True,
         )
 
+    @_coordinated_write
     def delete_file(
         self,
         branch_id: str,
@@ -1017,7 +1084,9 @@ class ChronosKnowledgeBackend:
         # Mounted checkouts share one ChronosFS daemon process. Drop
         # negative/path cache entries before reading files that an agent may
         # have created through normal POSIX tools.
-        self.filesystem.refresh_branch(branch_id)
+        self.filesystem.refresh_branch(
+            self.workspace.resolve_branch("filesystem", branch_id)
+        )
         normalized = normalize_workspace_path(path)
         fs = self.workspace.checkout(branch_id).fs
         if not fs.exists(normalized):
@@ -1060,8 +1129,8 @@ class ChronosKnowledgeBackend:
         source: dict[str, str] = {}
         target: dict[str, str] = {}
         for diff in self.sqlite.diff_rows(
-            target_branch,
-            source_branch,
+            self.workspace.resolve_branch("sqlite", target_branch),
+            self.workspace.resolve_branch("sqlite", source_branch),
             _DOCUMENTS_TABLE,
         ):
             document_id = str(diff.key["id"])
@@ -1080,12 +1149,14 @@ class ChronosKnowledgeBackend:
 
         changed_inodes: set[int] = set()
         context = self.filesystem.context
+        source_fs_branch = self.workspace.resolve_branch("filesystem", source_branch)
+        target_fs_branch = self.workspace.resolve_branch("filesystem", target_branch)
         # ChronosFS updates the inode whenever file content changes. Directory
         # entries cover path additions, removals, and renames. Inspecting block
         # rows as well is redundant and can materialize hundreds of thousands
         # of rows after a build or test run writes many sandbox artifacts.
         for table in ("chronosfs_dirents", "chronosfs_inodes"):
-            for diff in context.diff_rows(target_branch, source_branch, table):
+            for diff in context.diff_rows(target_fs_branch, source_fs_branch, table):
                 for row in (diff.key, diff.before, diff.after):
                     if row is None:
                         continue
@@ -1108,7 +1179,9 @@ class ChronosKnowledgeBackend:
     def _path_for_inode(self, branch_id: str, inode_id: int) -> str | None:
         if inode_id == 1:
             return "/"
-        session = self.filesystem.context.checkout(branch_id)
+        session = self.filesystem.context.checkout(
+            self.workspace.resolve_branch("filesystem", branch_id)
+        )
         parts: list[str] = []
         current = inode_id
         seen: set[int] = set()
@@ -1140,7 +1213,9 @@ class ChronosKnowledgeBackend:
         branch_id: str,
         paths: set[str],
     ) -> dict[str, str]:
-        self.filesystem.refresh_branch(branch_id)
+        self.filesystem.refresh_branch(
+            self.workspace.resolve_branch("filesystem", branch_id)
+        )
         branch = self.workspace.checkout(branch_id)
         result: dict[str, str] = {}
         for path in sorted(paths):
@@ -1157,13 +1232,226 @@ class ChronosKnowledgeBackend:
         target_branch: str,
         *,
         operation_id: str,
+        selected_change_ids: Sequence[str] | None = None,
+        preview_token: str | None = None,
+        policy: Any = None,
+        conflict_choices: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
-        del operation_id
-        result = self.workspace.merge_apply(source_branch, target_branch)
-        return {name: _jsonable_diff(value) for name, value in sorted(result.items())}
+        # Mounted POSIX writes bypass the Python writer lease. A strict unmount
+        # makes the reviewed source and target quiescent before reservation.
+        self.unmount_branch(source_branch, force=False)
+        self.unmount_branch(target_branch, force=False)
+        effective_policy = (
+            "manual_review"
+            if policy is None and conflict_choices is not None
+            else policy
+        )
+        preview = self.workspace.merge_atomic_preview(
+            source_branch,
+            target_branch,
+            policy=effective_policy,
+        )
+        if preview_token is None or preview_token == preview.preview_token:
+            selected_for_validation = (
+                preview.change_ids
+                if selected_change_ids is None
+                else frozenset(str(value) for value in selected_change_ids)
+            )
+            self._validate_merge_dependencies(
+                preview,
+                selected_for_validation,
+            )
+        result = self.workspace.merge_atomic(
+            source_branch,
+            target_branch,
+            selection=(
+                None
+                if selected_change_ids is None
+                else MergeSelection.from_ids(selected_change_ids)
+            ),
+            preview_token=preview_token,
+            policy=effective_policy,
+            resolution=(
+                MergeResolution(dict(conflict_choices))
+                if conflict_choices is not None
+                else None
+            ),
+            operation_id=operation_id,
+        )
+        payload = _jsonable_diff(result)
+        return {
+            **{
+                name: {"applied": count}
+                for name, count in payload.get("stores", {}).items()
+            },
+            **payload,
+        }
+
+    def merge_preview(
+        self,
+        source_branch: str,
+        target_branch: str,
+        *,
+        policy: Any = None,
+    ) -> dict[str, Any]:
+        preview = self.workspace.merge_atomic_preview(
+            source_branch,
+            target_branch,
+            policy=policy,
+        )
+        bundles, paths, non_filesystem, content_changes, filesystem_groups = (
+            self._merge_dependency_groups(preview)
+        )
+        payload = _jsonable_diff(preview)
+        payload["selection_groups"] = {
+            "indexed_documents": {
+                document_id: sorted(change_ids)
+                for document_id, change_ids in sorted(bundles.items())
+            },
+            "filesystem_paths": {
+                path: sorted(change_ids)
+                for path, change_ids in sorted(filesystem_groups.items())
+            },
+        }
+        payload["stale_index_paths"] = sorted(
+            path
+            for path in content_changes
+            if any(
+                not non_filesystem.get(document_id)
+                for document_id in paths.get(path, ())
+            )
+        )
+        return payload
+
+    def _validate_merge_dependencies(
+        self,
+        preview: AtomicMergePreview,
+        selected: frozenset[str],
+    ) -> None:
+        bundles, paths, non_filesystem_changes, content_changes, _ = (
+            self._merge_dependency_groups(preview)
+        )
+        missing: set[str] = set()
+        for bundle in bundles.values():
+            chosen = bundle & selected
+            if chosen and chosen != bundle:
+                missing.update(bundle - selected)
+        if missing:
+            raise MergeDependencyError(sorted(missing))
+        stale_paths = {
+            path
+            for path, change_ids in content_changes.items()
+            if change_ids & selected
+            and any(
+                not non_filesystem_changes.get(document_id)
+                for document_id in paths.get(path, ())
+            )
+        }
+        if stale_paths:
+            raise MergeDependencyError(stale_index_paths=sorted(stale_paths))
+
+    def _merge_dependency_groups(
+        self,
+        preview: AtomicMergePreview,
+    ) -> tuple[
+        dict[str, set[str]],
+        dict[str, set[str]],
+        dict[str, set[str]],
+        dict[str, set[str]],
+        dict[str, set[str]],
+    ]:
+        bundles: dict[str, set[str]] = {}
+        paths: dict[str, set[str]] = {}
+        point_documents: dict[str, set[str]] = {}
+        non_filesystem_changes: dict[str, set[str]] = {}
+        content_changes: dict[str, set[str]] = {}
+        filesystem_groups: dict[str, set[str]] = {}
+
+        for branch_id in (preview.source, preview.target):
+            rows = self.workspace.checkout(branch_id).sqlite.query(
+                f"SELECT id, path FROM {_DOCUMENTS_TABLE}"
+            )
+            for row in rows:
+                path = str(row["path"])
+                document_id = str(row["id"])
+                if path and document_id:
+                    paths.setdefault(path, set()).add(document_id)
+
+        def add(
+            document_id: str,
+            change_id: str | None,
+            *,
+            filesystem: bool = False,
+        ) -> None:
+            if document_id and change_id:
+                bundles.setdefault(document_id, set()).add(change_id)
+                if not filesystem:
+                    non_filesystem_changes.setdefault(document_id, set()).add(
+                        change_id
+                    )
+
+        sqlite_preview = preview.stores.get("sqlite")
+        if sqlite_preview is not None:
+            for change in (*sqlite_preview.changes, *sqlite_preview.conflicts):
+                rows = [row for row in (change.before, change.after) if row is not None]
+                if change.table == _DOCUMENTS_TABLE:
+                    document_id = str(change.key.get("id", ""))
+                    add(document_id, change.change_id)
+                    for row in rows:
+                        path = str(row.get("path", ""))
+                        if path:
+                            paths.setdefault(path, set()).add(document_id)
+                elif change.table == _CHUNKS_TABLE:
+                    document_ids = {
+                        str(row.get("document_id", "")) for row in rows
+                    }
+                    for document_id in document_ids:
+                        add(document_id, change.change_id)
+                    for row in rows:
+                        point_id = str(row.get("point_id") or row.get("id") or "")
+                        if point_id:
+                            point_documents.setdefault(point_id, set()).update(document_ids)
+
+        qdrant_preview = preview.stores.get("qdrant")
+        if qdrant_preview is not None:
+            for change in (*qdrant_preview.changes, *qdrant_preview.conflicts):
+                point_id = str(change.key.get("id", ""))
+                document_ids = set(point_documents.get(point_id, ()))
+                for row in (change.before, change.after):
+                    if row is None:
+                        continue
+                    payload = row.get("payload") or {}
+                    document_id = str(payload.get("document_id", ""))
+                    if document_id:
+                        document_ids.add(document_id)
+                for document_id in document_ids:
+                    add(document_id, change.change_id)
+
+        filesystem_preview = preview.stores.get("filesystem")
+        if filesystem_preview is not None:
+            for change in (*filesystem_preview.changes, *filesystem_preview.conflicts):
+                path = str(change.key.get("path", ""))
+                if path and change.change_id:
+                    filesystem_groups.setdefault(path, set()).add(change.change_id)
+                    if change.table in {
+                        "chronosfs_file_range",
+                        "chronosfs_dirent",
+                    }:
+                        content_changes.setdefault(path, set()).add(change.change_id)
+                for document_id in paths.get(path, ()):
+                    add(document_id, change.change_id, filesystem=True)
+        return (
+            bundles,
+            paths,
+            non_filesystem_changes,
+            content_changes,
+            filesystem_groups,
+        )
 
     def state_digest(self, branch_id: str) -> str:
-        self.filesystem.refresh_branch(branch_id)
+        self.filesystem.refresh_branch(
+            self.workspace.resolve_branch("filesystem", branch_id)
+        )
         branch = self.workspace.checkout(branch_id)
         document_rows = branch.sqlite.query(
             f"""

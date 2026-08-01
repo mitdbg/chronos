@@ -300,6 +300,7 @@ def test_mcp_exposes_simple_branch_knowledge_tools(tmp_path: Path) -> None:
             "knowledge_write_artifact",
             "knowledge_remember",
             "knowledge_diff",
+            "knowledge_merge_preview",
             "knowledge_merge",
             "knowledge_delete_branch",
         } <= tools

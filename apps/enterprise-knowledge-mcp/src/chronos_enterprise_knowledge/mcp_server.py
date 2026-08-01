@@ -26,6 +26,10 @@ the completed outcome, or a reusable procedure with knowledge_remember. Raw
 conversation turns and unsupported hypotheses are not durable memory.
 When new evidence changes a durable memory, write the replacement with
 supersedes instead of retaining contradictory entries.
+Before promotion, call knowledge_merge_preview and pass only approved change
+IDs plus its preview token to knowledge_merge. Omit the allow-list only when
+every branch-local document, embedding, memory, and artifact should be
+published. Scratch files should normally remain unselected.
 """.strip()
 
 
@@ -200,9 +204,43 @@ def create_mcp_server(
         return service.diff(source_branch, target_branch)
 
     @mcp.tool()
-    def knowledge_merge(source_branch: str, target_branch: str) -> dict[str, Any]:
-        """Promote reviewed state from one branch into another."""
-        return service.merge(source_branch, target_branch)
+    def knowledge_merge_preview(
+        source_branch: str,
+        target_branch: str,
+    ) -> dict[str, Any]:
+        """Preview raw cross-store changes and return stable change IDs.
+
+        Review the returned changes and selection_groups before calling
+        knowledge_merge with an allow-list. The preview token prevents applying
+        that selection after either branch has changed. Resolve every
+        stale_index_path by reindexing the file before promotion.
+        """
+        return service.merge_preview(source_branch, target_branch)
+
+    @mcp.tool()
+    def knowledge_merge(
+        source_branch: str,
+        target_branch: str,
+        selected_change_ids: list[str] | None = None,
+        preview_token: str | None = None,
+        conflict_choices: dict[str, str] | None = None,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically promote all or selected reviewed changes.
+
+        Omit selected_change_ids to merge everything, or pass IDs returned by
+        knowledge_merge_preview. An empty list is a no-op. Selecting part of
+        an indexed-document bundle is rejected with the exact missing IDs, so
+        relational rows, embeddings, and the source file cannot diverge.
+        """
+        return service.merge(
+            source_branch,
+            target_branch,
+            selected_change_ids=selected_change_ids,
+            preview_token=preview_token,
+            conflict_choices=conflict_choices,
+            operation_id=operation_id,
+        )
 
     @mcp.tool()
     def knowledge_delete_branch(branch_id: str) -> dict[str, Any]:

@@ -195,10 +195,11 @@ class TraceRecorder:
         *,
         branch_id: str | None = None,
         arguments: Mapping[str, Any] | None = None,
+        operation_id: str | None = None,
     ) -> Any:
         sequence = self._sequence
         operation = BackendOperation(
-            operation_id=f"{self.trace_id}:{sequence:08d}",
+            operation_id=operation_id or f"{self.trace_id}:{sequence:08d}",
             kind=kind,
             branch_id=branch_id,
             arguments=dict(arguments or {}),

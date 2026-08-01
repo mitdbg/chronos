@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from chronos_core.workspace import AtomicMergeError
 from chronos_enterprise_knowledge.backends import ChronosKnowledgeBackend
+from chronos_enterprise_knowledge.backends.chronos import MergeDependencyError
 from chronos_enterprise_knowledge.models import (
     DocumentChunk,
     IndexedDocument,
@@ -237,6 +240,153 @@ def test_merge_promotes_coordinated_document_and_file_state(tmp_path: Path) -> N
             (0.0, 0.0, 1.0),
             limit=5,
         )
+    finally:
+        backend.close()
+
+
+def test_selective_merge_keeps_temporary_artifacts_private(tmp_path: Path) -> None:
+    backend = ChronosKnowledgeBackend(tmp_path, vector_dimensions=3)
+    try:
+        backend.create_branch("draft", "main")
+        indexed = _indexed(
+            "oncall",
+            "The primary on-call acknowledges P0 incidents within five minutes.",
+            (0.0, 0.0, 1.0),
+        )
+        backend.put_document("draft", indexed, operation_id="draft:oncall")
+        backend.write_file(
+            "draft",
+            "/artifacts/review.md",
+            b"approved",
+            operation_id="draft:review",
+        )
+        backend.write_file(
+            "draft",
+            "/artifacts/scratch.txt",
+            b"private notes",
+            operation_id="draft:scratch",
+        )
+
+        preview = backend.merge_preview("draft", "main")
+        filesystem_changes = preview["stores"]["filesystem"]["changes"]
+        selected = [
+            change["change_id"]
+            for change in filesystem_changes
+            if change["key"].get("path") == "/artifacts/review.md"
+        ]
+        assert set(selected) == set(
+            preview["selection_groups"]["filesystem_paths"][
+                "/artifacts/review.md"
+            ]
+        )
+        assert len(selected) > 1
+        with pytest.raises(AtomicMergeError, match="every change for a path"):
+            backend.merge(
+                "draft",
+                "main",
+                operation_id="merge:partial-file",
+                selected_change_ids=selected[:1],
+                preview_token=preview["preview_token"],
+            )
+        result = backend.merge(
+            "draft",
+            "main",
+            operation_id="merge:review-only",
+            selected_change_ids=selected,
+            preview_token=preview["preview_token"],
+        )
+
+        assert result["status"] == "committed"
+        assert backend.read_file("main", "/artifacts/review.md") == b"approved"
+        with pytest.raises(FileNotFoundError):
+            backend.read_file("main", "/artifacts/scratch.txt")
+        assert backend.get_document("main", "oncall") is None
+    finally:
+        backend.close()
+
+
+def test_selective_merge_requires_complete_indexed_document_bundle(
+    tmp_path: Path,
+) -> None:
+    backend = ChronosKnowledgeBackend(tmp_path, vector_dimensions=3)
+    try:
+        backend.create_branch("draft", "main")
+        indexed = _indexed(
+            "oncall",
+            "The primary on-call acknowledges P0 incidents within five minutes.",
+            (0.0, 0.0, 1.0),
+        )
+        backend.put_document("draft", indexed, operation_id="draft:oncall")
+        preview = backend.merge_preview("draft", "main")
+        document_change = next(
+            change
+            for change in preview["stores"]["sqlite"]["changes"]
+            if change["table"] == "knowledge_documents"
+        )
+        assert document_change["change_id"] in preview["selection_groups"][
+            "indexed_documents"
+        ]["oncall"]
+
+        with pytest.raises(MergeDependencyError) as raised:
+            backend.merge(
+                "draft",
+                "main",
+                operation_id="merge:partial-document",
+                selected_change_ids=[document_change["change_id"]],
+                preview_token=preview["preview_token"],
+            )
+
+        assert raised.value.missing_change_ids
+        assert document_change["change_id"] not in raised.value.missing_change_ids
+        assert backend.get_document("main", "oncall") is None
+    finally:
+        backend.close()
+
+
+def test_selective_merge_rejects_document_file_changed_without_reindex(
+    tmp_path: Path,
+) -> None:
+    backend = ChronosKnowledgeBackend(tmp_path, vector_dimensions=3)
+    try:
+        indexed = _indexed(
+            "oncall",
+            "The primary on-call acknowledges P0 incidents within five minutes.",
+            (0.0, 0.0, 1.0),
+        )
+        backend.put_document("main", indexed, operation_id="seed:oncall")
+        backend.create_branch("draft", "main")
+        backend.write_file(
+            "draft",
+            indexed.document.path,
+            b"Unindexed replacement content",
+            operation_id="draft:raw-edit",
+        )
+        preview = backend.merge_preview("draft", "main")
+        selected = [
+            change["change_id"]
+            for change in preview["stores"]["filesystem"]["changes"]
+            if change["key"].get("path") == indexed.document.path
+        ]
+        assert preview["stale_index_paths"] == [indexed.document.path]
+
+        with pytest.raises(MergeDependencyError, match="reindex before merge"):
+            backend.merge(
+                "draft",
+                "main",
+                operation_id="merge:stale-index-all",
+                preview_token=preview["preview_token"],
+            )
+        with pytest.raises(MergeDependencyError, match="reindex before merge") as raised:
+            backend.merge(
+                "draft",
+                "main",
+                operation_id="merge:stale-index",
+                selected_change_ids=selected,
+                preview_token=preview["preview_token"],
+            )
+
+        assert raised.value.stale_index_paths == (indexed.document.path,)
+        assert backend.get_document("main", "oncall") == indexed
     finally:
         backend.close()
 
