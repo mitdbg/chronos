@@ -7,7 +7,9 @@ from chronos_enterprise_knowledge.backends.comparison import (
 )
 from chronos_enterprise_knowledge.backends.factory import (
     BackendName,
+    DEFAULT_CHRONOS_POSTGRES_DSN,
     create_knowledge_backend,
+    default_chronos_postgres_dsn,
 )
 from chronos_enterprise_knowledge.backends.native_branching import (
     DoltgresQdrantBtrfsKnowledgeBackend,
@@ -18,6 +20,8 @@ __all__ = [
     "BackendName",
     "ChronosKnowledgeBackend",
     "DoltgresQdrantBtrfsKnowledgeBackend",
+    "DEFAULT_CHRONOS_POSTGRES_DSN",
     "PhysicalCloneKnowledgeBackend",
     "create_knowledge_backend",
+    "default_chronos_postgres_dsn",
 ]

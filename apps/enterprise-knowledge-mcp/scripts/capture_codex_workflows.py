@@ -12,12 +12,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
-from chronos_enterprise_knowledge.backends import create_knowledge_backend
+from chronos_enterprise_knowledge.backends import (
+    create_knowledge_backend,
+    default_chronos_postgres_dsn,
+)
 from chronos_enterprise_knowledge.rollout_trace import (
     RolloutAnalyzer,
     WorkloadTrace,
@@ -66,6 +70,15 @@ _TRACE_NAMES = {
     "13-launch-readiness-revision-cycle": (
         "13-launch-readiness-revision-cycle.jsonl"
     ),
+    "14-selective-residency-runbook-promotion": (
+        "14-selective-residency-runbook-promotion.jsonl"
+    ),
+    "15-competing-rollback-playbooks": (
+        "15-competing-rollback-playbooks.jsonl"
+    ),
+    "16-retention-memory-supersession": (
+        "16-retention-memory-supersession.jsonl"
+    ),
 }
 
 
@@ -81,7 +94,20 @@ def parse_args() -> argparse.Namespace:
         default=Path.home() / ".codex" / "sessions",
     )
     parser.add_argument("--codex", default="codex")
+    parser.add_argument(
+        "--codex-config",
+        action="append",
+        default=[],
+        help="Repeatable Codex -c override used for every captured session.",
+    )
     parser.add_argument("--state-dir", type=Path, required=True)
+    parser.add_argument("--qdrant-url")
+    parser.add_argument("--qdrant-storage-dir", type=Path)
+    parser.add_argument(
+        "--chronos-postgres-dsn",
+        default=default_chronos_postgres_dsn(),
+        help="PostgreSQL DSN for Chronos capture state (SQLite is disabled).",
+    )
     parser.add_argument("--dimensions", type=int, required=True)
     parser.add_argument(
         "--snapshot-manifest",
@@ -108,6 +134,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    # The MCP child launched by Codex receives the same default through its
+    # environment.  This keeps capture verification and the live session on
+    # one PostgreSQL metadata plane even when the caller supplies a custom DSN.
+    os.environ["CHRONOS_POSTGRES_DSN"] = args.chronos_postgres_dsn
     args.runs_dir.mkdir(parents=True, exist_ok=True)
     args.traces_dir.mkdir(parents=True, exist_ok=True)
     args.workdir.mkdir(parents=True, exist_ok=True)
@@ -154,6 +184,11 @@ def main() -> int:
         ),
         "embedding_mode": "forced-zero",
     }
+    backend = _open_capture_backend(args)
+    try:
+        capture_corpus["ingested_state"] = backend.storage_stats()
+    finally:
+        backend.close()
     prompt_paths = [
         path
         for path in sorted(args.prompts_dir.glob("[0-9][0-9]-*.md"))
@@ -244,8 +279,11 @@ def capture_one(
         str(final_path),
         "-C",
         str(args.workdir.resolve()),
-        "-",
     ]
+    for override in args.codex_config:
+        command.extend(("-c", override))
+    command.append("-")
+    capture_started_ns = time.monotonic_ns()
     with (
         events_path.open("wb") as events,
         stderr_path.open("wb") as errors,
@@ -257,21 +295,17 @@ def capture_one(
             stderr=errors,
             check=False,
         )
-    if completed.returncode:
-        raise RuntimeError(
-            f"Codex failed for {stem} with exit code {completed.returncode}; "
-            f"see {stderr_path}"
-        )
+    capture_wall_time_ms = round(
+        (time.monotonic_ns() - capture_started_ns) / 1_000_000,
+        3,
+    )
+    if not final_path.exists():
+        _write_fallback_final(events_path, final_path, completed.returncode)
 
     thread_id = _thread_id(events_path)
     rollout = _find_rollout(args.session_root, thread_id)
     rollout_sha256 = _sha256(rollout)
     analysis = RolloutAnalyzer().analyze(rollout, trace_id=stem)
-    if not analysis.trace.metadata.get("fully_replayable", False):
-        raise RuntimeError(
-            f"Codex rollout {thread_id} contains unsupported calls: "
-            f"{analysis.skipped_calls}"
-        )
     backend = _open_capture_backend(args)
     try:
         trace, resolved = resolve_memory_timestamps(analysis.trace, backend)
@@ -281,6 +315,13 @@ def capture_one(
     metadata.update(
         {
             "capture_corpus": capture_corpus,
+            "codex_exit_code": completed.returncode,
+            "capture_status": (
+                "not_replayable"
+                if not analysis.trace.metadata.get("fully_replayable", False)
+                else ("ok" if completed.returncode == 0 else "codex_failed")
+            ),
+            "unsupported_calls": list(analysis.skipped_calls),
             "source_session_id": thread_id,
             "source_rollout_sha256": rollout_sha256,
             "memory_timestamps_resolved": resolved,
@@ -300,6 +341,15 @@ def capture_one(
         "shell_events": trace.summary()["shell_events"],
         "patch_events": trace.summary()["patch_events"],
         "memory_timestamps_resolved": resolved,
+        "codex_exit_code": completed.returncode,
+        "capture_status": (
+            "not_replayable"
+            if not analysis.trace.metadata.get("fully_replayable", False)
+            else ("ok" if completed.returncode == 0 else "codex_failed")
+        ),
+        "unsupported_calls": list(analysis.skipped_calls),
+        "llm_timing": trace.metadata["llm_timing"],
+        "capture_wall_time_ms": capture_wall_time_ms,
         "trace": str(trace_path.resolve()),
         "trace_sha256": _sha256(trace_path),
         "events_output": str(events_path.resolve()),
@@ -312,6 +362,34 @@ def capture_one(
     )
     print(json.dumps(result, ensure_ascii=False), flush=True)
     return result
+
+
+def _write_fallback_final(
+    events_path: Path,
+    final_path: Path,
+    exit_code: int,
+) -> None:
+    """Create a provenance-complete final output for a failed Codex turn."""
+
+    messages: list[str] = []
+    for line in events_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = row.get("item")
+        if (
+            row.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+        ):
+            messages.append(str(item.get("text") or ""))
+    text = messages[-1] if messages else (
+        f"Codex exited with status {exit_code}; see the persisted event stream.\n"
+    )
+    final_path.write_text(text + ("\n" if not text.endswith("\n") else ""), encoding="utf-8")
 
 
 def _open_capture_backend(
@@ -328,6 +406,13 @@ def _open_capture_backend(
                 "chronos",
                 args.state_dir.resolve(),
                 vector_dimensions=args.dimensions,
+                qdrant_url=args.qdrant_url,
+                qdrant_storage_dir=(
+                    args.qdrant_storage_dir.resolve()
+                    if args.qdrant_storage_dir is not None
+                    else None
+                ),
+                chronos_postgres_dsn=args.chronos_postgres_dsn,
             )
         except RuntimeError as exc:
             if (

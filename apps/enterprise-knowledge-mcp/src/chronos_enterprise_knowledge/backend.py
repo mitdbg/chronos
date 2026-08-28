@@ -86,6 +86,12 @@ class KnowledgeBackend(Protocol):
         document_id: str,
     ) -> IndexedDocument | None: ...
 
+    def find_document_id_by_path(
+        self,
+        branch_id: str,
+        path: str,
+    ) -> str | None: ...
+
     def search(
         self,
         branch_id: str,
@@ -116,12 +122,25 @@ class KnowledgeBackend(Protocol):
 
     def diff(self, source_branch: str, target_branch: str) -> dict[str, Any]: ...
 
+    def merge_preview(
+        self,
+        source_branch: str,
+        target_branch: str,
+        *,
+        policy: Any = None,
+    ) -> dict[str, Any]: ...
+
     def merge(
         self,
         source_branch: str,
         target_branch: str,
         *,
         operation_id: str,
+        selected_change_ids: Sequence[str] | None = None,
+        preview_token: str | None = None,
+        prepared_preview: Any | None = None,
+        policy: Any = None,
+        conflict_choices: Mapping[str, str] | None = None,
     ) -> dict[str, Any]: ...
 
     def state_digest(self, branch_id: str) -> str: ...

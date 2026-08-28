@@ -190,13 +190,21 @@ def configure_agentfs_sqlite_file(
 ) -> dict[str, Any]:
     normalized = normalize_sqlite_synchronous(synchronous)
     with sqlite3.connect(db_path) as conn:
-        journal_mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        # AgentFS opens the database with Turso/libSQL.  Leaving a CPython
+        # SQLite WAL shared-memory file behind makes that opener reject the
+        # database as locked, so keep the initialized file in rollback mode.
+        journal_mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         conn.execute(f"PRAGMA synchronous={normalized}")
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        requested_cache_pages = None
         if (cache_size := sqlite_cache_size_kib(cache_size_bytes)) is not None:
-            conn.execute(f"PRAGMA cache_size=-{cache_size}")
-        conn.execute("PRAGMA fullfsync=OFF")
-        conn.execute("PRAGMA checkpoint_fullfsync=OFF")
-        checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            requested_cache_pages = max(
+                1,
+                (cache_size_bytes + page_size - 1) // page_size,
+            )
+            # cache_size is connection-local.  default_cache_size persists
+            # the equivalent page count for AgentFS's later connections.
+            conn.execute(f"PRAGMA default_cache_size={requested_cache_pages}")
         effective_synchronous = conn.execute("PRAGMA synchronous").fetchone()[0]
         effective_cache_size = conn.execute("PRAGMA cache_size").fetchone()[0]
     return {
@@ -204,8 +212,8 @@ def configure_agentfs_sqlite_file(
         "requested_synchronous": normalized,
         "effective_synchronous": effective_synchronous,
         "requested_cache_size_kib": sqlite_cache_size_kib(cache_size_bytes),
+        "requested_cache_pages": requested_cache_pages,
         "effective_cache_size": effective_cache_size,
-        "wal_checkpoint": tuple(checkpoint or ()),
     }
 
 
@@ -478,11 +486,19 @@ class OverlayFSBenchBackend(FsBackend):
     def _unmount_branch(self, branch_id: str) -> None:
         merged = self._branch_dir(branch_id) / "merged"
         if os.path.ismount(merged):
-            run_privileged_checked(
-                ["umount", str(merged)],
-                cwd=merged.parent,
-                timeout=30,
-            )
+            try:
+                run_privileged_checked(
+                    ["umount", str(merged)],
+                    cwd=merged.parent,
+                    timeout=120,
+                )
+            except subprocess.TimeoutExpired:
+                if os.path.ismount(merged):
+                    run_privileged_checked(
+                        ["umount", "--lazy", str(merged)],
+                        cwd=merged.parent,
+                        timeout=30,
+                    )
         self._mounted_branches.discard(branch_id)
 
 
@@ -2087,12 +2103,14 @@ def mounted_chronosfs(
     sqlite_wal_autocheckpoint_pages: int | None = None,
 ) -> Iterator[Path]:
     from chronos_core.workspace.chronosfs.fuse import (
+        _database_urls_for_mount,
         _shutdown_shared_chronosfs_daemon,
         _start_shared_chronosfs_mount,
         _with_default_cache_options,
     )
 
     mountpoint = Path(tempfile.mkdtemp(prefix=f"chronosfs-{branch_id}-"))
+    mount_database_url, metadata_url = _database_urls_for_mount(store)
     cache_size_kib = sqlite_cache_size_kib(sqlite_cache_size_bytes)
     previous_sync = os.environ.get("CHRONOS_NATIVE_SQLITE_SYNCHRONOUS")
     previous_cache_size = os.environ.get("CHRONOS_NATIVE_SQLITE_CACHE_SIZE_KIB")
@@ -2110,7 +2128,8 @@ def mounted_chronosfs(
                 sqlite_wal_autocheckpoint_pages
             )
         _start_shared_chronosfs_mount(
-            database_url,
+            mount_database_url,
+            metadata_url,
             mountpoint,
             branch_id=branch_id,
             block_size=store.block_size,
@@ -2119,7 +2138,11 @@ def mounted_chronosfs(
         yield mountpoint
     finally:
         unmount(mountpoint)
-        _shutdown_shared_chronosfs_daemon(database_url, store.block_size)
+        _shutdown_shared_chronosfs_daemon(
+            mount_database_url,
+            metadata_url,
+            store.block_size,
+        )
         restore_env("CHRONOS_NATIVE_SQLITE_SYNCHRONOUS", previous_sync)
         restore_env("CHRONOS_NATIVE_SQLITE_CACHE_SIZE_KIB", previous_cache_size)
         restore_env(

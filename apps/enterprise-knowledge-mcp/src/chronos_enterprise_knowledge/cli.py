@@ -15,7 +15,10 @@ from chronos_enterprise_knowledge.backend import (
     KnowledgeBackend,
     OperationExecutor,
 )
-from chronos_enterprise_knowledge.backends import create_knowledge_backend
+from chronos_enterprise_knowledge.backends import (
+    create_knowledge_backend,
+    default_chronos_postgres_dsn,
+)
 from chronos_enterprise_knowledge.embedding import (
     CacheOnlyEmbedder,
     CachedEmbedder,
@@ -62,8 +65,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="chronos-enterprise-knowledge",
         description=(
-            "Branch-aware EnterpriseRAG knowledge and memory using SQLite, "
-            "ChronosFS, and Qdrant"
+            "Branch-aware EnterpriseRAG knowledge and memory using a relational "
+            "database, ChronosFS, and Qdrant"
         ),
     )
     parser.add_argument(
@@ -114,6 +117,26 @@ def _parser() -> argparse.ArgumentParser:
             else None
         ),
         help="Optional Qdrant storage directory used for byte accounting.",
+    )
+    parser.add_argument(
+        "--chronos-postgres-dsn",
+        default=default_chronos_postgres_dsn(),
+        help=(
+            "PostgreSQL URL for the Chronos relational control/data plane. "
+            "Chronos service and benchmark invocations use PostgreSQL by "
+            "default; SQLite is only available through an explicit low-level "
+            "backend URL."
+        ),
+    )
+    parser.add_argument(
+        "--chronos-postgres-data-dir",
+        type=Path,
+        default=(
+            Path(os.environ["CHRONOS_POSTGRES_DATA_DIR"])
+            if os.environ.get("CHRONOS_POSTGRES_DATA_DIR")
+            else None
+        ),
+        help="PostgreSQL host data directory used for physical-byte accounting.",
     )
     parser.add_argument(
         "--embedding-model",
@@ -570,6 +593,8 @@ def _create_backend(
         btrfs_root=args.btrfs_root,
         doltgres_data_dir=args.doltgres_data_dir,
         qdrant_storage_dir=args.qdrant_storage_dir,
+        chronos_postgres_dsn=args.chronos_postgres_dsn,
+        chronos_postgres_data_dir=args.chronos_postgres_data_dir,
     )
 
 
@@ -1218,6 +1243,8 @@ def _benchmark_rollouts(args: argparse.Namespace) -> int:
         btrfs_root=args.btrfs_root,
         doltgres_data_dir=args.doltgres_data_dir,
         qdrant_storage_dir=args.qdrant_storage_dir,
+        chronos_postgres_dsn=args.chronos_postgres_dsn,
+        chronos_postgres_data_dir=args.chronos_postgres_data_dir,
         force_zero_embeddings=args.placeholder_zero_embeddings,
     )
     report = benchmark.run(traces)

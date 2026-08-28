@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from chronos_core.branching import BranchingError
 from chronos_enterprise_knowledge.backends import ChronosKnowledgeBackend
 from chronos_enterprise_knowledge.embedding import HashEmbedder
 from chronos_enterprise_knowledge.hierarchy import (
@@ -78,13 +79,13 @@ def test_chronos_keeps_each_content_form_in_one_store(tmp_path: Path) -> None:
 
         document_columns = {
             str(row["name"])
-            for row in backend.sqlite.db.execute(
+            for row in backend.relational.db.execute(
                 "PRAGMA table_info(knowledge_documents)"
             ).fetchall()
         }
         chunk_columns = {
             str(row["name"])
-            for row in backend.sqlite.db.execute(
+            for row in backend.relational.db.execute(
                 "PRAGMA table_info(knowledge_chunks)"
             ).fetchall()
         }
@@ -204,6 +205,78 @@ def test_workspace_file_can_be_indexed_after_posix_checkout_write(
             "validated diagnosis",
             limit=5,
         )
+    finally:
+        backend.close()
+
+
+def test_workspace_reindex_preserves_existing_document_identity(
+    tmp_path: Path,
+) -> None:
+    backend = ChronosKnowledgeBackend(tmp_path, vector_dimensions=16)
+    service = KnowledgeService(backend, HashEmbedder(16))
+    path = "/knowledge/notes/diagnosis.md"
+    try:
+        service.update_document(
+            "main",
+            path=path,
+            title="Diagnosis",
+            content="Initial diagnosis.\n",
+            source="source snapshot",
+            document_id="source-document",
+        )
+        service.checkout("draft", from_branch="main", mount=False)
+        backend.write_file(
+            "draft",
+            path,
+            b"Validated diagnosis.\n",
+            operation_id="edit:diagnosis",
+        )
+
+        indexed = service.index_workspace_file(
+            "draft",
+            path=path,
+            title="Validated diagnosis",
+            source="agent workspace",
+        )
+
+        assert indexed["document_id"] == "source-document"
+        service.merge("draft", "main")
+        assert backend.get_document("main", "source-document") is not None
+    finally:
+        backend.close()
+
+
+def test_failed_merge_restores_mounted_workspace(tmp_path: Path) -> None:
+    backend = ChronosKnowledgeBackend(tmp_path, vector_dimensions=16)
+    service = KnowledgeService(backend, HashEmbedder(16))
+    path = "/knowledge/notes/diagnosis.md"
+    try:
+        service.update_document(
+            "main",
+            path=path,
+            title="Diagnosis",
+            content="Initial diagnosis.\n",
+            source="source snapshot",
+            document_id="source-document",
+        )
+        left = service.checkout("left", from_branch="main", mount=True)
+        right = service.checkout("right", from_branch="main", mount=True)
+        Path(left["workspace_path"], path.lstrip("/")).write_text("Left.\n")
+        Path(right["workspace_path"], path.lstrip("/")).write_text("Right.\n")
+        service.index_workspace_file(
+            "left", path=path, title="Left", source="left workspace"
+        )
+        service.index_workspace_file(
+            "right", path=path, title="Right", source="right workspace"
+        )
+        service.merge("left", "main")
+
+        with pytest.raises(BranchingError, match="unresolved conflicts"):
+            service.merge("right", "main")
+
+        right_path = Path(right["workspace_path"])
+        assert right_path.is_mount()
+        assert (right_path / path.lstrip("/")).read_text() == "Right.\n"
     finally:
         backend.close()
 

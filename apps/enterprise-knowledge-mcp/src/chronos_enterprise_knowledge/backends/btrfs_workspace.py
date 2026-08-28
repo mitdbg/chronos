@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -28,6 +29,7 @@ class BtrfsWorkspaceStore:
     ):
         self.root = Path(root).expanduser().resolve()
         self._run_command = command_runner or _run_checked
+        self._use_native_incremental_diff = command_runner is None
         self.root.parent.mkdir(parents=True, exist_ok=True)
         actual_type = filesystem_type or _filesystem_type(self.root.parent)
         if actual_type != "btrfs":
@@ -39,9 +41,13 @@ class BtrfsWorkspaceStore:
         self.branches_root = self.root / "branches"
         self.bases_root = self.root / "fork-bases"
         self.bindings_root = self.root / "bindings"
+        self.diffs_root = self.root / "diff-snapshots"
         self.branches_root.mkdir(exist_ok=True)
         self.bases_root.mkdir(exist_ok=True)
         self.bindings_root.mkdir(exist_ok=True)
+        self.diffs_root.mkdir(exist_ok=True)
+        for path in self.diffs_root.iterdir():
+            self._delete_if_subvolume(path)
         self._bindings: dict[str, Path] = {}
         main = self.branch_path("main")
         if not main.exists():
@@ -188,6 +194,106 @@ class BtrfsWorkspaceStore:
                 self.write(target_branch, path, source_content)
         return changed
 
+    def changed_file_paths(
+        self,
+        source_branch: str,
+        fork_branch: str,
+    ) -> set[str]:
+        """Return the final file delta from a branch's relevant fork snapshot."""
+
+        source = self.require_branch(source_branch)
+        base = self.base_path(fork_branch)
+        if not base.exists():
+            raise ValueError(f"branch has no fork snapshot: {fork_branch}")
+        return self._different_file_paths(source, base)
+
+    def differing_file_paths(
+        self,
+        left_branch: str,
+        right_branch: str,
+    ) -> set[str]:
+        """Return regular files whose final contents differ between heads."""
+
+        return self._different_file_paths(
+            self.require_branch(left_branch),
+            self.require_branch(right_branch),
+        )
+
+    def _different_file_paths(self, left: Path, right: Path) -> set[str]:
+        if self._use_native_incremental_diff:
+            try:
+                return self._btrfs_incremental_file_paths(left, right)
+            except (OSError, subprocess.CalledProcessError, ValueError):
+                # Btrfs send requires CAP_SYS_ADMIN on current kernels. Keep
+                # the baseline usable in unprivileged environments without
+                # changing its final-tree semantics.
+                pass
+        return _different_file_paths(left, right)
+
+    def _btrfs_incremental_file_paths(
+        self,
+        left: Path,
+        right: Path,
+    ) -> set[str]:
+        token = uuid.uuid4().hex
+        left_snapshot = self.diffs_root / f"left-{token}"
+        right_snapshot = self.diffs_root / f"right-{token}"
+        stream_path: Path | None = None
+        try:
+            self._snapshot(left, left_snapshot, read_only=True)
+            self._snapshot(right, right_snapshot, read_only=True)
+            with tempfile.NamedTemporaryFile(
+                prefix="chronos-btrfs-diff-",
+                suffix=".stream",
+                delete=False,
+            ) as stream:
+                stream_path = Path(stream.name)
+            self._run_command(
+                [
+                    "sudo",
+                    "-n",
+                    "btrfs",
+                    "send",
+                    "--no-data",
+                    "-p",
+                    str(right_snapshot),
+                    "-f",
+                    str(stream_path),
+                    str(left_snapshot),
+                ]
+            )
+            dumped = self._run_command(
+                [
+                    "btrfs",
+                    "receive",
+                    "--dump",
+                    "-f",
+                    str(stream_path),
+                ]
+            )
+            (
+                candidates,
+                recursive_candidates,
+                one_sided_candidates,
+                one_sided_file_candidates,
+            ) = _btrfs_dump_candidates_with_presence(
+                dumped.stdout,
+                left_snapshot.name,
+            )
+            return _different_candidate_file_paths(
+                left,
+                right,
+                candidates,
+                recursive_candidates=recursive_candidates,
+                one_sided_candidates=one_sided_candidates,
+                one_sided_file_candidates=one_sided_file_candidates,
+            )
+        finally:
+            self._delete_if_subvolume(left_snapshot)
+            self._delete_if_subvolume(right_snapshot)
+            if stream_path is not None:
+                stream_path.unlink(missing_ok=True)
+
     def apply_paths_delta(
         self,
         source_branch: str,
@@ -214,6 +320,33 @@ class BtrfsWorkspaceStore:
                 self.write(target_branch, path, source_content)
         return changed
 
+    def conflicting_paths(
+        self,
+        source_branch: str,
+        base_branch: str,
+        target_branch: str,
+        paths: list[str] | set[str] | tuple[str, ...],
+    ) -> set[str]:
+        """Return paths changed differently in source and target from base."""
+
+        source_root = self.require_branch(source_branch)
+        base_root = self.base_path(base_branch)
+        if not base_root.exists():
+            raise ValueError(f"branch has no fork snapshot: {base_branch}")
+        target_root = self.require_branch(target_branch)
+        conflicts: set[str] = set()
+        for path in paths:
+            source_content = _optional_content(source_root, path)
+            base_content = _optional_content(base_root, path)
+            target_content = _optional_content(target_root, path)
+            if (
+                source_content != base_content
+                and target_content != base_content
+                and target_content != source_content
+            ):
+                conflicts.add(path)
+        return conflicts
+
     def logical_bytes(self) -> int:
         total = 0
         for root in (self.branches_root, self.bases_root):
@@ -223,14 +356,31 @@ class BtrfsWorkspaceStore:
         return total
 
     def exclusive_bytes(self) -> int | None:
+        return self.subvolume_usage().get("subvolume_exclusive_bytes")
+
+    def subvolume_usage(self) -> dict[str, int | None]:
+        """Return logical, exclusive, and shared bytes for owned subvolumes.
+
+        ``btrfs filesystem usage`` describes the complete mounted filesystem,
+        which can include unrelated service directories.  This per-subvolume
+        view is recorded alongside it so a benchmark can distinguish shared
+        snapshot extents from data outside the native workspace scope.
+        """
+
         subvolumes = [
             path
             for root in (self.branches_root, self.bases_root)
+            if root.exists()
             for path in root.iterdir()
             if self._is_subvolume(path)
         ]
         if not subvolumes:
-            return 0
+            return {
+                "subvolume_count": 0,
+                "subvolume_total_bytes": 0,
+                "subvolume_exclusive_bytes": 0,
+                "subvolume_shared_bytes": 0,
+            }
         try:
             result = self._run_command(
                 [
@@ -243,16 +393,64 @@ class BtrfsWorkspaceStore:
                 ]
             )
         except subprocess.CalledProcessError:
-            return None
-        exclusive = 0
-        matched = False
+            return {
+                "subvolume_count": len(subvolumes),
+                "subvolume_total_bytes": None,
+                "subvolume_exclusive_bytes": None,
+                "subvolume_shared_bytes": None,
+            }
+        total = exclusive = shared = 0
+        matched = 0
         for line in result.stdout.splitlines():
             fields = line.split()
-            if len(fields) < 4 or not fields[0].isdigit():
+            # ``btrfs filesystem du --raw -s`` begins data rows with
+            # Total, Exclusive, and Set shared byte counts.  Ignore headers
+            # and summary text without relying on localized labels.
+            if len(fields) < 4 or not all(
+                field.isdigit() for field in fields[:3]
+            ):
                 continue
+            total += int(fields[0])
             exclusive += int(fields[1])
-            matched = True
-        return exclusive if matched else None
+            shared += int(fields[2])
+            matched += 1
+        if matched == 0:
+            return {
+                "subvolume_count": len(subvolumes),
+                "subvolume_total_bytes": None,
+                "subvolume_exclusive_bytes": None,
+                "subvolume_shared_bytes": None,
+            }
+        return {
+            "subvolume_count": matched,
+            "subvolume_total_bytes": total,
+            "subvolume_exclusive_bytes": exclusive,
+            "subvolume_shared_bytes": shared,
+        }
+
+    def filesystem_usage(self) -> dict[str, int]:
+        """Return synchronized aggregate and allocator-level Btrfs usage."""
+
+        self._run_command(["btrfs", "filesystem", "sync", str(self.root)])
+        result = self._run_command(
+            ["btrfs", "filesystem", "usage", "--raw", str(self.root)]
+        )
+        overall = re.search(
+            r"^\s*Used:\s*(\d+)\s*$", result.stdout, re.MULTILINE
+        )
+        if overall is None:
+            raise RuntimeError("could not parse Btrfs filesystem used bytes")
+        usage: dict[str, int] = {"filesystem_used_bytes": int(overall.group(1))}
+        for component in ("Data", "Metadata", "System"):
+            match = re.search(
+                rf"^\s*{component}[^:]*:.*?\bUsed:\s*(\d+)",
+                result.stdout,
+                re.MULTILINE,
+            )
+            usage[f"{component.lower()}_used_bytes"] = (
+                int(match.group(1)) if match is not None else 0
+            )
+        return usage
 
     def filesystem_used_bytes(self) -> int:
         """Return physical bytes used by the dedicated Btrfs filesystem.
@@ -262,18 +460,7 @@ class BtrfsWorkspaceStore:
         shared extents once and avoids recursively walking every snapshot.
         """
 
-        self._run_command(
-            ["btrfs", "filesystem", "sync", str(self.root)]
-        )
-        result = self._run_command(
-            ["btrfs", "filesystem", "usage", "--raw", str(self.root)]
-        )
-        match = re.search(r"^\s*Used:\s*(\d+)\s*$", result.stdout, re.MULTILINE)
-        if match is None:
-            raise RuntimeError(
-                "could not parse Btrfs filesystem used bytes"
-            )
-        return int(match.group(1))
+        return self.filesystem_usage()["filesystem_used_bytes"]
 
     def close(self) -> None:
         for destination in self._bindings.values():
@@ -283,7 +470,7 @@ class BtrfsWorkspaceStore:
 
     def destroy(self) -> None:
         self.close()
-        for root in (self.bases_root, self.branches_root):
+        for root in (self.diffs_root, self.bases_root, self.branches_root):
             for path in sorted(root.iterdir(), reverse=True):
                 self._delete_if_subvolume(path)
         shutil.rmtree(self.root)
@@ -389,6 +576,255 @@ def _optional_content(root: Path, path: str) -> bytes | None:
     if not source.is_file():
         return None
     return source.read_bytes()
+
+
+def _different_file_paths(left: Path, right: Path) -> set[str]:
+    left_files = _regular_files(left)
+    right_files = _regular_files(right)
+    changed = set(left_files.keys() ^ right_files.keys())
+    for path in left_files.keys() & right_files.keys():
+        if not _same_file_contents(left_files[path], right_files[path]):
+            changed.add(path)
+    return changed
+
+
+def _btrfs_dump_candidate_paths(
+    output: str,
+    snapshot_name: str,
+) -> set[str]:
+    candidates, _ = _btrfs_dump_candidates(output, snapshot_name)
+    return candidates
+
+
+def _btrfs_dump_candidates(
+    output: str,
+    snapshot_name: str,
+) -> tuple[set[str], set[str]]:
+    candidates, recursive_candidates, _, _ = _btrfs_dump_candidates_with_presence(
+        output,
+        snapshot_name,
+    )
+    return candidates, recursive_candidates
+
+
+def _btrfs_dump_candidates_with_presence(
+    output: str,
+    snapshot_name: str,
+) -> tuple[set[str], set[str], set[str], set[str]]:
+    """Return direct candidates and paths requiring directory expansion.
+
+    A Btrfs send stream emits metadata operations for ancestor directories of
+    every changed file. Treating every such directory as a recursive candidate
+    makes a small diff scan an entire checkout (for example, an ``utimes`` on
+    ``/knowledge``). Only structural operations can change the paths of files
+    below a directory and therefore require recursive verification.
+    """
+
+    candidates: set[str] = set()
+    recursive_candidates: set[str] = set()
+    # ``send --no-data`` compares the source snapshot against the supplied
+    # parent snapshot.  A final ``mkfile``/``unlink`` therefore establishes a
+    # one-sided file without a stat or content read.  Keep enough operation
+    # history to avoid treating a temporary ``mkfile`` followed by ``rename``
+    # or ``unlink`` as a published change.
+    one_sided_candidates: set[str] = set()
+    one_sided_file_candidates: set[str] = set()
+    added_candidates: set[str] = set()
+    removed_candidates: set[str] = set()
+    file_candidates: set[str] = set()
+    directory_candidates: set[str] = set()
+    removed_file_candidates: set[str] = set()
+    removed_directory_candidates: set[str] = set()
+    prefix = f"./{snapshot_name}"
+    for line in output.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) < 2:
+            continue
+        operation = fields[0]
+        # Access-time updates are incidental reads, not logical workspace
+        # changes.  Treating every ``utimes`` record as a candidate would
+        # force a full tree walk after a read-heavy workflow because Btrfs
+        # records atime changes for many otherwise unchanged files.
+        if operation == "utimes":
+            continue
+        path = _btrfs_dump_path(fields[1], prefix)
+        if path is not None:
+            candidates.add(path)
+            if operation in {"rename", "rmdir"}:
+                recursive_candidates.add(path)
+            if operation in {"mkfile", "link", "symlink"}:
+                file_candidates.add(path)
+                if path not in removed_candidates:
+                    one_sided_candidates.add(path)
+                    one_sided_file_candidates.add(path)
+                added_candidates.add(path)
+            elif operation == "mkdir":
+                # Btrfs materializes a new directory through a temporary
+                # directory followed by rename.  Track it as temporary, but
+                # do not fast-path it as a file candidate.
+                directory_candidates.add(path)
+                added_candidates.add(path)
+            elif operation == "rmdir":
+                removed_candidates.add(path)
+                removed_directory_candidates.add(path)
+            elif operation == "unlink":
+                if path in added_candidates:
+                    candidates.discard(path)
+                    recursive_candidates.discard(path)
+                    one_sided_candidates.discard(path)
+                    one_sided_file_candidates.discard(path)
+                else:
+                    one_sided_candidates.add(path)
+                    one_sided_file_candidates.add(path)
+                removed_candidates.add(path)
+                removed_file_candidates.add(path)
+            elif operation == "rename":
+                # A temporary source created in this stream is not a final
+                # one-sided path.  A destination preceded by unlink existed
+                # in the parent and needs a normal content comparison.
+                if path in added_candidates:
+                    candidates.discard(path)
+                    recursive_candidates.discard(path)
+                    one_sided_candidates.discard(path)
+                    one_sided_file_candidates.discard(path)
+                else:
+                    one_sided_candidates.add(path)
+                    if path in file_candidates or path in removed_file_candidates:
+                        one_sided_file_candidates.add(path)
+                    elif (
+                        path in directory_candidates
+                        or path in removed_directory_candidates
+                    ):
+                        one_sided_file_candidates.discard(path)
+        if len(fields) < 3:
+            continue
+        match = re.search(r"(?:^|\s)dest=(\S+)", fields[2])
+        if match is None:
+            continue
+        destination = _btrfs_dump_path(match.group(1), prefix)
+        if destination is not None:
+            candidates.add(destination)
+            if operation == "rename":
+                recursive_candidates.add(destination)
+                if destination in removed_candidates:
+                    one_sided_candidates.discard(destination)
+                    one_sided_file_candidates.discard(destination)
+                else:
+                    one_sided_candidates.add(destination)
+                    if (
+                        path in file_candidates
+                        or path in removed_file_candidates
+                    ):
+                        one_sided_file_candidates.add(destination)
+                added_candidates.add(destination)
+                if path in file_candidates or path in removed_file_candidates:
+                    file_candidates.add(destination)
+                elif (
+                    path in directory_candidates
+                    or path in removed_directory_candidates
+                ):
+                    directory_candidates.add(destination)
+    return (
+        candidates,
+        recursive_candidates,
+        one_sided_candidates,
+        one_sided_file_candidates,
+    )
+
+
+def _btrfs_dump_path(value: str, prefix: str) -> str | None:
+    if value == prefix or value == f"{prefix}/":
+        return None
+    if value.startswith(f"{prefix}/"):
+        value = value[len(prefix) + 1 :]
+    elif value.startswith("./"):
+        return None
+    normalized = normalize_workspace_path(value)
+    return None if normalized == "/" else normalized
+
+
+def _different_candidate_file_paths(
+    left: Path,
+    right: Path,
+    candidates: set[str],
+    *,
+    recursive_candidates: set[str] | None = None,
+    one_sided_candidates: set[str] | None = None,
+    one_sided_file_candidates: set[str] | None = None,
+) -> set[str]:
+    recursive = recursive_candidates or set()
+    one_sided = one_sided_candidates or set()
+    one_sided_files = one_sided_file_candidates or set()
+    expanded: set[str] = set()
+    for candidate in candidates:
+        if candidate in one_sided_files:
+            expanded.add(candidate)
+            continue
+        found_directory = False
+        for root in (left, right):
+            path = _workspace_path(root, candidate)
+            if path.is_symlink() or not path.is_dir():
+                continue
+            found_directory = True
+            if candidate in recursive:
+                for child in path.rglob("*"):
+                    if child.is_symlink() or not child.is_file():
+                        continue
+                    expanded.add("/" + child.relative_to(root).as_posix())
+        if not found_directory:
+            expanded.add(candidate)
+    return {
+        path
+        for path in expanded
+        if path in one_sided or _candidate_file_differs(left, right, path)
+    }
+
+
+def _candidate_file_differs(left: Path, right: Path, path: str) -> bool:
+    """Compare one send candidate without reading one-sided files.
+
+    Btrfs ``send --no-data`` already tells us that a path was created or
+    removed.  Reading a newly-created file merely to compare it with a
+    missing path defeats the point of the metadata-only diff, especially for
+    generated trees such as virtual environments.  Only candidates present
+    in both snapshots need content comparison.
+    """
+
+    left_path = _workspace_path(left, path)
+    right_path = _workspace_path(right, path)
+    left_exists = left_path.is_file()
+    right_exists = right_path.is_file()
+    if left_exists != right_exists:
+        return True
+    if not left_exists:
+        return False
+    return not _same_file_contents(left_path, right_path)
+
+
+def _regular_files(root: Path) -> dict[str, Path]:
+    resolved_root = root.resolve()
+    result: dict[str, Path] = {}
+    for path in root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        resolved = path.resolve()
+        if not resolved.is_relative_to(resolved_root):
+            continue
+        result["/" + path.relative_to(root).as_posix()] = path
+    return result
+
+
+def _same_file_contents(left: Path, right: Path) -> bool:
+    if left.stat().st_size != right.stat().st_size:
+        return False
+    with left.open("rb") as left_file, right.open("rb") as right_file:
+        while True:
+            left_chunk = left_file.read(1024 * 1024)
+            right_chunk = right_file.read(1024 * 1024)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
 
 
 def _remove_empty_parents(path: Path, root: Path) -> None:

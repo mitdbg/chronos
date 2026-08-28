@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,10 @@ from chronos_enterprise_knowledge.rollout_trace import (
     WorkloadReplayReport,
     WorkloadReplayer,
     WorkloadTrace,
+    _resolve_merge_selection,
     _apply_recorded_patch,
+    _extract_nested_actions,
+    _mcp_structured_result,
     resolve_memory_timestamps,
 )
 
@@ -154,6 +158,666 @@ def test_memory_timestamp_uses_rollout_time_after_branch_deletion() -> None:
         == "2026-07-28T03:39:00.125Z"
     )
     assert resolved.metadata["memory_timestamps_from_event"] == 1
+
+
+def test_analyzer_extracts_nested_shell_and_patch_calls(
+    tmp_path: Path,
+) -> None:
+    rollout = tmp_path / "rollout.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"session_id": "nested-tools", "cwd": str(tmp_path)},
+        },
+        {
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "exec-1",
+                "input": (
+                    "const w=\"" + str(tmp_path) + "\";\n"
+                    "const patch=`*** Begin Patch\\n"
+                    "*** Add File: ${w}/state\\n"
+                    "+value\\n*** End Patch`;\n"
+                    "await tools.apply_patch(patch);\n"
+                    "await tools.shell_command({command:\"printf value\",workdir:w,timeout_ms:1000});\n"
+                ),
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:01.010Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "patch_apply_end",
+                "success": True,
+                "stdout": "Success. Updated the following files:\nA state\n",
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:01.020Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "exec-1",
+                "output": [
+                        {"type": "input_text", "text": "Script completed\n"},
+                    {"type": "input_text", "text": "{}"},
+                    {
+                        "type": "input_text",
+                        "text": "Exit code: 0\nWall time: 0.0s\nOutput:\nvalue",
+                    },
+                ],
+            },
+        },
+    ]
+    rollout.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    analysis = RolloutAnalyzer().analyze(rollout)
+
+    assert analysis.as_dict()["fully_replayable"]
+    assert analysis.skipped_calls == ()
+    assert [event.kind for event in analysis.trace.events] == ["patch", "shell"]
+    assert analysis.trace.events[0].arguments["patch"].endswith(
+        "*** Add File: {{repo}}/state\n+value\n*** End Patch"
+    )
+    assert analysis.trace.events[1].expected["status"] == "ok"
+
+
+def test_mcp_structured_result_decodes_nested_text_envelope() -> None:
+    result = _mcp_structured_result(
+        {
+            "Ok": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": json.dumps(
+                                            {
+                                                "preview_token": "token",
+                                                "selection_groups": {
+                                                    "filesystem_paths": {
+                                                        "/artifact": [
+                                                            "filesystem:1"
+                                                        ]
+                                                    }
+                                                },
+                                            }
+                                        ),
+                                    }
+                                ],
+                                "isError": False,
+                            }
+                        ),
+                    }
+                ]
+            }
+        }
+    )
+
+    assert result == {
+        "preview_token": "token",
+        "selection_groups": {
+            "filesystem_paths": {"/artifact": ["filesystem:1"]}
+        },
+    }
+
+
+def test_analyzer_expands_nested_shell_loop(
+    tmp_path: Path,
+) -> None:
+    rollout = tmp_path / "rollout-loop.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"session_id": "nested-loop", "cwd": str(tmp_path)},
+        },
+        {
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "exec-loop",
+                "input": (
+                    'const cmds=["printf one","printf two"];\n'
+                    'for (const command of cmds) {'
+                    'const r=await tools.shell_command('
+                    '{command,workdir:"/tmp",timeout_ms:1000});'
+                    'text(JSON.stringify({command,output:r}));}'
+                ),
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:01.010Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "exec-loop",
+                "output": [
+                    {"type": "input_text", "text": "Script completed\n"},
+                    {
+                        "type": "input_text",
+                        "text": "{\"command\":\"printf one\",\"output\":"
+                        "\"Process exited with code 0\\nOutput: one\"}",
+                    },
+                    {
+                        "type": "input_text",
+                        "text": "{\"command\":\"printf two\",\"output\":"
+                        "\"Process exited with code 0\\nOutput: two\"}",
+                    },
+                ],
+            },
+        },
+    ]
+    rollout.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    analysis = RolloutAnalyzer().analyze(rollout)
+
+    assert analysis.as_dict()["fully_replayable"]
+    assert [event.arguments["cmd"] for event in analysis.trace.events] == [
+        "printf one",
+        "printf two",
+    ]
+
+
+def test_nested_parser_ignores_array_text_inside_patch_string() -> None:
+    source = (
+        'const patch="const values = [\\"one\\"];\\n";'
+        "await tools.apply_patch(patch);"
+    )
+
+    actions = _extract_nested_actions(source)
+
+    assert len(actions) == 1
+    assert actions[0].kind == "patch"
+    assert actions[0].arguments["patch"] == 'const values = ["one"];\n'
+
+
+def test_analyzer_records_llm_latency_without_tool_execution(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        {
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"session_id": "timed", "cwd": str(tmp_path)},
+        },
+        {
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "inspect"},
+        },
+        {
+            "timestamp": "2026-01-01T00:00:03.500Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "shell",
+                "arguments": json.dumps({"cmd": "true"}),
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:08.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "shell",
+                "output": "Process exited with code 0\nOutput:\n",
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:08.001Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:09.501Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "phase": "final_answer",
+                "message": "done",
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:09.502Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 120,
+                        "output_tokens": 10,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:09.503Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "duration_ms": 8503,
+                "time_to_first_token_ms": 700,
+            },
+        },
+    ]
+    rollout = tmp_path / "rollout-timing.jsonl"
+    rollout.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    timing = RolloutAnalyzer().analyze(rollout).trace.metadata["llm_timing"]
+
+    assert timing["call_count"] == 2
+    assert timing["total_ms"] == 4000.0
+    assert timing["p50_ms"] == 1500.0
+    assert timing["p95_ms"] == 2500.0
+    assert timing["turn_duration_ms"] == 8503
+    assert timing["non_llm_ms"] == 4503.0
+    assert timing["time_to_first_token_ms"] == 700
+    assert timing["calls"][0]["latency_ms"] == 2500.0
+    assert timing["calls"][0]["usage"]["output_tokens"] == 20
+    assert timing["calls"][1]["latency_ms"] == 1500.0
+
+
+def test_replayer_can_replay_recorded_llm_latency_without_store_attribution(
+    tmp_path: Path,
+) -> None:
+    trace = WorkloadTrace(
+        "llm-replay",
+        (
+            WorkloadEvent(
+                0,
+                "mcp",
+                "knowledge_status",
+                {},
+            ),
+        ),
+        {
+            "llm_timing": {
+                "total_ms": 30.0,
+                "calls": [
+                    {"latency_ms": 10.0},
+                    {"latency_ms": 20.0},
+                ],
+            }
+        },
+    )
+    report = WorkloadReplayer(
+        _Service(tmp_path),
+        repo_dir=tmp_path,
+        replay_llm_latency=True,
+        llm_latency_scale=0.01,
+    ).replay(trace)
+
+    assert report.succeeded
+    assert report.llm_latency_enabled
+    assert report.llm_recorded_ms == 30.0
+    assert report.llm_calls_slept == 2
+    assert report.llm_slept_ms == pytest.approx(0.3)
+    assert report.events[0].model_inference_ms == pytest.approx(0.3)
+    assert report.events[0].timing_ms["others"] == pytest.approx(0.0)
+
+
+def test_replayer_uses_replay_time_merge_preview_token(tmp_path: Path) -> None:
+    class MergeService(_Service):
+        def __init__(self, root: Path):
+            super().__init__(root)
+            self.received_token: str | None = None
+
+        def merge_preview(self, source: str, target: str) -> dict[str, Any]:
+            assert (source, target) == ("task/a", "main")
+            return {"preview_token": "replay-token", "changes": []}
+
+        def merge(
+            self,
+            source: str,
+            target: str,
+            *,
+            selected_change_ids: list[str] | None,
+            preview_token: str | None,
+            conflict_choices: dict[str, str] | None,
+            operation_id: str | None,
+        ) -> dict[str, Any]:
+            del selected_change_ids, conflict_choices, operation_id
+            assert (source, target) == ("task/a", "main")
+            self.received_token = preview_token
+            return {"status": "committed"}
+
+    trace = WorkloadTrace(
+        "dynamic-preview-token",
+        (
+            WorkloadEvent(
+                0,
+                "mcp",
+                "knowledge_merge_preview",
+                {"source_branch": "task/a", "target_branch": "main"},
+                expected={"status": "ok"},
+            ),
+            WorkloadEvent(
+                1,
+                "mcp",
+                "knowledge_merge",
+                {
+                    "source_branch": "task/a",
+                    "target_branch": "main",
+                    "preview_token": "capture-token",
+                    "selected_change_ids": [],
+                },
+                expected={"status": "ok"},
+            ),
+        ),
+    )
+    service = MergeService(tmp_path / "checkouts")
+
+    report = WorkloadReplayer(service, repo_dir=tmp_path).replay(trace)  # type: ignore[arg-type]
+
+    assert report.succeeded
+    assert service.received_token == "replay-token"
+
+
+@pytest.mark.parametrize("merge_retries", [1, -1])
+def test_replayer_carries_prepared_preview_and_quiesces_retries_once(
+    tmp_path: Path,
+    merge_retries: int,
+) -> None:
+    class PreparedPreview(dict[str, Any]):
+        def __init__(self, token: str):
+            super().__init__(preview_token=token, changes=[])
+            self.atomic_preview = self
+
+    class QuiescingBackend(_Backend):
+        def __init__(self) -> None:
+            self.quiesce_events: list[str] = []
+
+        @contextlib.contextmanager
+        def merge_quiesce(self, source: str, target: str):
+            self.quiesce_events.append(f"enter:{source}->{target}")
+            try:
+                yield
+            finally:
+                self.quiesce_events.append(f"exit:{source}->{target}")
+
+    class MergeService(_Service):
+        def __init__(self, root: Path):
+            super().__init__(root)
+            self.backend = QuiescingBackend()
+            self.preview_count = 0
+            self.merge_count = 0
+            self.received_previews: list[Any] = []
+
+        def merge_preview(self, source: str, target: str) -> PreparedPreview:
+            assert (source, target) == ("task/a", "main")
+            self.preview_count += 1
+            return PreparedPreview(f"token-{self.preview_count}")
+
+        def merge(
+            self,
+            source: str,
+            target: str,
+            *,
+            selected_change_ids: list[str] | None,
+            preview_token: str | None,
+            conflict_choices: dict[str, str] | None,
+            operation_id: str | None,
+            prepared_preview: Any | None = None,
+        ) -> dict[str, Any]:
+            del selected_change_ids, conflict_choices, operation_id
+            assert (source, target) == ("task/a", "main")
+            self.merge_count += 1
+            self.received_previews.append(prepared_preview)
+            if self.merge_count == 1:
+                raise RuntimeError("target branch commit already in progress")
+            assert preview_token == "token-2"
+            return {"status": "committed"}
+
+    trace = WorkloadTrace(
+        "prepared-preview-retry",
+        (
+            WorkloadEvent(
+                0,
+                "mcp",
+                "knowledge_merge_preview",
+                {"source_branch": "task/a", "target_branch": "main"},
+                expected={"status": "ok"},
+            ),
+            WorkloadEvent(
+                1,
+                "mcp",
+                "knowledge_merge",
+                {
+                    "source_branch": "task/a",
+                    "target_branch": "main",
+                    "preview_token": "capture-token",
+                    "selected_change_ids": [],
+                },
+                expected={"status": "ok"},
+            ),
+        ),
+    )
+    service = MergeService(tmp_path / "checkouts")
+
+    report = WorkloadReplayer(
+        service,
+        repo_dir=tmp_path,
+        merge_retries=merge_retries,
+    ).replay(trace)  # type: ignore[arg-type]
+
+    assert report.succeeded
+    assert service.preview_count == 2
+    assert service.merge_count == 2
+    assert all(item is not None for item in service.received_previews)
+    assert service.received_previews[0] is not service.received_previews[1]
+    assert service.backend.quiesce_events == [
+        "enter:task/a->main",
+        "exit:task/a->main",
+    ]
+
+
+def test_replayer_does_not_retry_an_expected_merge_error_in_unlimited_mode(
+    tmp_path: Path,
+) -> None:
+    class MergeService(_Service):
+        def __init__(self, root: Path):
+            super().__init__(root)
+            self.preview_count = 0
+            self.merge_count = 0
+
+        def merge_preview(self, source: str, target: str) -> dict[str, Any]:
+            assert (source, target) == ("task/a", "main")
+            self.preview_count += 1
+            return {"preview_token": f"token-{self.preview_count}", "changes": []}
+
+        def merge(
+            self,
+            source: str,
+            target: str,
+            *,
+            selected_change_ids: list[str] | None,
+            preview_token: str | None,
+            conflict_choices: dict[str, str] | None,
+            operation_id: str | None,
+        ) -> dict[str, Any]:
+            del selected_change_ids, preview_token, conflict_choices, operation_id
+            assert (source, target) == ("task/a", "main")
+            self.merge_count += 1
+            raise RuntimeError("target branch commit already in progress")
+
+    trace = WorkloadTrace(
+        "expected-merge-error",
+        (
+            WorkloadEvent(
+                0,
+                "mcp",
+                "knowledge_merge_preview",
+                {"source_branch": "task/a", "target_branch": "main"},
+                expected={"status": "ok"},
+            ),
+            WorkloadEvent(
+                1,
+                "mcp",
+                "knowledge_merge",
+                {
+                    "source_branch": "task/a",
+                    "target_branch": "main",
+                    "preview_token": "capture-token",
+                    "selected_change_ids": [],
+                },
+                expected={"status": "error"},
+            ),
+        ),
+    )
+    service = MergeService(tmp_path / "checkouts")
+
+    report = WorkloadReplayer(
+        service,
+        repo_dir=tmp_path,
+        merge_retries=-1,
+    ).replay(trace)  # type: ignore[arg-type]
+
+    assert report.succeeded
+    assert service.preview_count == 1
+    assert service.merge_count == 1
+    assert report.events[-1].status == "error"
+    assert report.events[-1].expected_status == "error"
+
+
+def test_retryable_merge_error_accepts_machine_readable_progress_marker() -> None:
+    from chronos_enterprise_knowledge.rollout_trace import _retryable_merge_error
+
+    assert _retryable_merge_error(
+        RuntimeError("chronos_session_barrier_in_progress: team/site-reliability")
+    )
+
+
+def test_replayer_resolves_logical_merge_selection_against_fresh_preview(
+    tmp_path: Path,
+) -> None:
+    class MergeService(_Service):
+        def __init__(self, root: Path):
+            super().__init__(root)
+            self.selected: list[str] | None = None
+
+        def merge_preview(self, source: str, target: str) -> dict[str, Any]:
+            del source, target
+            return {
+                "preview_token": "fresh-token",
+                "selection_groups": {
+                    "indexed_documents": {
+                        "policy": ["sqlite:fresh", "qdrant:fresh"],
+                    },
+                    "filesystem_paths": {
+                        "/knowledge": ["filesystem:fresh"],
+                    },
+                },
+            }
+
+        def merge(
+            self,
+            source: str,
+            target: str,
+            *,
+            selected_change_ids: list[str] | None,
+            preview_token: str | None,
+            conflict_choices: dict[str, str] | None,
+            operation_id: str | None,
+        ) -> dict[str, Any]:
+            del source, target, conflict_choices, operation_id
+            assert preview_token == "fresh-token"
+            self.selected = selected_change_ids
+            return {"status": "committed"}
+
+    trace = WorkloadTrace(
+        "logical-selection",
+        (
+            WorkloadEvent(
+                0,
+                "mcp",
+                "knowledge_merge_preview",
+                {"source_branch": "task/a", "target_branch": "main"},
+                expected={"status": "ok"},
+            ),
+            WorkloadEvent(
+                1,
+                "mcp",
+                "knowledge_merge",
+                {
+                    "source_branch": "task/a",
+                    "target_branch": "main",
+                    "preview_token": "capture-token",
+                    "selected_change_ids": ["capture-only"],
+                },
+                expected={
+                    "status": "ok",
+                    "merge_selection_groups": [
+                        {"category": "indexed_documents", "key": "policy"},
+                        {"category": "filesystem_paths", "key": "/knowledge"},
+                    ],
+                },
+            ),
+        ),
+    )
+    service = MergeService(tmp_path / "checkouts")
+
+    report = WorkloadReplayer(service, repo_dir=tmp_path).replay(trace)  # type: ignore[arg-type]
+
+    assert report.succeeded
+    assert service.selected == [
+        "filesystem:fresh",
+        "qdrant:fresh",
+        "sqlite:fresh",
+    ]
+
+
+def test_replayer_preserves_failed_partial_merge_selection_shape() -> None:
+    preview = {
+        "selection_groups": {
+            "indexed_documents": {
+                "report": ["sqlite:r1", "qdrant:r1"],
+                "memory": ["sqlite:m1", "qdrant:m1"],
+            },
+            "filesystem_paths": {"/artifact": ["filesystem:a1"]},
+        }
+    }
+
+    selected = _resolve_merge_selection(
+        preview,
+        [{"category": "indexed_documents", "key": "memory"}],
+        [
+            {
+                "category": "indexed_documents",
+                "key": "report",
+                "count": 1,
+            }
+        ],
+    )
+
+    assert selected == ["qdrant:m1", "qdrant:r1", "sqlite:m1"]
 
 
 def test_rollout_analyzer_extracts_mcp_and_portable_shell_paths(
@@ -670,6 +1334,42 @@ def test_replayer_isolates_trace_temporary_paths(tmp_path: Path) -> None:
     assert not trace_tmp.exists()
 
 
+def test_replayer_isolates_literal_absolute_tmp_paths(tmp_path: Path) -> None:
+    trace = WorkloadTrace(
+        "isolated-absolute-temp",
+        (
+            WorkloadEvent(
+                0,
+                "shell",
+                "exec_command",
+                {
+                    "cmd": (
+                        "mkdir -p /tmp/chronos-literal-replay/state; "
+                        "touch /tmp/chronos-literal-replay/state/ready"
+                    )
+                },
+                expected={"status": "ok", "exit_code": 0},
+            ),
+            WorkloadEvent(
+                1,
+                "shell",
+                "exec_command",
+                {"cmd": "test -f /tmp/chronos-literal-replay/state/ready"},
+                expected={"status": "ok", "exit_code": 0},
+            ),
+        ),
+    )
+
+    report = WorkloadReplayer(
+        _Service(tmp_path / "checkouts"),  # type: ignore[arg-type]
+        repo_dir=tmp_path,
+        allow_shell=True,
+    ).replay(trace)
+
+    assert report.succeeded
+    assert not Path("/tmp/chronos-literal-replay").exists()
+
+
 def test_replayer_expands_checkout_path_and_runs_trusted_shell(
     tmp_path: Path,
 ) -> None:
@@ -836,6 +1536,41 @@ def test_replayer_accepts_terminal_status_for_unfinished_shell_capture(
     assert report.succeeded
     assert report.events[0].status == "ok"
     assert report.events[0].expected_status == "any"
+
+
+def test_replayer_continues_after_unexpected_exception_with_any_status(
+    tmp_path: Path,
+) -> None:
+    trace = WorkloadTrace(
+        "continue-after-any-error",
+        (
+            WorkloadEvent(
+                0,
+                "mcp",
+                "knowledge_not_a_tool",
+                {},
+                expected={"status": "any"},
+            ),
+            WorkloadEvent(
+                1,
+                "shell",
+                "exec_command",
+                {"cmd": "exit 0", "workdir": "{{repo}}"},
+                expected={"status": "ok", "exit_code": 0},
+            ),
+        ),
+    )
+
+    report = WorkloadReplayer(
+        _Service(tmp_path / "checkouts"),  # type: ignore[arg-type]
+        repo_dir=tmp_path,
+        allow_shell=True,
+    ).replay(trace)
+
+    assert len(report.events) == 2
+    assert report.events[0].status == "error"
+    assert report.events[0].expected_status == "any"
+    assert report.events[1].status == "ok"
 
 
 def test_replayer_remaps_branches_but_preserves_trace_workspace_tokens(

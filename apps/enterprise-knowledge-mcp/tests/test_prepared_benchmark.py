@@ -182,6 +182,11 @@ def test_isolated_workflows_restore_pristine_branch_state(
         backend.set_placeholder_vector_mode(True)
         backend.put_document("main", _seed_document(), operation_id="seed")
         backend.create_branch("person/alex", "main")
+        stale_namespace = prepared_benchmark._isolation_namespace(
+            0,
+            "01-first",
+        )
+        backend.create_branch(f"{stale_namespace}stale", "person/alex")
     finally:
         backend.close()
     manifest = tmp_path / "snapshot" / "manifest.json"

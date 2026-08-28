@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from chronos_enterprise_knowledge.backends import create_knowledge_backend
-from chronos_enterprise_knowledge.embedding import ZeroEmbedder
+from chronos_enterprise_knowledge.embedding import (
+    SentenceTransformerEmbedder,
+    SentenceTransformerEmbeddingConfig,
+    ZeroEmbedder,
+)
 from chronos_enterprise_knowledge.models import (
     canonical_json,
     content_hash,
@@ -28,6 +32,7 @@ from chronos_enterprise_knowledge.rollout_trace import (
     WorkloadTrace,
 )
 from chronos_enterprise_knowledge.service import KnowledgeService
+from chronos_enterprise_knowledge.timing import instrument_backend
 
 
 class PreparedRootBenchmark:
@@ -57,6 +62,7 @@ class PreparedRootBenchmark:
         require_result_match: bool = False,
         backend_options: Mapping[str, Mapping[str, Any]] | None = None,
         in_place_backends: Sequence[str] = (),
+        real_embeddings: bool = False,
     ):
         manifest_values = (
             (snapshot_manifest,)
@@ -88,6 +94,10 @@ class PreparedRootBenchmark:
         self.repo_dir = Path(repo_dir).resolve()
         self.dimensions = int(dimensions)
         self.embedding_model = str(embedding_model)
+        self.real_embeddings = bool(real_embeddings)
+        self.embedding_mode = (
+            "snapshot" if self.real_embeddings else "forced-zero"
+        )
         self.repetitions = int(repetitions)
         self.run_namespace = f"run-{os.getpid()}-{time.time_ns()}"
         self.allow_shell = bool(allow_shell)
@@ -208,7 +218,9 @@ class PreparedRootBenchmark:
         )
         report = BenchmarkReport(
             snapshot=self.snapshot_description,
-            embedding_cache="<forced-zero>",
+            embedding_cache=(
+                "<snapshot>" if self.real_embeddings else "<forced-zero>"
+            ),
             backends=backends,
             traces=(trace.trace_id,),
             require_result_match=self.require_result_match,
@@ -324,10 +336,7 @@ class PreparedRootBenchmark:
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 try:
                     backend = self._create_backend(backend_name, run_state)
-                    embedder = ZeroEmbedder(
-                        self.dimensions,
-                        model=self.embedding_model,
-                    )
+                    embedder = self._create_replay_embedder()
                     service = KnowledgeService(backend, embedder)
                     service.start()
                     try:
@@ -367,6 +376,7 @@ class PreparedRootBenchmark:
                                     completed_position=position,
                                 )
                     finally:
+                        _close_embedder(embedder)
                         backend.close()
                 finally:
                     if not in_place:
@@ -389,7 +399,9 @@ class PreparedRootBenchmark:
             )
             report = BenchmarkReport(
                 snapshot=self.snapshot_description,
-                embedding_cache="<forced-zero>",
+                embedding_cache=(
+                    "<snapshot>" if self.real_embeddings else "<forced-zero>"
+                ),
                 backends=backends,
                 traces=(trace.trace_id,),
                 require_result_match=self.require_result_match,
@@ -427,12 +439,18 @@ class PreparedRootBenchmark:
         for repetition in range(self.repetitions):
             for backend_name, base_state in self.base_states.items():
                 backend = self._create_backend(backend_name, base_state)
-                embedder = ZeroEmbedder(
-                    self.dimensions,
-                    model=self.embedding_model,
-                )
+                embedder = self._create_replay_embedder()
                 service = KnowledgeService(backend, embedder)
                 service.start()
+                # A process interruption can leave the current workflow's
+                # deterministic isolation namespace behind. Remove namespaces
+                # for this run before defining the pristine branch set; they
+                # are benchmark scratch state, not prepared-root branches.
+                for trace in traces:
+                    _delete_isolation_namespace(
+                        backend,
+                        _isolation_namespace(repetition, trace.trace_id),
+                    )
                 pristine_branches = set(backend.list_branches())
                 try:
                     for trace in traces:
@@ -499,6 +517,7 @@ class PreparedRootBenchmark:
                         )
                         runs_by_trace[trace.trace_id].append(run)
                 finally:
+                    _close_embedder(embedder)
                     backend.close()
 
         reports: list[BenchmarkReport] = []
@@ -515,7 +534,9 @@ class PreparedRootBenchmark:
             )
             report = BenchmarkReport(
                 snapshot=self.snapshot_description,
-                embedding_cache="<forced-zero>",
+                embedding_cache=(
+                    "<snapshot>" if self.real_embeddings else "<forced-zero>"
+                ),
                 backends=backends,
                 traces=(trace.trace_id,),
                 require_result_match=self.require_result_match,
@@ -537,10 +558,7 @@ class PreparedRootBenchmark:
         reset_elapsed_ns: int,
     ) -> BenchmarkRun:
         backend = self._create_backend(backend_name, run_state)
-        embedder = ZeroEmbedder(
-            self.dimensions,
-            model=self.embedding_model,
-        )
+        embedder = self._create_replay_embedder()
         service = KnowledgeService(backend, embedder)
         service.start()
         setup_elapsed_ns = 0
@@ -597,6 +615,7 @@ class PreparedRootBenchmark:
                 final_storage,
             )
         finally:
+            _close_embedder(embedder)
             backend.close()
         return BenchmarkRun(
             trace_id=trace.trace_id,
@@ -611,7 +630,7 @@ class PreparedRootBenchmark:
                 "elapsed_ms": setup_elapsed_ns / 1_000_000,
                 "reset_elapsed_ms": reset_elapsed_ns / 1_000_000,
                 "selection_digest": self.manifest["selection_digest"],
-                "embedding_mode": "forced-zero",
+                "embedding_mode": self.embedding_mode,
                 "prepared_root_reused": True,
                 "max_shell_interrupt_seconds": (
                     self.max_shell_interrupt_seconds
@@ -627,11 +646,37 @@ class PreparedRootBenchmark:
         )
 
     def _create_backend(self, backend_name: str, state_dir: Path) -> Any:
-        return create_knowledge_backend(
+        backend = create_knowledge_backend(
             backend_name,  # type: ignore[arg-type]
             state_dir,
             vector_dimensions=self.dimensions,
             **self.backend_options.get(backend_name, {}),
+        )
+        return instrument_backend(backend)
+
+    def _create_replay_embedder(self) -> Any:
+        if not self.real_embeddings:
+            return ZeroEmbedder(
+                self.dimensions,
+                model=self.embedding_model,
+            )
+        model, separator, variant = self.embedding_model.partition("#")
+        backend = "torch"
+        model_file = None
+        if separator:
+            backend, _, model_file = variant.partition(":")
+            if not model_file:
+                model_file = None
+        return SentenceTransformerEmbedder(
+            config=SentenceTransformerEmbeddingConfig(
+                model=model,
+                dimensions=self.dimensions,
+                batch_size=128,
+                workers=1,
+                chunk_size=512,
+                backend=backend,
+                model_file=model_file,
+            )
         )
 
     def _run_sequence_trace(
@@ -693,7 +738,7 @@ class PreparedRootBenchmark:
                 "elapsed_ms": 0,
                 "reset_elapsed_ms": reset_elapsed_ns / 1_000_000,
                 "selection_digest": self.manifest["selection_digest"],
-                "embedding_mode": "forced-zero",
+                "embedding_mode": self.embedding_mode,
                 "prepared_root_reused": True,
                 "max_shell_interrupt_seconds": (
                     self.max_shell_interrupt_seconds
@@ -781,7 +826,7 @@ class PreparedRootBenchmark:
                 "elapsed_ms": setup_elapsed_ns / 1_000_000,
                 "reset_elapsed_ms": 0,
                 "selection_digest": self.manifest["selection_digest"],
-                "embedding_mode": "forced-zero",
+                "embedding_mode": self.embedding_mode,
                 "prepared_root_reused": True,
                 "isolated_workflow": True,
                 "setup_traces": [
@@ -1115,6 +1160,7 @@ def _touched_state_digests(
             for branch in sorted(branches | deleted_branches)
         },
         "documents": {},
+        "document_errors": {},
         "deleted_documents": {},
         "files": {},
     }
@@ -1122,7 +1168,17 @@ def _touched_state_digests(
         physical = physical_branch(branch)
         if physical not in current_branches:
             continue
-        indexed = backend.get_document(physical, identifier)
+        try:
+            indexed = backend.get_document(physical, identifier)
+        except (FileNotFoundError, RuntimeError) as error:
+            # A selective merge may leave a document catalog row on a
+            # private branch while its filesystem materialization is not part
+            # of the published selection.  Keep that state observable in the
+            # digest instead of aborting benchmark verification.
+            indexed = None
+            projection["document_errors"][f"{branch}\0{identifier}"] = str(
+                error
+            )
         projection["documents"][f"{branch}\0{identifier}"] = (
             indexed_document_digest(indexed)
             if indexed is not None
@@ -1261,6 +1317,12 @@ def _safe_name(value: str) -> str:
         else "-"
         for character in value
     ).strip("-")
+
+
+def _close_embedder(embedder: Any) -> None:
+    close = getattr(embedder, "close", None)
+    if callable(close):
+        close()
 
 
 __all__ = ["PreparedRootBenchmark"]

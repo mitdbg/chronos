@@ -21,6 +21,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from chronos_core.branching import ChronosBranchContext
+from chronos_core.branching._common import (
+    INTERVAL_RESERVE_RATIOS,
+    interval_reserve_bits_for_coordinate_width,
+)
 from chronos_core.branching.sql_adapters import SQLDatabaseAdapter, connect_sql_database
 
 
@@ -48,7 +52,8 @@ LOG_SCALE_METRICS = {"branch_create", "branch_delete"}
 CSV_FIELDS = [
     "backend",
     "shape",
-    "interval_continuation_percent",
+    "interval_reserve_bits",
+    "interval_harmonic_reserve",
     "dataset_size",
     "depth",
     "width",
@@ -60,6 +65,7 @@ CSV_FIELDS = [
     "p95_ms",
     "total_ms",
 ]
+INTERVAL_HARMONIC_RESERVE = 8
 
 
 @dataclass(frozen=True)
@@ -69,7 +75,6 @@ class BenchCase:
     depth: int
     width: int = 0
     shape: str = "depth"
-    interval_continuation_percent: int = 5
 
     @property
     def span(self) -> int:
@@ -406,7 +411,7 @@ def make_context(
         ctx = ChronosBranchContext.connect(
             database_url,
             backend=backend,
-            interval_continuation_percent=case.interval_continuation_percent,
+            interval_harmonic_reserve=INTERVAL_HARMONIC_RESERVE,
         )
         db = ctx.db
         if database_url.startswith(("postgres://", "postgresql://")):
@@ -426,7 +431,7 @@ def make_context(
             ctx = ChronosBranchContext.connect(
                 database_url,
                 backend=backend,
-                interval_continuation_percent=case.interval_continuation_percent,
+                interval_harmonic_reserve=INTERVAL_HARMONIC_RESERVE,
             )
             db = ctx.db
     progress(f"{case_label(case)} create logical tables")
@@ -686,7 +691,10 @@ def build_depth_chain(
             f"branch={branch} parent={parent}"
         )
         start = time.perf_counter_ns()
-        ctx.create_branch(branch, from_branch=parent)
+        if isinstance(ctx, ChronosBranchContext):
+            ctx.create_branch(branch, from_branch=parent, fanout=1)
+        else:
+            ctx.create_branch(branch, from_branch=parent)
         create_timings_ms.append((time.perf_counter_ns() - start) / 1_000_000)
         progress(f"{case_label(case)} created branch={branch}")
         mutate_branch_state(ctx, branch, case, level, mutations_per_branch)
@@ -710,7 +718,10 @@ def build_width_fanout(
             f"branch={branch} parent=main"
         )
         start = time.perf_counter_ns()
-        ctx.create_branch(branch, from_branch="main")
+        if isinstance(ctx, ChronosBranchContext):
+            ctx.create_branch(branch, from_branch="main", fanout=case.width)
+        else:
+            ctx.create_branch(branch, from_branch="main")
         create_timings_ms.append((time.perf_counter_ns() - start) / 1_000_000)
         progress(f"{case_label(case)} created branch={branch}")
         mutate_branch_state(ctx, branch, case, level, mutations_per_branch)
@@ -1034,7 +1045,11 @@ def result_row(
     return {
         "backend": case.backend,
         "shape": case.shape,
-        "interval_continuation_percent": case.interval_continuation_percent,
+        "interval_reserve_bits": ",".join(
+            str(value)
+            for value in interval_reserve_bits_for_coordinate_width(0, "postgres")
+        ),
+        "interval_harmonic_reserve": INTERVAL_HARMONIC_RESERVE,
         "dataset_size": case.dataset_size,
         "depth": case.depth,
         "width": case.width,
@@ -1392,18 +1407,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of update/insert/delete mutation groups applied after each branch creation.",
     )
     parser.add_argument(
-        "--interval-depth-continuation-percent",
-        type=int,
-        default=5,
-        help="Chronos interval source-branch continuation percent for depth cases.",
-    )
-    parser.add_argument(
-        "--interval-width-continuation-percent",
-        type=int,
-        default=98,
-        help="Chronos interval source-branch continuation percent for width cases.",
-    )
-    parser.add_argument(
         "--include-join-aggregate",
         action="store_true",
         help="Also run the expensive join/group/order read benchmark.",
@@ -1494,8 +1497,11 @@ def main() -> None:
         "warmup_ops": warmup_ops,
         "post_branch_warmup": args.post_branch_warmup,
         "branch_mutations": branch_mutations,
-        "interval_depth_continuation_percent": args.interval_depth_continuation_percent,
-        "interval_width_continuation_percent": args.interval_width_continuation_percent,
+        "interval_reserve_ratios": [list(ratio) for ratio in INTERVAL_RESERVE_RATIOS],
+        "default_postgres_interval_reserve_bits": list(
+            interval_reserve_bits_for_coordinate_width(0, "postgres")
+        ),
+        "interval_harmonic_reserve": INTERVAL_HARMONIC_RESERVE,
         "include_join_aggregate": args.include_join_aggregate,
         "database_url": args.database_url,
     }
@@ -1518,11 +1524,6 @@ def main() -> None:
                             depth=depth,
                             width=0,
                             shape="depth",
-                            interval_continuation_percent=(
-                                args.interval_depth_continuation_percent
-                                if backend == "interval"
-                                else 5
-                            ),
                         )
                         print(
                             f"shape=depth backend={backend} dataset={dataset_size} depth={depth}",
@@ -1556,11 +1557,6 @@ def main() -> None:
                             depth=0,
                             width=width,
                             shape="width",
-                            interval_continuation_percent=(
-                                args.interval_width_continuation_percent
-                                if backend == "interval"
-                                else 5
-                            ),
                         )
                         print(
                             f"shape=width backend={backend} dataset={dataset_size} width={width}",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 from chronos_core.workspace import AtomicMergeError
@@ -229,7 +230,7 @@ def test_merge_promotes_coordinated_document_and_file_state(tmp_path: Path) -> N
 
         result = backend.merge("draft", "main", operation_id="merge:draft")
 
-        assert {"filesystem", "qdrant", "sqlite"} <= set(result)
+        assert {"filesystem", "qdrant", "relational"} <= set(result)
         merged = backend.get_document("main", "oncall")
         assert merged is not None
         assert merged.document.content == indexed.document.content
@@ -240,6 +241,61 @@ def test_merge_promotes_coordinated_document_and_file_state(tmp_path: Path) -> N
             (0.0, 0.0, 1.0),
             limit=5,
         )
+    finally:
+        backend.close()
+
+
+def test_merge_reuses_prepared_preview_without_dependency_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ChronosKnowledgeBackend(tmp_path, vector_dimensions=3)
+    try:
+        indexed = _indexed(
+            "oncall",
+            "The primary on-call acknowledges P0 incidents within five minutes.",
+            (0.0, 0.0, 1.0),
+        )
+        backend.put_document("main", indexed, operation_id="seed:oncall")
+        backend.create_branch("draft", "main")
+        backend.write_file(
+            "draft",
+            "/artifacts/review.md",
+            b"reviewed",
+            operation_id="draft:review",
+        )
+        preview = backend.merge_preview("draft", "main")
+        assert json.dumps(preview)
+
+        original_checkout = backend.workspace.checkout
+
+        def fail_checkout(*args: object, **kwargs: object) -> object:
+            raise AssertionError("dependency construction checked out a branch")
+
+        monkeypatch.setattr(backend.workspace, "checkout", fail_checkout)
+        backend._merge_dependency_groups(preview.atomic_preview)
+
+        monkeypatch.setattr(backend.workspace, "checkout", original_checkout)
+        original_preview = backend.workspace.merge_atomic_preview
+        calls = 0
+
+        def counted_preview(*args: object, **kwargs: object):
+            nonlocal calls
+            calls += 1
+            return original_preview(*args, **kwargs)
+
+        monkeypatch.setattr(backend.workspace, "merge_atomic_preview", counted_preview)
+        result = backend.merge(
+            "draft",
+            "main",
+            operation_id="merge:prepared",
+            preview_token=preview["preview_token"],
+            prepared_preview=preview,
+        )
+        assert result["status"] == "committed"
+        # The only preview after the caller's prepared result is the required
+        # post-reservation revalidation inside the generic atomic protocol.
+        assert calls == 1
     finally:
         backend.close()
 
@@ -275,9 +331,7 @@ def test_selective_merge_keeps_temporary_artifacts_private(tmp_path: Path) -> No
             if change["key"].get("path") == "/artifacts/review.md"
         ]
         assert set(selected) == set(
-            preview["selection_groups"]["filesystem_paths"][
-                "/artifacts/review.md"
-            ]
+            preview["selection_groups"]["filesystem_paths"]["/artifacts/review.md"]
         )
         assert len(selected) > 1
         with pytest.raises(AtomicMergeError, match="every change for a path"):
@@ -320,12 +374,13 @@ def test_selective_merge_requires_complete_indexed_document_bundle(
         preview = backend.merge_preview("draft", "main")
         document_change = next(
             change
-            for change in preview["stores"]["sqlite"]["changes"]
+            for change in preview["stores"]["relational"]["changes"]
             if change["table"] == "knowledge_documents"
         )
-        assert document_change["change_id"] in preview["selection_groups"][
-            "indexed_documents"
-        ]["oncall"]
+        assert (
+            document_change["change_id"]
+            in preview["selection_groups"]["indexed_documents"]["oncall"]
+        )
 
         with pytest.raises(MergeDependencyError) as raised:
             backend.merge(
@@ -376,7 +431,9 @@ def test_selective_merge_rejects_document_file_changed_without_reindex(
                 operation_id="merge:stale-index-all",
                 preview_token=preview["preview_token"],
             )
-        with pytest.raises(MergeDependencyError, match="reindex before merge") as raised:
+        with pytest.raises(
+            MergeDependencyError, match="reindex before merge"
+        ) as raised:
             backend.merge(
                 "draft",
                 "main",
@@ -423,6 +480,27 @@ def test_backend_reopens_with_identical_visible_state(tmp_path: Path) -> None:
         reopened.close()
 
 
+def test_same_interval_url_reuses_relational_context(tmp_path: Path) -> None:
+    """Avoid a duplicate interval context when stores share one database."""
+
+    shared_url = f"sqlite:///{tmp_path / 'shared.sqlite'}"
+    backend = ChronosKnowledgeBackend(
+        tmp_path / "state",
+        vector_dimensions=3,
+        relational_url=shared_url,
+        workspace_metadata_url=shared_url,
+    )
+    try:
+        assert backend.filesystem.context is backend.relational
+        assert backend.filesystem._borrows_context_native is True
+        assert backend.workspace.stores["relational"] is backend.relational
+    finally:
+        # The filesystem and relational workspace entries intentionally refer
+        # to the same context; teardown must therefore be idempotent.
+        backend.close()
+        backend.close()
+
+
 def test_placeholder_vectors_use_lexical_search_and_branch_visibility(
     tmp_path: Path,
 ) -> None:
@@ -452,12 +530,15 @@ def test_placeholder_vectors_use_lexical_search_and_branch_visibility(
         )
         backend.put_document("draft", revised, operation_id="draft:release")
 
-        assert backend.search(
-            "draft",
-            "cobalt approval",
-            (0.0, 0.0, 0.0),
-            limit=5,
-        ) == []
+        assert (
+            backend.search(
+                "draft",
+                "cobalt approval",
+                (0.0, 0.0, 0.0),
+                limit=5,
+            )
+            == []
+        )
         updated = backend.search(
             "draft",
             "saffron review",
@@ -477,11 +558,9 @@ def test_chronos_indexes_chunks_by_document(tmp_path: Path) -> None:
     try:
         indexes = {
             index.name: index
-            for index in backend.sqlite.list_indexes("knowledge_chunks")
+            for index in backend.relational.list_indexes("knowledge_chunks")
         }
-        assert indexes["knowledge_chunks_by_document"].columns == (
-            "document_id",
-        )
+        assert indexes["knowledge_chunks_by_document"].columns == ("document_id",)
     finally:
         backend.close()
 
@@ -509,6 +588,12 @@ def test_diff_is_change_proportional_for_documents_and_files(
             b"remove me\n",
             operation_id="seed:remove",
         )
+        backend.write_file(
+            "main",
+            "/artifacts/same-size.md",
+            b"before\n",
+            operation_id="seed:same-size",
+        )
         backend.create_branch("task", "main")
 
         revised = _indexed(
@@ -529,6 +614,15 @@ def test_diff_is_change_proportional_for_documents_and_files(
             b"new\n",
             operation_id="task:new",
         )
+        # Exercise the POSIX in-place write path.  The replacement has the
+        # same length, so ChronosFS versions file_blocks without changing the
+        # inode's size metadata.
+        backend.filesystem.write_at(
+            "task",
+            "/artifacts/same-size.md",
+            0,
+            b"after!\n",
+        )
         assert backend.delete_file(
             "task",
             "/artifacts/remove.md",
@@ -540,10 +634,10 @@ def test_diff_is_change_proportional_for_documents_and_files(
             AssertionError("full filesystem walk")
         )
         original_diff_rows = backend.filesystem.context.diff_rows
+        compared_tables: list[str] = []
 
         def sparse_file_diff(left: str, right: str, table: str):
-            if table == "chronosfs_file_blocks":
-                raise AssertionError("block-level filesystem diff")
+            compared_tables.append(table)
             return original_diff_rows(left, right, table)
 
         backend.filesystem.context.diff_rows = sparse_file_diff  # type: ignore[method-assign]
@@ -557,10 +651,12 @@ def test_diff_is_change_proportional_for_documents_and_files(
         assert result["files"] == {
             "added": ["/artifacts/new.md"],
             "deleted": ["/artifacts/remove.md"],
-            "modified": [
-                "/artifacts/existing.md",
-                "/knowledge/deploy.md",
-            ],
+                "modified": [
+                    "/artifacts/existing.md",
+                    "/artifacts/same-size.md",
+                    "/knowledge/deploy.md",
+                ],
         }
+        assert "chronosfs_file_blocks" in compared_tables
     finally:
         backend.close()

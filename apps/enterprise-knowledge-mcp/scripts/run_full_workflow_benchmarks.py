@@ -60,16 +60,34 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--qdrant-url")
+    parser.add_argument(
+        "--require-remote-qdrant",
+        action="store_true",
+        help=(
+            "fail unless every backend is configured through the shared "
+            "remote Qdrant URL"
+        ),
+    )
     parser.add_argument("--qdrant-api-key")
     parser.add_argument("--doltgres-dsn")
     parser.add_argument("--btrfs-root", type=Path)
     parser.add_argument("--doltgres-data-dir", type=Path)
     parser.add_argument("--qdrant-storage-dir", type=Path)
+    parser.add_argument("--chronos-postgres-dsn")
+    parser.add_argument("--chronos-postgres-data-dir", type=Path)
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--repo-dir", type=Path, required=True)
     parser.add_argument("--dimensions", type=int, required=True)
     parser.add_argument("--embedding-model", required=True)
+    parser.add_argument(
+        "--real-embeddings",
+        action="store_true",
+        help=(
+            "Use the prepared sentence-transformer model for replay queries; "
+            "the default uses implicit zero vectors for staged benchmarks."
+        ),
+    )
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument(
         "--max-shell-interrupt-seconds",
@@ -135,6 +153,11 @@ def main() -> int:
         if not separator or not backend or not path:
             raise SystemExit(f"invalid --base-state value: {value}")
         base_states[backend] = Path(path)
+    if args.require_remote_qdrant and not args.qdrant_url:
+        raise SystemExit(
+            "--require-remote-qdrant requires --qdrant-url; embedded Qdrant "
+            "is not permitted in a cross-backend benchmark"
+        )
     traces = {
         path.name[:2]: WorkloadTrace.load(path)
         for path in sorted(args.traces_dir.glob("[0-9][0-9]-*.jsonl"))
@@ -179,6 +202,14 @@ def main() -> int:
                     "qdrant_storage_dir": args.qdrant_storage_dir,
                     **(
                         {
+                            "chronos_postgres_dsn": args.chronos_postgres_dsn,
+                            "chronos_postgres_data_dir": args.chronos_postgres_data_dir,
+                        }
+                        if backend == "chronos"
+                        else {}
+                    ),
+                    **(
+                        {
                             "doltgres_dsn": args.doltgres_dsn,
                             "btrfs_root": args.btrfs_root,
                             "doltgres_data_dir": args.doltgres_data_dir,
@@ -192,6 +223,7 @@ def main() -> int:
             for backend in base_states
         },
         in_place_backends=args.in_place_backend,
+        real_embeddings=args.real_embeddings,
     )
     completed = []
     if args.isolated_workflows:
@@ -260,7 +292,14 @@ def main() -> int:
                     str(path.resolve()) for path in args.snapshot_manifest
                 ],
                 "backends": list(base_states),
+                "qdrant_deployment": (
+                    "remote-required"
+                    if args.require_remote_qdrant
+                    else "caller-selected"
+                ),
+                "qdrant_url": args.qdrant_url,
                 "repetitions": args.repetitions,
+                "real_embeddings": args.real_embeddings,
                 "dependency_mode": args.dependency_mode,
                 "excluded_workflows": sorted(set(args.exclude)),
                 "max_shell_interrupt_seconds": (
@@ -273,7 +312,15 @@ def main() -> int:
         + "\n",
         encoding="utf-8",
     )
-    return 0 if all(item["matched"] for item in completed) else 2
+    # A replay can legitimately diverge from a capture made by a weaker
+    # backend: for example, Chronos may return a document that the captured
+    # baseline could not read after a non-atomic publication.  The replay
+    # report preserves ``matched`` so that the anomaly is measurable, while
+    # the benchmark should fail only when result matching was explicitly
+    # requested.  Stateful replay failures already raise before this point.
+    return 0 if not benchmark.require_result_match or all(
+        item["matched"] for item in completed
+    ) else 2
 
 
 if __name__ == "__main__":

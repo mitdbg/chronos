@@ -140,6 +140,8 @@ class RolloutBenchmark:
         btrfs_root: str | Path | None = None,
         doltgres_data_dir: str | Path | None = None,
         qdrant_storage_dir: str | Path | None = None,
+        chronos_postgres_dsn: str | None = None,
+        chronos_postgres_data_dir: str | Path | None = None,
         force_zero_embeddings: bool = False,
         progress: Callable[[dict[str, Any]], None] | None = None,
     ):
@@ -170,6 +172,12 @@ class RolloutBenchmark:
         self.qdrant_storage_dir = (
             Path(qdrant_storage_dir).expanduser().resolve()
             if qdrant_storage_dir is not None
+            else None
+        )
+        self.chronos_postgres_dsn = chronos_postgres_dsn
+        self.chronos_postgres_data_dir = (
+            Path(chronos_postgres_data_dir).expanduser().resolve()
+            if chronos_postgres_data_dir is not None
             else None
         )
         self.force_zero_embeddings = force_zero_embeddings
@@ -304,6 +312,8 @@ class RolloutBenchmark:
             btrfs_root=self.btrfs_root,
             doltgres_data_dir=self.doltgres_data_dir,
             qdrant_storage_dir=self.qdrant_storage_dir,
+            chronos_postgres_dsn=self.chronos_postgres_dsn,
+            chronos_postgres_data_dir=self.chronos_postgres_data_dir,
         )
         cache = EmbeddingCache(self.embedding_cache_path)
         try:
@@ -526,6 +536,7 @@ class RolloutBenchmark:
             "require_result_match": self.require_result_match,
             "qdrant_url": self.qdrant_url,
             "doltgres_dsn": self.doltgres_dsn,
+            "chronos_postgres_dsn": self.chronos_postgres_dsn,
             "btrfs_root": (
                 str(self.btrfs_root) if self.btrfs_root is not None else None
             ),
@@ -537,6 +548,11 @@ class RolloutBenchmark:
             "qdrant_storage_dir": (
                 str(self.qdrant_storage_dir)
                 if self.qdrant_storage_dir is not None
+                else None
+            ),
+            "chronos_postgres_data_dir": (
+                str(self.chronos_postgres_data_dir)
+                if self.chronos_postgres_data_dir is not None
                 else None
             ),
             "force_zero_embeddings": self.force_zero_embeddings,

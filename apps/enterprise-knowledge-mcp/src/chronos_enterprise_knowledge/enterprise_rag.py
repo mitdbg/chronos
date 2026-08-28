@@ -18,6 +18,7 @@ _TITLE_FIELDS = (
     "title",
     "summary",
     "subject",
+    "channel",
     "name",
     "company_name",
     "event_name",
@@ -36,6 +37,10 @@ _CONTEXT_FIELDS = (
     "customer_company",
     "mailbox_owner",
     "thread_id",
+    "repository",
+    "artifact_type",
+    "number",
+    "state_at_cutoff",
 )
 _CODEBASE_EXCLUDED_DIRECTORIES = {
     ".git",
@@ -348,7 +353,13 @@ class EnterpriseRAGCorpus:
     @staticmethod
     def _title(path: Path, parsed: Any) -> str:
         if isinstance(parsed, Mapping):
-            for field in _TITLE_FIELDS:
+            declared_field = parsed.get("title_field_name")
+            fields = (
+                (str(declared_field), *_TITLE_FIELDS)
+                if isinstance(declared_field, str) and declared_field.strip()
+                else _TITLE_FIELDS
+            )
+            for field in dict.fromkeys(fields):
                 value = parsed.get(field)
                 if isinstance(value, (str, int, float)) and str(value).strip():
                     return str(value).strip()
@@ -365,7 +376,10 @@ class EnterpriseRAGCorpus:
         }
         parts = relative.parts
         if len(parts) >= 3 and parts[0] == "sources":
-            context["workspace"] = parts[2]
+            if parts[1] == "github_public" and len(parts) >= 4:
+                context["workspace"] = "/".join(parts[2:4])
+            else:
+                context["workspace"] = parts[2]
         elif len(parts) >= 2 and parts[0] == "codebases":
             context["workspace"] = parts[1]
             context["repository"] = parts[1]

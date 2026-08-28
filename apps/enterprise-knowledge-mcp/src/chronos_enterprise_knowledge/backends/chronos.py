@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
@@ -50,6 +51,7 @@ from chronos_enterprise_knowledge.retrieval import (
     Bm25Encoder,
     payload_for_chunk,
     point_vectors,
+    qdrant_on_disk,
 )
 
 _DOCUMENTS_TABLE = "knowledge_documents"
@@ -59,6 +61,17 @@ _VECTOR_COLLECTION = "knowledge"
 _CHUNKS_BY_DOCUMENT_INDEX = "knowledge_chunks_by_document"
 _DIRENTS_BY_INODE_INDEX = "chronosfs_dirents_by_inode"
 _STORAGE_SCHEMA_VERSION = 3
+_UNMOUNT_TIMEOUT_SECONDS = 5.0
+
+
+class PreparedChronosMergePreview(dict[str, Any]):
+    """JSON-compatible preview payload carrying the in-process core preview."""
+
+    __slots__ = ("atomic_preview",)
+
+    def __init__(self, payload: Mapping[str, Any], atomic_preview: AtomicMergePreview):
+        super().__init__(payload)
+        self.atomic_preview = atomic_preview
 
 
 def _coordinated_write(method: Any) -> Any:
@@ -101,7 +114,14 @@ class MergeDependencyError(ValueError):
 
 
 class ChronosKnowledgeBackend:
-    """SQLite + ChronosFS + Qdrant knowledge workspace."""
+    """ChronosFS and Qdrant knowledge workspace with a relational control plane.
+
+    Enterprise service and benchmark entry points pass PostgreSQL by default,
+    so relational application tables, Chronos interval metadata, and
+    ChronosFS records share one server-backed database.  The constructor still
+    accepts an explicit SQLite URL for isolated unit tests and local adapter
+    experiments; it is never selected by the enterprise launchers.
+    """
 
     def __init__(
         self,
@@ -112,6 +132,9 @@ class ChronosKnowledgeBackend:
         qdrant_api_key: str | None = None,
         qdrant_storage_dir: str | Path | None = None,
         workspace_metadata_url: str | None = None,
+        relational_url: str | None = None,
+        relational_storage_dir: str | Path | None = None,
+        enable_session_epochs: bool = True,
     ):
         self.state_dir = Path(state_dir).expanduser().resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -133,14 +156,35 @@ class ChronosKnowledgeBackend:
             else self.state_dir / "qdrant"
         )
 
-        metadata_url = workspace_metadata_url or (
+        self.relational_url = relational_url
+        self._relational_storage_dir = (
+            Path(relational_storage_dir).expanduser().resolve()
+            if relational_storage_dir is not None
+            else None
+        )
+        metadata_url = workspace_metadata_url or relational_url or (
             f"sqlite:///{self.state_dir / 'knowledge.sqlite'}"
         )
-        self.sqlite = ChronosBranchContext.connect(metadata_url)
-        self.filesystem = ChronosFSStore.connect(
-            f"sqlite:///{self.state_dir / 'chronosfs.sqlite'}",
-            metadata_url=metadata_url,
+        data_url = relational_url or f"sqlite:///{self.state_dir / 'chronosfs.sqlite'}"
+        self.relational = ChronosBranchContext.connect(
+            metadata_url,
+            enable_session_epochs=enable_session_epochs,
         )
+        # The enterprise deployment puts application rows and ChronosFS rows
+        # in the same PostgreSQL database.  Reusing the already-open interval
+        # context avoids a second pair of Python adapters, a second native
+        # interval backend, its garbage-collector connection, and a second
+        # session-epoch coordinator for every worker process.  Keep the split
+        # context for the local/default layout (and for callers that really
+        # provide different data and metadata URLs).
+        if data_url == metadata_url:
+            self.filesystem = ChronosFSStore(self.relational)
+        else:
+            self.filesystem = ChronosFSStore.connect(
+                data_url,
+                metadata_url=metadata_url,
+                enable_session_epochs=enable_session_epochs,
+            )
         self.filesystem.ensure()
         self._ensure_filesystem_indexes()
         if qdrant_url:
@@ -150,25 +194,36 @@ class ChronosKnowledgeBackend:
                 api_key=qdrant_api_key,
                 collection_prefix=collection_prefix,
                 timeout=600.0,
-                context=self.sqlite,
+                context=self.relational,
             )
         else:
             self.qdrant = ChronosQdrantStore.local(
                 metadata_url,
                 path=self.state_dir / "qdrant",
                 collection_prefix=collection_prefix,
-                context=self.sqlite,
+                context=self.relational,
             )
         self.workspace = ChronosWorkspaceContext(
             filesystem=self.filesystem,
-            sqlite=self.sqlite,
+            relational=self.relational,
             qdrant=self.qdrant,
             shared_metadata_url=metadata_url,
         )
         self._active_mounts: dict[str, Path] = {}
+        self._merge_quiesce_lock = threading.RLock()
+        self._quiesced_merge_pairs: set[tuple[str, str]] = set()
+        self._document_paths_lock = threading.RLock()
+        self._document_paths: dict[str, dict[str, str]] = {}
+        # The prepared-workflow runner samples storage before and after every
+        # isolated trace.  Main is unchanged while those traces create and
+        # remove private branches, so re-counting its visible rows would scan
+        # the full interval tables for every sample. Cache the exact counts by
+        # the main head reference; a main-branch write naturally selects a new
+        # key and refreshes the measurement.
+        self._storage_count_cache: tuple[str, int, int] | None = None
         self._ensure_search_schema()
         self._ensure_schema()
-        self.sqlite.set_merge_table_scope([_DOCUMENTS_TABLE, _CHUNKS_TABLE])
+        self.relational.set_merge_table_scope([_DOCUMENTS_TABLE, _CHUNKS_TABLE])
         self._implicit_zero_vectors = self._state_flag("implicit_zero_vectors")
         self._bm25 = Bm25Encoder()
         self.qdrant.register_collection(
@@ -177,8 +232,17 @@ class ChronosKnowledgeBackend:
             distance="cosine",
             dense_vector_name=DENSE_VECTOR,
             sparse_vector_names=(BM25_VECTOR,),
-            on_disk=qdrant_url is not None,
+            on_disk=qdrant_on_disk(default=qdrant_url is not None),
         )
+        # The bootstrap path performs read-only registry lookups on the
+        # PostgreSQL adapters (for example when the tables, indexes, and
+        # Qdrant collection already exist).  Psycopg starts a transaction for
+        # those SELECTs even though no application work is pending.  End the
+        # initialization transaction before a worker begins replay so idle
+        # bootstrap connections cannot retain relation locks or interfere with
+        # a concurrent branch barrier.
+        self.relational.db.commit()
+        self.filesystem.context.db.commit()
 
     @property
     def backend_name(self) -> str:
@@ -186,7 +250,7 @@ class ChronosKnowledgeBackend:
 
     @property
     def storage_components(self) -> list[str]:
-        return ["sqlite", "chronosfs", "qdrant"]
+        return ["relational", "chronosfs", "qdrant"]
 
     def start(self) -> None:
         """Start the shared ChronosFS daemon before accepting MCP requests."""
@@ -213,6 +277,11 @@ class ChronosKnowledgeBackend:
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             filesystem_branch = self.workspace.resolve_branch("filesystem", branch_id)
+            # Branch creation and bulk ingestion can advance the ChronosFS
+            # interval state while the shared filesystem session is still
+            # cached. Refresh before mounting so POSIX directory traversal
+            # observes inherited files, not only direct API reads.
+            self.filesystem.refresh_branch(filesystem_branch)
             start_chronosfs_mount(
                 self.filesystem,
                 path,
@@ -251,10 +320,15 @@ class ChronosKnowledgeBackend:
                     check=True,
                     capture_output=True,
                     text=True,
+                    timeout=_UNMOUNT_TIMEOUT_SECONDS,
                 )
                 self._active_mounts.pop(branch_id, None)
                 return
-            except subprocess.CalledProcessError as exc:
+            except (
+                OSError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
                 errors.append(exc)
         if not force:
             error = RuntimeError(
@@ -263,9 +337,49 @@ class ChronosKnowledgeBackend:
             if errors:
                 raise error from errors[-1]
             raise error
-        if errors:
-            self._active_mounts.pop(branch_id, None)
-            self._detach_mount_path(path)
+        self._active_mounts.pop(branch_id, None)
+        self._detach_mount_path(path)
+
+    @contextlib.contextmanager
+    def merge_quiesce(
+        self,
+        source_branch: str,
+        target_branch: str,
+    ) -> Iterator[None]:
+        """Quiesce mounted branches once across one logical merge attempt.
+
+        The replay layer may retry a merge after a target reservation race.
+        Keeping the source and target mounts quiescent across those retries
+        avoids repeatedly tearing down and restarting FUSE sessions.  The
+        atomic workspace protocol still revalidates branch tokens after the
+        reservation, so this only removes lifecycle churn.
+        """
+
+        pair = (source_branch, target_branch)
+        already_quiesced = False
+        with self._merge_quiesce_lock:
+            if pair in self._quiesced_merge_pairs:
+                already_quiesced = True
+                mounted: dict[str, Path] = {}
+            else:
+                mounted = {
+                    branch_id: self._active_mounts[branch_id]
+                    for branch_id in {source_branch, target_branch}
+                    if branch_id in self._active_mounts
+                }
+                for branch_id in mounted:
+                    self.unmount_branch(branch_id, force=False)
+                self._quiesced_merge_pairs.add(pair)
+        if already_quiesced:
+            yield
+            return
+        try:
+            yield
+        finally:
+            with self._merge_quiesce_lock:
+                self._quiesced_merge_pairs.discard(pair)
+                for branch_id, mount_path in mounted.items():
+                    self.mount_branch(branch_id, mount_path)
 
     @staticmethod
     def _detach_mount_path(path: Path) -> None:
@@ -276,19 +390,24 @@ class ChronosKnowledgeBackend:
         ):
             if shutil.which(command[0]) is None:
                 continue
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=_UNMOUNT_TIMEOUT_SECONDS,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
             if completed.returncode == 0 or not os.path.ismount(path):
                 return
+
         if os.path.ismount(path):
             raise RuntimeError(f"failed to detach stale ChronosFS mount at {path}")
 
     def _ensure_schema(self) -> None:
-        db = self.sqlite.db
+        db = self.relational.db
         db.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {_DOCUMENTS_TABLE} (
@@ -315,11 +434,11 @@ class ChronosKnowledgeBackend:
             """
         )
         db.commit()
-        self.sqlite.register_table(_DOCUMENTS_TABLE, ["id"])
-        self.sqlite.register_table(_CHUNKS_TABLE, ["id"])
-        index_names = {index.name for index in self.sqlite.list_indexes(_CHUNKS_TABLE)}
+        self.relational.register_table(_DOCUMENTS_TABLE, ["id"])
+        self.relational.register_table(_CHUNKS_TABLE, ["id"])
+        index_names = {index.name for index in self.relational.list_indexes(_CHUNKS_TABLE)}
         if _CHUNKS_BY_DOCUMENT_INDEX not in index_names:
-            self.sqlite.create_index(
+            self.relational.create_index(
                 _CHUNKS_TABLE,
                 ["document_id"],
                 _CHUNKS_BY_DOCUMENT_INDEX,
@@ -338,7 +457,7 @@ class ChronosKnowledgeBackend:
             )
 
     def _ensure_search_schema(self) -> None:
-        db = self.sqlite.db
+        db = self.relational.db
         db.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {_BACKEND_STATE_TABLE} (
@@ -355,16 +474,11 @@ class ChronosKnowledgeBackend:
             """
         ).fetchone()
         if version is None:
-            old_tables = db.execute(
-                """
-                SELECT 1
-                FROM sqlite_master
-                WHERE type = 'table'
-                  AND name IN ('knowledge_documents', 'knowledge_chunks')
-                LIMIT 1
-                """
-            ).fetchone()
-            if old_tables is not None:
+            old_tables = any(
+                db.table_defs(table)[0]
+                for table in ("knowledge_documents", "knowledge_chunks")
+            )
+            if old_tables:
                 raise RuntimeError(
                     "enterprise knowledge state uses the legacy storage layout; "
                     "rebuild it from the prepared snapshot"
@@ -384,7 +498,7 @@ class ChronosKnowledgeBackend:
         db.commit()
 
     def _state_flag(self, key: str) -> bool:
-        row = self.sqlite.db.execute(
+        row = self.relational.db.execute(
             f"SELECT value FROM {_BACKEND_STATE_TABLE} WHERE state_key = ?",
             (key,),
         ).fetchone()
@@ -394,7 +508,7 @@ class ChronosKnowledgeBackend:
     def _metadata_transaction(self) -> Iterator[None]:
         """Commit direct backend-state writes through Chronos' SQL adapter."""
 
-        db = self.sqlite.db
+        db = self.relational.db
         started = not db.in_transaction
         if started:
             db.begin()
@@ -419,19 +533,52 @@ class ChronosKnowledgeBackend:
             from_branch=parent_branch,
             metadata=dict(metadata or {}),
         )
+        with self._document_paths_lock:
+            self._document_paths[branch_id] = dict(
+                self._document_paths.get(parent_branch, {})
+            )
 
     def delete_branch(self, branch_id: str) -> None:
         self.unmount_branch(branch_id)
         self.workspace.delete_branch(branch_id)
+        with self._document_paths_lock:
+            self._document_paths.pop(branch_id, None)
+
+    def _remember_document_paths(
+        self,
+        branch_id: str,
+        indexed_documents: Sequence[IndexedDocument],
+    ) -> None:
+        with self._document_paths_lock:
+            paths = self._document_paths.setdefault(branch_id, {})
+            for indexed in indexed_documents:
+                paths[indexed.document.id] = indexed.document.path
+
+    def _remember_deleted_document(self, branch_id: str, document_id: str) -> None:
+        with self._document_paths_lock:
+            self._document_paths.setdefault(branch_id, {}).pop(document_id, None)
+
+    def _cached_path_mapping(self, branch_ids: Sequence[str]) -> dict[str, set[str]]:
+        """Return path-to-document ownership without checking out a branch."""
+
+        result: dict[str, set[str]] = {}
+        with self._document_paths_lock:
+            for branch_id in branch_ids:
+                for document_id, path in self._document_paths.get(
+                    branch_id, {}
+                ).items():
+                    result.setdefault(path, set()).add(document_id)
+        return result
 
     def set_placeholder_vector_mode(self, enabled: bool) -> None:
         """Persist whether absent Qdrant points represent staged zero vectors."""
 
         with self._metadata_transaction():
-            self.sqlite.db.execute(
+            self.relational.db.execute(
                 f"""
-                INSERT OR REPLACE INTO {_BACKEND_STATE_TABLE}(state_key, value)
+                INSERT INTO {_BACKEND_STATE_TABLE}(state_key, value)
                 VALUES ('implicit_zero_vectors', ?)
+                ON CONFLICT(state_key) DO UPDATE SET value = excluded.value
                 """,
                 ("1" if enabled else "0",),
             )
@@ -448,7 +595,7 @@ class ChronosKnowledgeBackend:
         snapshot_id: str,
     ) -> str | None:
         key = self._snapshot_cursor_key(branch_id, snapshot_id)
-        row = self.sqlite.db.execute(
+        row = self.relational.db.execute(
             f"""
             SELECT value
             FROM {_BACKEND_STATE_TABLE}
@@ -466,10 +613,11 @@ class ChronosKnowledgeBackend:
     ) -> None:
         key = self._snapshot_cursor_key(branch_id, snapshot_id)
         with self._metadata_transaction():
-            self.sqlite.db.execute(
+            self.relational.db.execute(
                 f"""
-                INSERT OR REPLACE INTO {_BACKEND_STATE_TABLE}(state_key, value)
+                INSERT INTO {_BACKEND_STATE_TABLE}(state_key, value)
                 VALUES (?, ?)
+                ON CONFLICT(state_key) DO UPDATE SET value = excluded.value
                 """,
                 (key, relative_path),
             )
@@ -536,7 +684,7 @@ class ChronosKnowledgeBackend:
             )
             after_filesystem = time.monotonic()
             with branch.transaction():
-                branch.sqlite.upsert_rows(
+                branch.relational.upsert_rows(
                     _DOCUMENTS_TABLE,
                     [
                         self._document_row(indexed.document)
@@ -545,7 +693,7 @@ class ChronosKnowledgeBackend:
                 )
                 after_documents = time.monotonic()
                 if chunks:
-                    branch.sqlite.upsert_rows(
+                    branch.relational.upsert_rows(
                         _CHUNKS_TABLE,
                         [self._chunk_row(chunk) for chunk in chunks],
                     )
@@ -621,6 +769,7 @@ class ChronosKnowledgeBackend:
                     file=sys.stderr,
                     flush=True,
                 )
+            self._remember_document_paths(branch_id, indexed_documents)
         except Exception:
             for path in written_paths:
                 if branch.fs.exists(path):
@@ -641,14 +790,14 @@ class ChronosKnowledgeBackend:
 
         branch = self.workspace.checkout(branch_id)
         existing_rows = self._rows_for_ids(
-            branch.sqlite,
+            branch.relational,
             _DOCUMENTS_TABLE,
             ("id", "path"),
             document_ids,
         )
         existing_paths = {str(row["id"]): str(row["path"]) for row in existing_rows}
         old_chunk_rows = self._rows_for_ids(
-            branch.sqlite,
+            branch.relational,
             _CHUNKS_TABLE,
             ("id", "document_id"),
             document_ids,
@@ -692,7 +841,7 @@ class ChronosKnowledgeBackend:
         sparse_vectors = self._bm25.documents([chunk.text for chunk in chunks])
         try:
             with branch.transaction():
-                branch.sqlite.upsert_rows(
+                branch.relational.upsert_rows(
                     _DOCUMENTS_TABLE,
                     [
                         self._document_row(indexed.document)
@@ -700,7 +849,7 @@ class ChronosKnowledgeBackend:
                     ],
                 )
                 if removed_chunk_ids:
-                    branch.sqlite.delete_keys(
+                    branch.relational.delete_keys(
                         _CHUNKS_TABLE,
                         [{"id": chunk_id} for chunk_id in sorted(removed_chunk_ids)],
                     )
@@ -709,7 +858,7 @@ class ChronosKnowledgeBackend:
                         sorted(removed_chunk_ids),
                     )
                 if chunks:
-                    branch.sqlite.upsert_rows(
+                    branch.relational.upsert_rows(
                         _CHUNKS_TABLE,
                         [self._chunk_row(chunk) for chunk in chunks],
                     )
@@ -750,10 +899,11 @@ class ChronosKnowledgeBackend:
             for path, content in backups.items():
                 branch.fs.write_file(path, content, parents=True)
             raise
+        self._remember_document_paths(branch_id, indexed_documents)
 
     @staticmethod
     def _rows_for_ids(
-        sqlite_session: Any,
+        relational_session: Any,
         table: str,
         columns: Sequence[str],
         values: Sequence[str],
@@ -766,7 +916,7 @@ class ChronosKnowledgeBackend:
             params = {f"value_{index}": value for index, value in enumerate(batch)}
             placeholders = ",".join(f":value_{index}" for index in range(len(batch)))
             result.extend(
-                sqlite_session.query(
+                relational_session.query(
                     f"""
                     SELECT {", ".join(columns)}
                     FROM {table}
@@ -819,13 +969,13 @@ class ChronosKnowledgeBackend:
         try:
             with branch.transaction():
                 if chunk_ids:
-                    branch.sqlite.delete_keys(
+                    branch.relational.delete_keys(
                         _CHUNKS_TABLE,
                         [{"id": chunk_id} for chunk_id in chunk_ids],
                     )
                     for chunk_id in chunk_ids:
                         branch.qdrant.delete(_VECTOR_COLLECTION, chunk_id)
-                branch.sqlite.delete_keys(
+                branch.relational.delete_keys(
                     _DOCUMENTS_TABLE,
                     [{"id": document_id}],
                 )
@@ -836,6 +986,7 @@ class ChronosKnowledgeBackend:
                 parents=True,
             )
             raise
+        self._remember_deleted_document(branch_id, document_id)
         return True
 
     def get_document(
@@ -843,8 +994,16 @@ class ChronosKnowledgeBackend:
         branch_id: str,
         document_id: str,
     ) -> IndexedDocument | None:
+        # A merge or a POSIX checkout may have advanced the shared ChronosFS
+        # session since the last checkout. Refresh its branch view before
+        # pairing filesystem content with the relational document row; this
+        # keeps point reads from observing a stale negative/path cache.  A
+        # short retry also covers the daemon's asynchronous publication of a
+        # just-merged file without adding delay to the common hit path.
+        filesystem_branch = self.workspace.resolve_branch("filesystem", branch_id)
+        self.filesystem.refresh_branch(filesystem_branch)
         branch = self.workspace.checkout(branch_id)
-        rows = branch.sqlite.query(
+        rows = branch.relational.query(
             f"""
             SELECT id, path, title, source, kind, content_hash, metadata_json
             FROM {_DOCUMENTS_TABLE}
@@ -857,9 +1016,22 @@ class ChronosKnowledgeBackend:
         row = rows[0]
         path = str(row["path"])
         if not branch.fs.exists(path):
-            raise RuntimeError(
-                f"document metadata exists but ChronosFS path is missing: {path}"
-            )
+            # Merge publication can leave ChronosFS's object queue just ahead
+            # of its branch cache.  Drain that queue once before retrying so a
+            # reader never turns a committed relational row into a false
+            # missing-document error.
+            self.filesystem.wait_for_gc()
+            for delay in (0.05, 0.10, 0.20, 0.40, 0.80):
+                self.filesystem.refresh_branch(filesystem_branch)
+                time.sleep(delay)
+                branch = self.workspace.checkout(branch_id)
+                if branch.fs.exists(path):
+                    break
+            else:
+                raise RuntimeError(
+                    "document metadata exists but ChronosFS path is missing: "
+                    f"{path}"
+                )
         content = branch.fs.read_text(path)
         if hashlib.sha256(content.encode()).hexdigest() != row["content_hash"]:
             raise RuntimeError(f"document content hash mismatch: {document_id}")
@@ -872,7 +1044,7 @@ class ChronosKnowledgeBackend:
             kind=str(row["kind"]),  # type: ignore[arg-type]
             metadata=_decode_json_object(row["metadata_json"]),
         )
-        chunk_rows = branch.sqlite.query(
+        chunk_rows = branch.relational.query(
             f"""
             SELECT id, document_id, ordinal, content_hash,
                    point_id, metadata_json
@@ -920,6 +1092,17 @@ class ChronosKnowledgeBackend:
             )
         return IndexedDocument(document, tuple(chunks))
 
+    def find_document_id_by_path(
+        self,
+        branch_id: str,
+        path: str,
+    ) -> str | None:
+        rows = self.workspace.checkout(branch_id).relational.query(
+            f"SELECT id FROM {_DOCUMENTS_TABLE} WHERE path = :path ORDER BY id",
+            {"path": path},
+        )
+        return None if not rows else str(rows[0]["id"])
+
     def search(
         self,
         branch_id: str,
@@ -943,7 +1126,7 @@ class ChronosKnowledgeBackend:
             limit=max(limit * 4, 32),
         )
         ordered_ids = [result.id for result in results]
-        metadata_by_chunk = self._search_metadata(branch.sqlite, ordered_ids)
+        metadata_by_chunk = self._search_metadata(branch.relational, ordered_ids)
         hits: list[SearchHit] = []
         per_document: dict[str, int] = {}
         result_by_id = {result.id: result for result in results}
@@ -986,7 +1169,7 @@ class ChronosKnowledgeBackend:
 
     def _search_metadata(
         self,
-        sqlite_session: Any,
+        relational_session: Any,
         chunk_ids: Sequence[str],
     ) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
@@ -996,7 +1179,7 @@ class ChronosKnowledgeBackend:
                 f"chunk_{index}": chunk_id for index, chunk_id in enumerate(batch)
             }
             placeholders = ", ".join(f":chunk_{index}" for index in range(len(batch)))
-            rows = sqlite_session.query(
+            rows = relational_session.query(
                 f"""
                 SELECT c.id AS chunk_id, c.document_id, c.content_hash,
                        c.point_id, c.metadata_json AS chunk_metadata,
@@ -1092,9 +1275,9 @@ class ChronosKnowledgeBackend:
 
         source: dict[str, str] = {}
         target: dict[str, str] = {}
-        for diff in self.sqlite.diff_rows(
-            self.workspace.resolve_branch("sqlite", target_branch),
-            self.workspace.resolve_branch("sqlite", source_branch),
+        for diff in self.relational.diff_rows(
+            self.workspace.resolve_branch("relational", target_branch),
+            self.workspace.resolve_branch("relational", source_branch),
             _DOCUMENTS_TABLE,
         ):
             document_id = str(diff.key["id"])
@@ -1115,11 +1298,18 @@ class ChronosKnowledgeBackend:
         context = self.filesystem.context
         source_fs_branch = self.workspace.resolve_branch("filesystem", source_branch)
         target_fs_branch = self.workspace.resolve_branch("filesystem", target_branch)
-        # ChronosFS updates the inode whenever file content changes. Directory
-        # entries cover path additions, removals, and renames. Inspecting block
-        # rows as well is redundant and can materialize hundreds of thousands
-        # of rows after a build or test run writes many sandbox artifacts.
-        for table in ("chronosfs_dirents", "chronosfs_inodes"):
+        # Directory entries cover path additions, removals, and renames.  The
+        # inode table covers metadata and size-changing writes, while
+        # chronosfs_file_blocks is also needed for in-place writes that keep
+        # the file size unchanged.  The interval backend does not scan the
+        # complete block table here: its native diff first restricts candidates
+        # to rows written by segments divergent between the two branches using
+        # the writer-segment index.
+        for table in (
+            "chronosfs_dirents",
+            "chronosfs_inodes",
+            "chronosfs_file_blocks",
+        ):
             for diff in context.diff_rows(target_fs_branch, source_fs_branch, table):
                 for row in (diff.key, diff.before, diff.after):
                     if row is None:
@@ -1143,34 +1333,34 @@ class ChronosKnowledgeBackend:
     def _path_for_inode(self, branch_id: str, inode_id: int) -> str | None:
         if inode_id == 1:
             return "/"
-        session = self.filesystem.context.checkout(
+        with self.filesystem.context.checkout(
             self.workspace.resolve_branch("filesystem", branch_id)
-        )
-        parts: list[str] = []
-        current = inode_id
-        seen: set[int] = set()
-        while current != 1:
-            if current in seen:
-                raise RuntimeError(
-                    f"cycle in ChronosFS directory entries at inode {current}"
+        ) as session:
+            parts: list[str] = []
+            current = inode_id
+            seen: set[int] = set()
+            while current != 1:
+                if current in seen:
+                    raise RuntimeError(
+                        f"cycle in ChronosFS directory entries at inode {current}"
+                    )
+                seen.add(current)
+                rows = session.query(
+                    """
+                    SELECT parent_inode_id, name
+                    FROM chronosfs_dirents
+                    WHERE inode_id = :inode_id
+                    ORDER BY parent_inode_id, name
+                    LIMIT 1
+                    """,
+                    {"inode_id": current},
                 )
-            seen.add(current)
-            rows = session.query(
-                """
-                SELECT parent_inode_id, name
-                FROM chronosfs_dirents
-                WHERE inode_id = :inode_id
-                ORDER BY parent_inode_id, name
-                LIMIT 1
-                """,
-                {"inode_id": current},
-            )
-            if not rows:
-                return None
-            row = rows[0]
-            parts.append(str(row["name"]))
-            current = int(row["parent_inode_id"])
-        return "/" + "/".join(reversed(parts))
+                if not rows:
+                    return None
+                row = rows[0]
+                parts.append(str(row["name"]))
+                current = int(row["parent_inode_id"])
+            return "/" + "/".join(reversed(parts))
 
     def _file_digests_for_paths(
         self,
@@ -1198,59 +1388,90 @@ class ChronosKnowledgeBackend:
         operation_id: str,
         selected_change_ids: Sequence[str] | None = None,
         preview_token: str | None = None,
+        prepared_preview: Any | None = None,
         policy: Any = None,
         conflict_choices: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         # External POSIX processes cannot be paused by the caller. A strict
         # unmount makes their reviewed filesystem state quiescent before the
         # native Chronos branch transaction reserves source and target.
-        self.unmount_branch(source_branch, force=False)
-        self.unmount_branch(target_branch, force=False)
-        effective_policy = (
-            "manual_review"
-            if policy is None and conflict_choices is not None
-            else policy
+        pair = (source_branch, target_branch)
+        quiesced = pair in self._quiesced_merge_pairs
+        mounted = (
+            {}
+            if quiesced
+            else {
+                branch_id: self._active_mounts[branch_id]
+                for branch_id in {source_branch, target_branch}
+                if branch_id in self._active_mounts
+            }
         )
-        preview = self.workspace.merge_atomic_preview(
-            source_branch,
-            target_branch,
-            policy=effective_policy,
-        )
-        if preview_token is None or preview_token == preview.preview_token:
+        try:
+            if not quiesced:
+                self.unmount_branch(source_branch, force=False)
+                self.unmount_branch(target_branch, force=False)
+            effective_policy = (
+                "manual_review"
+                if policy is None and conflict_choices is not None
+                else policy
+            )
+            preview = (
+                prepared_preview.atomic_preview
+                if isinstance(prepared_preview, PreparedChronosMergePreview)
+                else self.workspace.merge_atomic_preview(
+                    source_branch,
+                    target_branch,
+                    policy=effective_policy,
+                )
+            )
+            if preview.source != source_branch or preview.target != target_branch:
+                raise ValueError("prepared merge preview branches do not match")
             selected_for_validation = (
                 preview.change_ids
                 if selected_change_ids is None
                 else frozenset(str(value) for value in selected_change_ids)
             )
-            self._validate_merge_dependencies(
-                preview,
-                selected_for_validation,
+            if selected_for_validation <= preview.change_ids:
+                self._validate_merge_dependencies(
+                    preview,
+                    selected_for_validation,
+                )
+            result = self.workspace.merge_atomic(
+                source_branch,
+                target_branch,
+                selection=(
+                    None
+                    if selected_change_ids is None
+                    else MergeSelection.from_ids(selected_change_ids)
+                ),
+                preview_token=preview_token,
+                policy=effective_policy,
+                resolution=(
+                    MergeResolution(dict(conflict_choices))
+                    if conflict_choices is not None
+                    else None
+                ),
+                operation_id=operation_id,
+                _prepared_preview=preview,
+                _allow_stable_selection_rebase=(selected_change_ids is not None),
             )
-        result = self.workspace.merge_atomic(
-            source_branch,
-            target_branch,
-            selection=(
-                None
-                if selected_change_ids is None
-                else MergeSelection.from_ids(selected_change_ids)
-            ),
-            preview_token=preview_token,
-            policy=effective_policy,
-            resolution=(
-                MergeResolution(dict(conflict_choices))
-                if conflict_choices is not None
-                else None
-            ),
-            operation_id=operation_id,
-        )
-        payload = _jsonable_diff(result)
-        return {
-            **{
-                name: {"applied": count}
-                for name, count in payload.get("stores", {}).items()
-            },
-            **payload,
-        }
+            payload = _jsonable_diff(result)
+            self._remember_document_paths_from_preview(
+                target_branch,
+                preview,
+                selected_change_ids,
+            )
+            return {
+                **{
+                    name: {"applied": count}
+                    for name, count in payload.get("stores", {}).items()
+                },
+                **payload,
+            }
+        finally:
+            if not quiesced:
+                for branch_id, mount_path in mounted.items():
+                    self.mount_branch(branch_id, mount_path)
 
     def merge_preview(
         self,
@@ -1286,7 +1507,40 @@ class ChronosKnowledgeBackend:
                 for document_id in paths.get(path, ())
             )
         )
-        return payload
+        return PreparedChronosMergePreview(payload, preview)
+
+    def _remember_document_paths_from_preview(
+        self,
+        branch_id: str,
+        preview: AtomicMergePreview,
+        selected_change_ids: Sequence[str] | None,
+    ) -> None:
+        selected = (
+            None
+            if selected_change_ids is None
+            else {str(value) for value in selected_change_ids}
+        )
+        relational_preview = preview.stores.get("relational")
+        if relational_preview is None:
+            return
+        with self._document_paths_lock:
+            paths = self._document_paths.setdefault(branch_id, {})
+            for change in (*relational_preview.changes, *relational_preview.conflicts):
+                if change.change_id is not None and selected is not None:
+                    if change.change_id not in selected:
+                        continue
+                if change.table != _DOCUMENTS_TABLE:
+                    continue
+                document_id = str(change.key.get("id", ""))
+                if not document_id:
+                    continue
+                after = change.after
+                if after is None:
+                    paths.pop(document_id, None)
+                    continue
+                path = str(after.get("path", ""))
+                if path:
+                    paths[document_id] = path
 
     def _validate_merge_dependencies(
         self,
@@ -1332,15 +1586,10 @@ class ChronosKnowledgeBackend:
         content_changes: dict[str, set[str]] = {}
         filesystem_groups: dict[str, set[str]] = {}
 
-        for branch_id in (preview.source, preview.target):
-            rows = self.workspace.checkout(branch_id).sqlite.query(
-                f"SELECT id, path FROM {_DOCUMENTS_TABLE}"
-            )
-            for row in rows:
-                path = str(row["path"])
-                document_id = str(row["id"])
-                if path and document_id:
-                    paths.setdefault(path, set()).add(document_id)
+        for path, document_ids in self._cached_path_mapping(
+            (preview.source, preview.target)
+        ).items():
+            paths.setdefault(path, set()).update(document_ids)
 
         def add(
             document_id: str,
@@ -1353,9 +1602,9 @@ class ChronosKnowledgeBackend:
                 if not filesystem:
                     non_filesystem_changes.setdefault(document_id, set()).add(change_id)
 
-        sqlite_preview = preview.stores.get("sqlite")
-        if sqlite_preview is not None:
-            for change in (*sqlite_preview.changes, *sqlite_preview.conflicts):
+        relational_preview = preview.stores.get("relational")
+        if relational_preview is not None:
+            for change in (*relational_preview.changes, *relational_preview.conflicts):
                 rows = [row for row in (change.before, change.after) if row is not None]
                 if change.table == _DOCUMENTS_TABLE:
                     document_id = str(change.key.get("id", ""))
@@ -1416,14 +1665,14 @@ class ChronosKnowledgeBackend:
             self.workspace.resolve_branch("filesystem", branch_id)
         )
         branch = self.workspace.checkout(branch_id)
-        document_rows = branch.sqlite.query(
+        document_rows = branch.relational.query(
             f"""
             SELECT id, path, title, source, kind, content_hash, metadata_json
             FROM {_DOCUMENTS_TABLE}
             ORDER BY id
             """
         )
-        chunk_rows = branch.sqlite.query(
+        chunk_rows = branch.relational.query(
             f"""
             SELECT id, document_id, ordinal, content_hash,
                    point_id, metadata_json
@@ -1495,20 +1744,44 @@ class ChronosKnowledgeBackend:
             self.state_dir / "chronosfs.sqlite",
             self.state_dir / "qdrant-metadata.sqlite",
         ]
-        sqlite_bytes = sum(_sqlite_family_bytes(path) for path in database_paths)
+        embedded_relational_bytes = (
+            0
+            if self.relational_url
+            else sum(_sqlite_family_bytes(path) for path in database_paths)
+        )
+        server_relational_bytes = _directory_bytes(self._relational_storage_dir)
+        relational_bytes = (
+            server_relational_bytes
+            if self.relational_url
+            else embedded_relational_bytes
+        )
         qdrant_bytes = _directory_bytes(self._qdrant_storage_dir)
         main = self.workspace.checkout("main")
-        document_rows = main.sqlite.query(
-            f"SELECT COUNT(*) AS count FROM {_DOCUMENTS_TABLE}"
-        )
-        chunk_rows = main.sqlite.query(f"SELECT COUNT(*) AS count FROM {_CHUNKS_TABLE}")
+        main_ref = str(main.relational.current_ref)
+        cached_counts = self._storage_count_cache
+        if cached_counts is not None and cached_counts[0] == main_ref:
+            main_documents, main_chunks = cached_counts[1:]
+        else:
+            document_rows = main.relational.query(
+                f"SELECT COUNT(*) AS count FROM {_DOCUMENTS_TABLE}"
+            )
+            chunk_rows = main.relational.query(
+                f"SELECT COUNT(*) AS count FROM {_CHUNKS_TABLE}"
+            )
+            main_documents = int(document_rows[0]["count"])
+            main_chunks = int(chunk_rows[0]["count"])
+            self._storage_count_cache = (
+                main_ref,
+                main_documents,
+                main_chunks,
+            )
         return {
             "branches": len(self.list_branches()),
-            "main_documents": int(document_rows[0]["count"]),
-            "main_chunks": int(chunk_rows[0]["count"]),
-            "sqlite_bytes": sqlite_bytes,
+            "main_documents": main_documents,
+            "main_chunks": main_chunks,
+            "relational_bytes": relational_bytes,
             "qdrant_bytes": qdrant_bytes,
-            "total_state_bytes": sqlite_bytes + qdrant_bytes,
+            "total_state_bytes": relational_bytes + qdrant_bytes,
         }
 
     def destroy(self) -> None:
@@ -1526,12 +1799,13 @@ class ChronosKnowledgeBackend:
                 result.append(child)
         return sorted(result)
 
-    def close(self) -> None:
+    def close(self, *, shutdown_daemon: bool = True) -> None:
         for branch_id in list(self._active_mounts):
             with contextlib.suppress(Exception):
                 self.unmount_branch(branch_id)
-        with contextlib.suppress(Exception):
-            shutdown_chronosfs_daemon(self.filesystem)
+        if shutdown_daemon:
+            with contextlib.suppress(Exception):
+                shutdown_chronosfs_daemon(self.filesystem)
         self.workspace.close()
 
 
@@ -1575,7 +1849,7 @@ def _is_zero_vector(vector: Sequence[float]) -> bool:
 
 def _sqlite_family_bytes(path: Path) -> int:
     return sum(
-        candidate.stat().st_size
+        candidate.stat().st_blocks * 512
         for candidate in (
             path,
             Path(f"{path}-wal"),
@@ -1585,8 +1859,8 @@ def _sqlite_family_bytes(path: Path) -> int:
     )
 
 
-def _directory_bytes(path: Path) -> int:
-    if not path.exists():
+def _directory_bytes(path: Path | None) -> int:
+    if path is None or not path.exists():
         return 0
     return sum(
         item.stat().st_blocks * 512 for item in path.rglob("*") if item.is_file()

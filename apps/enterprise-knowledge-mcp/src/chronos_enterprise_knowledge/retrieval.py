@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import os
 import threading
 from collections.abc import Mapping, Sequence
@@ -52,6 +53,65 @@ def _boolean_environment(name: str, *, default: bool = False) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
+def _qdrant_query_timeout() -> int:
+    """Return the server-side timeout used for every vector query.
+
+    Large on-disk collections can require more than Qdrant's default
+    sixty-second operation deadline on the first cold search after restart.
+    Keep the same explicit deadline for every backend so a timeout does not
+    turn into a backend-specific success/failure difference.
+    """
+
+    raw = os.environ.get("CHRONOS_QDRANT_QUERY_TIMEOUT_SECONDS", "600")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "CHRONOS_QDRANT_QUERY_TIMEOUT_SECONDS must be a positive integer"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            "CHRONOS_QDRANT_QUERY_TIMEOUT_SECONDS must be a positive integer"
+        )
+    return value
+
+
+def _qdrant_pool_size() -> int:
+    """Return the per-client Qdrant transport pool bound.
+
+    A worker owns one client, so an unbounded HTTP pool multiplies the number
+    of sockets by the worker fan-out.  Keep the default deliberately small;
+    callers can raise it explicitly for a workload that has concurrent
+    requests within one client.
+    """
+
+    return _positive_environment_integer("CHRONOS_QDRANT_POOL_SIZE") or 1
+
+
+def qdrant_on_disk(*, default: bool = True) -> bool:
+    """Return the shared dense-vector residency setting.
+
+    Both benchmark backends use the same Qdrant service, so vector residency
+    must be selected once for the experiment rather than by a backend.
+    """
+
+    return _boolean_environment("CHRONOS_QDRANT_ON_DISK", default=default)
+
+
+def qdrant_search_params() -> models.SearchParams | None:
+    """Return the shared search hint for already-indexed vectors.
+
+    ``indexed_only`` does not change ranking when all vectors are indexed; it
+    prevents a query from falling back to a full scan while a collection is
+    still completing maintenance.  HNSW effort remains Qdrant's default so
+    the recorded retrieval semantics are unchanged.
+    """
+
+    if not _boolean_environment("CHRONOS_QDRANT_QUERY_INDEXED_ONLY"):
+        return None
+    return models.SearchParams(indexed_only=True)
+
+
 def remote_qdrant_client(
     url: str,
     *,
@@ -60,14 +120,35 @@ def remote_qdrant_client(
 ) -> QdrantClient:
     """Create the shared benchmark Qdrant client."""
 
+    prefer_grpc = _boolean_environment("CHRONOS_QDRANT_PREFER_GRPC")
+    transport_options: dict[str, Any]
+    if prefer_grpc:
+        # Qdrant uses pool_size for its gRPC channel pool.  HTTPX's ``limits``
+        # and ``pool_size`` are mutually exclusive in qdrant-client.
+        transport_options = {"pool_size": _qdrant_pool_size()}
+    else:
+        # Qdrant-client intentionally disables HTTP keep-alive for localhost
+        # and otherwise defaults to a large/unbounded HTTP connection pool.
+        # Supplying explicit limits keeps high-fan-out worker runs bounded
+        # while preserving the same transport for every backend.
+        import httpx
+
+        pool_size = _qdrant_pool_size()
+        transport_options = {
+            "limits": httpx.Limits(
+                max_connections=pool_size,
+                max_keepalive_connections=pool_size,
+            )
+        }
     return QdrantClient(
         url=url,
         api_key=api_key,
         grpc_port=_positive_environment_integer(
             "CHRONOS_QDRANT_GRPC_PORT"
         ),
-        prefer_grpc=_boolean_environment("CHRONOS_QDRANT_PREFER_GRPC"),
+        prefer_grpc=prefer_grpc,
         timeout=timeout,
+        **transport_options,
     )
 
 
@@ -154,11 +235,20 @@ def bulk_upsert_points(
         for batch in batches:
             upload(batch)
         return
+
+    contexts = [contextvars.copy_context() for _ in batches]
+
+    def upload_in_context(
+        item: tuple[contextvars.Context, Sequence[models.PointStruct]],
+    ) -> None:
+        context, batch = item
+        context.run(upload, batch)
+
     with ThreadPoolExecutor(
         max_workers=workers,
         thread_name_prefix="enterprise-qdrant-upload",
     ) as executor:
-        list(executor.map(upload, batches))
+        list(executor.map(upload_in_context, zip(contexts, batches, strict=True)))
 
 
 class Bm25Encoder:
@@ -272,6 +362,7 @@ def hybrid_query(
     if int(limit) <= 0:
         return []
     candidates = int(candidate_limit or max(64, int(limit) * 8))
+    search_params = qdrant_search_params()
     prefetch: list[Any] = []
     if dense_query is not None:
         dense = dense_vector_or_none(dense_query)
@@ -282,6 +373,7 @@ def hybrid_query(
                     using=DENSE_VECTOR,
                     filter=query_filter,
                     limit=candidates,
+                    params=search_params,
                 )
             )
     if sparse_query is not None:
@@ -291,6 +383,7 @@ def hybrid_query(
                 using=BM25_VECTOR,
                 filter=query_filter,
                 limit=candidates,
+                params=search_params,
             )
         )
     if not prefetch:
@@ -313,6 +406,8 @@ def hybrid_query(
                 limit=int(limit),
                 with_payload=True,
                 with_vectors=False,
+                search_params=search_params,
+                timeout=_qdrant_query_timeout(),
             ).points
         )
     return list(
@@ -323,6 +418,10 @@ def hybrid_query(
             limit=int(limit),
             with_payload=True,
             with_vectors=False,
+            # The hint is applied to each prefetch above; retaining it at the
+            # fused query also covers Qdrant versions that inspect the parent.
+            search_params=search_params,
+            timeout=_qdrant_query_timeout(),
         ).points
     )
 

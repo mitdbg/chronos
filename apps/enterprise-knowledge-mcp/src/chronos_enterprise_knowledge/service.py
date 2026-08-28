@@ -57,7 +57,7 @@ class KnowledgeService:
                 getattr(
                     self.backend,
                     "storage_components",
-                    ["sqlite", "filesystem", "qdrant"],
+                    ["relational", "filesystem", "qdrant"],
                 )
             ),
         }
@@ -189,6 +189,10 @@ class KnowledgeService:
     ) -> dict[str, Any]:
         normalized = normalize_workspace_path(path)
         content = self.backend.read_file(branch_id, normalized).decode("utf-8")
+        if document_id is None:
+            find_by_path = getattr(self.backend, "find_document_id_by_path", None)
+            if callable(find_by_path):
+                document_id = find_by_path(branch_id, normalized)
         return self.update_document(
             branch_id,
             path=normalized,
@@ -308,6 +312,7 @@ class KnowledgeService:
         *,
         selected_change_ids: Sequence[str] | None = None,
         preview_token: str | None = None,
+        prepared_preview: Any | None = None,
         policy: Any = None,
         conflict_choices: Mapping[str, str] | None = None,
         operation_id: str | None = None,
@@ -347,6 +352,7 @@ class KnowledgeService:
                     for key, value in arguments.items()
                     if key not in {"source_branch", "target_branch"}
                 },
+                prepared_preview=prepared_preview,
             )
             return {
                 **result,

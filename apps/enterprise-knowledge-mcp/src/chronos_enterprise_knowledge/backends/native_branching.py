@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
-import re
+import os
 import threading
 import uuid
 from collections.abc import Mapping, Sequence
@@ -43,17 +43,25 @@ from chronos_enterprise_knowledge.retrieval import (
     DENSE_VECTOR,
     Bm25Encoder,
     bulk_upsert_points,
-    dense_vector_or_none,
     hybrid_query,
     named_vector_config,
     payload_for_chunk,
     point_vectors,
     qdrant_collection_options,
+    qdrant_on_disk,
     remote_qdrant_client,
+)
+from chronos_enterprise_knowledge.selective_merge import (
+    LogicalMergePlan,
+    PreparedMergePreview,
+    build_logical_merge_plan,
+    catalog_digest,
 )
 
 _AUTHOR = "Chronos baseline <chronos-baseline@example.com>"
 _POINT_NAMESPACE = uuid.UUID("b609e562-73bd-4f6d-a2c6-7066dc3c5b64")
+
+
 class DoltgresQdrantBtrfsKnowledgeBackend:
     """Coordinate Doltgres, branch-aware Qdrant, and Btrfs snapshots."""
 
@@ -71,8 +79,7 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
     ):
         if not doltgres_dsn:
             raise ValueError(
-                "doltgres-qdrant-btrfs requires --doltgres-dsn or "
-                "CHRONOS_DOLTGRES_DSN"
+                "doltgres-qdrant-btrfs requires --doltgres-dsn or CHRONOS_DOLTGRES_DSN"
             )
         if not qdrant_url:
             raise ValueError(
@@ -84,6 +91,17 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
         if self.vector_dimensions <= 0:
             raise ValueError("vector_dimensions must be positive")
         self._lock = threading.RLock()
+        # Snapshot ingestion is split into a company snapshot and a code
+        # snapshot.  The latter intentionally contains documents that are
+        # also present in the former, so remember whether a bulk load has
+        # already populated the relational table and reconcile overlapping
+        # IDs instead of feeding them to COPY as new primary keys.
+        self._bulk_load_has_rows: bool | None = None
+        # A resumed load may find relational and vector state from an earlier
+        # attempt while the Btrfs files were never written.  Only use the
+        # re-index fast path after checking the first batch's files; otherwise
+        # the load must repair the filesystem as well.
+        self._bulk_load_files_ready: bool | None = None
         self._db = psycopg.connect(
             doltgres_dsn,
             autocommit=True,
@@ -93,14 +111,19 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
             qdrant_url,
             api_key=qdrant_api_key,
         )
-        database = str(
-            conninfo_to_dict(doltgres_dsn).get("dbname") or "postgres"
-        )
-        namespace = hashlib.sha256(
-            f"{self.state_dir}:{database}".encode()
-        ).hexdigest()[:16]
+        database = str(conninfo_to_dict(doltgres_dsn).get("dbname") or "postgres")
+        namespace = hashlib.sha256(f"{self.state_dir}:{database}".encode()).hexdigest()[
+            :16
+        ]
         self._collection = f"enterprise_native_branching_v2_{namespace}"
         self._placeholder_vector_mode = False
+        # A freshly ingested collection has no supersession markers.  Avoid
+        # asking Qdrant to evaluate a nested exclusion over an empty payload
+        # array: on large collections Qdrant 1.18 falls back to a full scan
+        # for that predicate.  The flag is refreshed from the payload index
+        # when opening an existing collection and is set as soon as a write
+        # creates the first marker.
+        self._has_qdrant_overwrite_markers = False
         self._bm25 = Bm25Encoder()
         self._doltgres_data_dir = _component_storage_path(
             doltgres_data_dir,
@@ -116,8 +139,7 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
         workspace_root = self.state_dir / "btrfs"
         if btrfs_root is not None:
             workspace_root = (
-                Path(btrfs_root).expanduser().resolve()
-                / f"enterprise-{namespace}"
+                Path(btrfs_root).expanduser().resolve() / f"enterprise-{namespace}"
             )
         self._files = BtrfsWorkspaceStore(workspace_root)
         self._ensure_qdrant_collection()
@@ -150,30 +172,35 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
         sparse = collection.config.params.sparse_vectors or {}
         if BM25_VECTOR not in sparse:
             raise RuntimeError("native Qdrant collection lacks the BM25 vector")
+        overwrite_index = collection.payload_schema.get("overwritten_in[].by")
+        self._has_qdrant_overwrite_markers = bool(
+            overwrite_index is not None
+            and int(getattr(overwrite_index, "points", 0) or 0) > 0
+        )
         self._ensure_qdrant_payload_indexes()
 
     def _create_qdrant_collection(self) -> None:
+        on_disk = qdrant_on_disk()
         dense, sparse = named_vector_config(
             self.vector_dimensions,
-            on_disk=True,
+            on_disk=on_disk,
         )
         self._qdrant.create_collection(
             collection_name=self._collection,
             vectors_config=dense,
             sparse_vectors_config=sparse,
-            **qdrant_collection_options(on_disk=True),
+            **qdrant_collection_options(on_disk=on_disk),
         )
 
     def _ensure_qdrant_payload_indexes(self) -> None:
-        payload_schema = self._qdrant.get_collection(
-            self._collection
-        ).payload_schema
+        on_disk = qdrant_on_disk()
+        payload_schema = self._qdrant.get_collection(self._collection).payload_schema
         indexes = (
             (
                 "branch",
                 models.KeywordIndexParams(
                     type=models.KeywordIndexType.KEYWORD,
-                    on_disk=True,
+                    on_disk=on_disk,
                 ),
             ),
             (
@@ -182,14 +209,14 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                     type=models.IntegerIndexType.INTEGER,
                     lookup=True,
                     range=True,
-                    on_disk=True,
+                    on_disk=on_disk,
                 ),
             ),
             (
                 "overwritten_in[].by",
                 models.KeywordIndexParams(
                     type=models.KeywordIndexType.KEYWORD,
-                    on_disk=True,
+                    on_disk=on_disk,
                 ),
             ),
             (
@@ -198,7 +225,14 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                     type=models.IntegerIndexType.INTEGER,
                     lookup=True,
                     range=True,
-                    on_disk=True,
+                    on_disk=on_disk,
+                ),
+            ),
+            (
+                "document_id",
+                models.KeywordIndexParams(
+                    type=models.KeywordIndexType.KEYWORD,
+                    on_disk=on_disk,
                 ),
             ),
         )
@@ -250,9 +284,7 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
     def _read_ingestion_cursors(self) -> dict[str, str]:
         if not self._ingestion_cursors_path.is_file():
             return {}
-        value = json.loads(
-            self._ingestion_cursors_path.read_text(encoding="utf-8")
-        )
+        value = json.loads(self._ingestion_cursors_path.read_text(encoding="utf-8"))
         if not isinstance(value, Mapping):
             raise RuntimeError("invalid native snapshot-ingestion cursor file")
         return {str(key): str(item) for key, item in value.items()}
@@ -290,21 +322,28 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                 point_id TEXT NOT NULL
             )
             """,
-            """
-            CREATE INDEX IF NOT EXISTS knowledge_chunks_by_document
-            ON knowledge_chunks(document_id, ordinal)
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS cross_store_branch_changes (
-                branch_id TEXT NOT NULL,
-                object_kind TEXT NOT NULL,
-                object_key TEXT NOT NULL,
-                PRIMARY KEY(branch_id, object_kind, object_key)
-            )
-            """,
         )
         for statement in statements:
             self._db.execute(statement)
+        # Doltgres may spend minutes validating/rebuilding a large secondary
+        # index even when it already exists.  Check the catalog first so a
+        # resumed benchmark does not pay that cost on every process start.
+        index_exists = self._db.execute(
+            """
+            SELECT 1
+            FROM information_schema.statistics
+            WHERE table_name = 'knowledge_chunks'
+              AND index_name = 'knowledge_chunks_by_document'
+            LIMIT 1
+            """
+        ).fetchone()
+        if index_exists is None:
+            self._db.execute(
+                """
+                CREATE INDEX knowledge_chunks_by_document
+                ON knowledge_chunks(document_id, ordinal)
+                """
+            )
         row = self._db.execute(
             """
             SELECT 1 FROM cross_store_branch_catalog
@@ -342,9 +381,7 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
 
     def _registry_rows(self) -> dict[str, dict[str, Any]]:
         active = str(
-            self._db.execute("SELECT active_branch() AS name").fetchone()[
-                "name"
-            ]
+            self._db.execute("SELECT active_branch() AS name").fetchone()["name"]
         )
         self._checkout("main")
         try:
@@ -441,19 +478,20 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                 self._files.delete_branch(current)
                 self._remove_qdrant_branch_state(current)
                 self._checkout("main")
-                self._db.execute(
-                    "SELECT dolt_branch('-D', %s)",
-                    (current,),
-                )
+                try:
+                    self._db.execute(
+                        "SELECT dolt_branch('-D', %s)",
+                        (current,),
+                    )
+                except Exception as exc:
+                    # A failed worker can leave the catalog row after its
+                    # Dolt branch has already been removed.  Deletion is
+                    # idempotent across the three stores, so retain the
+                    # catalog cleanup below for this stale-branch case.
+                    if "branch not found" not in str(exc).casefold():
+                        raise
             self._checkout("main")
             for current in reversed(subtree):
-                self._db.execute(
-                    """
-                    DELETE FROM cross_store_branch_changes
-                    WHERE branch_id = %s
-                    """,
-                    (current,),
-                )
                 self._db.execute(
                     "DELETE FROM cross_store_branch_catalog WHERE branch_id = %s",
                     (current,),
@@ -488,17 +526,9 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
         branch_id: str,
         sequence: int,
         message: str,
-        *,
-        changed_documents: Sequence[str] = (),
-        changed_files: Sequence[str] = (),
     ) -> None:
         self._checkout("main")
         self._set_current_sequence(branch_id, sequence)
-        self._record_change_rows(
-            branch_id,
-            documents=changed_documents,
-            files=changed_files,
-        )
         self._commit_current(message)
 
     def _set_current_sequence(
@@ -516,49 +546,6 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
             """,
             (str(sequence), branch_id, str(sequence)),
         )
-
-    def _record_branch_changes(
-        self,
-        branch_id: str,
-        *,
-        documents: Sequence[str] = (),
-        files: Sequence[str] = (),
-        message: str,
-    ) -> None:
-        if branch_id == "main":
-            return
-        self._checkout("main")
-        self._record_change_rows(
-            branch_id,
-            documents=documents,
-            files=files,
-        )
-        self._commit_current(message)
-
-    def _record_change_rows(
-        self,
-        branch_id: str,
-        *,
-        documents: Sequence[str] = (),
-        files: Sequence[str] = (),
-    ) -> None:
-        if branch_id == "main":
-            return
-        for kind, values in (
-            ("document", documents),
-            ("file", files),
-        ):
-            for value in values:
-                self._db.execute(
-                    """
-                    INSERT INTO cross_store_branch_changes(
-                        branch_id, object_kind, object_key
-                    ) VALUES (%s, %s, %s)
-                    ON CONFLICT(branch_id, object_kind, object_key)
-                    DO NOTHING
-                    """,
-                    (branch_id, kind, value),
-                )
 
     def put_document(
         self,
@@ -614,28 +601,73 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
         if not indexed_documents:
             return
         with self._lock:
-            self._require_branch(branch_id)
-            sequence = self._next_sequence(branch_id)
+            branch = self._require_branch(branch_id)
+            sequence = int(branch["current_seq"]) + 1
             self._checkout(branch_id)
-            document_ids = [
-                indexed.document.id for indexed in indexed_documents
-            ]
+            document_ids = [indexed.document.id for indexed in indexed_documents]
+            fingerprints: dict[str, tuple[str, str]] | None = None
             if bulk_load:
-                existing_ids: set[str] = set()
+                if self._bulk_load_has_rows is None:
+                    self._bulk_load_has_rows = (
+                        self._db.execute(
+                            "SELECT 1 FROM knowledge_documents LIMIT 1"
+                        ).fetchone()
+                        is not None
+                    )
+                if self._bulk_load_has_rows:
+                    fingerprints = self._existing_document_fingerprints(
+                        document_ids
+                    )
+                    existing_ids = set(fingerprints)
+                else:
+                    existing_ids = set()
             else:
-                placeholders = sql.SQL(", ").join(
-                    sql.Placeholder() for _ in document_ids
-                )
-                existing_ids = {
-                    str(row["id"])
-                    for row in self._db.execute(
-                        sql.SQL(
-                            "SELECT id FROM knowledge_documents "
-                            "WHERE id IN ({})"
-                        ).format(placeholders),
-                        document_ids,
-                    ).fetchall()
-                }
+                existing_ids = self._existing_document_ids(document_ids)
+
+            # A resumed bulk load may be rebuilding only the vector store
+            # after a service restart.  Rewriting unchanged rows through
+            # Doltgres and Btrfs is both unnecessary and extremely expensive:
+            # the snapshot already agrees with the committed relational/file
+            # state.  Reuse the committed chunk point IDs and publish fresh
+            # Qdrant payloads without changing those stores.  The normal path
+            # below remains in force for new or changed documents.
+            if (
+                bulk_load
+                and self._bulk_load_has_rows
+                and existing_ids
+                and fingerprints is not None
+            ):
+                if self._bulk_load_files_ready is None:
+                    self._bulk_load_files_ready = self._files_match_batch(
+                        branch_id,
+                        indexed_documents,
+                    )
+                unchanged = [
+                    indexed
+                    for indexed in indexed_documents
+                    if fingerprints.get(indexed.document.id)
+                    == (indexed.document.path, indexed.document.sha256)
+                ]
+                if (
+                    self._bulk_load_files_ready
+                    and len(unchanged) == len(indexed_documents)
+                ):
+                    required_chunk_ids = {
+                        chunk.id
+                        for indexed in indexed_documents
+                        for chunk in indexed.chunks
+                    }
+                    point_ids_by_chunk = self._existing_chunk_point_ids(
+                        tuple(required_chunk_ids)
+                    )
+                    if required_chunk_ids <= point_ids_by_chunk.keys():
+                        self._upsert_document_points(
+                            branch_id,
+                            int(branch["current_seq"]),
+                            indexed_documents,
+                            point_ids_by_chunk=point_ids_by_chunk,
+                        )
+                        return
             old_point_ids = [
                 point_id
                 for document_id in existing_ids
@@ -683,16 +715,13 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                 self._commit_current(
                     f"{operation_id}: write {len(indexed_documents)} documents"
                 )
+                if bulk_load:
+                    self._bulk_load_has_rows = True
                 if branch_id != "main":
                     self._advance_sequence(
                         branch_id,
                         sequence,
                         f"{operation_id}: advance vector sequence",
-                        changed_documents=document_ids,
-                        changed_files=[
-                            indexed.document.path
-                            for indexed in indexed_documents
-                        ],
                     )
             except Exception:
                 self._reset_current()
@@ -705,6 +734,85 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                 for path, previous in file_backups.items():
                     _restore_file(self._files, branch_id, path, previous)
                 raise
+
+    def _files_match_batch(
+        self,
+        branch_id: str,
+        indexed_documents: Sequence[IndexedDocument],
+    ) -> bool:
+        """Check that a resumed relational load also has its file state."""
+
+        for indexed in indexed_documents:
+            try:
+                content = self._files.read(
+                    branch_id,
+                    indexed.document.path,
+                )
+            except FileNotFoundError:
+                return False
+            if content_hash(content) != indexed.document.sha256:
+                return False
+        return True
+
+    def _existing_document_ids(self, document_ids: Sequence[str]) -> set[str]:
+        if not document_ids:
+            return set()
+        placeholders = sql.SQL(", ").join(
+            sql.Placeholder() for _ in document_ids
+        )
+        return {
+            str(row["id"])
+            for row in self._db.execute(
+                sql.SQL(
+                    "SELECT id FROM knowledge_documents WHERE id IN ({})"
+                ).format(placeholders),
+                document_ids,
+            ).fetchall()
+        }
+
+    def _existing_document_fingerprints(
+        self,
+        document_ids: Sequence[str],
+    ) -> dict[str, tuple[str, str]]:
+        if not document_ids:
+            return {}
+        values = sql.SQL(", ").join(
+            sql.SQL("(%s)") for _ in document_ids
+        )
+        return {
+            str(row["id"]): (str(row["path"]), str(row["content_hash"]))
+            for row in self._db.execute(
+                sql.SQL(
+                    "WITH requested(id) AS (VALUES {values}) "
+                    "SELECT d.id, d.path, d.content_hash "
+                    "FROM requested JOIN knowledge_documents AS d "
+                    "ON d.id = requested.id"
+                ).format(values=values),
+                document_ids,
+            ).fetchall()
+        }
+
+    def _existing_chunk_point_ids(
+        self,
+        chunk_ids: Sequence[str],
+    ) -> dict[str, str]:
+        if not chunk_ids:
+            return {}
+        values = sql.SQL(", ").join(
+            sql.SQL("(%s)") for _ in chunk_ids
+        )
+        return {
+            str(row["id"]): str(row["point_id"])
+            for row in self._db.execute(
+                sql.SQL(
+                    "WITH requested(id) AS (VALUES {values}) "
+                    "SELECT c.id, c.point_id "
+                    "FROM requested JOIN knowledge_chunks AS c "
+                    "ON c.id = requested.id"
+                ).format(values=values),
+                chunk_ids,
+            ).fetchall()
+        }
 
     def _store_document_batch(
         self,
@@ -890,12 +998,12 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
         branch_id: str,
         sequence: int,
         indexed_documents: Sequence[IndexedDocument],
+        *,
+        point_ids_by_chunk: Mapping[str, str] | None = None,
     ) -> list[str]:
         points: list[models.PointStruct] = []
         point_ids: list[str] = []
-        chunks = [
-            chunk for indexed in indexed_documents for chunk in indexed.chunks
-        ]
+        chunks = [chunk for indexed in indexed_documents for chunk in indexed.chunks]
         sparse_vectors = self._bm25.documents([chunk.text for chunk in chunks])
         sparse_by_chunk = {
             chunk.id: sparse
@@ -903,17 +1011,17 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
         }
         for indexed in indexed_documents:
             for chunk in indexed.chunks:
-                point_id = self._point_id(branch_id, sequence, chunk.id)
+                point_id = (
+                    point_ids_by_chunk.get(chunk.id)
+                    if point_ids_by_chunk is not None
+                    else None
+                ) or self._point_id(branch_id, sequence, chunk.id)
                 point_ids.append(point_id)
                 points.append(
                     models.PointStruct(
                         id=point_id,
                         vector=point_vectors(
-                            (
-                                ()
-                                if self._placeholder_vector_mode
-                                else chunk.embedding
-                            ),
+                            (() if self._placeholder_vector_mode else chunk.embedding),
                             sparse_by_chunk[chunk.id],
                         ),
                         payload={
@@ -984,8 +1092,6 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                     branch_id,
                     sequence,
                     f"{operation_id}: advance vector sequence",
-                    changed_documents=(document_id,),
-                    changed_files=(existing.document.path,),
                 )
             except Exception:
                 self._reset_current()
@@ -1008,6 +1114,20 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
             self._require_branch(branch_id)
             self._checkout(branch_id)
             return self._get_document(document_id, hydrate=True)
+
+    def find_document_id_by_path(
+        self,
+        branch_id: str,
+        path: str,
+    ) -> str | None:
+        with self._lock:
+            self._require_branch(branch_id)
+            self._checkout(branch_id)
+            row = self._db.execute(
+                "SELECT id FROM knowledge_documents WHERE path = %s ORDER BY id",
+                (path,),
+            ).fetchone()
+            return None if row is None else str(row["id"])
 
     def _get_document(
         self,
@@ -1049,9 +1169,11 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
             title=str(row["title"]),
             source=str(row["source"]),
             content=self._files.read(
-                str(self._db.execute(
-                    "SELECT active_branch() AS name"
-                ).fetchone()["name"]),
+                str(
+                    self._db.execute("SELECT active_branch() AS name").fetchone()[
+                        "name"
+                    ]
+                ),
                 str(row["path"]),
             ).decode(),
             kind=str(row["kind"]),  # type: ignore[arg-type]
@@ -1068,8 +1190,7 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
             if content_hash(text) != str(chunk["content_hash"]):
                 raise RuntimeError(f"Qdrant chunk hash mismatch: {point_id}")
             metadata = dict(
-                payload.get("chunk_metadata")
-                or json.loads(str(chunk["metadata_json"]))
+                payload.get("chunk_metadata") or json.loads(str(chunk["metadata_json"]))
             )
             chunks.append(
                 DocumentChunk(
@@ -1116,58 +1237,20 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                 self._qdrant,
                 collection_name=self._collection,
                 dense_query=(
-                    None
-                    if self._placeholder_vector_mode
-                    else query_embedding
+                    None if self._placeholder_vector_mode else query_embedding
                 ),
                 sparse_query=self._bm25.query(query_text),
-                query_filter=_qdrant_branch_filter(lineage),
+                query_filter=_qdrant_branch_filter(
+                    lineage,
+                    include_overwrites=self._has_qdrant_overwrite_markers,
+                ),
                 limit=max(limit * 4, 32),
             )
             self._checkout(branch_id)
             chunk_ids = [
-                str((point.payload or {}).get("chunk_id", ""))
-                for point in points
+                str((point.payload or {}).get("chunk_id", "")) for point in points
             ]
-            chunk_rows: dict[str, dict[str, Any]] = {}
-            # Doltgres does not reliably turn a large IN predicate into point
-            # lookups, and its optimizer scans the table for the chunk-document
-            # join. Resolve the bounded candidate set through the two primary
-            # keys instead.
-            for chunk_id in dict.fromkeys(chunk_ids):
-                row = self._db.execute(
-                    """
-                    SELECT id AS chunk_id, document_id, content_hash,
-                           metadata_json, point_id
-                    FROM knowledge_chunks
-                    WHERE id = %s
-                    """,
-                    (chunk_id,),
-                ).fetchone()
-                if row is not None:
-                    chunk_rows[str(row["chunk_id"])] = dict(row)
-            document_rows: dict[str, dict[str, Any]] = {}
-            for document_id in dict.fromkeys(
-                str(row["document_id"]) for row in chunk_rows.values()
-            ):
-                row = self._db.execute(
-                    """
-                    SELECT id AS document_id, path, title, source, kind,
-                           metadata_json AS document_metadata_json
-                    FROM knowledge_documents
-                    WHERE id = %s
-                    """,
-                    (document_id,),
-                ).fetchone()
-                if row is not None:
-                    document_rows[document_id] = dict(row)
-            metadata_by_chunk: dict[str, dict[str, Any]] = {}
-            for chunk_id, chunk_row in chunk_rows.items():
-                document_row = document_rows.get(
-                    str(chunk_row["document_id"])
-                )
-                if document_row is not None:
-                    metadata_by_chunk[chunk_id] = chunk_row | document_row
+            metadata_by_chunk = self._search_metadata_by_join(chunk_ids)
             hits: list[SearchHit] = []
             per_document: dict[str, int] = {}
             for point in points:
@@ -1181,9 +1264,7 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                 document_id = str(row["document_id"])
                 if per_document.get(document_id, 0) >= 2:
                     continue
-                per_document[document_id] = (
-                    per_document.get(document_id, 0) + 1
-                )
+                per_document[document_id] = per_document.get(document_id, 0) + 1
                 hits.append(
                     SearchHit(
                         document_id=document_id,
@@ -1194,9 +1275,7 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                         score=float(getattr(point, "score", 0.0)),
                         source=str(row["source"]),
                         metadata={
-                            **json.loads(
-                                str(row["document_metadata_json"])
-                            ),
+                            **json.loads(str(row["document_metadata_json"])),
                             **dict(
                                 payload.get("chunk_metadata")
                                 or json.loads(str(row["metadata_json"]))
@@ -1208,6 +1287,71 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                 if len(hits) >= limit:
                     break
             return hits
+
+    def _search_metadata_by_join(
+        self,
+        chunk_ids: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch candidate chunk and document metadata in one bounded join.
+
+        Qdrant and Doltgres are separate services, so the vector candidates
+        must cross the service boundary first.  Once the candidate IDs are
+        available, however, Doltgres can join them to the chunk and document
+        tables in one query.  The VALUES relation preserves Qdrant's result
+        order without asking Doltgres to optimize a large IN predicate.
+        """
+
+        candidates = list(dict.fromkeys(str(value) for value in chunk_ids))
+        if not candidates:
+            return {}
+        values = sql.SQL(", ").join(sql.SQL("(%s, %s)") for _ in candidates)
+        parameters = [
+            value
+            for rank, chunk_id in enumerate(candidates)
+            for value in (chunk_id, rank)
+        ]
+        rows = self._db.execute(
+            sql.SQL(
+                """
+                WITH candidates(chunk_id, candidate_rank) AS (
+                    VALUES {values}
+                )
+                SELECT c.id AS chunk_id,
+                       c.document_id AS chunk_document_id,
+                       c.content_hash,
+                       c.metadata_json AS chunk_metadata_json,
+                       c.point_id,
+                       d.id AS document_id,
+                       d.path,
+                       d.title,
+                       d.source,
+                       d.kind,
+                       d.metadata_json AS document_metadata_json
+                FROM candidates
+                JOIN knowledge_chunks AS c
+                  ON c.id = candidates.chunk_id
+                JOIN knowledge_documents AS d
+                  ON d.id = c.document_id
+                ORDER BY candidates.candidate_rank
+                """
+            ).format(values=values),
+            parameters,
+        ).fetchall()
+        return {
+            str(row["chunk_id"]): {
+                "chunk_id": str(row["chunk_id"]),
+                "document_id": str(row["document_id"]),
+                "content_hash": str(row["content_hash"]),
+                "metadata_json": str(row["chunk_metadata_json"]),
+                "point_id": str(row["point_id"]),
+                "path": str(row["path"]),
+                "title": str(row["title"]),
+                "source": str(row["source"]),
+                "kind": str(row["kind"]),
+                "document_metadata_json": str(row["document_metadata_json"]),
+            }
+            for row in rows
+        }
 
     def _decode_dense_vector(self, vector: Any) -> tuple[float, ...]:
         if not isinstance(vector, Mapping):
@@ -1231,11 +1375,7 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
         with self._lock:
             self._require_branch(branch_id)
             self._files.write(branch_id, path, content)
-            self._record_branch_changes(
-                branch_id,
-                files=(path,),
-                message=f"{operation_id}: record file write",
-            )
+            del operation_id
 
     def delete_file(
         self,
@@ -1247,12 +1387,7 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
         with self._lock:
             self._require_branch(branch_id)
             deleted = self._files.delete(branch_id, path)
-            if deleted:
-                self._record_branch_changes(
-                    branch_id,
-                    files=(path,),
-                    message=f"{operation_id}: record file deletion",
-                )
+            del operation_id
             return deleted
 
     def read_file(self, branch_id: str, path: str) -> bytes:
@@ -1300,6 +1435,12 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                 source_branch,
                 target_branch,
             )
+            file_paths.update(
+                self._files.differing_file_paths(
+                    source_branch,
+                    target_branch,
+                )
+            )
             source = self._document_digests(source_branch, document_ids)
             target = self._document_digests(target_branch, document_ids)
             source_files = self._file_digests(source_branch, file_paths)
@@ -1318,41 +1459,182 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
     ) -> tuple[set[str], set[str]]:
         registry = self._registry_rows()
         if source_branch not in registry or target_branch not in registry:
-            missing = (
-                source_branch
-                if source_branch not in registry
-                else target_branch
-            )
+            missing = source_branch if source_branch not in registry else target_branch
             raise ValueError(f"unknown branch: {missing}")
-        related = set(
-            _branch_path_to_root(source_branch, registry)
-            + _branch_path_to_root(target_branch, registry)
+        documents = self._dolt_diff_document_ids(
+            source_branch,
+            target_branch,
         )
-        self._checkout("main")
-        placeholders = sql.SQL(", ").join(
-            sql.Placeholder() for _ in related
+        documents.update(
+            self._qdrant_changed_document_ids(
+                source_branch,
+                target_branch,
+            )
         )
-        rows = self._db.execute(
+        # Files are versioned and compared by Btrfs, not mirrored into an
+        # application-maintained relational change ledger.
+        return documents, set()
+
+    def _dolt_diff_document_ids(
+        self,
+        source_branch: str,
+        target_branch: str,
+    ) -> set[str]:
+        """Use Dolt's native table diff to find affected logical documents."""
+
+        documents: set[str] = set()
+        document_rows = self._db.execute(
             sql.SQL(
                 """
-                SELECT object_kind, object_key
-                FROM cross_store_branch_changes
-                WHERE branch_id IN ({})
+                SELECT to_id, from_id
+                FROM dolt_diff({}, {}, {})
                 """
-            ).format(placeholders),
-            sorted(related),
+            ).format(
+                sql.Literal(target_branch),
+                sql.Literal(source_branch),
+                sql.Literal("knowledge_documents"),
+            )
         ).fetchall()
-        documents = {
-            str(row["object_key"])
-            for row in rows
-            if row["object_kind"] == "document"
-        }
-        files = {
-            str(row["object_key"])
-            for row in rows
-            if row["object_kind"] == "file"
-        }
-        return documents, files
+        for row in document_rows:
+            for column in ("to_id", "from_id"):
+                if row[column] is not None:
+                    documents.add(str(row[column]))
+
+        # A chunk-only update still changes the indexed document bundle. Use
+        # both sides because a row may move between document identifiers.
+        chunk_rows = self._db.execute(
+            sql.SQL(
+                """
+                SELECT to_document_id, from_document_id
+                FROM dolt_diff({}, {}, {})
+                """
+            ).format(
+                sql.Literal(target_branch),
+                sql.Literal(source_branch),
+                sql.Literal("knowledge_chunks"),
+            )
+        ).fetchall()
+        for row in chunk_rows:
+            for column in ("to_document_id", "from_document_id"):
+                if row[column] is not None:
+                    documents.add(str(row[column]))
+        return documents
+
+    def _qdrant_changed_document_ids(
+        self,
+        source_branch: str,
+        target_branch: str,
+    ) -> set[str]:
+        """Find Qdrant candidates from divergent branch-history intervals."""
+
+        source_lineage = dict(self._lineage(source_branch))
+        target_lineage = dict(self._lineage(target_branch))
+        documents: set[str] = set()
+        for branch_id in source_lineage.keys() | target_lineage.keys():
+            source_cutoff = int(source_lineage.get(branch_id, 0))
+            target_cutoff = int(target_lineage.get(branch_id, 0))
+            documents.update(
+                self._qdrant_event_document_ids(
+                    branch_id,
+                    min(source_cutoff, target_cutoff),
+                    max(source_cutoff, target_cutoff),
+                )
+            )
+        return documents
+
+    def _qdrant_source_document_ids(
+        self,
+        source_branch: str,
+        target_branch: str,
+        registry: Mapping[str, Mapping[str, Any]],
+    ) -> set[str]:
+        """Find vector changes introduced along source after its target fork."""
+
+        source_lineage = dict(self._lineage(source_branch))
+        documents: set[str] = set()
+        current = source_branch
+        while current != target_branch:
+            documents.update(
+                self._qdrant_event_document_ids(
+                    current,
+                    0,
+                    int(source_lineage[current]),
+                )
+            )
+            parent = registry[current]["parent_id"]
+            if parent is None:
+                raise RuntimeError(
+                    f"{target_branch} is not an ancestor of {source_branch}"
+                )
+            current = str(parent)
+        return documents
+
+    def _qdrant_event_document_ids(
+        self,
+        branch_id: str,
+        lower_sequence: int,
+        upper_sequence: int,
+    ) -> set[str]:
+        if upper_sequence <= lower_sequence:
+            return set()
+        sequence_range = models.Range(
+            gt=lower_sequence,
+            lte=upper_sequence,
+        )
+        filters = (
+            models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="branch",
+                        match=models.MatchValue(value=branch_id),
+                    ),
+                    models.FieldCondition(
+                        key="seq",
+                        range=sequence_range,
+                    ),
+                ]
+            ),
+            models.Filter(
+                must=[
+                    models.NestedCondition(
+                        nested=models.Nested(
+                            key="overwritten_in",
+                            filter=models.Filter(
+                                must=[
+                                    models.FieldCondition(
+                                        key="by",
+                                        match=models.MatchValue(value=branch_id),
+                                    ),
+                                    models.FieldCondition(
+                                        key="seq",
+                                        range=sequence_range,
+                                    ),
+                                ]
+                            ),
+                        )
+                    )
+                ]
+            ),
+        )
+        documents: set[str] = set()
+        for scroll_filter in filters:
+            offset: Any | None = None
+            while True:
+                records, offset = self._qdrant.scroll(
+                    collection_name=self._collection,
+                    scroll_filter=scroll_filter,
+                    limit=256,
+                    offset=offset,
+                    with_payload=["document_id"],
+                    with_vectors=False,
+                )
+                for record in records:
+                    document_id = (record.payload or {}).get("document_id")
+                    if document_id is not None:
+                        documents.add(str(document_id))
+                if offset is None:
+                    break
+        return documents
 
     def _document_digests(
         self,
@@ -1360,12 +1642,105 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
         document_ids: Sequence[str],
     ) -> dict[str, str]:
         self._checkout(branch_id)
-        values: dict[str, str] = {}
+        document_values: dict[str, str] = {}
         for document_id in document_ids:
             indexed = self._get_document(document_id, hydrate=False)
             if indexed is not None:
-                values[document_id] = indexed_document_digest(indexed)
+                document_values[document_id] = indexed_document_digest(indexed)
+        qdrant_values = self._qdrant_document_digests(
+            branch_id,
+            document_ids,
+        )
+        values: dict[str, str] = {}
+        for document_id in document_values.keys() | qdrant_values.keys():
+            values[document_id] = hashlib.sha256(
+                canonical_json(
+                    {
+                        "document": document_values.get(document_id),
+                        "qdrant": qdrant_values.get(document_id),
+                    }
+                ).encode()
+            ).hexdigest()
         return values
+
+    def _qdrant_document_digests(
+        self,
+        branch_id: str,
+        document_ids: Sequence[str],
+    ) -> dict[str, str]:
+        """Digest Qdrant's live branch-aware view for candidate documents.
+
+        Qdrant does not expose a branch-diff operation. Its branch-aware search
+        model resolves a branch through payload filters, so diff uses the same
+        native filtered scroll and compares the resulting logical point views.
+        """
+
+        requested = sorted({str(value) for value in document_ids})
+        if not requested:
+            return {}
+        lineage_filter = _qdrant_branch_filter(
+            self._lineage(branch_id),
+            include_overwrites=self._has_qdrant_overwrite_markers,
+        )
+        points_by_document: dict[str, dict[str, dict[str, Any]]] = {}
+        for start in range(0, len(requested), 128):
+            batch = requested[start : start + 128]
+            scroll_filter = models.Filter(
+                must=[
+                    lineage_filter,
+                    models.FieldCondition(
+                        key="document_id",
+                        match=models.MatchAny(any=batch),
+                    ),
+                ]
+            )
+            offset: Any | None = None
+            while True:
+                records, offset = self._qdrant.scroll(
+                    collection_name=self._collection,
+                    scroll_filter=scroll_filter,
+                    limit=256,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=True,
+                )
+                for record in records:
+                    payload = dict(record.payload or {})
+                    document_id = str(payload.get("document_id", ""))
+                    chunk_id = str(payload.get("chunk_id", ""))
+                    if document_id not in batch or not chunk_id:
+                        raise RuntimeError(
+                            "Qdrant branch view returned an invalid knowledge point"
+                        )
+                    projection = {
+                        "document_id": document_id,
+                        "chunk_id": chunk_id,
+                        "ordinal": int(payload.get("ordinal", 0)),
+                        "text": str(payload.get("text", "")),
+                        "content_hash": str(payload.get("content_hash", "")),
+                        "chunk_metadata": dict(payload.get("chunk_metadata") or {}),
+                        "vectors": _qdrant_vector_projection(record.vector),
+                    }
+                    document_points = points_by_document.setdefault(
+                        document_id,
+                        {},
+                    )
+                    if chunk_id in document_points:
+                        raise RuntimeError(
+                            "Qdrant branch view contains multiple live versions "
+                            f"of chunk {chunk_id}"
+                        )
+                    document_points[chunk_id] = projection
+                if offset is None:
+                    break
+        return {
+            document_id: hashlib.sha256(
+                canonical_json(
+                    [points[chunk_id] for chunk_id in sorted(points)]
+                ).encode()
+            ).hexdigest()
+            for document_id, points in points_by_document.items()
+        }
 
     def _file_digests(
         self,
@@ -1387,146 +1762,446 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
         target_branch: str,
         *,
         operation_id: str,
+        selected_change_ids: Sequence[str] | None = None,
+        preview_token: str | None = None,
+        prepared_preview: Any | None = None,
+        policy: Any = None,
+        conflict_choices: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
+        del policy
         if source_branch == target_branch:
             return {"documents": 0, "files": 0}
         with self._lock:
-            registry = self._registry_rows()
-            if source_branch not in registry:
-                raise ValueError(f"unknown branch: {source_branch}")
-            if target_branch not in registry:
-                raise ValueError(f"unknown branch: {target_branch}")
-            source_lineage = dict(self._lineage(source_branch))
-            if target_branch not in source_lineage:
-                raise ValueError(
-                    "merge target must be an ancestor of the source branch"
-                )
-            target_sequence = int(registry[target_branch]["current_seq"])
-            source_cutoff = int(source_lineage[target_branch])
-            if target_sequence != source_cutoff:
-                raise ValueError(
-                    "merge target advanced after the source branch was created"
-                )
-            document_ids, file_paths = self._changed_keys(
+            plan = (
+                prepared_preview.plan
+                if isinstance(prepared_preview, PreparedMergePreview)
+                else self._logical_merge_plan(source_branch, target_branch)
+            )
+            if plan.source != source_branch or plan.target != target_branch:
+                raise ValueError("prepared merge preview branches do not match")
+            if preview_token is not None and preview_token != plan.preview_token:
+                raise ValueError("merge preview token is stale")
+            document_ids, file_paths = plan.resolve_selection(selected_change_ids)
+            self._require_target_changes_compatible(
                 source_branch,
                 target_branch,
-            )
-            self._checkout(target_branch)
-            before = {
-                identifier: value
-                for identifier in document_ids
-                if (
-                    value := self._get_document(
-                        identifier,
-                        hydrate=False,
+                document_ids=document_ids,
+                file_paths=file_paths,
+                allow_source_conflicts=(
+                    bool(conflict_choices)
+                    and all(
+                        str(choice) == "source"
+                        for choice in conflict_choices.values()
                     )
+                ),
+            )
+            if selected_change_ids is None:
+                return self._merge_all_native(
+                    source_branch,
+                    target_branch,
+                    operation_id=operation_id,
+                    document_ids=document_ids,
+                    file_paths=file_paths,
                 )
-                is not None
-            }
-            before_point_ids = {
-                identifier: self._document_point_ids(identifier)
-                for identifier in before
-            }
-            self._db.execute("SELECT dolt_merge(%s)", (source_branch,))
-            base_branch = self._filesystem_merge_base(
-                source_branch,
-                target_branch,
-            )
-            files = self._files.apply_paths_delta(
-                source_branch,
-                base_branch,
-                target_branch,
-                file_paths,
-            )
-            self._checkout(target_branch)
-            after = {
-                identifier: value
-                for identifier in document_ids
-                if (
-                    value := self._get_document(
-                        identifier,
-                        hydrate=False,
+            document_paths: set[str] = set()
+            for document_id in document_ids:
+                self._checkout(source_branch)
+                source_value = self._get_document(
+                    document_id,
+                    hydrate=True,
+                )
+                self._checkout(target_branch)
+                target_value = self._get_document(
+                    document_id,
+                    hydrate=False,
+                )
+                for value in (source_value, target_value):
+                    if value is not None:
+                        document_paths.add(value.document.path)
+                if source_value is None:
+                    self.delete_document(
+                        target_branch,
+                        document_id,
+                        operation_id=f"{operation_id}:delete:{document_id}",
                     )
-                )
-                is not None
-            }
-            changed_ids = [
-                identifier
-                for identifier in sorted(before.keys() | after.keys())
-                if _optional_document_digest(before.get(identifier))
-                != _optional_document_digest(after.get(identifier))
+                else:
+                    self.put_document(
+                        target_branch,
+                        source_value,
+                        operation_id=f"{operation_id}:put:{document_id}",
+                    )
+
+            standalone_files = [
+                path for path in file_paths if path not in document_paths
             ]
-            if changed_ids:
-                sequence = self._next_sequence(target_branch)
-                old_point_ids = [
-                    point_id
-                    for identifier in changed_ids
-                    if identifier in before
-                    for point_id in before_point_ids[identifier]
-                ]
-                changed_documents = [
-                    self._get_document(identifier, hydrate=True)
-                    for identifier in changed_ids
-                    if identifier in after
-                ]
-                materialized = [
-                    value for value in changed_documents if value is not None
-                ]
-                new_point_ids = self._upsert_document_points(
+            for path in standalone_files:
+                content = _optional_file(self._files, source_branch, path)
+                if content is None:
+                    self.delete_file(
+                        target_branch,
+                        path,
+                        operation_id=f"{operation_id}:delete-file:{path}",
+                    )
+                else:
+                    self.write_file(
+                        target_branch,
+                        path,
+                        content,
+                        operation_id=f"{operation_id}:write-file:{path}",
+                    )
+            return {
+                "documents": len(document_ids),
+                "files": len(file_paths),
+                "status": "applied",
+                "atomic": False,
+            }
+
+    def _merge_all_native(
+        self,
+        source_branch: str,
+        target_branch: str,
+        *,
+        operation_id: str,
+        document_ids: Sequence[str],
+        file_paths: Sequence[str],
+    ) -> dict[str, Any]:
+        """Apply an unfiltered merge with each store's native mechanism."""
+
+        self._checkout(target_branch)
+        before_point_ids = {
+            document_id: self._document_point_ids(document_id)
+            for document_id in document_ids
+        }
+
+        filesystem_base = self._filesystem_merge_base(
+            source_branch,
+            target_branch,
+        )
+        filesystem_conflicts = self._files.conflicting_paths(
+            source_branch,
+            filesystem_base,
+            target_branch,
+            file_paths,
+        )
+        if filesystem_conflicts:
+            raise ValueError(
+                "merge target changed source paths after the common snapshot: "
+                + ", ".join(sorted(filesystem_conflicts))
+            )
+
+        # Dolt performs the relational three-way merge. The remaining stores
+        # are coordinated afterward, so this comparison baseline intentionally
+        # does not claim cross-store atomicity.
+        self._db.execute("SELECT dolt_merge(%s)", (source_branch,))
+        self._files.apply_paths_delta(
+            source_branch,
+            filesystem_base,
+            target_branch,
+            file_paths,
+        )
+
+        self._checkout(target_branch)
+        materialized = [
+            indexed
+            for document_id in document_ids
+            if (
+                indexed := self._get_document(
+                    document_id,
+                    hydrate=True,
+                )
+            )
+            is not None
+        ]
+        if document_ids:
+            sequence = self._next_sequence(target_branch)
+            old_point_ids = [
+                point_id
+                for document_id in document_ids
+                for point_id in before_point_ids[document_id]
+            ]
+            new_point_ids = self._upsert_document_points(
+                target_branch,
+                sequence,
+                materialized,
+            )
+            self._append_supersession(
+                old_point_ids,
+                target_branch,
+                sequence,
+            )
+            try:
+                self._checkout(target_branch)
+                with self._db.transaction():
+                    for indexed in materialized:
+                        for chunk in indexed.chunks:
+                            self._db.execute(
+                                """
+                                UPDATE knowledge_chunks
+                                SET point_id = %s
+                                WHERE id = %s
+                                """,
+                                (
+                                    self._point_id(
+                                        target_branch,
+                                        sequence,
+                                        chunk.id,
+                                    ),
+                                    chunk.id,
+                                ),
+                            )
+                self._commit_current(f"{operation_id}: materialize merged vectors")
+                self._advance_sequence(
                     target_branch,
                     sequence,
-                    materialized,
+                    f"{operation_id}: advance vector sequence",
                 )
-                self._append_supersession(
+            except Exception:
+                self._delete_points(new_point_ids)
+                self._remove_supersession(
                     old_point_ids,
                     target_branch,
                     sequence,
                 )
-                try:
-                    self._checkout(target_branch)
-                    with self._db.transaction():
-                        for indexed in materialized:
-                            for chunk in indexed.chunks:
-                                self._db.execute(
-                                    """
-                                    UPDATE knowledge_chunks
-                                    SET point_id = %s
-                                    WHERE id = %s
-                                    """,
-                                    (
-                                        self._point_id(
-                                            target_branch,
-                                            sequence,
-                                            chunk.id,
-                                        ),
-                                        chunk.id,
-                                    ),
-                                )
-                    self._commit_current(
-                        f"{operation_id}: materialize merged vectors"
-                    )
-                    self._advance_sequence(
-                        target_branch,
-                        sequence,
-                        f"{operation_id}: advance vector sequence",
-                        changed_documents=changed_ids,
-                        changed_files=sorted(file_paths),
-                    )
-                except Exception:
-                    self._delete_points(new_point_ids)
-                    self._remove_supersession(
-                        old_point_ids,
-                        target_branch,
-                        sequence,
-                    )
-                    raise
-            elif files:
-                self._record_branch_changes(
-                    target_branch,
-                    files=sorted(file_paths),
-                    message=f"{operation_id}: record merged files",
+                raise
+            return {
+                "documents": len(document_ids),
+                "files": len(file_paths),
+                "status": "applied",
+                "atomic": False,
+            }
+
+    def _require_target_at_merge_base(
+        self,
+        source_branch: str,
+        target_branch: str,
+    ) -> None:
+        """Enforce the benchmark's snapshot-style merge contract via Dolt."""
+
+        row = self._db.execute(
+            """
+            SELECT
+                dolt_merge_base(%s, %s) AS merge_base,
+                dolt_hashof(%s) AS target_head
+            """,
+            (source_branch, target_branch, target_branch),
+        ).fetchone()
+        if row is None or row["merge_base"] is None or row["target_head"] is None:
+            raise RuntimeError(
+                f"Dolt found no merge base for {source_branch} and {target_branch}"
+            )
+        if str(row["merge_base"]) != str(row["target_head"]):
+            raise ValueError(
+                "merge target advanced after the source branch was created"
+            )
+
+    def _require_target_changes_compatible(
+        self,
+        source_branch: str,
+        target_branch: str,
+        *,
+        document_ids: Sequence[str],
+        file_paths: Sequence[str],
+        allow_source_conflicts: bool = False,
+    ) -> None:
+        """Allow disjoint sibling merges while retaining conflict checks.
+
+        Native branching systems can merge independent siblings after the
+        target advances.  The old snapshot-only guard rejected that valid
+        case and made the baseline unable to replay parallel workflows.  Use
+        the stores' native ancestry/diff information to reject only an
+        overlapping change with a different value.
+        """
+
+        row = self._db.execute(
+            """
+            SELECT
+                dolt_merge_base(%s, %s) AS merge_base,
+                dolt_hashof(%s) AS target_head
+            """,
+            (source_branch, target_branch, target_branch),
+        ).fetchone()
+        if row is None or row["merge_base"] is None or row["target_head"] is None:
+            raise RuntimeError(
+                f"Dolt found no merge base for {source_branch} and {target_branch}"
+            )
+        merge_base = str(row["merge_base"])
+        if merge_base == str(row["target_head"]):
+            return
+
+        target_documents = self._dolt_diff_document_ids(
+            target_branch,
+            merge_base,
+        )
+        for document_id in sorted(set(document_ids) & target_documents):
+            self._checkout(source_branch)
+            source_value = self._get_document(document_id, hydrate=False)
+            self._checkout(target_branch)
+            target_value = self._get_document(document_id, hydrate=False)
+            source_digest = (
+                self._catalog_digest(source_value) if source_value is not None else None
+            )
+            target_digest = (
+                self._catalog_digest(target_value) if target_value is not None else None
+            )
+            if source_digest != target_digest:
+                if allow_source_conflicts:
+                    continue
+                raise ValueError(
+                    "merge target changed a selected document after the "
+                    f"common snapshot: {document_id}"
                 )
-            return {"documents": len(changed_ids), "files": files}
+
+        filesystem_base = self._filesystem_merge_base(
+            source_branch,
+            target_branch,
+        )
+        target_files = set(
+            self._files.changed_file_paths(target_branch, filesystem_base)
+        )
+        for path in sorted(set(file_paths) & target_files):
+            source_content = _optional_file(self._files, source_branch, path)
+            target_content = _optional_file(self._files, target_branch, path)
+            if source_content != target_content:
+                if allow_source_conflicts:
+                    continue
+                raise ValueError(
+                    "merge target changed a selected file after the common "
+                    f"snapshot: {path}"
+                )
+
+    def merge_preview(
+        self,
+        source_branch: str,
+        target_branch: str,
+        *,
+        policy: Any = None,
+    ) -> dict[str, Any]:
+        del policy
+        with self._lock:
+            return self._logical_merge_plan(
+                source_branch,
+                target_branch,
+            ).preview()
+
+    def _logical_merge_plan(
+        self,
+        source_branch: str,
+        target_branch: str,
+    ) -> LogicalMergePlan:
+        registry = self._registry_rows()
+        if source_branch not in registry:
+            raise ValueError(f"unknown branch: {source_branch}")
+        if target_branch not in registry:
+            raise ValueError(f"unknown branch: {target_branch}")
+        source_lineage = dict(self._lineage(source_branch))
+        if target_branch not in source_lineage:
+            raise ValueError("merge target must be an ancestor of the source branch")
+        merge_base = self._db.execute(
+            "SELECT dolt_merge_base(%s, %s) AS revision",
+            (source_branch, target_branch),
+        ).fetchone()
+        if merge_base is None or merge_base["revision"] is None:
+            raise RuntimeError(
+                f"Dolt found no merge base for {source_branch} and {target_branch}"
+            )
+        document_ids = self._dolt_diff_document_ids(
+            source_branch,
+            str(merge_base["revision"]),
+        )
+        document_ids.update(
+            self._qdrant_source_document_ids(
+                source_branch,
+                target_branch,
+                registry,
+            )
+        )
+        filesystem_fork = self._filesystem_merge_base(
+            source_branch,
+            target_branch,
+        )
+        file_paths = self._files.changed_file_paths(
+            source_branch,
+            filesystem_fork,
+        )
+        if file_paths:
+            for branch_id in (source_branch, target_branch):
+                self._checkout(branch_id)
+                document_ids.update(
+                    str(row["id"])
+                    for row in self._db.execute(
+                        "SELECT id, path FROM knowledge_documents"
+                    ).fetchall()
+                    if str(row["path"]) in file_paths
+                )
+        source_documents: dict[str, IndexedDocument] = {}
+        target_documents: dict[str, IndexedDocument] = {}
+        source_digests: dict[str, str] = {}
+        target_digests: dict[str, str] = {}
+        for branch_id, documents, digests in (
+            (source_branch, source_documents, source_digests),
+            (target_branch, target_documents, target_digests),
+        ):
+            self._checkout(branch_id)
+            for document_id in document_ids:
+                indexed = self._get_document(document_id, hydrate=False)
+                if indexed is None:
+                    continue
+                documents[document_id] = indexed
+                digests[document_id] = self._catalog_digest(indexed)
+            qdrant_digests = self._qdrant_document_digests(
+                branch_id,
+                document_ids,
+            )
+            for document_id in digests.keys() | qdrant_digests.keys():
+                digests[document_id] = hashlib.sha256(
+                    canonical_json(
+                        {
+                            "doltgres": digests.get(document_id),
+                            "qdrant": qdrant_digests.get(document_id),
+                        }
+                    ).encode()
+                ).hexdigest()
+        return build_logical_merge_plan(
+            source_branch,
+            target_branch,
+            source_documents=source_documents,
+            target_documents=target_documents,
+            source_document_digests=source_digests,
+            target_document_digests=target_digests,
+            source_files={
+                path: _optional_file(self._files, source_branch, path)
+                for path in file_paths
+            },
+            target_files={
+                path: _optional_file(self._files, target_branch, path)
+                for path in file_paths
+            },
+        )
+
+    def _catalog_digest(self, indexed: IndexedDocument) -> str:
+        document = indexed.document
+        document_row = self._db.execute(
+            """
+            SELECT id, path, title, source, kind, content_hash, metadata_json
+            FROM knowledge_documents WHERE id = %s
+            """,
+            (document.id,),
+        ).fetchone()
+        if document_row is None:
+            raise RuntimeError(f"document catalog row is missing: {document.id}")
+        chunk_rows = self._db.execute(
+            """
+            SELECT id, document_id, ordinal, content_hash, metadata_json
+            FROM knowledge_chunks
+            WHERE document_id = %s
+            ORDER BY ordinal, id
+            """,
+            (document.id,),
+        ).fetchall()
+        return catalog_digest(
+            dict(document_row),
+            [dict(row) for row in chunk_rows],
+        )
 
     def _filesystem_merge_base(
         self,
@@ -1583,11 +2258,25 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                     exact=True,
                 ).count
             )
-            btrfs_bytes = self._files.filesystem_used_bytes()
+            btrfs_usage = self._files.filesystem_usage()
+            if os.environ.get("CHRONOS_NATIVE_FAST_STORAGE_STATS") == "1":
+                # ``filesystem_usage`` is the physical footprint used by the
+                # benchmark.  Per-subvolume ``filesystem du`` is an optional
+                # diagnostic that walks every inode in every snapshot and is
+                # prohibitively expensive for the full corpus at each replay.
+                btrfs_subvolume_usage = {
+                    "subvolume_count": None,
+                    "subvolume_total_bytes": None,
+                    "subvolume_exclusive_bytes": None,
+                    "subvolume_shared_bytes": None,
+                }
+            else:
+                btrfs_subvolume_usage = self._files.subvolume_usage()
+            btrfs_bytes = btrfs_usage["filesystem_used_bytes"]
             doltgres_bytes = _directory_bytes(self._doltgres_data_dir)
             qdrant_bytes = _directory_bytes(self._qdrant_storage_dir)
             known_bytes = btrfs_bytes + doltgres_bytes + qdrant_bytes
-            return {
+            result: dict[str, int | None] = {
                 "branches": len(registry),
                 "main_documents": main_documents,
                 "main_chunks": main_chunks,
@@ -1597,6 +2286,15 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                 "qdrant_bytes": qdrant_bytes,
                 "total_state_bytes": known_bytes,
             }
+            result.update(
+                {
+                    "btrfs_data_bytes": btrfs_usage["data_used_bytes"],
+                    "btrfs_metadata_bytes": btrfs_usage["metadata_used_bytes"],
+                    "btrfs_system_bytes": btrfs_usage["system_used_bytes"],
+                    **btrfs_subvolume_usage,
+                }
+            )
+            return result
 
     def _append_supersession(
         self,
@@ -1606,6 +2304,10 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
     ) -> None:
         if not point_ids:
             return
+        # Set this before issuing updates so an exception cannot leave the
+        # backend using a filter that would expose a superseded point after a
+        # partially completed payload update.
+        self._has_qdrant_overwrite_markers = True
         records = self._qdrant.retrieve(
             collection_name=self._collection,
             ids=list(point_ids),
@@ -1680,9 +2382,7 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
                             must=[
                                 models.FieldCondition(
                                     key="by",
-                                    match=models.MatchValue(
-                                        value=branch_id
-                                    ),
+                                    match=models.MatchValue(value=branch_id),
                                 )
                             ]
                         ),
@@ -1751,6 +2451,8 @@ class DoltgresQdrantBtrfsKnowledgeBackend:
 
 def _qdrant_branch_filter(
     lineage: Sequence[tuple[str, int]],
+    *,
+    include_overwrites: bool = True,
 ) -> models.Filter:
     should: list[models.Condition] = []
     must_not: list[models.Condition] = []
@@ -1769,26 +2471,66 @@ def _qdrant_branch_filter(
                 ]
             )
         )
-        must_not.append(
-            models.NestedCondition(
-                nested=models.Nested(
-                    key="overwritten_in",
-                    filter=models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="by",
-                                match=models.MatchValue(value=branch_id),
-                            ),
-                            models.FieldCondition(
-                                key="seq",
-                                range=models.Range(lte=cutoff),
-                            ),
-                        ]
-                    ),
+        if include_overwrites:
+            must_not.append(
+                models.NestedCondition(
+                    nested=models.Nested(
+                        key="overwritten_in",
+                        filter=models.Filter(
+                            must=[
+                                models.FieldCondition(
+                                    key="by",
+                                    match=models.MatchValue(value=branch_id),
+                                ),
+                                models.FieldCondition(
+                                    key="seq",
+                                    range=models.Range(lte=cutoff),
+                                ),
+                            ]
+                        ),
+                    )
                 )
             )
-        )
-    return models.Filter(should=should, must_not=must_not)
+    return models.Filter(should=should, must_not=must_not or None)
+
+
+def _qdrant_vector_projection(vector: Any) -> Any:
+    """Normalize named dense and sparse vectors for deterministic comparison."""
+
+    if vector is None:
+        return None
+    if isinstance(vector, Mapping):
+        result: dict[str, Any] = {}
+        for name, value in sorted(vector.items(), key=lambda item: str(item[0])):
+            if isinstance(value, models.SparseVector):
+                result[str(name)] = {
+                    "indices": [int(index) for index in value.indices],
+                    "values": [float(item) for item in value.values],
+                }
+            elif isinstance(value, Mapping) and {
+                "indices",
+                "values",
+            }.issubset(value):
+                result[str(name)] = {
+                    "indices": [int(index) for index in value["indices"]],
+                    "values": [float(item) for item in value["values"]],
+                }
+            elif isinstance(value, Sequence) and not isinstance(
+                value,
+                (str, bytes, bytearray),
+            ):
+                result[str(name)] = [float(item) for item in value]
+            else:
+                raise RuntimeError(
+                    f"Qdrant returned an unsupported named vector {name!r}"
+                )
+        return result
+    if isinstance(vector, Sequence) and not isinstance(
+        vector,
+        (str, bytes, bytearray),
+    ):
+        return [float(value) for value in vector]
+    raise RuntimeError("Qdrant returned an unsupported vector representation")
 
 
 def _coerce_vector(vector: Any) -> list[float]:
@@ -1815,10 +2557,6 @@ def _branch_path_to_root(
         parent = registry[current]["parent_id"]
         current = str(parent) if parent is not None else None
     return path
-
-
-def _optional_document_digest(indexed: IndexedDocument | None) -> str | None:
-    return indexed_document_digest(indexed) if indexed is not None else None
 
 
 def _optional_file(
@@ -1848,9 +2586,7 @@ def _directory_bytes(path: Path | None) -> int:
     if path is None or not path.exists():
         return 0
     return sum(
-        item.stat().st_blocks * 512
-        for item in path.rglob("*")
-        if item.is_file()
+        item.stat().st_blocks * 512 for item in path.rglob("*") if item.is_file()
     )
 
 

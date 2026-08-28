@@ -38,7 +38,6 @@ from chronos_enterprise_knowledge.models import (
     normalize_workspace_path,
 )
 from chronos_enterprise_knowledge.retrieval import (
-    BM25_VECTOR,
     DENSE_VECTOR,
     Bm25Encoder,
     bulk_upsert_points,
@@ -48,6 +47,12 @@ from chronos_enterprise_knowledge.retrieval import (
     point_vectors,
     qdrant_collection_options,
     remote_qdrant_client,
+)
+from chronos_enterprise_knowledge.selective_merge import (
+    LogicalMergePlan,
+    PreparedMergePreview,
+    build_logical_merge_plan,
+    catalog_digest,
 )
 
 _MAX_REVISION = (1 << 63) - 1
@@ -104,6 +109,16 @@ class _ApplicationStateBackend:
         self._ensure_schema()
         self._file_store = self.state_dir / "files"
         self._file_store.mkdir(parents=True, exist_ok=True)
+        # A materialized checkout is a workspace scratch directory, not
+        # application metadata.  Allow the benchmark/service launcher to put
+        # it on its separate service volume so agent commands that inspect
+        # their home tree do not traverse the backend's private files.
+        configured_checkout_root = os.environ.get("CHRONOS_APP_CHECKOUT_ROOT")
+        self._checkout_root = (
+            Path(configured_checkout_root).expanduser().resolve()
+            if configured_checkout_root
+            else self.state_dir / "checkouts"
+        )
         self._bm25 = Bm25Encoder()
         placeholder = self._db.execute(
             """
@@ -201,7 +216,7 @@ class _ApplicationStateBackend:
 
     @property
     def storage_components(self) -> list[str]:
-        return ["sqlite", "qdrant", "materialized-checkout"]
+        return ["relational", "qdrant", "materialized-checkout"]
 
     def _ensure_schema(self) -> None:
         old_document_columns = {
@@ -214,8 +229,7 @@ class _ApplicationStateBackend:
                 "JSON; rebuild the benchmark state with storage schema v3"
             )
         old_file_columns = {
-            str(row[1])
-            for row in self._db.execute("PRAGMA table_info(file_versions)")
+            str(row[1]) for row in self._db.execute("PRAGMA table_info(file_versions)")
         }
         if old_file_columns and "storage_key" not in old_file_columns:
             raise RuntimeError(
@@ -246,6 +260,8 @@ class _ApplicationStateBackend:
             );
             CREATE INDEX IF NOT EXISTS document_versions_by_branch
             ON document_versions(branch_id, id, revision DESC);
+            CREATE INDEX IF NOT EXISTS document_versions_by_path
+            ON document_versions(branch_id, path, revision DESC, id);
 
             CREATE TABLE IF NOT EXISTS chunk_versions (
                 branch_id TEXT NOT NULL,
@@ -406,9 +422,7 @@ class _ApplicationStateBackend:
 
     @staticmethod
     def _snapshot_cursor_key(branch_id: str, snapshot_id: str) -> str:
-        digest = hashlib.sha256(
-            f"{branch_id}\0{snapshot_id}".encode()
-        ).hexdigest()
+        digest = hashlib.sha256(f"{branch_id}\0{snapshot_id}".encode()).hexdigest()
         return f"snapshot_ingestion:{digest}"
 
     def snapshot_ingestion_cursor(
@@ -714,9 +728,7 @@ class _ApplicationStateBackend:
                             must=[
                                 models.FieldCondition(
                                     key="by",
-                                    match=models.MatchValue(
-                                        value=branch_id
-                                    ),
+                                    match=models.MatchValue(value=branch_id),
                                 )
                             ]
                         ),
@@ -890,13 +902,9 @@ class _ApplicationStateBackend:
             # avoiding a revision-clock round trip per document.
             revision = self._next_revision()
             chunks = [
-                chunk
-                for indexed in indexed_documents
-                for chunk in indexed.chunks
+                chunk for indexed in indexed_documents for chunk in indexed.chunks
             ]
-            sparse_vectors = self._bm25.documents(
-                [chunk.text for chunk in chunks]
-            )
+            sparse_vectors = self._bm25.documents([chunk.text for chunk in chunks])
             sparse_by_chunk = {
                 chunk.id: sparse
                 for chunk, sparse in zip(
@@ -909,11 +917,7 @@ class _ApplicationStateBackend:
                 models.PointStruct(
                     id=self._point_id(branch_id, revision, chunk.id),
                     vector=point_vectors(
-                        (
-                            ()
-                            if self._implicit_zero_vectors
-                            else chunk.embedding
-                        ),
+                        (() if self._implicit_zero_vectors else chunk.embedding),
                         sparse_by_chunk[chunk.id],
                     ),
                     payload={
@@ -1023,11 +1027,7 @@ class _ApplicationStateBackend:
                             chunk.id,
                         ),
                         vector=point_vectors(
-                            (
-                                ()
-                                if self._implicit_zero_vectors
-                                else chunk.embedding
-                            ),
+                            (() if self._implicit_zero_vectors else chunk.embedding),
                             sparse,
                         ),
                         payload={
@@ -1059,9 +1059,7 @@ class _ApplicationStateBackend:
                 kind, content_hash, metadata_json, deleted
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """,
-            self._document_version_values(
-                branch_id, write_revision, indexed.document
-            ),
+            self._document_version_values(branch_id, write_revision, indexed.document),
         )
         self._db.executemany(
             """
@@ -1215,9 +1213,7 @@ class _ApplicationStateBackend:
         target_branch: str,
     ) -> tuple[str, int]:
         source_ancestry = self._ancestry_with_cutoffs(source_branch)
-        target_ancestry = dict(
-            self._ancestry_with_cutoffs(target_branch)
-        )
+        target_ancestry = dict(self._ancestry_with_cutoffs(target_branch))
         common = next(
             (
                 (ancestor, min(cutoff, target_ancestry[ancestor]))
@@ -1245,9 +1241,7 @@ class _ApplicationStateBackend:
         document_ids: set[str] = set()
         file_paths: set[str] = set()
         for ancestor, cutoff in self._ancestry_with_cutoffs(branch_id):
-            lower_bound = (
-                common_cutoff if ancestor == common_branch else -1
-            )
+            lower_bound = common_cutoff if ancestor == common_branch else -1
             if cutoff > lower_bound:
                 document_ids.update(
                     str(row["id"])
@@ -1278,8 +1272,7 @@ class _ApplicationStateBackend:
             if ancestor == common_branch:
                 return document_ids, file_paths
         raise RuntimeError(
-            f"branch {branch_id!r} does not descend from "
-            f"{common_branch!r}"
+            f"branch {branch_id!r} does not descend from {common_branch!r}"
         )
 
     def _sparse_diff_change_keys(
@@ -1318,18 +1311,6 @@ class _ApplicationStateBackend:
             source_branch,
             target_branch,
         )
-        _, target_file_paths = self._change_keys_since(
-            target_branch,
-            common_branch=common_branch,
-            common_cutoff=common_cutoff,
-        )
-        if target_file_paths and source_branch in self._checkouts:
-            raise ValueError(
-                f"merge conflict: target branch {target_branch!r} "
-                "contains filesystem changes made after the source "
-                "snapshot; recreate the source branch from the current "
-                "target before merging"
-            )
         return self._change_keys_since(
             source_branch,
             common_branch=common_branch,
@@ -1410,6 +1391,33 @@ class _ApplicationStateBackend:
         source_branch, revision, indexed = value
         return self._hydrate_vectors(source_branch, revision, indexed)
 
+    def find_document_id_by_path(
+        self,
+        branch_id: str,
+        path: str,
+    ) -> str | None:
+        normalized = normalize_workspace_path(path)
+        candidates: set[str] = set()
+        for ancestor, cutoff in self._lineage(branch_id):
+            candidates.update(
+                str(row["id"])
+                for row in self._db.execute(
+                    """
+                    SELECT DISTINCT id
+                    FROM document_versions
+                    WHERE branch_id = ?
+                      AND path = ?
+                      AND revision <= ?
+                    """,
+                    (ancestor, normalized, cutoff),
+                )
+            )
+        for document_id in sorted(candidates):
+            value = self._effective_document(branch_id, document_id)
+            if value is not None and value[2].document.path == normalized:
+                return document_id
+        return None
+
     def _hydrate_vectors(
         self,
         source_branch: str,
@@ -1468,10 +1476,7 @@ class _ApplicationStateBackend:
                         if dense is not None
                         else (0.0,) * self.vector_dimensions
                     ),
-                    metadata=dict(
-                        payload.get("chunk_metadata")
-                        or chunk.metadata
-                    ),
+                    metadata=dict(payload.get("chunk_metadata") or chunk.metadata),
                 )
             )
         return IndexedDocument(document, tuple(chunks))
@@ -1489,13 +1494,9 @@ class _ApplicationStateBackend:
         points = hybrid_query(
             self._qdrant,
             collection_name=self._collection,
-            dense_query=(
-                None if self._implicit_zero_vectors else query_embedding
-            ),
+            dense_query=(None if self._implicit_zero_vectors else query_embedding),
             sparse_query=self._bm25.query(query_text),
-            query_filter=_application_qdrant_filter(
-                self._lineage(branch_id)
-            ),
+            query_filter=_application_qdrant_filter(self._lineage(branch_id)),
             limit=max(limit * 4, 32),
         )
         effective: dict[str, tuple[str, int, IndexedDocument] | None] = {}
@@ -1566,8 +1567,7 @@ class _ApplicationStateBackend:
                 ).fetchone()
                 latest_revision = (
                     int(latest["revision"])
-                    if latest is not None
-                    and latest["revision"] is not None
+                    if latest is not None and latest["revision"] is not None
                     else -1
                 )
                 if (
@@ -1710,11 +1710,7 @@ class _ApplicationStateBackend:
         normalized = normalize_workspace_path(path)
         write_revision = revision or self._next_revision()
         digest = content_hash(content)
-        storage_key = (
-            Path(_safe_branch_path(branch_id))
-            / digest[:2]
-            / digest
-        )
+        storage_key = Path(_safe_branch_path(branch_id)) / digest[:2] / digest
         target = self._file_store / storage_key
         target.parent.mkdir(parents=True, exist_ok=True)
         if not target.exists():
@@ -1822,7 +1818,7 @@ class _ApplicationStateBackend:
             if path.exists() and any(path.iterdir()):
                 raise ValueError(f"comparison checkout path must be empty: {path}")
         else:
-            checkout_root = self.state_dir / "checkouts"
+            checkout_root = self._checkout_root
             path = (checkout_root / _safe_branch_path(branch_id)).resolve()
             if path.exists() and any(path.iterdir()):
                 path = (
@@ -1876,10 +1872,7 @@ class _ApplicationStateBackend:
                 content = path.read_bytes()
                 digest = hashlib.sha256(content).hexdigest()
                 fingerprints[workspace_path] = (digest, *metadata)
-                if (
-                    previous_fingerprint is None
-                    or previous_fingerprint[0] != digest
-                ):
+                if previous_fingerprint is None or previous_fingerprint[0] != digest:
                     self._store_file_row(
                         branch_id,
                         workspace_path,
@@ -2026,195 +2019,305 @@ class _ApplicationStateBackend:
         target_branch: str,
         *,
         operation_id: str,
+        selected_change_ids: Sequence[str] | None = None,
+        preview_token: str | None = None,
+        prepared_preview: Any | None = None,
+        policy: Any = None,
+        conflict_choices: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
-        del operation_id
+        del policy, conflict_choices
         if source_branch == target_branch:
             return {"documents": 0, "files": 0}
         with self._lock:
-            self._synchronize_checkout(source_branch)
-            self._synchronize_checkout(target_branch)
-            sparse_changes = self._sparse_merge_change_keys(
+            plan = (
+                prepared_preview.plan
+                if isinstance(prepared_preview, PreparedMergePreview)
+                else self._logical_merge_plan(source_branch, target_branch)
+            )
+            if plan.source != source_branch or plan.target != target_branch:
+                raise ValueError("prepared merge preview branches do not match")
+            if preview_token is not None and preview_token != plan.preview_token:
+                raise ValueError("merge preview token is stale")
+            document_ids, file_paths = plan.resolve_selection(selected_change_ids)
+            self._require_target_changes_compatible(
                 source_branch,
                 target_branch,
+                document_ids=document_ids,
+                file_paths=file_paths,
             )
-            if sparse_changes is not None:
-                document_ids, file_paths = sparse_changes
-                source_documents: dict[str, IndexedDocument | None] = {}
-                target_document_digests: dict[str, str | None] = {}
-                for document_id in document_ids:
-                    source_value = self._effective_document(
-                        source_branch,
-                        document_id,
-                    )
-                    target_value = self._effective_document(
-                        target_branch,
-                        document_id,
-                    )
-                    source_documents[document_id] = (
-                        self._hydrate_vectors(*source_value)
-                        if source_value is not None
-                        else None
-                    )
-                    target_document_digests[document_id] = (
-                        indexed_document_digest(
-                            self._hydrate_vectors(*target_value)
-                        )
-                        if target_value is not None
-                        else None
-                    )
-                source_files = {
-                    path: self._effective_file(source_branch, path)
-                    for path in file_paths
-                }
-                target_files = {
-                    path: self._effective_file(target_branch, path)
-                    for path in file_paths
-                }
-
-                document_changes = 0
-                for document_id in sorted(document_ids):
-                    source_value = source_documents[document_id]
-                    source_digest = (
-                        indexed_document_digest(source_value)
-                        if source_value is not None
-                        else None
-                    )
-                    if source_digest == target_document_digests[document_id]:
-                        continue
-                    document_changes += 1
-                    if source_value is None:
-                        self.delete_document(
-                            target_branch,
-                            document_id,
-                            operation_id=f"merge-delete:{document_id}",
-                        )
-                    else:
-                        self._put_document_local(target_branch, source_value)
-
-                file_changes = 0
-                for path in sorted(file_paths):
-                    source_content = source_files[path]
-                    if source_content == target_files[path]:
-                        continue
-                    file_changes += 1
-                    if self._effective_file(target_branch, path) == source_content:
-                        continue
-                    if source_content is None:
-                        self._delete_file_row(target_branch, path)
-                    else:
-                        self._store_file_row(
-                            target_branch,
-                            path,
-                            source_content,
-                        )
-                self._db.commit()
-                return {
-                    "documents": document_changes,
-                    "files": file_changes,
-                }
-            source_values = self._effective_documents(source_branch)
-            source_documents = {
-                document_id: self._hydrate_vectors(
-                    owner,
-                    revision,
-                    indexed,
+            document_paths: set[str] = set()
+            for document_id in document_ids:
+                source_value = self._effective_document(
+                    source_branch,
+                    document_id,
                 )
-                for document_id, (
-                    owner,
-                    revision,
-                    indexed,
-                ) in source_values.items()
-            }
-            source_ancestry = self._ancestry_with_cutoffs(source_branch)
-            target_ancestry = dict(self._ancestry_with_cutoffs(target_branch))
-            common = next(
-                (
-                    (ancestor, min(cutoff, target_ancestry[ancestor]))
-                    for ancestor, cutoff in source_ancestry
-                    if ancestor in target_ancestry
-                ),
-                None,
-            )
-            if common is None:
-                raise ValueError(
-                    f"branches {source_branch!r} and {target_branch!r} "
-                    "do not share an ancestor"
+                target_value = self._effective_document(
+                    target_branch,
+                    document_id,
                 )
-            common_branch, common_cutoff = common
-            base_values = self._effective_documents(
-                common_branch,
-                cutoff=common_cutoff,
-            )
-            base_documents = {
-                document_id: self._hydrate_vectors(
-                    owner,
-                    revision,
-                    indexed,
-                )
-                for document_id, (
-                    owner,
-                    revision,
-                    indexed,
-                ) in base_values.items()
-            }
-            document_changes = 0
-            for document_id in sorted(source_documents.keys() | base_documents.keys()):
-                source_value = source_documents.get(document_id)
-                base_value = base_documents.get(document_id)
-                source_digest = (
-                    indexed_document_digest(source_value)
-                    if source_value is not None
-                    else None
-                )
-                base_digest = (
-                    indexed_document_digest(base_value)
-                    if base_value is not None
-                    else None
-                )
-                if source_digest == base_digest:
-                    continue
-                document_changes += 1
+                for value in (source_value, target_value):
+                    if value is not None:
+                        document_paths.add(value[2].document.path)
                 if source_value is None:
                     self.delete_document(
                         target_branch,
                         document_id,
-                        operation_id=f"merge-delete:{document_id}",
+                        operation_id=f"{operation_id}:delete:{document_id}",
                     )
                 else:
-                    self._put_document_local(target_branch, source_value)
+                    self.put_document(
+                        target_branch,
+                        self._hydrate_vectors(*source_value),
+                        operation_id=f"{operation_id}:put:{document_id}",
+                    )
 
-            source_files = self._effective_files(source_branch)
-            base_files = self._effective_files(
+            standalone_files = [
+                path for path in file_paths if path not in document_paths
+            ]
+            for path in standalone_files:
+                content = self._effective_file(source_branch, path)
+                if content is None:
+                    self.delete_file(
+                        target_branch,
+                        path,
+                        operation_id=f"{operation_id}:delete-file:{path}",
+                    )
+                else:
+                    self.write_file(
+                        target_branch,
+                        path,
+                        content,
+                        operation_id=f"{operation_id}:write-file:{path}",
+                    )
+            return {
+                "documents": len(document_ids),
+                "files": len(file_paths),
+                "status": "applied",
+                "atomic": False,
+            }
+
+    def _require_target_changes_compatible(
+        self,
+        source_branch: str,
+        target_branch: str,
+        *,
+        document_ids: Sequence[str],
+        file_paths: Sequence[str],
+    ) -> None:
+        """Permit disjoint sibling merges while rejecting real conflicts."""
+
+        common_branch, common_cutoff = self._common_snapshot(
+            source_branch,
+            target_branch,
+        )
+        target_documents, target_files = self._change_keys_since(
+            target_branch,
+            common_branch=common_branch,
+            common_cutoff=common_cutoff,
+        )
+        for document_id in sorted(set(document_ids) & target_documents):
+            source_value = self._effective_document(source_branch, document_id)
+            target_value = self._effective_document(target_branch, document_id)
+            source_digest = (
+                self._catalog_digest(*source_value)
+                if source_value is not None
+                else None
+            )
+            target_digest = (
+                self._catalog_digest(*target_value)
+                if target_value is not None
+                else None
+            )
+            if source_digest != target_digest:
+                raise ValueError(
+                    "merge target advanced: changed a selected document "
+                    f"after the common snapshot: {document_id}"
+                )
+        for path in sorted(set(file_paths) & target_files):
+            if self._effective_file(source_branch, path) != self._effective_file(
+                target_branch,
+                path,
+            ):
+                raise ValueError(
+                    "merge target advanced: changed a selected file after "
+                    f"the common snapshot: {path}"
+                )
+
+    def merge_preview(
+        self,
+        source_branch: str,
+        target_branch: str,
+        *,
+        policy: Any = None,
+    ) -> dict[str, Any]:
+        del policy
+        with self._lock:
+            return self._logical_merge_plan(
+                source_branch,
+                target_branch,
+            ).preview()
+
+    def _logical_merge_plan(
+        self,
+        source_branch: str,
+        target_branch: str,
+    ) -> LogicalMergePlan:
+        self._synchronize_checkout(source_branch)
+        self._synchronize_checkout(target_branch)
+        sparse_changes = self._sparse_merge_change_keys(
+            source_branch,
+            target_branch,
+        )
+        if sparse_changes is None:
+            common_branch, common_cutoff = self._common_snapshot(
+                source_branch,
+                target_branch,
+            )
+            source_values = self._effective_documents(source_branch)
+            base_values = self._effective_documents(
                 common_branch,
                 cutoff=common_cutoff,
             )
-            file_changes = 0
-            for path in sorted(source_files.keys() | base_files.keys()):
-                source_content = source_files.get(path)
-                base_content = base_files.get(path)
-                if source_content == base_content:
-                    continue
-                file_changes += 1
-                if source_content is None:
-                    self._delete_file_row(target_branch, path)
-                else:
-                    self._store_file_row(
-                        target_branch,
-                        path,
-                        source_content,
-                    )
-            self._db.commit()
-            return {
-                "documents": document_changes,
-                "files": file_changes,
+            document_ids = {
+                document_id
+                for document_id in source_values.keys() | base_values.keys()
+                if (
+                    self._catalog_digest(*source_values[document_id])
+                    if document_id in source_values
+                    else None
+                )
+                != (
+                    self._catalog_digest(*base_values[document_id])
+                    if document_id in base_values
+                    else None
+                )
             }
+            source_file_values = self._effective_files(source_branch)
+            base_file_values = self._effective_files(
+                common_branch,
+                cutoff=common_cutoff,
+            )
+            file_paths = {
+                path
+                for path in source_file_values.keys() | base_file_values.keys()
+                if source_file_values.get(path) != base_file_values.get(path)
+            }
+        else:
+            document_ids, file_paths = sparse_changes
+
+        if file_paths:
+            for branch_id in (source_branch, target_branch):
+                document_ids.update(
+                    self._effective_document_ids_for_paths(
+                        branch_id,
+                        file_paths,
+                    )
+                )
+
+        source_documents: dict[str, IndexedDocument] = {}
+        target_documents: dict[str, IndexedDocument] = {}
+        source_digests: dict[str, str] = {}
+        target_digests: dict[str, str] = {}
+        for document_id in document_ids:
+            source_value = self._effective_document(
+                source_branch,
+                document_id,
+            )
+            target_value = self._effective_document(
+                target_branch,
+                document_id,
+            )
+            if source_value is not None:
+                source_documents[document_id] = source_value[2]
+                source_digests[document_id] = self._catalog_digest(*source_value)
+            if target_value is not None:
+                target_documents[document_id] = target_value[2]
+                target_digests[document_id] = self._catalog_digest(*target_value)
+        return build_logical_merge_plan(
+            source_branch,
+            target_branch,
+            source_documents=source_documents,
+            target_documents=target_documents,
+            source_document_digests=source_digests,
+            target_document_digests=target_digests,
+            source_files={
+                path: self._effective_file(source_branch, path) for path in file_paths
+            },
+            target_files={
+                path: self._effective_file(target_branch, path) for path in file_paths
+            },
+        )
+
+    def _catalog_digest(
+        self,
+        branch_id: str,
+        revision: int,
+        indexed: IndexedDocument,
+    ) -> str:
+        document = indexed.document
+        chunks = self._db.execute(
+            """
+            SELECT id, document_id, ordinal, content_hash, metadata_json
+            FROM chunk_versions
+            WHERE branch_id = ? AND document_id = ? AND revision = ?
+            ORDER BY ordinal, id
+            """,
+            (branch_id, document.id, revision),
+        ).fetchall()
+        document_row = self._db.execute(
+            """
+            SELECT id, path, title, source, kind, content_hash, metadata_json
+            FROM document_versions
+            WHERE branch_id = ? AND id = ? AND revision = ?
+            """,
+            (branch_id, document.id, revision),
+        ).fetchone()
+        if document_row is None:
+            raise RuntimeError(f"document catalog row is missing: {document.id}")
+        return catalog_digest(
+            dict(document_row),
+            [dict(row) for row in chunks],
+        )
+
+    def _effective_document_ids_for_paths(
+        self,
+        branch_id: str,
+        paths: set[str],
+    ) -> set[str]:
+        if not paths:
+            return set()
+        placeholders = ", ".join("?" for _ in paths)
+        candidates: set[str] = set()
+        ordered_paths = sorted(paths)
+        for ancestor, cutoff in self._lineage(branch_id):
+            candidates.update(
+                str(row["id"])
+                for row in self._db.execute(
+                    f"""
+                    SELECT DISTINCT id
+                    FROM document_versions
+                    WHERE branch_id = ? AND revision <= ?
+                      AND path IN ({placeholders})
+                    """,
+                    (ancestor, cutoff, *ordered_paths),
+                )
+            )
+        return {
+            document_id
+            for document_id in candidates
+            if (
+                (value := self._effective_document(branch_id, document_id)) is not None
+                and value[2].document.path in paths
+            )
+        }
 
     def state_digest(self, branch_id: str) -> str:
         self._synchronize_checkout(branch_id)
         documents = [
             self._hydrate_vectors(owner, revision, indexed)
-            for owner, revision, indexed in
-            self._effective_documents(branch_id).values()
+            for owner, revision, indexed in self._effective_documents(
+                branch_id
+            ).values()
         ]
         return knowledge_state_digest(
             documents,
@@ -2232,27 +2335,22 @@ class _ApplicationStateBackend:
         if stats is None:
             raise RuntimeError("application storage statistics are missing")
         branches = self._db.execute("SELECT COUNT(*) AS count FROM branches").fetchone()
-        sqlite_bytes = (
-            self.state_dir / "application-state.sqlite"
-        ).stat().st_size
+        relational_bytes = (self.state_dir / "application-state.sqlite").stat().st_size
         qdrant_bytes = _directory_bytes(self._qdrant_storage_dir)
         filesystem_bytes = _directory_bytes(self._file_store)
-        checkout_bytes = _directory_bytes(self.state_dir / "checkouts")
+        checkout_bytes = _directory_bytes(self._checkout_root)
         return {
             "branches": int(branches["count"]),
             "document_rows": int(stats["document_rows"]),
             "chunk_rows": int(stats["chunk_rows"]),
             "file_rows": int(stats["file_rows"]),
             "file_bytes": int(stats["file_bytes"]),
-            "sqlite_bytes": sqlite_bytes,
+            "relational_bytes": relational_bytes,
             "qdrant_bytes": qdrant_bytes,
             "filesystem_bytes": filesystem_bytes,
             "materialized_checkout_bytes": checkout_bytes,
             "total_state_bytes": (
-                sqlite_bytes
-                + qdrant_bytes
-                + filesystem_bytes
-                + checkout_bytes
+                relational_bytes + qdrant_bytes + filesystem_bytes + checkout_bytes
             ),
         }
 
@@ -2402,9 +2500,7 @@ def _directory_bytes(path: Path) -> int:
     if not path.exists():
         return 0
     return sum(
-        item.stat().st_blocks * 512
-        for item in path.rglob("*")
-        if item.is_file()
+        item.stat().st_blocks * 512 for item in path.rglob("*") if item.is_file()
     )
 
 

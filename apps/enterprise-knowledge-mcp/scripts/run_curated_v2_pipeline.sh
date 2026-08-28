@@ -3,9 +3,9 @@ set -euo pipefail
 
 repo=/home/ubuntu/TAR-OS/chronos
 app="$repo/apps/enterprise-knowledge-mcp"
-corpus=/home/ubuntu/TAR-OS/EnterpriseRAG-Bench/generated_data
+corpus="${ENTERPRISE_CORPUS:-/home/ubuntu/TAR-OS/EnterpriseRAG-Bench/generated_data_infra_v1}"
 artifact_root="$repo/.enterprise-knowledge/enterprise-rag-curated-v2"
-document_snapshot="$repo/.enterprise-knowledge/enterprise-rag-full-staged-v1/snapshot"
+document_snapshot="${ENTERPRISE_DOCUMENT_SNAPSHOT:-$artifact_root/document-snapshot}"
 code_snapshot="$artifact_root/code-snapshot"
 document_manifest="$document_snapshot/manifest.json"
 code_manifest="$code_snapshot/manifest.json"
@@ -154,6 +154,21 @@ Path(sys.argv[3]).write_text(
 )
 PY
 }
+
+log_phase prepare-document-snapshot
+if ! manifest_complete "$document_manifest"; then
+  nice -n 10 ionice -c 3 \
+    "$cli" \
+    --dimensions 384 \
+    --placeholder-zero-embeddings \
+    prepare-snapshot "$corpus" "$document_snapshot" \
+    --sample-fraction 1 \
+    --sample-seed chronos-enterprise-infra-v1 \
+    --batch-size 256 \
+    --chunk-workers 2 \
+    --progress-every 1000 \
+    >>"$pipeline_log" 2>&1
+fi
 
 log_phase prepare-code-snapshot
 if ! manifest_complete "$code_manifest"; then

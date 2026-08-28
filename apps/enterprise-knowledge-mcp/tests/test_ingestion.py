@@ -64,6 +64,61 @@ def test_enterprise_record_preserves_original_and_extracts_context(
     assert json.loads(record.document.content)["key"] == "ENG-42"
 
 
+def test_public_github_record_exposes_cutoff_metadata(tmp_path: Path) -> None:
+    source = tmp_path / "sources" / "github_public" / "vllm-project" / "vllm" / "issues"
+    source.mkdir(parents=True)
+    path = source / "50026.json"
+    path.write_text(
+        json.dumps(
+            {
+                "title": "Batch endpoint contract",
+                "body": "Reject unsupported streaming.",
+                "repository": "vllm-project/vllm",
+                "artifact_type": "issue",
+                "number": 50026,
+                "state_at_cutoff": "open",
+                "dataset_doc_uuid": "gh_fixture",
+                "title_field_name": "title",
+                "content_field_names": ["body"],
+            }
+        )
+    )
+    (tmp_path / "uuid_index.json").write_text(
+        json.dumps({"gh_fixture": "github_public/vllm-project/vllm/issues/50026.json"})
+    )
+
+    record = EnterpriseRAGCorpus(tmp_path).read_record(path)
+
+    assert record.context == {
+        "connector": "github_public",
+        "workspace": "vllm-project/vllm",
+        "repository": "vllm-project/vllm",
+        "artifact_type": "issue",
+        "number": 50026,
+        "state_at_cutoff": "open",
+    }
+    assert record.document.id == "gh_fixture"
+
+
+def test_connector_declared_title_field_is_used(tmp_path: Path) -> None:
+    source = tmp_path / "sources" / "slack" / "eng-runtime"
+    source.mkdir(parents=True)
+    path = source / "infra-v1-slack-000.json"
+    path.write_text(
+        json.dumps(
+            {
+                "channel": "eng-runtime",
+                "title_field_name": "channel",
+                "content_field_names": ["messages"],
+                "messages": ["Track the upstream qualification decision."],
+                "dataset_doc_uuid": "infra_fixture",
+            }
+        )
+    )
+    record = EnterpriseRAGCorpus(tmp_path).read_record(path)
+    assert record.document.title == "eng-runtime"
+
+
 def test_cached_embedder_deduplicates_exact_inputs(tmp_path: Path) -> None:
     provider = _CountingEmbedder(16)
     cache = EmbeddingCache(tmp_path / "embeddings.sqlite")

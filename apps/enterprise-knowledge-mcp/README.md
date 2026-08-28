@@ -3,7 +3,8 @@
 This application gives a coding agent one branch-aware company workspace backed
 by three ordinary systems:
 
-- SQLite stores the document/chunk catalog, provenance, and memory metadata.
+- PostgreSQL stores the document/chunk catalog, provenance, and memory
+  metadata for the Chronos service and benchmarks.
 - ChronosFS stores the original EnterpriseRAG documents, curated knowledge,
   durable memory, and generated task artifacts.
 - Qdrant stores chunk text, dense embeddings, and BM25 sparse vectors.
@@ -37,6 +38,21 @@ identical logical API:
 They are not additional MCP protocols. They exist so one recorded agent task
 can quantify the application complexity, query work, storage amplification,
 and cross-store coordination avoided by Chronos.
+
+All backends expose merge previews, stable change IDs, complete indexed-document
+bundles, filesystem-path groups, preview-token validation, and explicit subset
+selection. The comparison backends report `atomic: false`: after validating the
+same high-level request, they apply the selected relational, vector, and file
+changes through their existing application-managed write paths. They therefore
+match successful-run semantics without acquiring Chronos's single atomic
+multi-store publication point.
+
+The concurrency microbenchmark also includes `app-managed-big-lock` and
+`doltgres-qdrant-btrfs-big-lock`. These are benchmark-only controls: a single
+process lock surrounds the complete `merge_preview` plus `merge` call while
+leaving the underlying backend, stores, and configuration unchanged. They
+measure how much throughput a coarse application-level serialization policy
+can recover, rather than adding a new storage implementation.
 
 ## Why this memory model
 
@@ -74,7 +90,8 @@ agent frameworks:
 | `episodic_memory` | The outcome and useful retrospective of a completed task |
 | `playbook` | A reusable, validated procedure |
 
-Every memory is also a ChronosFS document, SQLite record, and Qdrant embedding.
+Every memory is also a ChronosFS document, relational record, and Qdrant
+embedding.
 Replacing or deleting it updates all three stores in the same branch. Memory
 consolidation uses the same write path: the agent writes the reviewed
 replacement and lists the old memory IDs in `supersedes`; Chronos removes the
@@ -358,6 +375,12 @@ The persistent end-to-end driver is:
 apps/enterprise-knowledge-mcp/scripts/run_curated_v2_pipeline.sh
 ```
 
+The driver accepts `ENTERPRISE_CORPUS` and defaults to
+`/home/ubuntu/TAR-OS/EnterpriseRAG-Bench/generated_data_infra_v1`. Set that
+variable explicitly to use the original corpus. `ENTERPRISE_DOCUMENT_SNAPSHOT`
+can select a separate prepared snapshot; otherwise the derivative corpus is
+prepared under the curated artifact directory.
+
 It layers the complete EnterpriseRAG snapshot and pinned-code snapshot,
 creates the 3-by-2 hierarchy, captures all thirteen real Codex workflows, and
 uses those traces as the benchmark workload.
@@ -408,8 +431,8 @@ Each concurrent Codex session uses its own task branch.
    searchable.
 5. Save a validated fact, task outcome, or procedure with
    `knowledge_remember`.
-6. Call `knowledge_merge_preview` to review stable change IDs across SQLite,
-   ChronosFS, and Qdrant.
+6. Call `knowledge_merge_preview` to review stable change IDs across the
+   relational store, ChronosFS, and Qdrant.
 7. Call `knowledge_merge` with the preview token and only the approved change
    IDs, or omit the allow-list to promote everything. An empty allow-list is a
    no-op. The server rejects incomplete indexed-document bundles, so document
@@ -422,10 +445,11 @@ The Chronos backend publishes a selected merge with one native branch-head
 change: readers see either the old shared interval head or the continuation
 head containing the selected changes. Generated reports and scratch files
 remain private unless their filesystem change IDs are explicitly selected.
-`knowledge.sqlite` is the single Chronos metadata plane and relational
-application store. Relational rows, ChronosFS rows, and Qdrant interval payloads
-share its branch head and segment allocation. The application creates no
-workspace manifest, concurrency generation, or separate branch catalog.
+The PostgreSQL database named by `CHRONOS_POSTGRES_DSN` is the single Chronos
+metadata plane and relational application store. Relational rows, ChronosFS
+rows, and Qdrant interval payloads share its branch head and segment
+allocation. The application creates no workspace manifest, concurrency
+generation, or separate branch catalog.
 `knowledge_merge` first performs a non-lazy unmount of the source and target
 workspaces so external tools cannot race the reviewed filesystem state. Native
 Chronos writes are also rejected while the branch transaction reservation is
@@ -575,6 +599,9 @@ explicitly required by a workflow. Use `--all-documents` for the complete
 prepared snapshot. The state-division experiment loads the same complete
 company-document and source-code snapshots into Chronos, the native
 Doltgres–Qdrant–Btrfs composition, and the app-managed overlay in sequence.
+For this protocol Chronos uses a pinned PostgreSQL 16 service for its shared
+relational metadata and application/ChronosFS state; the comparison backends
+keep their own specified relational stores.
 Each backend finishes ingestion and all recorded workflows before the next
 backend starts. The physical-clone baseline remains excluded at this scale
 because it eagerly duplicates every inherited file and retrieval point. The
@@ -598,10 +625,10 @@ embedding provider. These runs validate lexical retrieval, execution,
 final-state equivalence, and storage amplification, but do not measure
 semantic retrieval quality.
 
-Storage statistics include the Qdrant directory for each run's collection and,
-when supplied, the corresponding Doltgres database directory. The benchmark
-counts allocated filesystem blocks rather than the logical lengths of sparse
-database files.
+Storage statistics include the Qdrant directory for each run's collection,
+the PostgreSQL data directory for Chronos, and (when supplied) the
+corresponding Doltgres database directory. The benchmark counts allocated
+filesystem blocks rather than the logical lengths of sparse database files.
 
 Generate the paper-style comparison figure and CSV summaries with:
 
@@ -614,3 +641,31 @@ pip install -e 'apps/enterprise-knowledge-mcp[experiment]'
 
 The script refuses to summarize a run unless every replay succeeds and the
 backends reach equivalent logical state.
+
+### Concurrent merge experiments
+
+`scripts/run_concurrent_polystore_experiments.py` runs four small, repeatable
+concurrency scenarios: disjoint promotions, competing revisions with
+selective promotion, recursive fan-out/fan-in, and a process crash during
+publication.  A dedicated verifier process continuously cross-checks each
+visible document's relational row, file bytes, and Qdrant payload while the
+workers write and merge.  It records publication anomalies separately from
+expected branch-local write windows, so verification is not serialized by the
+Python GIL.  The driver waits for the verifier's ready signal before releasing
+the workers, and records the verifier PID and observed overlap in each result.
+
+Use a single Docker Qdrant endpoint for all backends (and the same Doltgres and
+Btrfs services for the native backend):
+
+```bash
+uv run python apps/enterprise-knowledge-mcp/scripts/run_concurrent_polystore_experiments.py \
+  --backend chronos --backend app-managed \
+  --backend doltgres-qdrant-btrfs \
+  --qdrant-url http://127.0.0.1:6333 \
+  --doltgres-dsn postgresql://root@127.0.0.1:5433/knowledge \
+  --scenario all --output /data/concurrent-polystore
+```
+
+The embedded Qdrant client is supported only as an explicitly requested
+single-process smoke test (`--allow-local-qdrant`); it cannot be shared by the
+worker, verifier, and crash-child processes.

@@ -4,7 +4,8 @@ set -euo pipefail
 repo=/home/ubuntu/TAR-OS/chronos
 app="$repo/apps/enterprise-knowledge-mcp"
 artifact_root="$repo/.enterprise-knowledge/enterprise-rag-curated-v2"
-document_snapshot="$repo/.enterprise-knowledge/enterprise-rag-full-staged-v1/snapshot"
+corpus="${ENTERPRISE_CORPUS:-/home/ubuntu/TAR-OS/EnterpriseRAG-Bench/generated_data_infra_v1}"
+document_snapshot="${ENTERPRISE_DOCUMENT_SNAPSHOT:-$repo/.enterprise-knowledge/enterprise-rag-curated-v2/document-snapshot}"
 code_snapshot="$artifact_root/code-snapshot"
 native_root=/tmp/chronos-enterprise-full-bench/native-curated-v2
 state="$native_root/state"
@@ -48,6 +49,18 @@ mkdir -p \
   "$output" \
   "$replay_workdir"
 cd "$repo"
+
+if [[ ! -f "$document_snapshot/manifest.json" ]]; then
+  "$cli" \
+    --dimensions 384 \
+    --placeholder-zero-embeddings \
+    prepare-snapshot "$corpus" "$document_snapshot" \
+    --sample-fraction 1 \
+    --sample-seed chronos-enterprise-infra-v1 \
+    --batch-size 256 \
+    --chunk-workers 2 \
+    --progress-every 1000
+fi
 
 log_phase() {
   printf '%s phase=%s\n' "$(date -u +%FT%TZ)" "$1" | tee -a "$log"

@@ -18,6 +18,9 @@ from chronos_enterprise_knowledge.models import (
     KnowledgeDocument,
     indexed_document_digest,
 )
+from chronos_enterprise_knowledge.selective_merge import (
+    SelectiveMergeDependencyError,
+)
 from chronos_enterprise_knowledge.trace import TraceRecorder, TraceReplayer
 
 
@@ -77,6 +80,74 @@ def test_application_backend_applies_configured_sqlite_cache(
         assert backend._db.execute(  # noqa: SLF001 - configuration invariant
             "PRAGMA cache_size"
         ).fetchone()[0] == -4096
+    finally:
+        backend.close()
+
+
+def test_app_managed_path_lookup_does_not_materialize_full_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ApplicationManagedKnowledgeBackend(
+        tmp_path,
+        vector_dimensions=3,
+    )
+
+    def indexed_at(document_id: str, path: str, content: str) -> IndexedDocument:
+        value = _indexed(document_id, content, (1.0, 0.0, 0.0))
+        return IndexedDocument(
+            KnowledgeDocument(
+                id=value.document.id,
+                path=path,
+                title=value.document.title,
+                source=value.document.source,
+                content=value.document.content,
+                metadata=value.document.metadata,
+            ),
+            value.chunks,
+        )
+
+    try:
+        backend.put_document(
+            "main",
+            indexed_at("doc-b", "/knowledge/shared.md", "B"),
+            operation_id="seed:b",
+        )
+        backend.put_document(
+            "main",
+            indexed_at("doc-a", "/knowledge/shared.md", "A"),
+            operation_id="seed:a",
+        )
+        backend.create_branch("task", "main")
+        backend.put_document(
+            "task",
+            indexed_at("doc-a", "/knowledge/moved.md", "moved"),
+            operation_id="task:move",
+        )
+
+        monkeypatch.setattr(
+            backend,
+            "_effective_documents",
+            lambda *_args, **_kwargs: pytest.fail(
+                "path lookup must not materialize the full document catalog"
+            ),
+        )
+
+        assert backend.find_document_id_by_path(
+            "task", "/knowledge/shared.md"
+        ) == "doc-b"
+        assert backend.find_document_id_by_path(
+            "task", "/knowledge/moved.md"
+        ) == "doc-a"
+        assert backend.find_document_id_by_path(
+            "task", "/knowledge/missing.md"
+        ) is None
+        assert "document_versions_by_path" in {
+            str(row[1])
+            for row in backend._db.execute(  # noqa: SLF001 - index invariant
+                "PRAGMA index_list(document_versions)"
+            )
+        }
     finally:
         backend.close()
 
@@ -427,6 +498,185 @@ def test_comparison_merge_applies_source_delta_not_whole_snapshot(
         PhysicalCloneKnowledgeBackend,
     ],
 )
+def test_comparison_selective_merge_keeps_unselected_file_private(
+    tmp_path: Path,
+    backend_type: type[
+        ApplicationManagedKnowledgeBackend | PhysicalCloneKnowledgeBackend
+    ],
+) -> None:
+    backend = backend_type(tmp_path, vector_dimensions=3)
+    try:
+        backend.create_branch("candidate", "main")
+        backend.put_document(
+            "candidate",
+            _indexed("reviewed", "Reviewed guidance.", (1.0, 0.0, 0.0)),
+            operation_id="candidate:document",
+        )
+        backend.write_file(
+            "candidate",
+            "/artifacts/private-notes.md",
+            b"do not publish",
+            operation_id="candidate:notes",
+        )
+
+        preview = backend.merge_preview("candidate", "main")
+        selected = preview["selection_groups"]["indexed_documents"][
+            "reviewed"
+        ]
+        assert preview["atomic"] is False
+        assert preview["selection_groups"]["filesystem_paths"][
+            "/artifacts/private-notes.md"
+        ]
+
+        result = backend.merge(
+            "candidate",
+            "main",
+            operation_id="merge:reviewed",
+            selected_change_ids=selected,
+            preview_token=preview["preview_token"],
+        )
+
+        assert result["atomic"] is False
+        assert backend.get_document("main", "reviewed") is not None
+        with pytest.raises(FileNotFoundError):
+            backend.read_file("main", "/artifacts/private-notes.md")
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    "backend_type",
+    [
+        ApplicationManagedKnowledgeBackend,
+        PhysicalCloneKnowledgeBackend,
+    ],
+)
+def test_comparison_selective_merge_rejects_partial_document_bundle(
+    tmp_path: Path,
+    backend_type: type[
+        ApplicationManagedKnowledgeBackend | PhysicalCloneKnowledgeBackend
+    ],
+) -> None:
+    backend = backend_type(tmp_path, vector_dimensions=3)
+    try:
+        backend.create_branch("candidate", "main")
+        backend.put_document(
+            "candidate",
+            _indexed("reviewed", "Reviewed guidance.", (1.0, 0.0, 0.0)),
+            operation_id="candidate:document",
+        )
+        preview = backend.merge_preview("candidate", "main")
+        group = preview["selection_groups"]["indexed_documents"]["reviewed"]
+
+        with pytest.raises(SelectiveMergeDependencyError):
+            backend.merge(
+                "candidate",
+                "main",
+                operation_id="merge:partial",
+                selected_change_ids=group[:1],
+                preview_token=preview["preview_token"],
+            )
+        assert backend.get_document("main", "reviewed") is None
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    "backend_type",
+    [
+        ApplicationManagedKnowledgeBackend,
+        PhysicalCloneKnowledgeBackend,
+    ],
+)
+def test_comparison_selective_merge_rejects_stale_preview(
+    tmp_path: Path,
+    backend_type: type[
+        ApplicationManagedKnowledgeBackend | PhysicalCloneKnowledgeBackend
+    ],
+) -> None:
+    backend = backend_type(tmp_path, vector_dimensions=3)
+    try:
+        backend.create_branch("candidate", "main")
+        backend.write_file(
+            "candidate",
+            "/artifacts/reviewed.md",
+            b"v1",
+            operation_id="candidate:v1",
+        )
+        preview = backend.merge_preview("candidate", "main")
+        backend.write_file(
+            "candidate",
+            "/artifacts/reviewed.md",
+            b"v2",
+            operation_id="candidate:v2",
+        )
+
+        with pytest.raises(ValueError, match="preview token is stale"):
+            backend.merge(
+                "candidate",
+                "main",
+                operation_id="merge:stale",
+                selected_change_ids=preview["change_ids"],
+                preview_token=preview["preview_token"],
+            )
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    "backend_type",
+    [
+        ApplicationManagedKnowledgeBackend,
+        PhysicalCloneKnowledgeBackend,
+    ],
+)
+def test_comparison_selective_merge_rejects_unindexed_document_edit(
+    tmp_path: Path,
+    backend_type: type[
+        ApplicationManagedKnowledgeBackend | PhysicalCloneKnowledgeBackend
+    ],
+) -> None:
+    backend = backend_type(tmp_path, vector_dimensions=3)
+    try:
+        indexed = _indexed(
+            "reviewed",
+            "Reviewed guidance.",
+            (1.0, 0.0, 0.0),
+        )
+        backend.put_document("main", indexed, operation_id="seed")
+        backend.create_branch("candidate", "main")
+        backend.write_file(
+            "candidate",
+            indexed.document.path,
+            b"unindexed replacement",
+            operation_id="candidate:raw-edit",
+        )
+        preview = backend.merge_preview("candidate", "main")
+        selected = preview["selection_groups"]["filesystem_paths"][
+            indexed.document.path
+        ]
+
+        assert preview["stale_index_paths"] == [indexed.document.path]
+        with pytest.raises(SelectiveMergeDependencyError, match="reindex"):
+            backend.merge(
+                "candidate",
+                "main",
+                operation_id="merge:stale-index",
+                selected_change_ids=selected,
+                preview_token=preview["preview_token"],
+            )
+        assert backend.get_document("main", "reviewed") == indexed
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    "backend_type",
+    [
+        ApplicationManagedKnowledgeBackend,
+        PhysicalCloneKnowledgeBackend,
+    ],
+)
 def test_nested_merge_carries_changes_since_common_ancestor(
     tmp_path: Path,
     backend_type: type[
@@ -552,7 +802,7 @@ def test_app_managed_nested_diff_and_merge_do_not_materialize_corpus(
         backend.close()
 
 
-def test_app_managed_merge_rejects_stale_filesystem_snapshot(
+def test_app_managed_merge_requires_rebase_after_target_advances(
     tmp_path: Path,
 ) -> None:
     backend = ApplicationManagedKnowledgeBackend(
@@ -578,11 +828,8 @@ def test_app_managed_merge_rejects_stale_filesystem_snapshot(
         )
 
         backend.merge("first", "main", operation_id="merge:first")
-        with pytest.raises(
-            ValueError,
-            match="target branch 'main' contains filesystem changes",
-        ):
-            backend.merge("second", "main", operation_id="merge:stale")
+        with pytest.raises(ValueError, match="merge target advanced"):
+            backend.merge("second", "main", operation_id="merge:second")
 
         assert (
             backend.read_file("main", "/artifacts/first.md")
@@ -590,22 +837,37 @@ def test_app_managed_merge_rejects_stale_filesystem_snapshot(
         )
         with pytest.raises(FileNotFoundError):
             backend.read_file("main", "/artifacts/second.md")
+    finally:
+        backend.close()
 
-        backend.delete_branch("second")
-        backend.create_branch("second", "main")
-        backend.mount_branch("second")
-        backend.write_file(
-            "second",
-            "/artifacts/second.md",
-            b"second candidate\n",
-            operation_id="second:file:refreshed",
-        )
-        backend.merge("second", "main", operation_id="merge:refreshed")
 
-        assert (
-            backend.read_file("main", "/artifacts/second.md")
-            == b"second candidate\n"
+def test_app_managed_merge_rejects_overlapping_target_update(
+    tmp_path: Path,
+) -> None:
+    backend = ApplicationManagedKnowledgeBackend(
+        tmp_path,
+        vector_dimensions=3,
+    )
+    try:
+        backend.put_document(
+            "main",
+            _indexed("shared", "Initial state.", (1.0, 0.0, 0.0)),
+            operation_id="seed",
         )
+        backend.create_branch("candidate", "main")
+        backend.put_document(
+            "candidate",
+            _indexed("shared", "Candidate state.", (0.0, 1.0, 0.0)),
+            operation_id="candidate:update",
+        )
+        backend.put_document(
+            "main",
+            _indexed("shared", "Advanced main state.", (0.0, 0.0, 1.0)),
+            operation_id="main:update",
+        )
+
+        with pytest.raises(ValueError, match="merge target advanced"):
+            backend.merge("candidate", "main", operation_id="merge")
     finally:
         backend.close()
 
@@ -773,6 +1035,30 @@ def test_app_managed_checkout_materializes_nested_visible_files(
         assert (checkout / "knowledge/replaced.md").read_bytes() == b"new\n"
         assert (checkout / "knowledge/team.md").read_bytes() == b"team\n"
         assert not (checkout / "knowledge/removed.md").exists()
+    finally:
+        backend.close()
+
+
+def test_app_managed_checkout_uses_configured_service_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    service_checkout_root = tmp_path / "service-checkouts"
+    monkeypatch.setenv(
+        "CHRONOS_APP_CHECKOUT_ROOT",
+        str(service_checkout_root),
+    )
+    backend = ApplicationManagedKnowledgeBackend(
+        state_dir,
+        vector_dimensions=3,
+    )
+    try:
+        backend.create_branch("task", "main")
+        checkout = backend.mount_branch("task")
+
+        assert checkout.is_relative_to(service_checkout_root.resolve())
+        assert not (state_dir / "checkouts").exists()
     finally:
         backend.close()
 
