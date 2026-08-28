@@ -1,0 +1,12 @@
+Implemented and published the LiteLLM #24720 mitigation to `person/aisha-bello`.
+
+- Reproduction: deterministic concurrent-callback regression test in `/code/litellm/tests/local_testing/test_lowest_latency_routing.py`; incident timeline indexed as `workspace_2380778860d9bb76bee20516`.
+- Fix: per-latency-key `asyncio.Lock` protects the success callback’s cache read-modify-write without a process-wide lock around provider/network I/O.
+- Runbook: `/knowledge/runbooks/latency-routing-concurrency.md`, indexed as `workspace_510abe9ba69ea51fabb25d9c`.
+- Checks: both modified Python files passed `python3 -m py_compile`. Pytest could not run because the snapshot lacks pytest and no offline package cache was available; external dependency retrieval was not attempted.
+- Review: reproduction, fix, and personal branch diffs contained only the router, regression test, timeline, and runbook. Generated virtualenv and bytecode artifacts were removed.
+- Publication: committed exclusively to `person/aisha-bello` under operation `aisha-litellm-24720-publish`.
+- Memory: episodic memory `memory_c8e32f442588d8ba85b63099` records the mitigation, evidence, validation boundary, and residual risk.
+- Cleanup: both temporary task branches were deleted.
+
+Remaining uncertainty: the lock is process-local. Multiple workers sharing Redis can still race across processes; full pytest execution and a distributed atomic-cache solution remain outstanding.

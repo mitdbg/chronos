@@ -1,0 +1,46 @@
+Resolved vLLM issue #34752 against the pinned company source and promoted the reviewed changes to `person/jamal-pierce`.
+
+Final precedence rule:
+
+1. If checkpoint `kv_cache_quant_algo` exists, omitted or explicit `auto` resolves to that format.
+2. A matching/equivalent explicit dtype is accepted; checkpoint FP8 metadata treats generic `fp8` as compatible with `fp8_e4m3`.
+3. An incompatible explicit override fails during configuration with actionable alternatives.
+4. Without checkpoint metadata, existing behavior remains: `auto` continues downstream and explicit dtype is honored.
+
+Changed and indexed paths:
+
+- `/code/vllm/vllm/utils/torch_utils.py`
+- `/code/vllm/tests/utils_/test_torch_utils.py`
+- `/knowledge/runbooks/kv-cache-dtype-rollout.md`
+
+Checks:
+
+- CPU configuration tests: `32 passed, 1 GPU-only skipped`
+- Ruff lint: passed
+- Ruff formatting: passed
+- Python bytecode compilation: passed
+- Full repository conftest was unavailable because the mounted environment lacked optional test dependencies; the focused file passed using `--noconftest`.
+
+Merge:
+
+- Status: `committed`
+- Operation: `merge:task/jamal-pierce/vllm-kv-cache-dtype-v2:person/jamal-pierce:c11d6c5814cd435f9709bb93c5b0b440`
+- Stale indexes: none
+- Task branch deleted successfully
+
+Playbook memory:
+
+- ID: `memory_735b3995bb0622a88909d5fa`
+- Stored and verified on `person/jamal-pierce`
+
+Primary evidence:
+
+- Issue snapshot: `enterprise_2a55f685a336b0c76f99aa99`
+- Implementation: `enterprise_97b36da892839ccc46c62291`
+- CPU tests: `enterprise_3f8c396d789481c22d12842a`
+- Rollout runbook: `workspace_101071d82d702ddff3249333`
+- Private deployment standard: `dsid_a1bd525bf3ef484d9aa37b4b3f63f98c`
+- Hardware matrix: `dsid_ceff8cd25c714f5faf8052f59e580184`
+- Rollout/incident guidance: `dsid_c2289fb6eb774ab581564cd191db1fb6`
+
+Chronos and GitHub were not modified or contacted upstream.

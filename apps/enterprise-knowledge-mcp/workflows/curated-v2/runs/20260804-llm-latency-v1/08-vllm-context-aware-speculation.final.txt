@@ -1,0 +1,18 @@
+Implemented and promoted the CPU-testable RFC #48627 prototype to `person/olivia-grant`.
+
+- Schema: preserved legacy three-field schedules; added five-field batch/context rectangles, dense int32 lookup, clamping, and validation for gaps, overlaps, mixed formats, and invalid ranges.
+- Scheduler: integrated at the existing speculative-depth selection boundary using scheduled batch size and maximum computed context. GPU graphs, buffers, KV allocation, and output shapes remain unchanged.
+- Checks: bytecode compilation and direct CPU schema assertions passed. Full pytest collection was blocked by missing `cbor2`; no GPU or performance claims were validated.
+- Report: `/artifacts/experiments/context-aware-speculation.md`, document `workspace_40ff7605167df1aa4bcec22c`.
+- Promotion: merge committed as `merge:task/olivia-grant/spec-scheduler-v2:person/olivia-grant:4f63369d4b604328b99649c4932f327b`. Indexed documents match after promotion; generated `.venv`/bytecode files were excluded.
+- Cleanup: both temporary branches deleted; only `person/olivia-grant` remains.
+- Episodic memory: `memory_9e561aacea9bbb6500363752`.
+
+Primary evidence:
+
+- RFC snapshot: `/code/upstream-issues/vllm-48627.md`, `enterprise_a251a0a0364578007031aba8`
+- Acceptance gates: `dsid_b218fd2b04a041df876e8d57571ecc98`
+- Workload profiles: `dsid_b875b2c7d7404486832f7cf8b25ed483`
+- Rollback/check requirements: `dsid_a9517bdb331149c88c8aa3f1bbee7b9f`
+
+No Chronos internals, GitHub operations, commits, or upstream PRs were used.

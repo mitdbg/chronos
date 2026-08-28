@@ -1,0 +1,38 @@
+Resolved and revalidated LiteLLM #34399 against the pinned company source.
+
+Changed/indexed paths:
+
+- `/code/litellm/litellm/router.py`
+- `/code/litellm/tests/test_litellm/test_router.py`
+- `/code/litellm/tests/local_testing/test_router_retries.py`
+- `/artifacts/reviews/litellm-34399.md`
+
+Policy contract: an explicit upstream `Retry-After` overrides immediate sibling failover; without that header, healthy-deployment failover remains immediate.
+
+Checks:
+
+- Ruff format check: passed
+- Ruff syntax-critical checks: passed
+- Focused pytest: blocked during import because the pinned source lacks `litellm/model_prices_and_context_window_backup.json`
+- No provider or paid API calls ran
+- Generated environment/cache files were removed
+
+Merge:
+
+- Task branch merged into `person/kaitlyn-nguyen`
+- Operation: `merge:task/kaitlyn-nguyen/litellm-retry-after-v2:person/kaitlyn-nguyen:c293912006974fe9978f87db861dfdbf`
+- Status: committed, 981 reviewed changes applied, none skipped
+- Task branch deleted successfully
+
+Memory:
+
+- ID: `memory_dd8a385d19d15e83525a0c96`
+- Kind: playbook
+- Stored on `person/kaitlyn-nguyen`
+
+Primary evidence:
+
+- Issue: `/code/upstream-issues/litellm-34399.md` — `enterprise_2034a8245bcfb88af6beb9e8`
+- Incident: `/knowledge/company/sources/jira/customer-support/SUP-659999-rate-limit-header-misparse-triggering-retry-spin-and-apigw-5xx.json` — `dsid_ba812bea360c4d39beeeccaa0f3dcff0`
+- 429 guidance: `/knowledge/company/sources/github/redwood-docs/pr-2217-document-429-reason-codes-and-retry-guidance.json` — `dsid_5dc49c2fda754b04ae09f952ddba3b70`
+- Review: `/artifacts/reviews/litellm-34399.md` — `workspace_9a608396e1cc1920874aa673`

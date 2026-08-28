@@ -1,0 +1,214 @@
+{
+  "workflow": "02-vllm-flashinfer-virtual-buffers",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/02-vllm-flashinfer-virtual-buffers.md",
+  "prompt_sha256": "bb4ed613f776b31ea3b5107850943046ca03b661ee6bd48dd2e88d72aff395c8",
+  "session_id": "019fcac5-4c0c-7543-931d-09b869a76a1b",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/codex-home/sessions/2026/08/04/rollout-2026-08-04T03-15-55-019fcac5-4c0c-7543-931d-09b869a76a1b.jsonl",
+  "rollout_sha256": "b65a3ad50335137347b5a7617aaff3118c1c5ee144a87cb775dd6ae0040e342f",
+  "events": 19,
+  "mcp_events": 16,
+  "shell_events": 3,
+  "patch_events": 0,
+  "memory_timestamps_resolved": 0,
+  "codex_exit_code": 1,
+  "capture_status": "codex_failed",
+  "llm_timing": {
+    "measurement": "wall-clock time from user/tool result to the next model-emitted tool call or final response; tool execution excluded",
+    "call_count": 12,
+    "total_ms": 81720.0,
+    "p50_ms": 5862.0,
+    "p95_ms": 13890.0,
+    "max_ms": 13890.0,
+    "time_to_first_token_ms": 5683,
+    "turn_duration_ms": 107930,
+    "non_llm_ms": 26210.0,
+    "calls": [
+      {
+        "sequence": 0,
+        "started_at": "2026-08-04T03:15:59.269Z",
+        "completed_at": "2026-08-04T03:16:03.633Z",
+        "latency_ms": 4364.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 13986,
+          "cached_input_tokens": 12032,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 152,
+          "reasoning_output_tokens": 39,
+          "total_tokens": 14138
+        }
+      },
+      {
+        "sequence": 1,
+        "started_at": "2026-08-04T03:16:03.692Z",
+        "completed_at": "2026-08-04T03:16:07.468Z",
+        "latency_ms": 3776.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 22926,
+          "cached_input_tokens": 13056,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 95,
+          "reasoning_output_tokens": 17,
+          "total_tokens": 23021
+        }
+      },
+      {
+        "sequence": 2,
+        "started_at": "2026-08-04T03:16:07.510Z",
+        "completed_at": "2026-08-04T03:16:12.929Z",
+        "latency_ms": 5419.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 24278,
+          "cached_input_tokens": 22272,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 140,
+          "reasoning_output_tokens": 22,
+          "total_tokens": 24418
+        }
+      },
+      {
+        "sequence": 3,
+        "started_at": "2026-08-04T03:16:12.999Z",
+        "completed_at": "2026-08-04T03:16:19.919Z",
+        "latency_ms": 6920.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 24850,
+          "cached_input_tokens": 23296,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 173,
+          "reasoning_output_tokens": 22,
+          "total_tokens": 25023
+        }
+      },
+      {
+        "sequence": 4,
+        "started_at": "2026-08-04T03:16:20.574Z",
+        "completed_at": "2026-08-04T03:16:27.361Z",
+        "latency_ms": 6787.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 36376,
+          "cached_input_tokens": 24320,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 197,
+          "reasoning_output_tokens": 45,
+          "total_tokens": 36573
+        }
+      },
+      {
+        "sequence": 5,
+        "started_at": "2026-08-04T03:16:27.662Z",
+        "completed_at": "2026-08-04T03:16:33.524Z",
+        "latency_ms": 5862.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 44658,
+          "cached_input_tokens": 35584,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 208,
+          "reasoning_output_tokens": 17,
+          "total_tokens": 44866
+        }
+      },
+      {
+        "sequence": 6,
+        "started_at": "2026-08-04T03:16:33.604Z",
+        "completed_at": "2026-08-04T03:16:47.494Z",
+        "latency_ms": 13890.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 44966,
+          "cached_input_tokens": 43776,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 62,
+          "reasoning_output_tokens": 29,
+          "total_tokens": 45028
+        }
+      },
+      {
+        "sequence": 7,
+        "started_at": "2026-08-04T03:16:47.823Z",
+        "completed_at": "2026-08-04T03:16:52.380Z",
+        "latency_ms": 4557.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 45604,
+          "cached_input_tokens": 44800,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 156,
+          "reasoning_output_tokens": 41,
+          "total_tokens": 45760
+        }
+      },
+      {
+        "sequence": 8,
+        "started_at": "2026-08-04T03:16:52.446Z",
+        "completed_at": "2026-08-04T03:17:05.927Z",
+        "latency_ms": 13481.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 45925,
+          "cached_input_tokens": 44800,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 231,
+          "reasoning_output_tokens": 42,
+          "total_tokens": 46156
+        }
+      },
+      {
+        "sequence": 9,
+        "started_at": "2026-08-04T03:17:07.405Z",
+        "completed_at": "2026-08-04T03:17:13.557Z",
+        "latency_ms": 6152.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 46311,
+          "cached_input_tokens": 44800,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 170,
+          "reasoning_output_tokens": 21,
+          "total_tokens": 46481
+        }
+      },
+      {
+        "sequence": 10,
+        "started_at": "2026-08-04T03:17:13.632Z",
+        "completed_at": "2026-08-04T03:17:17.222Z",
+        "latency_ms": 3590.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 47941,
+          "cached_input_tokens": 45824,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 114,
+          "reasoning_output_tokens": 23,
+          "total_tokens": 48055
+        }
+      },
+      {
+        "sequence": 11,
+        "started_at": "2026-08-04T03:17:17.287Z",
+        "completed_at": "2026-08-04T03:17:24.209Z",
+        "latency_ms": 6922.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 48135,
+          "cached_input_tokens": 46848,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 284,
+          "reasoning_output_tokens": 10,
+          "total_tokens": 48419
+        }
+      }
+    ]
+  },
+  "capture_wall_time_ms": 108328.54,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/llm-latency-v1/02-vllm-flashinfer-virtual-buffers.jsonl",
+  "trace_sha256": "fbaba686f89f6d1f02d914d467f065e04941e2891f80b76d30e906ec12857256",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260804-llm-latency-v1/02-vllm-flashinfer-virtual-buffers.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260804-llm-latency-v1/02-vllm-flashinfer-virtual-buffers.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260804-llm-latency-v1/02-vllm-flashinfer-virtual-buffers.final.txt"
+}

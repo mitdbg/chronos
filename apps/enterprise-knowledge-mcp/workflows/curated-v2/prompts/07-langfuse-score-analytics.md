@@ -1,35 +1,23 @@
-You are Sana Farid, an evals data scientist at Redwood Inference. Use the
-`chronos_enterprise_knowledge` MCP tools and mounted workspaces. Do not modify
-Chronos, contact GitHub, push commits, or open an upstream pull request. Do
-not inspect the MCP server's backing databases directly; access company state
-through MCP tools and mounted branch workspaces only.
-Use `knowledge_search` to discover company evidence and source paths. Read
-source code with targeted shell commands in the mounted workspace; do not call
-`knowledge_get_document` for source-code documents or load whole source files
-through an MCP response.
+You are Sana Farid, an evals data scientist at Redwood Inference. Resolve the
+two independent correctness problems in the local snapshot of Langfuse issue
+#15208 in the pinned `/code/langfuse` checkout.
 
-Resolve the two independent correctness bugs in open Langfuse issue #15208:
-https://github.com/langfuse/langfuse/issues/15208.
+Use the Redwood enterprise-state MCP server for company evidence, source
+trees, branches, indexed files, and evaluation memory. Search and fetch the
+issue, dashboard requirements, and statistical validation guidance. Work only
+through the MCP server and mounted workspaces; do not inspect backing
+databases, contact GitHub, push changes, or open an upstream pull request.
 
-1. From `person/sana-farid`, create and mount sibling branches
-   `task/sana-farid/histogram-binning-v2` and
-   `task/sana-farid/pivot-weighting-v2`.
-2. Search for the issue snapshot, score analytics requirements, eval
-   dashboards, and statistical validation guidance. Fetch the strongest
-   sources and read the applicable Langfuse agent instructions.
-3. On the histogram branch, add the `0.857` regression case, bin on raw
-   values, and round only display labels with enough precision to keep edges
-   distinct. Run the narrowest test and re-index every changed file.
-4. On the pivot branch, add unequal-group regression cases and implement a
-   count-weighted average when a count metric is available, with an explicit
-   tested fallback otherwise. Run the narrowest test and re-index every
-   changed file.
-5. Write and index one candidate note on each branch. Diff both branches
-   against `person/sana-farid`, merge both non-conflicting reviewed changes
-   into the personal branch, verify the combined diff, and delete both task
-   branches.
-6. Store one semantic memory on the personal branch stating the corrected
-   histogram and aggregation contracts, citing issue, code, tests, candidate
-   notes, and internal eval evidence.
+From `person/sana-farid`, keep two candidate fixes isolated. On one branch,
+add the `0.857` regression and correct histogram binning while keeping display
+labels precise. On the other, add unequal-group regression cases and make the
+aggregation count-weighted when counts exist, with a tested fallback. Run the
+narrowest useful tests on each branch and re-index every changed file.
 
-Report both fixes, checks, merge/deletion results, memory ID, and evidence.
+Write a short candidate note on each branch. Compare both candidates against
+the evidence and acceptance behavior, then publish both non-conflicting
+reviewed fixes to `person/sana-farid`, clean up the temporary branches, and
+save the corrected analytics contracts as semantic memory.
+
+Return both fixes, evidence, checks, publication status, memory, and any
+remaining validation.

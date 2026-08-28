@@ -1,0 +1,575 @@
+{
+  "workflow": "02-vllm-flashinfer-virtual-buffers",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/02-vllm-flashinfer-virtual-buffers.md",
+  "prompt_sha256": "2c315b4e14d91b02b3f6e1d672faf3e7235227a241d692f7f9bc0210d2aa5bfb",
+  "session_id": "01a000fc-801f-7563-9a58-bab1d2140940",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-realistic-v2-20260814/codex-home/sessions/2026/08/14/rollout-2026-08-14T15-55-43-01a000fc-801f-7563-9a58-bab1d2140940.jsonl",
+  "rollout_sha256": "65a6f36c600556262581ad714c29af970f9d9c9e97a6081b9fe9f6fab86451d8",
+  "events": 55,
+  "mcp_events": 31,
+  "shell_events": 21,
+  "patch_events": 3,
+  "memory_timestamps_resolved": 1,
+  "codex_exit_code": 0,
+  "capture_status": "ok",
+  "unsupported_calls": [],
+  "llm_timing": {
+    "measurement": "wall-clock time from user/tool result to the next model-emitted tool call or final response; tool execution excluded",
+    "call_count": 36,
+    "total_ms": 346270.0,
+    "p50_ms": 6099.0,
+    "p95_ms": 25745.0,
+    "max_ms": 35184.0,
+    "time_to_first_token_ms": 5255,
+    "turn_duration_ms": 358926,
+    "non_llm_ms": 12656.0,
+    "calls": [
+      {
+        "sequence": 0,
+        "started_at": "2026-08-14T15:55:46.386Z",
+        "completed_at": "2026-08-14T15:55:50.916Z",
+        "latency_ms": 4530.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 13532,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 149,
+          "reasoning_output_tokens": 27,
+          "total_tokens": 13681
+        }
+      },
+      {
+        "sequence": 1,
+        "started_at": "2026-08-14T15:55:51.004Z",
+        "completed_at": "2026-08-14T15:55:54.366Z",
+        "latency_ms": 3362.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 22678,
+          "cached_input_tokens": 13056,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 61,
+          "reasoning_output_tokens": 15,
+          "total_tokens": 22739
+        }
+      },
+      {
+        "sequence": 2,
+        "started_at": "2026-08-14T15:55:54.422Z",
+        "completed_at": "2026-08-14T15:55:59.506Z",
+        "latency_ms": 5084.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 22963,
+          "cached_input_tokens": 22272,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 163,
+          "reasoning_output_tokens": 12,
+          "total_tokens": 23126
+        }
+      },
+      {
+        "sequence": 3,
+        "started_at": "2026-08-14T15:55:59.582Z",
+        "completed_at": "2026-08-14T15:56:06.204Z",
+        "latency_ms": 6622.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 23208,
+          "cached_input_tokens": 22272,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 144,
+          "reasoning_output_tokens": 18,
+          "total_tokens": 23352
+        }
+      },
+      {
+        "sequence": 4,
+        "started_at": "2026-08-14T15:56:06.297Z",
+        "completed_at": "2026-08-14T15:56:11.603Z",
+        "latency_ms": 5306.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 23533,
+          "cached_input_tokens": 22272,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 121,
+          "reasoning_output_tokens": 12,
+          "total_tokens": 23654
+        }
+      },
+      {
+        "sequence": 5,
+        "started_at": "2026-08-14T15:56:11.650Z",
+        "completed_at": "2026-08-14T15:56:16.704Z",
+        "latency_ms": 5054.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 24010,
+          "cached_input_tokens": 23296,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 123,
+          "reasoning_output_tokens": 11,
+          "total_tokens": 24133
+        }
+      },
+      {
+        "sequence": 6,
+        "started_at": "2026-08-14T15:56:17.105Z",
+        "completed_at": "2026-08-14T15:56:23.204Z",
+        "latency_ms": 6099.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 34671,
+          "cached_input_tokens": 23296,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 151,
+          "reasoning_output_tokens": 24,
+          "total_tokens": 34822
+        }
+      },
+      {
+        "sequence": 7,
+        "started_at": "2026-08-14T15:56:23.418Z",
+        "completed_at": "2026-08-14T15:56:27.681Z",
+        "latency_ms": 4263.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 38736,
+          "cached_input_tokens": 33536,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 133,
+          "reasoning_output_tokens": 30,
+          "total_tokens": 38869
+        }
+      },
+      {
+        "sequence": 8,
+        "started_at": "2026-08-14T15:56:28.335Z",
+        "completed_at": "2026-08-14T15:56:34.976Z",
+        "latency_ms": 6641.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 58231,
+          "cached_input_tokens": 37632,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 213,
+          "reasoning_output_tokens": 48,
+          "total_tokens": 58444
+        }
+      },
+      {
+        "sequence": 9,
+        "started_at": "2026-08-14T15:56:35.062Z",
+        "completed_at": "2026-08-14T15:56:39.871Z",
+        "latency_ms": 4809.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 58966,
+          "cached_input_tokens": 58112,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 144,
+          "reasoning_output_tokens": 9,
+          "total_tokens": 59110
+        }
+      },
+      {
+        "sequence": 10,
+        "started_at": "2026-08-14T15:56:39.944Z",
+        "completed_at": "2026-08-14T15:56:45.045Z",
+        "latency_ms": 5101.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 62503,
+          "cached_input_tokens": 58112,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 177,
+          "reasoning_output_tokens": 8,
+          "total_tokens": 62680
+        }
+      },
+      {
+        "sequence": 11,
+        "started_at": "2026-08-14T15:56:45.134Z",
+        "completed_at": "2026-08-14T15:57:10.082Z",
+        "latency_ms": 24948.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 70398,
+          "cached_input_tokens": 62208,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 470,
+          "reasoning_output_tokens": 342,
+          "total_tokens": 70868
+        }
+      },
+      {
+        "sequence": 12,
+        "started_at": "2026-08-14T15:57:10.161Z",
+        "completed_at": "2026-08-14T15:57:45.345Z",
+        "latency_ms": 35184.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 71991,
+          "cached_input_tokens": 69376,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 735,
+          "reasoning_output_tokens": 582,
+          "total_tokens": 72726
+        }
+      },
+      {
+        "sequence": 13,
+        "started_at": "2026-08-14T15:57:45.418Z",
+        "completed_at": "2026-08-14T15:57:51.131Z",
+        "latency_ms": 5713.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 73158,
+          "cached_input_tokens": 71424,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 117,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 73275
+        }
+      },
+      {
+        "sequence": 14,
+        "started_at": "2026-08-14T15:57:51.199Z",
+        "completed_at": "2026-08-14T15:58:16.113Z",
+        "latency_ms": 24914.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 74074,
+          "cached_input_tokens": 72448,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 1074,
+          "reasoning_output_tokens": 255,
+          "total_tokens": 75148
+        }
+      },
+      {
+        "sequence": 15,
+        "started_at": "2026-08-14T15:58:16.188Z",
+        "completed_at": "2026-08-14T15:58:26.175Z",
+        "latency_ms": 9987.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 75172,
+          "cached_input_tokens": 73472,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 148,
+          "reasoning_output_tokens": 15,
+          "total_tokens": 75320
+        }
+      },
+      {
+        "sequence": 16,
+        "started_at": "2026-08-14T15:58:26.244Z",
+        "completed_at": "2026-08-14T15:58:36.535Z",
+        "latency_ms": 10291.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 76142,
+          "cached_input_tokens": 74496,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 383,
+          "reasoning_output_tokens": 87,
+          "total_tokens": 76525
+        }
+      },
+      {
+        "sequence": 17,
+        "started_at": "2026-08-14T15:58:36.594Z",
+        "completed_at": "2026-08-14T15:59:02.339Z",
+        "latency_ms": 25745.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 76549,
+          "cached_input_tokens": 75520,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 1109,
+          "reasoning_output_tokens": 280,
+          "total_tokens": 77658
+        }
+      },
+      {
+        "sequence": 18,
+        "started_at": "2026-08-14T15:59:02.410Z",
+        "completed_at": "2026-08-14T15:59:14.751Z",
+        "latency_ms": 12341.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 77682,
+          "cached_input_tokens": 75520,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 182,
+          "reasoning_output_tokens": 16,
+          "total_tokens": 77864
+        }
+      },
+      {
+        "sequence": 19,
+        "started_at": "2026-08-14T15:59:14.813Z",
+        "completed_at": "2026-08-14T15:59:25.830Z",
+        "latency_ms": 11017.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 77918,
+          "cached_input_tokens": 76544,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 175,
+          "reasoning_output_tokens": 8,
+          "total_tokens": 78093
+        }
+      },
+      {
+        "sequence": 20,
+        "started_at": "2026-08-14T15:59:25.909Z",
+        "completed_at": "2026-08-14T15:59:31.383Z",
+        "latency_ms": 5474.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 78144,
+          "cached_input_tokens": 77568,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 156,
+          "reasoning_output_tokens": 17,
+          "total_tokens": 78300
+        }
+      },
+      {
+        "sequence": 21,
+        "started_at": "2026-08-14T15:59:31.514Z",
+        "completed_at": "2026-08-14T15:59:37.143Z",
+        "latency_ms": 5629.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 78354,
+          "cached_input_tokens": 77568,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 195,
+          "reasoning_output_tokens": 24,
+          "total_tokens": 78549
+        }
+      },
+      {
+        "sequence": 22,
+        "started_at": "2026-08-14T15:59:37.245Z",
+        "completed_at": "2026-08-14T15:59:50.034Z",
+        "latency_ms": 12789.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 78680,
+          "cached_input_tokens": 77568,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 427,
+          "reasoning_output_tokens": 81,
+          "total_tokens": 79107
+        }
+      },
+      {
+        "sequence": 23,
+        "started_at": "2026-08-14T15:59:50.308Z",
+        "completed_at": "2026-08-14T16:00:01.727Z",
+        "latency_ms": 11419.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 79273,
+          "cached_input_tokens": 77568,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 381,
+          "reasoning_output_tokens": 71,
+          "total_tokens": 79654
+        }
+      },
+      {
+        "sequence": 24,
+        "started_at": "2026-08-14T16:00:03.683Z",
+        "completed_at": "2026-08-14T16:00:16.714Z",
+        "latency_ms": 13031.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 80418,
+          "cached_input_tokens": 78592,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 455,
+          "reasoning_output_tokens": 8,
+          "total_tokens": 80873
+        }
+      },
+      {
+        "sequence": 25,
+        "started_at": "2026-08-14T16:00:16.791Z",
+        "completed_at": "2026-08-14T16:00:21.954Z",
+        "latency_ms": 5163.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 80936,
+          "cached_input_tokens": 79616,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 121,
+          "reasoning_output_tokens": 28,
+          "total_tokens": 81057
+        }
+      },
+      {
+        "sequence": 26,
+        "started_at": "2026-08-14T16:00:22.045Z",
+        "completed_at": "2026-08-14T16:00:28.556Z",
+        "latency_ms": 6511.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 81767,
+          "cached_input_tokens": 80640,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 225,
+          "reasoning_output_tokens": 59,
+          "total_tokens": 81992
+        }
+      },
+      {
+        "sequence": 27,
+        "started_at": "2026-08-14T16:00:28.605Z",
+        "completed_at": "2026-08-14T16:00:37.538Z",
+        "latency_ms": 8933.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 82070,
+          "cached_input_tokens": 80640,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 303,
+          "reasoning_output_tokens": 86,
+          "total_tokens": 82373
+        }
+      },
+      {
+        "sequence": 28,
+        "started_at": "2026-08-14T16:00:37.631Z",
+        "completed_at": "2026-08-14T16:00:45.581Z",
+        "latency_ms": 7950.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 82431,
+          "cached_input_tokens": 81664,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 275,
+          "reasoning_output_tokens": 207,
+          "total_tokens": 82706
+        }
+      },
+      {
+        "sequence": 29,
+        "started_at": "2026-08-14T16:00:46.708Z",
+        "completed_at": "2026-08-14T16:00:51.820Z",
+        "latency_ms": 5112.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 99856,
+          "cached_input_tokens": 81664,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 163,
+          "reasoning_output_tokens": 42,
+          "total_tokens": 100019
+        }
+      },
+      {
+        "sequence": 30,
+        "started_at": "2026-08-14T16:00:51.891Z",
+        "completed_at": "2026-08-14T16:00:56.824Z",
+        "latency_ms": 4933.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 100060,
+          "cached_input_tokens": 99072,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 132,
+          "reasoning_output_tokens": 8,
+          "total_tokens": 100192
+        }
+      },
+      {
+        "sequence": 31,
+        "started_at": "2026-08-14T16:00:57.891Z",
+        "completed_at": "2026-08-14T16:01:03.647Z",
+        "latency_ms": 5756.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 115162,
+          "cached_input_tokens": 99072,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 129,
+          "reasoning_output_tokens": 20,
+          "total_tokens": 115291
+        }
+      },
+      {
+        "sequence": 32,
+        "started_at": "2026-08-14T16:01:05.156Z",
+        "completed_at": "2026-08-14T16:01:15.077Z",
+        "latency_ms": 9921.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 115528,
+          "cached_input_tokens": 114432,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 284,
+          "reasoning_output_tokens": 34,
+          "total_tokens": 115812
+        }
+      },
+      {
+        "sequence": 33,
+        "started_at": "2026-08-14T16:01:15.186Z",
+        "completed_at": "2026-08-14T16:01:19.492Z",
+        "latency_ms": 4306.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 115892,
+          "cached_input_tokens": 114432,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 107,
+          "reasoning_output_tokens": 22,
+          "total_tokens": 115999
+        }
+      },
+      {
+        "sequence": 34,
+        "started_at": "2026-08-14T16:01:19.604Z",
+        "completed_at": "2026-08-14T16:01:25.138Z",
+        "latency_ms": 5534.0,
+        "response_kind": "tool_call",
+        "usage": {
+          "input_tokens": 116102,
+          "cached_input_tokens": 115456,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 159,
+          "reasoning_output_tokens": 24,
+          "total_tokens": 116261
+        }
+      },
+      {
+        "sequence": 35,
+        "started_at": "2026-08-14T16:01:25.224Z",
+        "completed_at": "2026-08-14T16:01:42.022Z",
+        "latency_ms": 16798.0,
+        "response_kind": "final_answer",
+        "usage": {
+          "input_tokens": 116566,
+          "cached_input_tokens": 115456,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 654,
+          "reasoning_output_tokens": 98,
+          "total_tokens": 117220
+        }
+      }
+    ]
+  },
+  "capture_wall_time_ms": 359387.441,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/realistic-v2-20260814/02-vllm-flashinfer-virtual-buffers.jsonl",
+  "trace_sha256": "5f1e268694f63e02330b1c6a9343706a9eb410c26759230f0b610deef065ca6f",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260814-realistic-v2/02-vllm-flashinfer-virtual-buffers.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260814-realistic-v2/02-vllm-flashinfer-virtual-buffers.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260814-realistic-v2/02-vllm-flashinfer-virtual-buffers.final.txt"
+}

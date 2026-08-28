@@ -1,0 +1,47 @@
+Published and corrected successfully on `person/ethan-park`.
+
+- Revision 1 — baseline:
+  - Policy: `/knowledge/policies/hosted-api-retention.md`
+  - SHA-256: `18f0e8672c952d8180cf446484b5334d969160edc85c77eab79b7cafa84261e3`
+  - Memory: `mem_hosted_api_retention_v1`
+  - Publication: `publish-hosted-retention-v1`, committed with 22 changes.
+  - Limited claims to non-persistence guidance, scoped deletion workflow, residency caveats, explicit unknowns, and validation steps.
+
+- Revision 2 — corrected canonical version:
+  - Same document ID and path, revised in place.
+  - Document ID: `workspace_18c7cb7529877f59cc016aa5`
+  - SHA-256: `4bccc0a724dbafcd8f7379258ed9c1e159eed0fa72da6ff2e3674796d0c0cdd2`
+  - Establishes 30-day default request/response retention, 14-day embeddings retention, immediate traffic stop on termination, primary purge within 30 days, backup/replica scrub within 90 days, and conditional cross-region behavior.
+  - Preserves uncertainty around faster SLAs, immutable snapshots, legal holds, evidence formats, and customer-specific configurations.
+
+Supersession:
+
+- Replacement memory: `mem_hosted_api_retention_v2`
+- Explicitly supersedes: `mem_hosted_api_retention_v1`
+- The old memory was removed from documents, search index, vectors, and filesystem as part of the same atomic publication.
+- Verification found the corrected memory visible and the baseline memory absent.
+
+Evidence used:
+
+- Customer-facing retention overview: `dsid_074bc1f357314d8da96c1ef84cf92b85`
+- Approved Crestline security-questionnaire response: `dsid_7c0ce3505c1d46d8a00aa6680c35fbd3`
+- Infrastructure/DR backup-sweep and audit evidence: `dsid_5af161cb46d6483abc0eea8167a63147`
+
+Correction publication:
+
+- Preview reported zero conflicts and zero stale indexes.
+- Atomic operation: `publish-hosted-retention-correction-atomic`
+- Applied 22 selected changes across SQLite, semantic index, and filesystem.
+- Eight draft-related filesystem changes were intentionally skipped.
+
+Excluded draft:
+
+- `/artifacts/drafts/retention-evidence-matrix.md`
+- Remained private and unindexed.
+- Personal-branch search returned no artifact hits.
+- The post-publication diff showed the draft as the only unpublished correction-branch file.
+
+Cleanup:
+
+- `task/ethan-hosted-api-retention-correction` deleted successfully and confirmed absent from branch status.
+- `person/ethan-park` now exposes revision 2 and `mem_hosted_api_retention_v2` only; no stale policy or baseline memory remains.

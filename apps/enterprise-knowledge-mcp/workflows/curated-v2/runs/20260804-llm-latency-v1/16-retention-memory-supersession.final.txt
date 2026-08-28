@@ -1,0 +1,104 @@
+Completed the two-stage Hosted API retention publication and correction. The corrected policy and memory replaced v1; no stale guidance remains visible.
+
+### Policy revisions
+
+- v1 — interim support rule:
+  - Content not persisted by default.
+  - Opt-in debug payloads: 7 days.
+  - Metadata-only operational logs and no-payload traces: 14 days.
+  - Verified deletion from Redwood-managed systems: within 30 days.
+  - Backup purge, termination timing, residency, cross-region behavior, and deletion evidence remained explicit unknowns.
+
+- v3 — corrected canonical rule at `/knowledge/policies/hosted-api-retention.md`:
+  - Retains the v1 default-retention claims.
+  - Hosted erasure/termination: primary purge within 30 days; backups and replicated snapshots within 90 days; attestation available on completion, subject to holds and contracts.
+  - Configured allowed-region sets constrain customer-content processing and content-bearing logs and prevent out-of-region fallback.
+  - Unpinned accounts have no residency guarantee.
+  - Backup locality remains contract/SLA-dependent.
+  - Replica deletion uses tombstones, DeletionEvent state, restore guards, and per-replica acknowledgements; typical internal timings are not presented as general SLAs.
+  - Final document SHA-256: `549f62ef224abc6034b29dd95b2f5d6b66f739956015fafc9480faa641b054f8`.
+
+### Memory replacement
+
+- v1 memory: `mem_hosted_api_retention_v1`
+- Replacement memory: `mem_hosted_api_retention_v3`
+- Supersession: `mem_hosted_api_retention_v3` → `supersedes: ["mem_hosted_api_retention_v1"]`
+- Promotion included the complete deletion bundle for v1, so the old memory is no longer branch-visible.
+
+### Evidence
+
+Evidence was fetched from Confluence, Gmail, and Fireflies. Principal sources included:
+
+- `dsid_e51021765c694a65bd60b3d38b12db6e` — published Security retention policy.
+- `dsid_eb9f7314dd10443fbf70a80306d5119a` — published Hosted residency policy and controls.
+- `dsid_7c0ce3505c1d46d8a00aa6680c35fbd3` — approved Hosted security-questionnaire response covering termination and 30/90-day erasure windows.
+- `dsid_58d93b12079648b29e41e8afb78aa7cf` — SRE-backed replica tombstone, restore-guard, and acknowledgement workflow.
+- `dsid_c7f6ff2dcf674dd784e7f65c738d0724` — Dedicated/Private decommission playbook, used to establish that its 10-business-day SLA must not be applied to Hosted.
+- Initial conflict checks also fetched `dsid_49ad83c4629c4d52a3873ef5c501fa5d` from Gmail and `dsid_06b6ace6ae094712806536c0ccea07e0` from Fireflies.
+
+### Merge results
+
+v1 operation `ethan-retention-rule-v1-v3-promote`:
+
+- Status: committed
+- Selected: 14 stable changes
+- Applied: SQLite 5, vector index 3, filesystem 13
+- Selected IDs:
+  - `filesystem:5ba850a67cbfcd072047b0b3`
+  - `filesystem:d891972472932b4b3c36ff1e`
+  - `filesystem:e87d49b4dd744ee21b5a41c4`
+  - `qdrant:e28c45ceb3145e5b8cec797c`
+  - `sqlite:2ed4a06041d3868a423a88bd`
+  - `sqlite:df05bde9d951a7ce68a6b823`
+  - `filesystem:44628242af92a78b6ff77bbb`
+  - `filesystem:87d843bce6ce7844044e3cf3`
+  - `filesystem:cbf02de01e1f07d9fb79b278`
+  - `qdrant:be6f35c444159c1e11b86437`
+  - `qdrant:f518ed39c9ce9075b123c0bd`
+  - `sqlite:64da3406173291a5e4b0c0ac`
+  - `sqlite:a31410bc438e201f914f4cc7`
+  - `sqlite:b2e9bd5a6fd3679bff0b0687`
+
+Correction operation `ethan-retention-rule-correction-v3-promote`:
+
+- Status: committed
+- Selected: 21 stable changes
+- Applied: SQLite 8, vector index 5, filesystem 9
+- Selected IDs:
+  - `filesystem:4005d769a2fc9f07e6f47978`
+  - `filesystem:b4ceec2f94a370b10b652def`
+  - `qdrant:4d89cdfd9dbf5e6bab519db0`
+  - `sqlite:45dafed422d7eb094f7d4063`
+  - `sqlite:fbf90afb24fa9e6a2f2b07bb`
+  - `filesystem:33d3da466da52c5ce48509de`
+  - `filesystem:c20c94dd2a6cc4addefd34cb`
+  - `filesystem:d096443cb52cb1b1a6f715c6`
+  - `qdrant:8ec0d741af53c4a1fbdedfa8`
+  - `sqlite:2cbfcca4575c5241385687c4`
+  - `sqlite:bb513577e6dcd0945adc0d8c`
+  - `filesystem:0ee1f948cb8854ac6607675a`
+  - `filesystem:14f4a16982be1582e81f2cd7`
+  - `filesystem:4cab036236baf2fd1407259e`
+  - `qdrant:260f6ed136ae5d6a5b8403e4`
+  - `qdrant:2d774bd7136488d84a241a35`
+  - `qdrant:981d40147deba73c321b475c`
+  - `sqlite:19c57e4a7dd2d19fbe212a0a`
+  - `sqlite:253daa63f1d8d50fa0c6b3b0`
+  - `sqlite:b6bb7405ec04b0ab67f8bc64`
+  - `sqlite:fe51a35dca58e9b14aca213f`
+
+Excluded path: `/artifacts/drafts/retention-evidence-matrix.md`. It remained unindexed and none of its changes were promoted.
+
+### Verification and cleanup
+
+On `person/ethan-park`:
+
+- Corrected policy returns with revision `v3`, status `corrected`.
+- Replacement memory returns with the expected evidence and supersession metadata.
+- `mem_hosted_api_retention_v1` returns no document and no search result.
+- The draft evidence matrix returns no search result.
+- Both task branches were deleted:
+  - `task/ethan-park/retention-rule-v1-v3`
+  - `task/ethan-park/retention-rule-correction-v3`
+
+All file writes used `knowledge_write_artifact`; the Chronos source repository was not modified.

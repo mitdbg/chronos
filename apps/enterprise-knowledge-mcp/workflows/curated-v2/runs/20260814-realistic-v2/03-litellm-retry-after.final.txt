@@ -1,0 +1,12 @@
+Resolved LiteLLM #34399 and published the validated result to `person/kaitlyn-nguyen`.
+
+- Changed [router.py](/code/litellm/litellm/router.py): valid `Retry-After` values in the existing 1–60 second range now take precedence over healthy-sibling immediate failover.
+- Changed [test_router_retries.py](/code/litellm/tests/local_testing/test_router_retries.py): covers two deployments sharing a throttled upstream and preserves zero-delay failover when no backoff header exists.
+- Published the indexed [engineering review](/artifacts/reviews/litellm-34399.md), including evidence, contract, operational effect, and rollback.
+- Re-indexed both changed Python files and the review artifact.
+- Focused pytest was attempted but unavailable because `pytest` is not installed in the pinned snapshot. `python3 -m py_compile` passed for both changed files; no paid providers or external APIs were used.
+- Reviewed and selectively promoted the intended bundles. Merge operation: `merge:task/kaitlyn-nguyen/litellm-34399:person/kaitlyn-nguyen:ec346299261c4ebaae28b1bff638f0a4`.
+- Removed task branch `task/kaitlyn-nguyen/litellm-34399`.
+- Verified durable playbook memory: `playbook-litellm-retry-after-failover-precedence`.
+
+Remaining risk: the focused regression tests still need execution in an environment containing the repository’s test dependencies. The intentional operational tradeoff is up to 60 seconds of added failover latency when an upstream explicitly requests backoff.

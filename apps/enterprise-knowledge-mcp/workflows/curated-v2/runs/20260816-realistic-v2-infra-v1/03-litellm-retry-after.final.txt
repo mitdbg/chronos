@@ -1,0 +1,20 @@
+Resolved LiteLLM #34399 and promoted the reviewed change to `person/kaitlyn-nguyen`.
+
+- Changed [router.py](/mnt/chronos-enterprise-state-division-v2/infra-v1-realistic-v2-20260815/host/states/01-chronos/state/checkouts/person-kaitlyn-nguyen/code/litellm/litellm/router.py): valid provider `Retry-After` values now precede healthy-deployment failover; no applicable backoff still returns zero immediately.
+- Changed [test_router_retries.py](/mnt/chronos-enterprise-state-division-v2/infra-v1-realistic-v2-20260815/host/states/01-chronos/state/checkouts/person-kaitlyn-nguyen/code/litellm/tests/local_testing/test_router_retries.py): added deterministic shared-upstream and no-backoff control cases.
+- Added [review artifact](/mnt/chronos-enterprise-state-division-v2/infra-v1-realistic-v2-20260815/host/states/01-chronos/state/checkouts/person-kaitlyn-nguyen/artifacts/reviews/litellm-34399.md) covering contract, evidence, validation, operational impact, and rollback.
+- Re-indexed both changed code files.
+
+Checks:
+
+- Python syntax compilation passed for source and tests.
+- Focused pytest was attempted, but pytest is absent from the isolated image and offline package cache. No network or paid provider was used.
+- Branch diff was reviewed and limited to the intended source and test changes.
+
+Publication:
+
+- Merge operation `litellm-34399-kaitlyn-20260816` committed successfully.
+- Task branch was removed.
+- Playbook memory `playbook_litellm_retry_after_failover_precedence` was saved and verified searchable.
+
+Remaining risk: the focused tests still need execution in LiteLLM’s dependency-complete CI environment. The unchanged 60-second Retry-After validity ceiling remains part of the existing policy.

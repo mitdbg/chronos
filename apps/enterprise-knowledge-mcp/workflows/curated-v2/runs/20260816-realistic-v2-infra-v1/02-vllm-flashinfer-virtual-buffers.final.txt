@@ -1,0 +1,32 @@
+Assessment complete in the Redwood enterprise-state system of record.
+
+### Candidates
+
+| Candidate | Design | Assessment |
+|---|---|---|
+| Initialization capacity | Preallocate FlashInfer metadata for `max_num_seqs ×` maximum local-attention chunk expansion. | Correct and graph-stable, but reserves worst-case request/page metadata for every worker, including the common path. |
+| Guarded grow-on-demand | Retain normal initialization sizing; on overflow, grow request and page buffers to the observed exact sizes. Refuse pointer replacement after CUDA-graph decode wrappers exist. | Meets the failure case with minimal steady-state cost. Chunked local attention reports no CUDA-graph support, making growth safe on the affected prefill path. |
+
+Both candidates used the same CPU regression: a 34,000-token prefill with an 8,192-token attention chunk expands one physical request into five virtual batches with 2,560 padded pages.
+
+### Evidence
+
+- Issue and acceptance criteria: `/knowledge/company/sources/github_public/vllm-project/vllm/issues/49980.json` (`gh_e0aa62e0fa653464826dccc70710bdfd`)
+- Long-prefill/OOM incident: `/knowledge/company/sources/slack/incidents/7077777777-prefill-oom-sticky-crash-handoff.json` (`dsid_c793ed1b6a524a7dae3e014127d593b5`)
+- CUDA-graph snapshot expectations: `/knowledge/company/sources/linear/engineering/ENG-80521-prefill-boundary-coalescing-cuda-graph-snapshots.json` (`dsid_e3d87bb9dae44abf8c9aa2ba1b2c9adf`)
+- Selected implementation: `/code/vllm/vllm/v1/attention/backends/flashinfer.py`
+- Shared regression: `/code/vllm/tests/v1/attention/test_chunked_local_attention.py`
+- Candidate note: `/artifacts/vllm-49980-candidate.md`
+- Rejection memory: `/memory/playbook/prefer-guarded-exact-growth-over-worst-case-virtual-request-prea-9f29e065.md` (`memory_545b19207656d2f59f29e065`)
+
+### Checks
+
+- Python 3.12 bytecode compilation passed for both changed files.
+- Focused pytest could not run: the pinned snapshot has no `.venv`, and the isolated environment lacks pytest.
+- GPU validation still required: FlashInfer long-context serving, CUDA-graph capture/replay, and allocation/performance measurements.
+
+### Result and publication
+
+Guarded grow-on-demand is the selected candidate. It satisfies the issue’s “preallocate or reallocate” criterion, preserves the fit/common path with only capacity comparisons, avoids worst-case allocation, and guards captured pointers.
+
+The selected indexed source, test, candidate note, and rejection memory are published on `person/lena-fischer`. Temporary candidate workspaces were removed. No GitHub, upstream PR, push, or Chronos modification was performed.

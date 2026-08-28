@@ -1,0 +1,29 @@
+Resolved on isolated branch `task/langfuse-12736-jada-williams`; nothing was published or merged.
+
+Changed areas:
+
+- Preview adapter now prefers OTel `traceTags`, falling back to historical REST `tags`: [eventsToTraceAdapter.ts](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/task-langfuse-12736-jada-williams/code/langfuse/web/src/features/events/lib/eventsToTraceAdapter.ts)
+- Added REST/OTel mapping regressions: [eventsToTraceAdapter.clienttest.ts](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/task-langfuse-12736-jada-williams/code/langfuse/web/src/features/events/lib/eventsToTraceAdapter.clienttest.ts)
+- Added historical REST fixture with start/end times and tags: [historical-rest-trace.json](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/task-langfuse-12736-jada-williams/code/langfuse/web/src/features/events/lib/fixtures/historical-rest-trace.json)
+
+Visible behavior: the fixture maps to `latency: 4.25` seconds and tags `["rest", "historical"]`; OTel trace tags retain precedence.
+
+Checks:
+
+- Attempted `pnpm --filter web run test-client eventsToTraceAdapter.clienttest.ts`
+- Result: `/bin/bash: pnpm: command not found`
+- Node and Corepack are also absent, so targeted Vitest and `pnpm run lint` could not start.
+- Browser validation remains: run a seeded full stack with v4 preview enabled and confirm the latency badge/tags in both peek and standalone detail, plus OTel parity.
+
+Diff against `person/jada-williams`:
+
+- 1 source file modified
+- 1 client test modified
+- 1 fixture added
+- 1 review artifact added
+- 1 episodic memory added
+- No deletions
+
+All changed source, fixture, test, and review files were re-indexed. Diagnosis was saved as episodic memory `langfuse-12736-preview-rest-parity`.
+
+The full evidence, checks, browser procedure, and diff summary are in [langfuse-12736.md](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/task-langfuse-12736-jada-williams/artifacts/reviews/langfuse-12736.md). Primary evidence includes issue document `enterprise_98d847b52246775cfd590be6`, event query `enterprise_b919aa5051fcfbf1f004f7e4`, OTel mapping `enterprise_400af1f3cdeb0356d3b9d99e`, and preview renderers `enterprise_97afbebd55bd03fb75ae9735` / `enterprise_0ea60fe61ab87a394c2181ff`.

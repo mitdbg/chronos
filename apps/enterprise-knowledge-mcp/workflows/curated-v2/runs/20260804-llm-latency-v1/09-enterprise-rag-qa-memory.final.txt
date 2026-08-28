@@ -1,0 +1,115 @@
+Completed on isolated, unmerged branch `task/selene-huang/enterprise-rag-qa-v2`.
+
+```json
+[
+  {
+    "question_id": "qst_0006",
+    "answer": "The proposed canonical order is: (1) authoritative Reachability DOWN; (2) high-severity fast 5xx error burn; (3) sustained p99/p95 tail-latency burn (partial shift first, escalating only when corroborated); (4) capacity exhaustion/hard gate (HOLD and load-shed, rather than shifting into constrained capacity); and (5) control-plane degradation (HOLD to avoid oscillation).",
+    "citations": [
+      {
+        "document_id": "dsid_184be937d34a412ab5e61366d54d8ed6",
+        "path": "/knowledge/company/sources/google_drive/shared_drives/policy-engine-failover-extensions-draft.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0012",
+    "answer": "A bug in edge-switch firmware 1.2.3 made the switch proxy-ARP under high multicast/mDNS load and advertise VPN-assigned addresses on the local L2 domain. That produced ephemeral duplicate-IP ownership/forwarding to the wrong MAC, causing VPN rekeys and 30–90 second routing blackholes.",
+    "citations": [
+      {
+        "document_id": "dsid_59cb294da8964683bb165a3bb615df71",
+        "path": "/knowledge/company/sources/jira/ops-requests/INT-460811-edge-switch-arp-proxy-ip-duplication.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0028",
+    "answer": "Update the release branch (`git checkout release/v1.14` and `git pull --ff-only origin release/v1.14`), then create the required signed annotated tag with `git tag -s v1.14.0 -m \"Release v1.14.0\"` and push it using `git push origin v1.14.0`. Create the draft with `gh release create v1.14.0 dist/* --notes-file CHANGELOG.md --draft`. Generate SHA-256 checksums (`shasum -a 256 dist/* > checksums.txt`), create `manifest.json` with the hashes, upload `dist/*`, checksums, and manifest to `s3://redwood-release-bucket/v1.14.0/`, attach checksums/manifest to the draft, then run staging smoke tests and verify the GPG signature and hashes before publishing. (`-s` is the signed-annotated form; do not first create the same tag with `-a`.)",
+    "citations": [
+      {
+        "document_id": "dsid_7c0157af909c4a6190e00e1fc6b92b73",
+        "path": "/knowledge/company/sources/slack/1729999999-tagging-handoff-ops-checkin.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0030",
+    "answer": "Selected opt-in customers on both Dedicated and Hosted tiers can enter the beta; alpha is internal Redwood tenants only, and GA later opens to all Console users.",
+    "citations": [
+      {
+        "document_id": "dsid_54525a33e2d44d4a9b665feaf8fab624",
+        "path": "/knowledge/company/sources/linear/product-management/PM-24680-cohort-comparator-and-trace-linker-for-deployment-health.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0077",
+    "answer": "The three startup messages are: (1) client_hello; (2) server_ack, optionally carrying a resume_token; and (3) client_stream_start. Keepalive frames follow after startup. If the ACK has no resume token, the client checkpoints locally and permits idempotent retry only for non-side-effecting tools.",
+    "citations": [
+      {
+        "document_id": "dsid_169dca195c96410b80ff166803a50512",
+        "path": "/knowledge/company/sources/linear/engineering/ENG-77120-fn-schema-mapper-compatibility-and-streaming-handshake.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0138",
+    "answer": "The CTO’s non-negotiable was an audit trail: the dedicated deployment had to provide audit logging (with immutable/exportable logs and retention controls as the account’s detailed blocker) before security/legal would approve it.",
+    "citations": [
+      {
+        "document_id": "dsid_68b482f2a38a4ccb86aa77bde4565bb5",
+        "path": "/knowledge/company/sources/hubspot/company-helmshore-saas-innovations.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0165",
+    "answer": "The freeze exception authorized immediate sourcing and interviews, but no offer could be made until budget owner Marcus signed off on total compensation/runway within the posted band. If no viable candidate appeared within three weeks of the live posting, the team had to escalate to Lauren to consider a contractor interim or backlog reprioritization.",
+    "citations": [
+      {
+        "document_id": "dsid_2d58cc0f0a074241a91a072f5f5624d6",
+        "path": "/knowledge/company/sources/gmail/soojin_lee/20261028-senior-infra-freeze-exception-and-sourcing-ask.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0174",
+    "answer": "Each ledger row requires: timestamp, service_a, service_a_version, service_b, service_b_version, endpoint, dcts_version, test_case_id, result (pass|fail), failure_reason, and run_id.",
+    "citations": [
+      {
+        "document_id": "dsid_04b24bf957c047f4b7d8ceefdfde8290",
+        "path": "/knowledge/company/sources/confluence/architecture-and-standards/decision-records/adr-declarative-contract-tests-and-schema-fencing-2026.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0210",
+    "answer": "Compute SS = 100 × [Σp wp × (failure_countp / max(1,total_callsp))] / Σp wp; LP = min(30, 10 × max(0,(median_latency_ms − latency_slo_ms)/latency_slo_ms)); DF = 50 × the 95th-percentile embedding-drift score normalized against baseline; then DS = clamp(SS + LP + DF, 0, 100). DS ≤15 means GO; 15<DS≤35 means CAUTION (cap/slow to 10% and human review within 4 hours); 35<DS≤60 means HOLD (pause and run bisect/focused probes); DS>60 means automatic ROLLBACK and incident creation. A critical-slice failure-rate/severity hard gate can force rollback regardless of DS.",
+    "citations": [
+      {
+        "document_id": "dsid_b4bd83b46612452e858bc02b380082e2",
+        "path": "/knowledge/company/sources/confluence/applied-ml-and-evals/regression-triage/probe-heatmap-rollout-decision-protocol-2024.json"
+      }
+    ]
+  },
+  {
+    "question_id": "qst_0460",
+    "answer": "Send Priya the take-home exercise, which she agreed to return within 48 hours, and schedule the panel interview.",
+    "citations": [
+      {
+        "document_id": "dsid_2c9dcc3afa3249f39c725884e5be5c72",
+        "path": "/knowledge/company/sources/fireflies/interviews/2025-02-11-candidate-interview-senior-se.json"
+      }
+    ]
+  }
+]
+```
+
+Artifacts:
+
+- [answers.json](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/task-selene-huang-enterprise-rag-qa-v2/artifacts/enterprise-rag/answers.json) — indexed as `workspace_917834d63facf61b2ed3acb3`
+- [evidence-reconciliation.md](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/task-selene-huang-enterprise-rag-qa-v2/artifacts/enterprise-rag/evidence-reconciliation.md) — indexed as `workspace_07ba2cb6f7a8cbcd5787738c`
+
+Playbook memory: `memory_1341259d5a62e4328e7a4480`
+
+Its evidence spans Google Drive, Slack, Gmail, Confluence, and Jira using the cited document IDs above. Final searches confirmed that both indexed artifacts and the memory are branch-visible. The branch was not merged or deleted.

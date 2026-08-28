@@ -1,0 +1,27 @@
+Implemented and published both fixes to `person/sana-farid`.
+
+- Histogram: raw-value binning, three-decimal display labels, explicit `0.857` and narrow-range regressions in [score-analytics-utils.clienttest.ts](/mnt/chronos-enterprise-state-division-v2/infra-v1-realistic-v2-20260815/host/states/01-chronos/state/checkouts/person-sana-farid/code/langfuse/web/src/features/dashboard/lib/score-analytics-utils.clienttest.ts).
+- Aggregation: count-weighted `avg_`/`average_` totals with unequal-group cases and tested unweighted fallback in [pivot-table-utils.servertest.ts](/mnt/chronos-enterprise-state-division-v2/infra-v1-realistic-v2-20260815/host/states/01-chronos/state/checkouts/person-sana-farid/code/langfuse/web/src/__tests__/server/pivot-table-utils.servertest.ts).
+
+Evidence came from Langfuse issue #15208 and PR #15211 in the enterprise index. They establish raw-magnitude histogram semantics, precise distinct labels, and `Σ(mean×count)/Σcount` when matching counts exist.
+
+Publication completed atomically:
+
+- Histogram operation: `issue-15208-publish-histogram`
+- Weighted operation: `issue-15208-publish-weighted`
+- Both candidate notes published under `artifacts/`.
+- Both temporary branches deleted.
+- All six candidate files were re-indexed; merge previews reported no stale index paths.
+
+Semantic memories saved:
+
+- `memory_d9cb5231c88864487780a72a` — numeric histogram contract
+- `memory_d487a26745d91a3158ef8a71` — pivot average aggregation contract
+
+Remaining validation: targeted Vitest and browser review could not run because the mounted snapshot contains no Node, pnpm, or dependencies. The attempted command failed with `/bin/bash: pnpm: command not found`. In a bootstrapped checkout, run:
+
+```bash
+pnpm --filter web run test-client score-analytics-utils.clienttest.ts
+pnpm --filter web run test pivot-table-utils.servertest.ts
+pnpm run lint
+```

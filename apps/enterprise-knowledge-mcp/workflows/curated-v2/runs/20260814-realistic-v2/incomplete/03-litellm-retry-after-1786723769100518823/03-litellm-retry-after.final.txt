@@ -1,0 +1,13 @@
+Implemented and promoted LiteLLM #34399 to `person/kaitlyn-nguyen`.
+
+- Changed [router.py](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/person-kaitlyn-nguyen/code/litellm/litellm/router.py): valid `Retry-After` now takes precedence over healthy-sibling fast failover.
+- Updated [test_router_retries.py](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/person-kaitlyn-nguyen/code/litellm/tests/local_testing/test_router_retries.py): covers shared-upstream backoff and immediate failover without backoff.
+- Added [review artifact](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/person-kaitlyn-nguyen/artifacts/reviews/litellm-34399.md) with contract, evidence, validation, operational effect, and rollback.
+- Re-indexed both changed files.
+- Offline AST syntax validation passed.
+- Focused pytest could not collect because `pytest` is absent from the mounted snapshot. No dependencies, paid providers, or external APIs were used.
+- Merge committed as `merge:task/litellm-34399-kaitlyn:person/kaitlyn-nguyen:606f79662dbd4deca470ef2040ee2b65`.
+- Generated cache directories were excluded; task branch was deleted.
+- Saved playbook memory `playbook-litellm-retry-after-failover-precedence`.
+
+Remaining risk: the focused tests still need execution in LiteLLM’s provisioned test environment. The policy also intentionally adds up to the existing supported 60-second delay when a provider supplies applicable backoff.

@@ -1,0 +1,44 @@
+Organizational change completed and left isolated—no merges were performed.
+
+- `team/runtime-diagnostics`, parent `department/infrastructure-sre`
+- `person/priya-shah`, parent `team/runtime-diagnostics`
+
+Created and indexed:
+
+- `/knowledge/teams/runtime-diagnostics/operating-charter.md`
+  - Document: `workspace_2f45b5996eb8413c361464ae`
+  - Final revision: 2
+  - SHA-256: `fcf262022b585a1203659beed606a46a60423faf5b686435bdcb93f264f1e87e`
+  - Revised in place—no duplicate document.
+  - Added release criteria: ≤10% p99 regression, ≤baseline +0.02 percentage-point error rate, zero new OOMs.
+  - Added failover criteria: 5,000 requests, ≤2-point error increase, p99 <3× baseline during the first five minutes.
+
+- `/knowledge/people/priya-shah/onboarding-plan.md`
+  - Document: `workspace_90138731027c9aaab2a740b5`
+  - SHA-256: `334640859f77cc931061e9f425935cbbb551842e5325d64caf0f9bec13684385`
+  - Covers boundaries, first-week access, mentors, 30-day sequence, validation rubric, and Gates A–D.
+
+Memories:
+
+- Team playbook: `runtime-diagnostics-investigate-promote-v1`
+- Priya semantic memory: `priya-shah-onboarding-access-turnaround`
+  - Baseline senior-IC access, including production view, reviewed within 48 hours; privileged access retains separate approvals.
+
+Reviewed diffs:
+
+- Team versus department parent: added only the charter and team playbook memory.
+- Priya versus team parent: added only her onboarding plan and semantic memory.
+- No deletions or modified inherited documents.
+- Both merge previews reported no conflicts and no stale indexes.
+- Search verification returned both new documents as their branches’ top results.
+
+Key grounding evidence included:
+
+- Runtime handoff and release thresholds: `dsid_be35ae65a0ee488f9e547f1a07cc4f11`
+- Dispatcher memory/connection-window failures: `dsid_2ea2131de00f4d67878323beb975861b`
+- Deployment safety and rollback procedure: `dsid_494a57549a2e4751a962aaedaa512f93`
+- Failover exercise criteria: `dsid_57f9b542665c4c82b8b2648da13dfb0e`
+- SRE evidence capture: `dsid_e66a224a5c7e47dc8924c71b23e6a10`
+- Senior-IC 48-hour access review: `dsid_11b4dc5c498c472b9827a245f5a0720e`
+- Manager access verification: `dsid_fdc9b77a90a5434d8c576afdcc0c8a72`
+- Incident-volume and ownership searches also surfaced recurring high-volume retry/failover spirals, partial runtime ownership gaps, and actionable-pager targets, informing the charter’s weekly intake and monthly volume/ownership reporting.

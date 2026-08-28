@@ -1,0 +1,36 @@
+Created and validated Maya’s safe onboarding workspace.
+
+- Branch: `people/maya-desai`, based on `team/platform-console`
+- Status: isolated; not published, promoted, or deleted
+- Parent review: exactly two added indexed documents, with no deletions or modifications
+
+Documents:
+
+- [Onboarding plan](/mnt/chronos-enterprise-state-division-v2/infra-v1-realistic-v2-20260815/host/states/01-chronos/state/checkouts/people-maya-desai/knowledge/people/maya-desai/onboarding-plan.md) — `workspace_cbe95ce565c09faba676695f`
+- [Codebase map](/mnt/chronos-enterprise-state-division-v2/infra-v1-realistic-v2-20260815/host/states/01-chronos/state/checkouts/people-maya-desai/knowledge/teams/platform-console/codebase-map.md) — `workspace_e05ea799be50113d3adf3c55`
+
+Both were indexed and successfully retrieved through enterprise-state search.
+
+Team memory:
+
+- Branch: `team/platform-console`
+- Memory ID: `platform-console-safe-onboarding-and-upstream-triage-v1`
+- Kind: `playbook`
+- Path: `/memory/playbook/safe-onboarding-and-upstream-code-triage-procedure-riage-v1.md`
+- The memory was synchronized down to Maya’s branch so its final parent diff contains only her two documents.
+
+Approval gaps:
+
+- Maya is absent from the authoritative employee-directory snapshot; employment activation and reporting line require confirmation.
+- No evidence currently grants repository, CI, tracker, observability, secrets, console-admin, customer-data, or production access.
+- Exact pinned revisions, bootstrap commands, CODEOWNERS groups, and mandatory CI checks remain to be confirmed after read access.
+- Proposed mentors must confirm availability.
+- Production, KMS/secrets, customer-data, and incident-command privileges remain unapproved.
+
+Primary evidence:
+
+- `curated_024986ded9ae947c8913f2eb` — Platform & Console scope, lead, and LiteLLM/Langfuse relationship.
+- `enterprise_9fbbe916a1d8961396219789` — Redwood organization and subsystem ownership.
+- `dsid_f954519b2b004d20acf952719135340a` — onboarding access, setup, validation, and production approval policy.
+- `infra_b0bb081732d3f8b2ab8b16f16d248328` — upstream-first qualification and bounded downstream-patch policy.
+- `infra_94ddb96e68610aa0f35d5b6a2d77276f` — Langfuse pinned-source reproduction and promotion checklist.

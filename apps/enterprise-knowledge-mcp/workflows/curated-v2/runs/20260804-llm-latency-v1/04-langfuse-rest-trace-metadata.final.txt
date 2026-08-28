@@ -1,0 +1,28 @@
+Implemented the isolated parity fix on `task/jada-williams/langfuse-rest-trace-v2`; it remains unmerged and mounted for review.
+
+Changed paths:
+
+- [eventsToTraceAdapter.ts](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/task-jada-williams-langfuse-rest-trace-v2/code/langfuse/web/src/features/events/lib/eventsToTraceAdapter.ts)
+- [eventsToTraceAdapter.fixtures.ts](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/task-jada-williams-langfuse-rest-trace-v2/code/langfuse/web/src/features/events/lib/eventsToTraceAdapter.fixtures.ts)
+- [eventsToTraceAdapter.clienttest.ts](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/task-jada-williams-langfuse-rest-trace-v2/code/langfuse/web/src/features/events/lib/eventsToTraceAdapter.clienttest.ts)
+- [langfuse-12736.md](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/task-jada-williams-langfuse-rest-trace-v2/artifacts/reviews/langfuse-12736.md)
+
+Behavior: REST events without `traceTags` now fall back to `tags`; latency remains derived from start/end timestamps. OTEL `traceTags` retain precedence. Regression coverage includes a historical REST fixture, 2.5-second latency assertion, tag assertion, and OTEL compatibility assertion.
+
+Checks attempted:
+
+- `pnpm --filter web run test-client src/features/events/lib/eventsToTraceAdapter.clienttest.ts` — blocked: `pnpm: command not found`.
+- `pnpm --filter web run lint` — blocked by the same environment limitation.
+- Browser review could not run because Node/pnpm and an exposed Playwright browser are unavailable.
+
+The exact remaining browser validation is documented in the review: seed a v4 trace tree, verify REST tags and the `2.50 s` badge, verify unchanged OTEL rendering, then inspect desktop/narrow layouts and browser console errors.
+
+Memory: `memory_609d5fdd19a7c439693456ca`.
+
+Diff against `person/jada-williams`:
+
+- Added: fixture, review artifact, episodic memory.
+- Modified: adapter and client test.
+- Deleted: none.
+
+Evidence includes issue snapshot `enterprise_98d847b52246775cfd590be6`, BeaconHealth customer evidence `dsid_2dbea63815614e35a7b98e86fa522bef`, preview-quality evidence `dsid_78e8f35d4d9945529de4157b5241bec9`, and API observability evidence `dsid_7cf150bf37b740b0a65b09d6b8cad669`. All changed source, fixture, test, and review files were re-indexed.

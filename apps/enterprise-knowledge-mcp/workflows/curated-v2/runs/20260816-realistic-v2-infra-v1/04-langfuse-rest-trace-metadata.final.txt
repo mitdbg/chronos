@@ -1,0 +1,41 @@
+Implemented the bounded parity fix on isolated branch `task/jada-williams/langfuse-12736`, created from `person/jada-williams`. Nothing was pushed, merged, or published.
+
+Changed areas:
+
+- [eventsToTraceAdapter.ts](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-realistic-v2-infra-v1-20260816/workdir/code/langfuse/code/langfuse/web/src/features/events/lib/eventsToTraceAdapter.ts)
+  - Unions tags from all preview event rows.
+  - Falls back to the latest distinct observation start when no `endTime` exists.
+  - Avoids falsely reporting `0s` for an indeterminate single-event trace.
+- [historical-rest-trace.json](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-realistic-v2-infra-v1-20260816/workdir/code/langfuse/code/langfuse/web/src/features/events/lib/fixtures/historical-rest-trace.json)
+  - Historical REST fixture with explicit start time, end time, tags, and event observations.
+- [eventsToTraceAdapter.clienttest.ts](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-realistic-v2-infra-v1-20260816/workdir/code/langfuse/code/langfuse/web/src/features/events/lib/eventsToTraceAdapter.clienttest.ts)
+  - Verifies both tags and six-second preview latency.
+
+Checks:
+
+- Client test attempted: `pnpm --filter web run test-client eventsToTraceAdapter.clienttest.ts`
+  - Could not start: `/bin/bash: pnpm: command not found`.
+- Server target identified: `pnpm --filter web run test ingestion-api.servertest.ts`
+- Lint target identified: `pnpm --filter web run lint`
+- Server and lint checks were likewise unavailable because the mounted environment has neither Node nor pnpm.
+- Enterprise diff confirms exactly two modified source/test files and one added fixture, plus the requested review and memory artifacts.
+
+Remaining browser validation requires a prepared Langfuse stack: ingest the historical fixture, compare preview and stable detail panels, verify both tags and `6s` latency, then verify an indeterminate single open event does not show `0s`.
+
+The complete evidence, behavior, commands, rollback/removal criteria, and browser checklist are in [langfuse-12736.md](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-realistic-v2-infra-v1-20260816/workdir/code/langfuse/artifacts/reviews/langfuse-12736.md).
+
+Re-indexed documents:
+
+- Adapter: `enterprise_1824ecafe798f2f02cd34ec4`
+- Client test: `enterprise_de4887c0ae327e22a3aa3c57`
+- Fixture: `workspace_3779035ac587ca7fa6e8f68f`
+- Review: `workspace_85665f9ed0647955693ef67c`
+
+Saved episodic memory `langfuse-12736-preview-rest-parity` at `/memory/episodic_memory/diagnosed-and-patched-langfuse-12736-preview-rest-parity-t-parity.md`.
+
+Primary evidence:
+
+- Issue #12736: `gh_6123d9d202c0afbbb78022976154bf64`
+- Preserved parity-fix evidence: `gh_5e935d453a51b1159918ed9b4ba9a346`
+- Redwood qualification record: `infra_f0cc671fa97e2f4cbe174a9ed45fe961`
+- Redwood review requirements: `infra_e765f2ca38a0dc8b91bf987991baf6f3`

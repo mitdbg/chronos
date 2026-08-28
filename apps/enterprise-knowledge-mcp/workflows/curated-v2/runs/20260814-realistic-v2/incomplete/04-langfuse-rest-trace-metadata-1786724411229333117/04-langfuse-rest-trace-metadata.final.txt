@@ -1,0 +1,23 @@
+Implemented and isolated on `task/jada-williams/langfuse-12736` from `person/jada-williams`; nothing was published or merged.
+
+Changed areas:
+
+- Preview adapter now accepts historical REST `tags` or normalized OpenTelemetry `traceTags`, preferring `traceTags`.
+- Trace latency is derived from earliest start/latest end timestamps.
+- Added a historical REST fixture with 3.5s latency and two tags.
+- Added REST regression coverage plus an OpenTelemetry parity guard.
+- Re-indexed source, fixture, test, and review files.
+
+Checks:
+
+- Targeted client test and formatting were attempted but could not run: `/bin/bash: pnpm: command not found`.
+- Node, dependencies, local services, and Playwright are absent, so ESLint, server tests, typecheck, and browser validation remain outstanding.
+- Required browser work: verify the preview displays the 3.5s latency badge and REST tags, then confirm an OpenTelemetry trace remains unchanged.
+
+Enterprise diff: 2 modified source/test files; 1 fixture, 1 review artifact, and 1 episodic memory added.
+
+Memory: `memory_76ca1b385aad093290aba7da`
+
+Evidence: issue document `enterprise_98d847b52246775cfd590be6`, API behavior `enterprise_24762787d9e3783b81edff11`, and preview UI evidence `enterprise_0ea60fe61ab87a394c2181ff`.
+
+Full evidence, behavior, checks, diff scope, and remaining browser steps are in `/artifacts/reviews/langfuse-12736.md`.

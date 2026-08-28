@@ -1,0 +1,32 @@
+Implemented and merged both Langfuse #15208 fixes into `person/sana-farid`.
+
+- Histogram fix: bucket calculations now use raw values. Only labels are rounded, with bin-width-derived precision. Added the `0.857`/seven-bin regression and distinct-edge assertion.
+- Pivot fix: `avg_*` subtotals and grand totals use count-weighted averages when a complete positive count metric exists. Added unequal `1/9` group coverage and an explicit unweighted fallback test when counts are unavailable.
+- Existing non-average aggregation behavior remains unchanged.
+- Indexed all four changed source/test files and both candidate notes.
+- Combined personal-branch inspection confirmed both implementations, both regression suites, and both notes are present.
+
+Checks:
+
+- Invoked `pnpm --filter web run test score-analytics-utils.servertest.ts`.
+- Invoked `pnpm --filter web run test pivot-table-utils.servertest.ts`.
+- Both were blocked before Vitest started: the mounted pinned snapshot references the absent `patches/next-auth@4.24.15.patch` (`ENOENT`). This limitation is recorded in both candidate notes; no test pass is claimed.
+
+Merge results:
+
+- Histogram merge committed: `merge:task/sana-farid/histogram-binning-v2:person/sana-farid:f38cfe7cf785425e800c0c8374e660c3`
+- Pivot merge committed: `merge:task/sana-farid/pivot-weighting-v2:person/sana-farid:f53b820258d14a0aa7e36147e8339721`
+- Three directory-inode conflicts created by the first merge were reviewed and resolved in favor of the personal-branch directory state; code changes were non-conflicting.
+- Both task branches were deleted successfully.
+
+Memory: `memory_b01e0d15b9a3263122f88bf6`
+
+Primary evidence:
+
+- Issue snapshot: `/code/upstream-issues/langfuse-15208.md`, document `enterprise_452a1a7f3eb80e14cfc4d7a0`
+- [Histogram implementation](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/person-sana-farid/code/langfuse/web/src/features/dashboard/lib/score-analytics-utils.ts:55)
+- [Histogram regression](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/person-sana-farid/code/langfuse/web/src/__tests__/server/score-analytics-utils.servertest.ts:1)
+- [Pivot implementation](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/person-sana-farid/code/langfuse/web/src/features/widgets/utils/pivot-table-utils.ts:493)
+- [Pivot regressions](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/person-sana-farid/code/langfuse/web/src/__tests__/server/pivot-table-utils.servertest.ts:360)
+- Candidate notes: `/artifacts/candidate-histogram-binning-v2.md` and `/artifacts/candidate-pivot-weighting-v2.md`
+- Internal evidence: multilang calibration bin-edge incident, coverage-weighted eval harness, ensemble weighting guidelines, and `ENG-46812` statistical-validation guidance.

@@ -1,0 +1,18 @@
+{
+  "workflow": "16-retention-memory-supersession",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/16-retention-memory-supersession.md",
+  "prompt_sha256": "1a956be23a79bfd76f798c68d66cbab6d3746fb79fa312a3815a792f14a653e9",
+  "session_id": "019fbf38-4e96-7101-9c19-fb1974411c25",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-atomic-updates-v1/codex-home/sessions/2026/08/01/rollout-2026-08-01T21-26-06-019fbf38-4e96-7101-9c19-fb1974411c25.jsonl",
+  "rollout_sha256": "e48d303bba34274214b1bf5153a26285269d14796e160b2d5b25740306cf38f2",
+  "events": 39,
+  "mcp_events": 39,
+  "shell_events": 0,
+  "patch_events": 0,
+  "memory_timestamps_resolved": 0,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/atomic-updates-v1/16-retention-memory-supersession.jsonl",
+  "trace_sha256": "4f635f3b105cd10c6c9c5090e708dab4b7ae367bd449e68523e6730d40554d38",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/16-retention-memory-supersession.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/16-retention-memory-supersession.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/16-retention-memory-supersession.final.txt"
+}

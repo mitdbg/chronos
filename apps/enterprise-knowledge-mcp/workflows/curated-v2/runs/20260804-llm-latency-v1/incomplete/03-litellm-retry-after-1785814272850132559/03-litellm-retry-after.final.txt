@@ -1,0 +1,40 @@
+Resolved LiteLLM #34399 and merged the reviewed changes into `person/kaitlyn-nguyen`.
+
+Changed paths:
+
+- `/code/litellm/litellm/router.py`
+- `/code/litellm/tests/test_litellm/test_router.py`
+- `/code/litellm/tests/local_testing/test_router_retries.py`
+- `/artifacts/reviews/litellm-34399.md`
+
+Policy contract:
+
+- Explicit provider `Retry-After` takes precedence over sibling-deployment failover.
+- Without `Retry-After`, a healthy sibling still enables immediate failover.
+- Regression coverage models two deployments sharing one upstream and fixes jitter for deterministic assertions.
+
+Checks:
+
+- Ruff formatting check: passed for all changed Python files.
+- Ruff syntax-critical rules `E9,F63,F7,F82`: passed.
+- Focused pytest: blocked during collection because the pinned source lacks `litellm/model_prices_and_context_window_backup.json`; no paid/provider calls occurred.
+- All changed files were re-indexed, with no stale index paths.
+
+Merge:
+
+- Status: `committed`
+- Operation: `merge:task/kaitlyn-nguyen/litellm-retry-after-v2:person/kaitlyn-nguyen:2b925eac00dd4ab89e317d8e4ad59ebc`
+- Four indexed document bundles promoted.
+- Task branch deleted successfully.
+
+Memory:
+
+- ID: `memory_dd8a385d19d15e83525a0c96`
+- Path: `/memory/playbook/litellm-retry-after-and-failover-precedence-contract-525a0c96.md`
+
+Primary evidence:
+
+- Issue snapshot: `/code/upstream-issues/litellm-34399.md` (`enterprise_2034a8245bcfb88af6beb9e8`)
+- Support incident: `SUP-659999` (`dsid_ba812bea360c4d39beeeccaa0f3dcff0`)
+- Redwood 429 guidance: `dsid_5dc49c2fda754b04ae09f952ddba3b70`
+- Review: `/artifacts/reviews/litellm-34399.md` (`workspace_9a608396e1cc1920874aa673`)

@@ -1,0 +1,21 @@
+Resolved vLLM issue #50026 and published the reviewed change to `person/marcus-reed`.
+
+- Added fail-closed validation for batch requests using `stream: true` or supplying `tools`.
+- Added focused coverage for streaming rejection, tools rejection, and a supported batch request.
+- Left the non-streaming collector and renderer unchanged, preserving their documented contract.
+- Re-indexed both changed files.
+- Added `/artifacts/reviews/vllm-50026-batch-validation.md`.
+- Saved reusable memory: `vllm-batch-chat-unsupported-features-fail-closed`.
+
+Validation:
+
+- Python compilation passed for both changed files.
+- Pytest and Ruff could not run because the offline checkout lacked cached dependencies.
+- GPU/model-server batch integration tests were unavailable and remain for CI.
+
+Publication:
+
+- Merge to `person/marcus-reed`: committed successfully.
+- No conflicts or stale indexes.
+- Temporary task branch removed.
+- No GitHub access, push, or upstream PR performed.

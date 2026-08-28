@@ -1,0 +1,106 @@
+Completed both publications and replaced the interim guidance with the corrected rule.
+
+### Policy revisions
+
+- v1, document `workspace_18c7cb7529877f59cc016aa5`
+  - Path: `/knowledge/policies/hosted-api-retention.md`
+  - SHA-256: `33824f473e5b79f6cdfbb00b82ef403328ecebfe92abbba84df9bfc79b429248`
+  - Published only the supported 90-day Hosted API-level log statement.
+  - Explicitly left payload retention, deletion, backups, tenant termination, and residency unresolved.
+  - Included validation and escalation steps.
+
+- Corrected v3, same document and path
+  - SHA-256: `65eac4c21fe252f522284eceafd67a6c71f01d9fb4af1e4fd928ca78aa80c1f0`
+  - Request/response payload logs: 30 days by default; 90/365 only by enterprise contract.
+  - Embeddings: 14 days by default, with a 7-day option.
+  - Ephemeral caches: under one hour unless explicitly persisted.
+  - Verified erasure/termination: serving stops immediately; primary purge within 30 days; backups and replicated snapshots scrubbed within 90 days.
+  - EU-only backup custody requires the enterprise residency addendum.
+  - Deletion/erasure audit events: 365 days.
+  - Region assignment does not by itself prevent cross-region runtime fallback.
+
+### Memories and supersession
+
+- v1: `mem_ethan_hosted_api_retention_v1_v3`
+- Replacement: `mem_ethan_hosted_api_retention_corrected_v3`
+- Relation: `mem_ethan_hosted_api_retention_corrected_v3` supersedes `mem_ethan_hosted_api_retention_v1_v3`.
+- Promotion removed the v1 memory’s document, chunk, vector, and file. It is no longer branch-visible.
+
+### Evidence
+
+Initial evidence covered three source systems:
+
+- Fireflies: `dsid_1ceb67c562a647838ca1b925f4187553`
+- Slack: `dsid_d9a15ab8f79c4c7e938f90cf3586da13`
+- Google Drive: `dsid_c0a03597cb93476b9904666e1aedd6e0`
+
+Correction evidence was fetched completely:
+
+- Gmail security-questionnaire response: `dsid_7c0ce3505c1d46d8a00aa6680c35fbd3`
+- Gmail Head-of-Security clarification: `dsid_9d01b1a924fd4ee994233893b1096d8a`
+- Jira production cross-region incident: `dsid_a6242651cc144f53bc7fe653dddfc8de`
+
+### Atomic merges
+
+v1 operation `merge-ethan-hosted-api-retention-v1-v3`:
+
+- Status: committed
+- Selected: 14; skipped: 8
+- Applied: SQLite 5, Qdrant 3, filesystem 13
+- Selected change IDs:
+  - `filesystem:664f0128d6b9d052e5282d66`
+  - `filesystem:be75010ac12239a51bca5f08`
+  - `filesystem:ccc7c299c8151cfed8db781c`
+  - `qdrant:e444d3551c84c4f9ab451f66`
+  - `sqlite:1e34261626c018c12566bd9e`
+  - `sqlite:66f8a6f74946f79eefaf49c3`
+  - `filesystem:951f15ed538a3f119e9f8b62`
+  - `filesystem:ae59d6f6ce6ee59546ff8d2a`
+  - `filesystem:cbf02de01e1f07d9fb79b278`
+  - `qdrant:15019f8f66463c6278774a75`
+  - `qdrant:fa8f82cedbea994d38f6d00a`
+  - `sqlite:5325ca638c933fded9752512`
+  - `sqlite:5db5c159632d739d33daa22e`
+  - `sqlite:7ed613a709563a5d2e0ccbff`
+
+Correction operation `merge-ethan-hosted-api-retention-correction-v3`:
+
+- Status: committed
+- Selected: 21; skipped: 9
+- Applied: SQLite 8, Qdrant 5, filesystem 9
+- Selected change IDs:
+  - `filesystem:58eb6a9af262586523480ead`
+  - `filesystem:6992c3e6687f11a9a95f2443`
+  - `filesystem:a22fd5b5f256f537404ac284`
+  - `qdrant:861dc3ffb0c50e47b7a15f5c`
+  - `sqlite:2e41cff204622e49eb537abd`
+  - `sqlite:e6c4f5fc148d05c87a3a2ba6`
+  - `filesystem:a9cac800907330b4d75d7313`
+  - `filesystem:faaf338ea221e6ceb1139ec2`
+  - `qdrant:1bd0a956a0b215cb5d251e17`
+  - `sqlite:bdf5c82619f6d8ac08f7a3e5`
+  - `sqlite:dcbfae01ea1016dd67764e47`
+  - `filesystem:96d3a941eedbcb274274df3e`
+  - `filesystem:a3cc66107a9e514e5d040963`
+  - `filesystem:d291e7ff1234cfa8c5d7d26a`
+  - `qdrant:382c76f1eb27d81c7188ff72`
+  - `qdrant:4d365326c58c0d3b3b52219c`
+  - `qdrant:8e99322901ce00d2fa53b5ae`
+  - `sqlite:1157da36dfcaf15bb20ea02b`
+  - `sqlite:a7d22ea6a07a35a87e6654f5`
+  - `sqlite:d1f96cdc5c61df2e932c7910`
+  - `sqlite:d5aeeec0486637756e2a4cae`
+
+### Exclusion and verification
+
+- Excluded from promotion: `/artifacts/drafts/retention-evidence-matrix.md`
+- Target verification confirmed:
+  - corrected policy present with `revision: corrected-v3`;
+  - replacement memory present with the correct `supersedes` metadata;
+  - v1 memory exact lookup returns no document;
+  - draft matrix does not appear in target search.
+
+Deleted task branches:
+
+- `task/ethan-park/retention-rule-v1-v3`
+- `task/ethan-park/retention-rule-correction-v3`

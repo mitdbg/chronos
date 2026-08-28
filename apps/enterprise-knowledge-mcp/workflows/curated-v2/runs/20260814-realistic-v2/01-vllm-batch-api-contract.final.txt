@@ -1,0 +1,25 @@
+Resolved vLLM issue #50026 in the pinned snapshot.
+
+- Added early validation rejecting `stream: true` and non-null `tools` for batch chat completions.
+- Added focused unit coverage for streaming rejection, tool rejection, and a supported batch request.
+- Left the renderer, collector, and supported batch-generation behavior unchanged.
+- Re-indexed both changed files and the review note.
+- Saved compatibility memory: `memory_58f1d8b9ef01a2ec63fb4ef8`.
+
+Validation:
+
+- Python byte-compilation passed for both changed files.
+- Focused pytest could not run because `pytest` is unavailable locally.
+- GPU/model-backed batch integration tests were not run because the runtime dependencies are unavailable.
+
+Publication:
+
+- Reviewed merge preview: no conflicts or stale indexes.
+- Promoted successfully to `person/marcus-reed`.
+- Operation: `vllm-50026-promote-20260814`.
+- Temporary branch `task/marcus-reed-vllm-50026` was removed.
+- No GitHub access, push, or upstream PR occurred.
+
+Review note: `/artifacts/reviews/vllm-50026-batch-validation.md`
+
+Remaining limitation: dependency-complete CI should run the focused validator tests and existing batched chat integration suite.

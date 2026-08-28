@@ -1,0 +1,21 @@
+Completed and left isolated pending approval.
+
+- Branch: `person/maya-desai-v2`, based on `team/platform-console`
+- Onboarding plan: `workspace_cbe95ce565c09faba676695f` — `/knowledge/people/maya-desai/onboarding-plan.md`
+- Codebase map: `workspace_e05ea799be50113d3adf3c55` — `/knowledge/teams/platform-console/codebase-map.md`
+- Playbook memory: `memory_8a9e594165306e2aaa43ef3b`
+- Search verification confirmed both indexed documents and memory are retrievable.
+- Diff contains exactly three added documents/files; no modifications or deletions. The branch was not merged or deleted.
+
+Approval gaps recorded in the plan:
+
+- Named LiteLLM gateway mentor/delegate
+- GitHub write and issue-tracker permissions
+- Non-production observability and local secret-development access
+- Internal CODEOWNERS aliases for both repositories
+- Upstream CLA/posting authorization
+- Any privileged or production roles
+
+Until approved, Maya remains limited to read-only access, local synthetic/seeded validation, and supervised support shadowing.
+
+Primary evidence includes the Platform & Console brief (`curated_024986ded9ae947c8913f2eb`), pinned repository manifest (`enterprise_3923c6b386416268c7e7f382`), published onboarding policies (`dsid_be4b992c9bd941c5942e600ef769f6e4`, `dsid_f954519b2b004d20acf952719135340a`), LiteLLM and Langfuse contributor guides, current In Progress support tickets, hosted-canary/audit work, and the platform ownership matrix. No Chronos source repository or backing database was inspected or modified.

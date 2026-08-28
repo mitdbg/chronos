@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "status": "correctness-add-on",
+  "base_suite": "suite.json",
+  "capture_policy": "real-codex-rollout-only",
+  "capture": {
+    "runs": "runs/20260801-atomic-updates-v1",
+    "traces": "traces/atomic-updates-v1",
+    "documents": 600,
+    "chunks": 8055,
+    "sample_fraction": 0.02,
+    "sample_seed": "chronos-atomic-updates-v1",
+    "selection_digest": "7c2c59c0d0bfb2560bf51053526b489b75827ed2b959011a6afb9ab2f6eb2cf9"
+  },
+  "workflows": [
+    {
+      "id": "14",
+      "prompt": "14-selective-residency-runbook-promotion.md",
+      "category": "selective-document-promotion",
+      "correctness_invariant": "reviewed runbook and memory are visible together while the draft remains private"
+    },
+    {
+      "id": "15",
+      "prompt": "15-competing-rollback-playbooks.md",
+      "category": "speculative-document-update",
+      "correctness_invariant": "one reviewed candidate is promoted without rejected-branch or experiment state"
+    },
+    {
+      "id": "16",
+      "prompt": "16-retention-memory-supersession.md",
+      "category": "document-and-memory-update",
+      "correctness_invariant": "the corrected policy and replacement memory become visible while the superseded memory disappears"
+    }
+  ]
+}

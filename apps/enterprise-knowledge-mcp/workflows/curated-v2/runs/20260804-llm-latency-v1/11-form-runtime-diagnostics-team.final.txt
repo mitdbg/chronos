@@ -1,0 +1,73 @@
+Implemented the approved organizational change. Both branches remain mounted, isolated, unmerged, and undeleted.
+
+### Branches and indexed knowledge
+
+- `team/runtime-diagnostics-v2`
+  - Parent: `department/infrastructure-sre`
+  - Mounted at `/state/checkouts/team-runtime-diagnostics-v2`
+  - Final charter: [operating-charter.md](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/team-runtime-diagnostics-v2/knowledge/teams/runtime-diagnostics/operating-charter.md)
+  - Document ID: `workspace_2f45b5996eb8413c361464ae`
+  - Initially indexed SHA: `745f5c0caad9c674b20d4556c041abaf6595044ecc2e6476b4d447a013432320`
+  - Replaced and re-indexed in place under the same path and document ID
+  - Final SHA: `a4c65b9678b5c8cc6688bab36c8dbefaa854b9ed6636ce6f82bf6aae3930dd12`
+  - Final index: 6 chunks
+
+- `person/priya-shah-v2`
+  - Parent: `team/runtime-diagnostics-v2`
+  - Mounted at `/state/checkouts/person-priya-shah-v2`
+  - Onboarding plan: [onboarding-plan.md](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/person-priya-shah-v2/knowledge/people/priya-shah/onboarding-plan.md)
+  - Document ID: `workspace_90138731027c9aaab2a740b5`
+  - SHA: `8444ff7a58b5fc46097ae6a848ec2d589549c8bcd4d5dfda0fffcfaedc6251b9`
+  - Index: 5 chunks
+
+### Memories
+
+- Team playbook memory: `memory_e941016df5e721f2d9a684e7`
+  - Reviewed runtime investigation and promotion procedure
+  - Cites the final charter, canary postmortem, regional failover criteria, release E2E strategy, and SEV-124 escalation evidence.
+
+- Priya semantic memory: `memory_626a6cd73591e0f3964fa815`
+  - Validated onboarding access rule: SSO within 1 business day; GitHub and PagerDuty/Datadog within 2; console sandbox within 3; 95% baseline access on day 1; same-day escalation of missed targets.
+
+### Parent diffs
+
+`team/runtime-diagnostics-v2` against `department/infrastructure-sre`:
+
+- Added documents:
+  - `workspace_2f45b5996eb8413c361464ae`
+  - `memory_e941016df5e721f2d9a684e7`
+- Added files:
+  - `/knowledge/teams/runtime-diagnostics/operating-charter.md`
+  - `/memory/playbook/reviewed-runtime-investigation-and-promotion-procedure-d9a684e7.md`
+- No deletions or parent modifications.
+
+`person/priya-shah-v2` against `team/runtime-diagnostics-v2`:
+
+- Added documents:
+  - `workspace_90138731027c9aaab2a740b5`
+  - `memory_626a6cd73591e0f3964fa815`
+- Added files:
+  - `/knowledge/people/priya-shah/onboarding-plan.md`
+  - `/memory/semantic_memory/validated-engineering-onboarding-access-turnaround-rule-964fa815.md`
+- No deletions or parent modifications.
+
+### Evidence used
+
+Authoritative evidence was fetched from six source systems:
+
+- Confluence — incident classification is currently insufficient to quantify reliable volume without a 90-day backfill; targets are ≥90% labeled coverage, 25% faster owner handoff, 15% lower median MTTR, and 20% QoQ reduction in the top three recurring classes:
+  - `dsid_0771b119d60346c2903084d9069b6fe3`
+- Slack — SEV-124 documented missing OOM triage, tokenization detection, and hot-rollout rollback ownership, plus escalation at 0–5, 5–15, and 15–60 minutes:
+  - `dsid_b7db94f4f13349948ae5d8303247897f`
+- Linear — runtime-1.19 reached a 2.6% bad-response rate and failed automatic rollback; evidence supports the 5% promotion boundary and sustained 1.5%/20-minute block:
+  - `dsid_63dc81476f6047fdbdf584c3bcd64f77`
+- Linear — regional resilience criteria include 99.95% global availability, ≤10% incremental canary burn over 24 hours, and ≥90% stream preservation or deterministic resume:
+  - `dsid_501d5f0ba32a4728a72d743ea5144f70`
+- Fireflies — customer incident review connected regional scheduling changes with queueing symptoms that ordinary GPU saturation signals did not explain:
+  - `dsid_46a4d80929554f98bdec1f3f63f3e9eb`
+- Gmail — customer failover requirements included ≤5-minute stateless RTO and 99.9% cross-region request success; the response explicitly warned that zero-loss telemetry cannot be promised without replication plumbing:
+  - `dsid_04a2b39fcb0148e18c60ee0faa837c94`
+- Confluence — release validation requires deterministic canary failure, idempotent rollback, known-good convergence, ≥99% Tier-A reliability, ≥95% injected-regression detection, and ≤2% false positives:
+  - `dsid_e023ab3458e04da28d248b4568e6fd06`
+- Confluence — onboarding turnaround and manager/buddy validation:
+  - `dsid_426645772b534ac4a6af358830cf7982`

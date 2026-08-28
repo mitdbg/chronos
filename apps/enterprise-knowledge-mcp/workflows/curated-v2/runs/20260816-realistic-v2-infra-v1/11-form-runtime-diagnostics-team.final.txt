@@ -1,0 +1,34 @@
+Organizational change completed in enterprise-state. Both approved branches remain isolated; no merge was performed.
+
+- `team/runtime-diagnostics`
+  - Parent: `department/infrastructure-sre`
+  - Charter: `/knowledge/teams/runtime-diagnostics/operating-charter.md`
+  - Document ID: `workspace_2f45b5996eb8413c361464ae`
+  - Final revision: 2, SHA-256 `807bbb86ab7d29da24463ef48cdadb946e9d5eeed917b3b010a384c6f8f50fc6`
+  - Revised in place—no duplicate document.
+  - Added measurable gates: 30-minute clean canary, p95 delta ≤50 ms, error delta ≤0.5 percentage points, 1–2% initial canary, failover RTO ≤5 minutes and RPO ≤15 minutes in ≥95% of drills.
+  - Playbook memory: `runtime-diagnostics-investigate-validate-promote-v1`
+
+- `person/priya-shah`
+  - Parent: `team/runtime-diagnostics`
+  - Onboarding plan: `/knowledge/people/priya-shah/onboarding-plan.md`
+  - Document ID: `workspace_90138731027c9aaab2a740b5`
+  - SHA-256: `3fe261c5f03487b07b18504d5c223df31eadb51fed89f0ced364d515007c4b6a`
+  - Covers role boundaries, first-week access, mentors, the 30-day investigation sequence, validation, and approval gates.
+  - Semantic memory: `priya-shah-onboarding-access-turnaround-v1`
+  - Validated rule: baseline access within two business days; scoped production access typically within five business days after training and Security approval.
+
+Reviewed diffs:
+
+- Team vs department: added only the charter and investigation/promotion playbook; no deletions or unrelated modifications.
+- Priya vs team: added only the onboarding plan and access-turnaround semantic memory; no deletions or unrelated modifications.
+- Merge previews reported no conflicts or stale index paths.
+
+Primary evidence included:
+
+- Recurring cold-start, KV-eviction, and ownership gaps: `dsid_a450344da1bb43d79ceaf112861b5f4c`, `dsid_d1eab7208aea4db0a3cfa8f197f19dbd`
+- Failover and restore gaps: `dsid_86f3cb6edffb487d889832a507515bf6`, `dsid_cfe3fb2db8bd446286e74dfbb2db0ef7`
+- Canary regression and rollback safety: `dsid_e24573c6625f402997436a2ede83bfa8`, `dsid_c6fab3836ce648d6ab83ec3a69c45d39`, `dsid_5b66dcf51a5948238c3338be191bf03f`
+- Priya’s preemption/rollback investigation: `dsid_62b9695b49a446acaa1f59a1427b8480`
+- Staffing and offer authorization: `dsid_e4bf62d7247e4867b72c78eb1441d392`
+- Access turnaround and approval controls: `dsid_6418143d8b5342cd80b308fdab0b726d`, `dsid_fdc9b77a90a5434d8c576afdcc0c8a72`, `dsid_c0cc0362bc394346a8445f5753751e18`

@@ -1,0 +1,59 @@
+Completed. Exactly one policy was published to `person/aisha-bello`.
+
+### Candidates
+
+- Fast recovery path: immediate operator-led rollback, 15-minute validation, limited network sampling, and retrospective approval completion. Strongest on recovery speed, but weaker on authorization, diagnosis, and auditability.
+- Evidence-gated path: immediate reversible traffic fencing, minimum evidence capture before persistent mutation, deterministic rollback thresholds, approval/break-glass controls, network/TLS isolation, validated snapshot sequencing, and 30-minute recovery validation.
+
+### Selection
+
+Selected the evidence-gated path without incorporating provisions from the rejected candidate.
+
+It better satisfies:
+
+- Published staged-rollout and deterministic rollback thresholds.
+- DNS/TLS incident evidence showing that network or trust-store failures can mimic release regressions.
+- Two-person, scoped, logged production break-glass requirements.
+- Snapshot integrity, ordered restoration, and destructive-change approval requirements.
+- Recovery needs by allowing traffic fencing immediately, before completing evidence collection.
+
+### Evidence reviewed
+
+Key evidence included:
+
+- `dsid_d7f999ad71f145a09f290ad23190df8b` — operational hardening and safe migration.
+- `dsid_fb0f5bcf6911468b8787ee48d1bef44a` — failure isolation and rollback.
+- `dsid_a43a83f1a6744c2fb07b1583f14c86c4` — phased rollout and rollback matrix.
+- `dsid_91f68bedf2d0467ab757b8bc6990d4c0` — private network evidence requirements.
+- `dsid_99c5a8ae5124458ea4cc4345b47a351f` — production break-glass controls.
+- `dsid_67fd0fa35c704bcbac0e7aa23fcd6285` — snapshot retention and ordered restore guidance.
+- `dsid_cff29f8260dc414bbbbd9b00d3110e96` — resolved DNS/TLS private-deployment incident.
+
+### Publication
+
+- Canonical runbook: `/knowledge/runbooks/private-deployment-rollback.md`
+- Policy: `Evidence-Gated`
+- Status: `reviewed-and-accepted`
+- SHA-256: `b591752bf74598ada8fb81d3da7bfe9827aeb37da10cb1bf5bf6ba73821d80f2`
+- Publication committed through reviewed, allow-listed atomic merges.
+- Experiment artifacts and rejected-branch state were excluded.
+
+### Semantic memory
+
+Saved and published:
+
+- ID: `private-deployment-rollback-contract-v1`
+- Path: `/memory/semantic_memory/accepted-private-deployment-rollback-contract-tract-v1.md`
+- Confidence: `0.96`
+
+The memory records immediate traffic fencing, evidence requirements, deterministic gates, approval controls, artifact/config reversion before state restoration, and 30-minute validation.
+
+### Verification and cleanup
+
+- Personal branch search returns the accepted memory and canonical runbook.
+- Runbook metadata confirms `policy_variant: evidence-gated` and `status: reviewed-and-accepted`.
+- Final diff showed the selected branch’s only unpublished file was its private experiment artifact.
+- No experiment artifact was published to the personal branch.
+- Both temporary branches were successfully deleted:
+  - `task/aisha-private-rollback-fast`
+  - `task/aisha-private-rollback-evidence`

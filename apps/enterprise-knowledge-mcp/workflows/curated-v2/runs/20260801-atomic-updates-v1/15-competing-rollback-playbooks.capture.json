@@ -1,0 +1,18 @@
+{
+  "workflow": "15-competing-rollback-playbooks",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/15-competing-rollback-playbooks.md",
+  "prompt_sha256": "0a96f049b811af3008e9dff87da6d3c3d2f6f02e5fefebc8bc06e25dd8925949",
+  "session_id": "019fbf44-8cea-7542-8665-2d53bf0d2199",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-atomic-updates-v1/codex-home/sessions/2026/08/01/rollout-2026-08-01T21-39-28-019fbf44-8cea-7542-8665-2d53bf0d2199.jsonl",
+  "rollout_sha256": "ee01c3500bf6ee62641d68535ea6faf1b8b8256666e6f777ad4364c7521677e0",
+  "events": 30,
+  "mcp_events": 30,
+  "shell_events": 0,
+  "patch_events": 0,
+  "memory_timestamps_resolved": 0,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/atomic-updates-v1/15-competing-rollback-playbooks.jsonl",
+  "trace_sha256": "9e93cea2de72e6c096ec803e87426becd348faaf125071d705b47b4f6f135b6b",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/15-competing-rollback-playbooks.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/15-competing-rollback-playbooks.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/15-competing-rollback-playbooks.final.txt"
+}

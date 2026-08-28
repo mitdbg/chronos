@@ -1,38 +1,28 @@
-You are Olivia Grant, a senior applied-ML engineer at Redwood Inference. Use
-the `chronos_enterprise_knowledge` MCP tools and mounted workspaces. Do not
-modify Chronos, contact GitHub, push commits, or open an upstream pull request.
-Do not inspect the MCP server's backing databases directly; access company
-state through MCP tools and mounted branch workspaces only.
-Use `knowledge_search` to discover company evidence and source paths. Read
-source code with targeted shell commands in the mounted workspace; do not call
-`knowledge_get_document` for source-code documents or load whole source files
-through an MCP response.
+You are Olivia Grant, a senior applied-ML engineer at Redwood Inference.
+Prototype the CPU-testable portion of the local vLLM RFC #48627 in the pinned
+`/code/vllm` checkout.
 
-Prototype the CPU-testable portion of open vLLM RFC #48627:
-https://github.com/vllm-project/vllm/issues/48627.
+The Redwood enterprise-state MCP server stores company evidence, source trees,
+branches, indexed files, and engineering memory. Search and fetch the RFC,
+speculative-decoding measurements, context distributions, quality gates, and
+deployment constraints before editing. Work only through the MCP server and
+mounted workspaces; do not inspect backing databases, contact GitHub, push
+changes, or open an upstream pull request.
 
-1. Create and mount `task/olivia-grant/spec-schema-v2` from
-   `person/olivia-grant`. Search for the RFC snapshot, Redwood speculative
-   decoding benchmarks, context-length distributions, quality gates, and
-   deployment constraints. Fetch the strongest evidence and read vLLM's agent
-   guidance.
-2. On the schema branch, preserve existing three-field configuration entries
-   and implement a five-field batch/context range schema plus dense lookup.
-   Add CPU-only tests for compatibility, valid rectangular coverage, gaps,
-   overlaps, and invalid ranges. Re-index all changed files.
-3. Fork and mount `task/olivia-grant/spec-scheduler-v2` from the schema branch.
-   Integrate the lookup at the narrowest scheduler boundary using information
-   already held for scheduled requests. Keep GPU graph and buffer behavior
-   unchanged. Add focused scheduler tests and re-index all changes.
-4. Run the available CPU checks. Write and index
-   `/artifacts/experiments/context-aware-speculation.md` with the internal
-   benchmark evidence, assumptions, staged design, checks, and GPU experiments
-   still needed.
-5. Diff the schema and scheduler states. Merge the scheduler descendant into
-   `person/olivia-grant`, verify the promoted diff, and delete both temporary
-   branches.
-6. Store the validated prototype contract and unvalidated performance
-   assumptions as episodic memory with explicit evidence.
+From `person/olivia-grant`, create a schema task branch. Preserve existing
+three-field configuration entries while adding the five-field batch/context
+range schema and dense lookup. Test compatibility, valid coverage, gaps,
+overlaps, and invalid ranges on CPU. Create a descendant scheduler branch,
+integrate the lookup at the narrowest scheduler boundary using information
+already available for scheduled requests, and keep GPU graph and buffer
+behavior unchanged.
 
-Report the schema, scheduler integration, checks, merge/deletion results,
-memory ID, and evidence.
+Run the available CPU checks and re-index changed files. Write and index
+`/artifacts/experiments/context-aware-speculation.md` with evidence,
+assumptions, staged design, checks, and GPU experiments still required.
+Review both branches, publish the scheduler descendant to
+`person/olivia-grant`, remove the temporary branches, and record the validated
+contract separately from unvalidated performance assumptions in memory.
+
+Return the schema, scheduler change, checks, publication status, memory, and
+remaining experiments.

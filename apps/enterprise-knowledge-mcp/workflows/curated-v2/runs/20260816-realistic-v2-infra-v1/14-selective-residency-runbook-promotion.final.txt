@@ -1,0 +1,30 @@
+Completed the EU failover review and atomically published it to `person/jada-williams`.
+
+- Evidence: finalized residency contract/playbook, routing authorization designs, regional KMS guidance, audit-support request, and a prior residency incident:
+  - `dsid_2b023bf742d74ad598bc190502d98808`
+  - `dsid_55b9ac7c77294d39bdd45108b052550d`
+  - `dsid_8bcf38423f3548078433c0dd4de38b36`
+  - `dsid_83fa9cbbc1a445e3aaacdce1f9e0d786`
+  - `dsid_5c1f084368874ecc9d633673048bc67f`
+  - `dsid_ebc7b93e97384de09af72b95fab6e1b6`
+
+- Published document: `/knowledge/runbooks/eu-residency-failover.md`
+  - Document ID: `workspace_a8999f9c18bb9db043105036`
+  - SHA-256: `f31f66fe1600975f272b3b0a18fe85536cfaa0eb815c8bad37ffeba8cdabddc0`
+  - Indexed as eight chunks.
+
+- Semantic memory: `support-rule-eu-hosted-failover-consent-v1`
+  - Records deny-by-default cross-region routing and evidence-qualified customer communications.
+  - Published as one indexed semantic-memory chunk.
+
+- Publication: operation `publish-eu-residency-failover-20260816` committed atomically.
+  - 34 approved changes selected.
+  - Nine draft-related changes skipped.
+
+- Excluded draft: `/artifacts/drafts/eu-residency-interview-notes.md`
+  - Kept private and unindexed.
+  - Post-publication diff confirmed it was the only remaining task-branch file and was absent from the published branch.
+
+- Verification: the published branch contains the runbook and semantic memory with matching hashes. The task branch was then deleted successfully.
+
+Remaining uncertainty concerns the authoritative Hosted audit-log retention/export SLA, precise control-plane metadata treatment under each contract, older customer-specific emergency language, readiness of individual EU/KMS failover pairs, and tenant-specific queue durations.

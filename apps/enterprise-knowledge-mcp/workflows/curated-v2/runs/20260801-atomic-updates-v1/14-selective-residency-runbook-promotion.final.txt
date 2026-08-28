@@ -1,0 +1,37 @@
+Completed the reviewed EU failover knowledge update.
+
+- Evidence from four source systems:
+  - Gmail contract guidance — `dsid_7c0ce3505c1d46d8a00aa6680c35fbd3`
+  - Slack architecture consent defaults — `dsid_1662fb1688464890a49bd76bf984e498`
+  - GitHub merged KMS/audit controls — `dsid_534ff13a34e54451b1f42e14745ae8fb`
+  - Jira EU-routing incident procedure — `dsid_a6242651cc144f53bc7fe653dddfc8de`
+
+- Indexed document:
+  - `/knowledge/runbooks/eu-residency-failover.md`
+  - Document ID: `workspace_a8999f9c18bb9db043105036`
+  - SHA-256: `52bc47c7a5bcdc0536a76bfdefebd977dc43a0a5cb102991a6bd9551a60806c9`
+
+- Semantic memory:
+  - ID: `memory_9037bc6798cef04522c36d34`
+  - Reviewed rule requires explicit affirmative consent, fail-closed defaults, KMS/key-region and signed-audit verification, and escalation for conflicts or unsupported promises.
+
+- Excluded path:
+  - `/artifacts/drafts/eu-residency-interview-notes.md`
+  - It was neither indexed nor merged.
+
+- Selected stable change IDs:
+  - Memory bundle: `filesystem:88abca208bc3acd8a281dafe`, `filesystem:95a38a72ed107011dad10f4c`, `filesystem:d24bd3f5689963d29a96769a`, `qdrant:8c0d9140afe5cc869c06e5ec`, `sqlite:52ff44738c33a517a3ba6bf3`, `sqlite:d6415c6a4185fd679e90a0c6`
+  - Runbook bundle: `filesystem:6b8ba9537f8537c20bbe6b42`, `filesystem:a3f7419b632d9aa7b5ca94ca`, `filesystem:b6ce17cf2620eccfda063326`, `filesystem:dcae218d299f4767cd8a46bd`, `qdrant:21d535f7066a1f257fbd3f33`, `qdrant:3f3a3d89b723800e73502f81`, `qdrant:520ee507bde2627b0ccace54`, `qdrant:b45c11b759e6fb320a05e043`, `sqlite:0cfc6294b70ef99d0655978b`, `sqlite:1e58432da8eab8692acb080b`, `sqlite:9191abed5d15a9ab4e46c0b1`, `sqlite:b72fe79999c9ba6b3e46406f`, `sqlite:ea72f122b5cbcf06b6b33756`
+
+- Merge:
+  - Status: `committed`
+  - Operation: `merge:task/jada-williams/eu-residency-runbook-v3:person/jada-williams:75dda87daf1540609aaac6b1f458ee27`
+  - 19 selected; 15 unselected changes skipped.
+
+- Verification:
+  - Target MCP reads confirmed both indexed document and memory.
+  - Post-merge diff showed only the draft remaining task-local.
+  - Target search returned zero draft-path hits.
+
+- Deletion:
+  - `task/jada-williams/eu-residency-runbook-v3` deleted successfully.

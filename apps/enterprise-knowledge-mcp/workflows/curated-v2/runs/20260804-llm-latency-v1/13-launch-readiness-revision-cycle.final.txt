@@ -1,0 +1,35 @@
+Prepared the reviewable launch decision on isolated branch `task/ethan-park/launch-readiness-v2`, based on `person/ethan-park`. It remains unmerged and mounted for review.
+
+Final artifact: [launch-readiness.md](/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/codex-trace-capture-llm-v1/state/checkouts/task-ethan-park-launch-readiness-v2/artifacts/product/launch-readiness.md)
+
+Indexed revisions, all using document ID `workspace_12049bce905e1125266e083d`:
+
+1. Product, delivery, and design — `65fa433339c3d6fa00b644c62827cda7e08e3a6590fe080a596c91c8d4a075f9`
+2. Operational reconciliation — `b9cc83a873af5031c646d3f958675a9dc0aa6defe39c03906b026ac253c7a5c2`
+3. Final customer/cohort decision — `4c65d1ec70ee9c960bcc1da8564127430a1ada095132caaf0ec3829c46a7e804`
+
+Final recommendation: **NO-GO for customer launch.** Internal dogfood and staging validation may continue. Once all gates close, the first reviewable customer scope is completions-only, for named design partners in one healthy region at 1% traffic with a matched control. Chat, embeddings, and rerank remain excluded pending their specific evidence.
+
+Primary blockers:
+
+- OpenAPI, examples, quickstarts, and migration guide
+- SDK RC1, SSE shim, Node streaming and large-payload coverage
+- Production-like benchmark and ENG-4239 autoscaler verification
+- Cohort telemetry, alerting, kill switches, and rollback rehearsal
+- Retention/audit/RBAC verification and final Security approval
+- Billing and quota E2E validation
+- Embeddings determinism and rerank-fidelity tests
+- Support training, macros, sample-ticket proof, and response-policy approval
+- Release evidence and Product, Engineering, SRE, Security, and Release signoffs
+
+Semantic memory: `memory_861ceee5373d26689807d434`.
+
+Diff against `person/ethan-park`:
+
+- Documents added: final artifact and semantic memory
+- Files added:
+  - `/artifacts/product/launch-readiness.md`
+  - `/memory/semantic_memory/hosted-api-launch-decision-and-accepted-criteria-9807d434.md`
+- Deleted or modified inherited files: none
+
+Evidence spans Linear product/delivery/support records, published Confluence SRE and Security requirements, Google Drive Release Engineering controls, Gmail support-readiness evidence, and Fireflies customer-success feedback. No Chronos source repository files were modified, and the branch was neither merged nor deleted.

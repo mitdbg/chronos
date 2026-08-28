@@ -1,0 +1,18 @@
+{
+  "workflow": "14-selective-residency-runbook-promotion",
+  "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/14-selective-residency-runbook-promotion.md",
+  "prompt_sha256": "8b417d40cb22edf03385f29bd43c3bc6928fdb658a4c5092495e0d3067270d87",
+  "session_id": "019fbf41-8c9f-7f02-82ff-26036c5acdd9",
+  "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-atomic-updates-v1/codex-home/sessions/2026/08/01/rollout-2026-08-01T21-36-11-019fbf41-8c9f-7f02-82ff-26036c5acdd9.jsonl",
+  "rollout_sha256": "897ae40a8087b39332cccaca87c5ad8bc5e74c4a15ba5a2ade36958959da81e0",
+  "events": 26,
+  "mcp_events": 26,
+  "shell_events": 0,
+  "patch_events": 0,
+  "memory_timestamps_resolved": 1,
+  "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/atomic-updates-v1/14-selective-residency-runbook-promotion.jsonl",
+  "trace_sha256": "cb3cb7d9ab69914a148b54ef2fc064f82a5936a57c63de423359d6f20caa19e4",
+  "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/14-selective-residency-runbook-promotion.events.jsonl",
+  "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/14-selective-residency-runbook-promotion.stderr.log",
+  "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/14-selective-residency-runbook-promotion.final.txt"
+}

@@ -1,0 +1,22 @@
+Resolved vLLM issue #50026 in the pinned `272abd5f` snapshot.
+
+- Added fail-closed validation rejecting batch chat requests with `stream: true` or non-empty `tools`.
+- Added focused tests for streaming rejection, tool rejection, and a supported non-streaming request.
+- Left collector and rendering behavior unchanged.
+
+Checks:
+
+- Passed Python compilation for both changed files.
+- Passed `git diff --check`.
+- Focused pytest was unavailable because `pytest` is not installed.
+- GPU-backed batch endpoint testing was not run due to unavailable model/integration dependencies and accelerator resources.
+
+Publication:
+
+- Re-indexed both changed files.
+- Published the reviewed changes, [review note](/mnt/chronos-enterprise-state-division-v2/infra-v1-realistic-v2-20260816/host/states/01-chronos/state/checkouts/task-marcus-reed-issue-50026/artifacts/reviews/vllm-issue-50026.md), and compatibility memory to `person/marcus-reed`.
+- Verified no remaining task/personal diff.
+- Deleted temporary branch `task/marcus-reed/issue-50026`.
+- No GitHub access, push, or upstream PR was performed.
+
+Remaining limitation: runtime pytest and GPU/integration validation still need to run in a provisioned vLLM test environment.

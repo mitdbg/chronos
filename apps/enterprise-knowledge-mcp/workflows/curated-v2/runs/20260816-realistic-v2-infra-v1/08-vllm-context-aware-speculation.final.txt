@@ -1,0 +1,30 @@
+Implemented and published the CPU-testable RFC #48627 prototype to `person/olivia-grant`.
+
+- Schema: supports legacy `(batch_start, batch_end, K)` entries and homogeneous five-field `(batch_start, batch_end, context_start, context_end, K)` entries with inclusive bounds.
+- Compatibility: legacy gap carry-forward remains unchanged.
+- Five-field behavior: validates bounds and overlapping rectangles; uncovered cells and contexts beyond the configured dense table safely use static K.
+- Scheduler: selects K at the existing final scheduling boundary using scheduled batch size and the maximum `num_computed_tokens` among scheduled requests.
+- GPU behavior: no changes to CUDA-graph capture, lookahead allocation, proposer/model-runner buffers, or worker structures.
+
+Checks:
+
+- Direct CPU contract checks passed for compatibility, coverage, gaps, overlaps, mixed schemas, and invalid ranges.
+- Bytecode compilation passed for configuration, lookup, scheduler, and tests.
+- Focused pytest was unavailable because `pytest` was not installed in the offline workspace; no dependencies were fetched.
+- All changed files were re-indexed.
+
+Publication:
+
+- Scheduler descendant merged into `person/olivia-grant`.
+- Operation: `publish-rfc48627-context-aware-speculation`
+- Status: committed, target segment advanced from 126 to 133.
+- Both temporary task branches were deleted.
+
+Memory:
+
+- Validated contract: `memory_ee44c10514c2b4191115dd74`
+- Explicitly unvalidated performance assumptions: `memory_9caeca91fd6a270959451447`
+
+The indexed report is at `/artifacts/experiments/context-aware-speculation.md` (`workspace_40ff7605167df1aa4bcec22c`).
+
+Remaining work is GPU qualification: CUDA-graph coverage for every K, batch/context sweeps across 1k–32k contexts, acceptance and throughput measurements, TTFT/TPOT and tail latency, GPU memory and graph-recapture monitoring, output-quality comparison, DP/fixed-proposer fallbacks, production-distribution replay, and rollback-qualified canary testing.

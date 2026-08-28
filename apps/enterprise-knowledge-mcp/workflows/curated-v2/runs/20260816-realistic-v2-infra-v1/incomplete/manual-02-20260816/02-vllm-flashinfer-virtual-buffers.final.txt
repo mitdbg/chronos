@@ -1,0 +1,29 @@
+Implemented and published the guarded grow-on-demand candidate to `person/lena-fischer`.
+
+Two designs:
+
+- Initialization capacity: pre-size FlashInfer metadata using `max_num_seqs × ceil(max_model_len / attention_chunk_size)`. Correct and graph-stable, but can reserve substantial virtual-request metadata at startup.
+- Guarded growth: resize request and page buffers only when observed virtual batches exceed capacity. Exact-sized allocations; captured CUDA-graph buffers cannot be replaced.
+
+Evidence:
+
+- Issue and acceptance criteria: `/knowledge/company/sources/github_public/vllm-project/vllm/issues/49980.json` (`gh_e0aa62e0fa653464826dccc70710bdfd`)
+- Long-prefill OOM history: `/knowledge/company/sources/slack/incidents/7077777777-prefill-oom-sticky-crash-handoff.json`
+- Graph-stability expectations: `/knowledge/company/sources/linear/engineering/ENG-80521-prefill-boundary-coalescing-cuda-graph-snapshots.json`
+- Chunked-local attention explicitly disables graph capture, making guarded growth safe on the affected prefill path.
+
+Coverage and checks:
+
+- Added the same CPU regression to both candidates: a 34,000-token request with an 8,192-token chunk expands into five virtual batches and 2,560 padded pages.
+- Python 3.12 AST and bytecode compilation passed on both branches.
+- Pytest could not run because the snapshot lacked a `.venv` and host Python 3.12 lacked pytest.
+- GPU validation remains required: FlashInfer long-prefill serving, ordinary decode, and CUDA-graph capture/replay checks.
+
+Publication:
+
+- Changed source and tests were re-indexed.
+- Stronger guarded-growth candidate merged successfully under operation `vllm-49980-publish-guarded-grow`.
+- Candidate note published at `/artifacts/vllm-49980-candidate.md`.
+- Rejection rationale recorded as reusable memory `memory_545b19207656d2f59f29e065`.
+- Both temporary task branches were deleted.
+- No GitHub contact, push, upstream PR, or Chronos modification occurred.

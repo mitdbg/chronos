@@ -1,0 +1,29 @@
+Resolved and published both independent fixes to `person/sana-farid`.
+
+- Histogram fix: bucket membership, minimum, and range now use raw values; only display labels are rounded. Added the seven-bin `0.857` regression plus integer-score preservation coverage.
+- Aggregation fix: grouped averages now use `Σ(avg × count) / Σ(count)` when a count metric exists. Missing pairs are excluded, zero total count returns zero, and absence of a count metric retains the documented unweighted fallback. Non-average aggregation logic is unchanged.
+
+Evidence used:
+
+- `/code/upstream-issues/langfuse-15208.md` (`enterprise_452a1a7f3eb80e14cfc4d7a0`)
+- `/code/langfuse/web/src/features/widgets/chart-library/ARCHITECTURE.md`
+- Quality Metrics Observability Standard (`dsid_84a9dac9a58d4626aaf08ec637efbff7`)
+
+Publication:
+
+- Histogram operation: `langfuse-15208-histogram-reviewed`
+- Weighted operation: `langfuse-15208-weighted-reviewed`
+- Both merges committed successfully.
+- All six changed source, test, and candidate-note files were re-indexed.
+- Candidate notes published under `/artifacts/`.
+- Temporary candidate branches deleted.
+
+Memory saved as `langfuse-15208-corrected-analytics-contracts`, recording both corrected analytics contracts and their evidence.
+
+Remaining validation: the narrow Vitest commands and lint could not run because the mounted snapshot contains no Node or `pnpm` executable (`pnpm: command not found`). Once a toolchain is available, run:
+
+```bash
+pnpm --filter web run test src/__tests__/server/unit/score-analytics-utils.servertest.ts
+pnpm --filter web run test src/__tests__/server/pivot-table-utils.servertest.ts
+pnpm --filter web run lint
+```

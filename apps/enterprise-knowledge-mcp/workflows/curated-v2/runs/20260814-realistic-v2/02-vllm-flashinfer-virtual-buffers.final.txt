@@ -1,0 +1,35 @@
+Implemented and published the initialization-time capacity candidate to `person/lena-fischer`.
+
+Design comparison:
+
+| Candidate | Correctness | Graph safety | Allocation cost | Decision |
+|---|---|---|---|---|
+| Initialization-time capacity | Covers all three buffers using worst-case virtual requests and padded chunk pages | Stable buffer identities; decode graph sizing remains based on `max_num_seqs` | Extra allocation only for chunked-local models; ordinary path unchanged | Selected |
+| Guarded grow-on-demand | Covers observed overflow and avoids allocation on the common path | Unsafe after capture because replacing GPU buffers can leave graphs referencing old storage | Lowest initial allocation; three integer guards per build | Rejected |
+
+The selected bound treats each scheduled token as a possible virtual request and sizes pages for each padded local-attention chunk. It preserves the existing allocation for models without `attention_chunk_size`.
+
+Evidence used:
+
+- Issue and acceptance criteria: `/code/upstream-issues/vllm-49980.md` (`enterprise_1273061e2e9eafa6a2016560`)
+- FlashInfer allocation and metadata writes: `/code/vllm/vllm/v1/attention/backends/flashinfer.py`
+- Chunked-local virtual-batch expansion: `/code/vllm/vllm/v1/attention/backends/utils.py`
+- CUDA-graph shape/storage stability expectations: `/knowledge/company/sources/fireflies/sales-calls/2025-12-03-persistent-kv-cache-impact-cuda-graph-instability.json`
+- Long-context/prefill stress expectations: `/knowledge/company/sources/confluence/eng-serving-runtime/benchmarking-and-perf-suite/tp-stress-suite-spec.json`
+
+Checks:
+
+- Identical CPU regression added to both candidates: `2` logical sequences and `16` scheduled tokens require capacity for `16` virtual requests and `32` padded pages.
+- Python compilation passed for all changed source and test files on both branches.
+- Focused CPU execution of the capacity helper passed for chunked-local and ordinary attention.
+- Full pytest could not run because `pytest` is not installed in the snapshot.
+- GPU FlashInfer execution and CUDA-graph capture/replay validation remain required on GPU CI.
+
+Publication status:
+
+- Changed files re-indexed.
+- Selected candidate and note merged atomically into `person/lena-fischer`.
+- Rejection rationale recorded as reusable memory: `memory_a6f007151cda2bf1bafb32cc`.
+- Both temporary task branches deleted.
+- No GitHub contact, push, upstream PR, or Chronos modification occurred.
+- Incidental `.venv` and bytecode artifacts created by unavailable test tooling were removed before publication.

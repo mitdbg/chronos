@@ -1,0 +1,61 @@
+Completed all three independent investigations and published the reviewed packages to `person/aisha-bello`.
+
+### Reports and diagnoses
+
+- `/artifacts/incidents/cross-language-streaming-startup-hang.md`
+  - Document: `workspace_4102dd7f054b1b9ed0841955`
+  - Diagnosis: cross-SDK session-grace inconsistencies and refresh/drain contention when token refresh overlaps EOF or cancellation.
+  - Memory: `episodic/aisha-stream-refresh-drain-hang`
+  - Confidence: 0.90
+
+- `/artifacts/incidents/predictive-autoscaling-reacts-too-late.md`
+  - Document: `workspace_6ea699522e9342f324162074`
+  - Diagnosis: predictive lead time may be shorter than SKU/region provisioning and warmup time; the 10-minute default is not universally sufficient.
+  - Memory: `episodic/aisha-predictive-lead-time`
+  - Confidence: 0.78
+
+- `/artifacts/incidents/shard-reassignment-policy-reload-throttling.md`
+  - Document: `workspace_b368b58121b997ab096f12ed`
+  - Diagnosis: shard handoff plus policy reload can expose a cached credit pointer validated by shard ID but not tenant ID, causing transient cross-tenant credit application and over-allow.
+  - Memory: `episodic/aisha-rateengine-pointer-race`
+  - Confidence: 0.96
+
+The reviewed branch diffs were disjoint: each investigation added one report and one episodic memory, with no inherited modifications or deletions.
+
+### Runbook
+
+Published:
+
+- `/knowledge/runbooks/runtime-incident-triage.md`
+- Document: `workspace_faa55d769e149d629fc1b55e`
+- SHA-256: `60bbf6b22bd1ce8024cfc1d88b27a9caf6aa40522d9024ab8e5419b4eccd5983`
+- Playbook memory: `playbook/aisha-runtime-incident-triage`
+
+The decision tree distinguishes:
+
+1. SDK refresh/EOF/drain overlap.
+2. On-time predictive decisions but late usable capacity.
+3. Over-allow with unexpected tenant-bucket binding during handoff/reload.
+
+### Publications
+
+Committed merge operations:
+
+- Streaming: `merge:task/aisha-streaming-startup-hang:person/aisha-bello:ce9b01f013cc46059adc55fbf4ef4799`
+- Autoscaling: `merge:task/aisha-predictive-autoscaling-late:person/aisha-bello:3baae87ced054d9bac9024084eaeff0c`
+- Throttling: `merge:task/aisha-shard-policy-throttling:person/aisha-bello:11ddcfc043154512967c1d88a33e8801`
+- Runbook: `merge:task/aisha-runtime-incident-triage-runbook:person/aisha-bello:3d60a1ff027f4e92985d9a889205284a`
+
+Final verification detected two missing ChronosFS report files despite existing metadata. They were restored and reindexed through:
+
+- `merge:task/aisha-incident-publication-repair:person/aisha-bello:2e4535ad383c469a8535094769bca168`
+
+All three reports, three episodic memories, the runbook, and playbook memory were subsequently fetched successfully from `person/aisha-bello`.
+
+### Remaining uncertainty
+
+- Streaming: confirm SDK versions and refresh/EOF or cancellation overlap; a post-byte idle hang may be a separate idle-timeout issue.
+- Autoscaling: no deployment timeline was supplied. Exclude timezone, stale forecast, bounds, cooldown, and regional shortage before declaring lead time the incident-specific root cause.
+- Throttling: the source ticket remains in progress; fleet-wide remediation and historical accounting impact still require rollout confirmation and reconciliation.
+
+All five temporary task branches, including the repair branch, were removed. Only the durable personal-branch publications remain.

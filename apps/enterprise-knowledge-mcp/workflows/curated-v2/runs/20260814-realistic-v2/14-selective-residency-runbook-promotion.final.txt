@@ -1,0 +1,38 @@
+Completed and published the reviewed EU failover response to `person/jada-williams`.
+
+- Evidence: Reviewed security boundaries, Hosted residency requirements, cross-border guidance, KMS failure controls, regional communications, and Support handoff procedures. Primary sources included:
+  - `dsid_e86ea669ce674d9e87dd8712dd738349` — Failover and Security Boundaries
+  - `dsid_eae602f3def843a5ab022d14e9d84ddf` — Hosted Data Residency Enforcement PRD
+  - `dsid_2f34daefcf1544f58612fd2f91746ee4` — Cross-border residency clarification
+  - `dsid_13ce99fab0df4c76ad68d572dbbca7c0` — KMS failure-mode matrix
+  - `dsid_620102a3964a4ef1969850909f59eeae` — KMS decrypt-failure runbook
+  - `dsid_f1e9331031a8466dadc67270525b36eb` — Regional failover communications
+  - `dsid_2ea8e611a8b448ffab3bc5b927a3d466` — Support security-review handoff
+
+- Runbook: `/knowledge/runbooks/eu-residency-failover.md`
+  - Document ID: `workspace_a8999f9c18bb9db043105036`
+  - SHA-256: `791f91150d3ad86514d5435dd4b4a5c523c5f891ba42acd955a895d7a99a3bd5`
+  - Indexed as seven chunks.
+  - Covers routing modes, deny defaults, consent, KMS/CMEK, auditing, validation, escalation, approved response language, and uncertainty.
+
+- Memory: `support-rule-eu-residency-hosted-failover-v1`
+  - Kind: semantic memory
+  - Confidence: `0.94`
+  - Published with the runbook as one coherent update.
+
+- Publication: Atomic merge `publish-eu-residency-failover-20260814` committed successfully.
+  - 26 reviewed changes selected.
+  - 15 private/unselected changes skipped.
+  - Applied across filesystem, document records, and embeddings.
+
+- Excluded draft: `/artifacts/drafts/eu-residency-interview-notes.md`
+  - Remained unindexed and unpublished.
+  - Verified absent from `person/jada-williams`.
+
+- Verification:
+  - Published runbook is present and fetchable.
+  - Semantic memory is present and searchable.
+  - Draft is absent.
+  - Task branch `task/jada-eu-residency-failover-20260814` was deleted.
+
+Remaining uncertainty is explicitly recorded: customer-specific contract terms and consent forms; control-plane field residency; final enterprise audit-retention default; and live region, model, capacity, and KMS mappings.

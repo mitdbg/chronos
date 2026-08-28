@@ -1,0 +1,16 @@
+Implemented and published the CPU prototype for vLLM RFC #48627 to `person/olivia-grant`.
+
+- Schema: preserved `(batch_start, batch_end, K)` and added inclusive `(batch_start, batch_end, context_start, context_end, K)`.
+- Validation: rejects mixed schemas, invalid/negative ranges, gaps, and overlaps; requires complete rectangular coverage.
+- Lookup: dense `[batch_size][context_length]` lookup with K clamped to the runtime maximum.
+- Scheduler: selects K at the existing narrow boundary using scheduled batch size and maximum post-schedule context from already-selected requests.
+- GPU behavior: graph cases still use configured K values; graph and buffer sizing behavior was otherwise unchanged.
+- Checks: Python 3.12 compilation and standalone CPU assertions passed. Added pytest coverage for compatibility, coverage, gaps, overlaps, invalid ranges, clamping, and scheduler behavior. Full pytest execution was unavailable because the pinned environment lacks `pytest`.
+- Artifact: `/artifacts/experiments/context-aware-speculation.md`, indexed as `workspace_40ff7605167df1aa4bcec22c`.
+- Memory:
+  - Validated contract: `memory_12c2c8c793f45787fcecc2e1`
+  - Unvalidated performance assumptions: `memory_07e24f72d330401ca2916b93`
+- Publication: committed to `person/olivia-grant` as operation `merge:task/olivia-vllm-48627-scheduler:person/olivia-grant:125f6a47c1be40769557080a6559aca6`.
+- Cleanup: both temporary schema and scheduler branches were removed. Nothing was pushed to GitHub and no upstream PR was opened.
+
+Remaining work is GPU validation: boundary sweeps, graph/buffer invariance, latency and throughput, acceptance/waste, KV memory, deterministic quality replay, mixed-context policy comparison, soak testing, and staged canaries with rollback gates. Dense-lookup initialization and memory cost also remain performance assumptions, not validated results.

@@ -1,0 +1,16 @@
+Resolved and published to `person/marcus-reed`. The temporary task branch was removed.
+
+- Batch validation rejects `stream=True` and tool definitions with parameter-specific client errors.
+- Supported non-streaming, tool-free batches remain accepted.
+- Focused coverage includes streaming, tools, and a supported request.
+- Collector behavior was intentionally unchanged.
+- Source and test indexes were refreshed.
+- Compatibility guidance was saved as engineering memory.
+
+Checks passed: source inspection and 88-character validation of touched regions. Pytest and live GPU/model evaluation could not run because the checkout lacks both `uv` and `.venv`; system Python is prohibited.
+
+The personal branch already contained the correct implementation when isolated, so no duplicate source edit was introduced. Enterprise publication completed successfully across filesystem, document index, and memory stores. An existing upstream PR for the same issue was found in enterprise records; no GitHub access or upstream PR action occurred.
+
+Review: [vllm-50026.md](/code/vllm/artifacts/reviews/vllm-50026.md)
+
+Remaining limitation: run the focused pytest suite in a provisioned vLLM environment before release.

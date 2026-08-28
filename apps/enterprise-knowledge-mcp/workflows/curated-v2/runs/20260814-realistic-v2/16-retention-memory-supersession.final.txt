@@ -1,0 +1,44 @@
+Published the baseline, then atomically replaced it with the corrected policy and memory on `person/ethan-park`.
+
+- Baseline revision: SHA-256 `3aa7561b1098b86a8505f272bef18057ad84fa4ff99a9417e05ba3bdbf2e4243`
+  - No persistent prompt/output storage by default.
+  - Debug payloads: 7 days.
+  - Metadata-only request logs and traces: 14 days.
+  - Verified deletion from Redwood-managed systems: within 30 days.
+  - Backup, termination, and full-residency behavior remained explicit unknowns.
+  - Published by `publish-hosted-api-retention-v1`, status `committed`.
+
+- Corrected canonical revision: SHA-256 `913ea10c1c3cc7091eb19ebcf095d6469817cdf9ac1047ccec58c74498b64e33`
+  - Primary purge after verified erasure or termination: within 30 days.
+  - Backups and replicated snapshots: scrubbed within 90 days.
+  - Deletion attestation available after completion, with stage-specific scope.
+  - Data-plane routing remains inside the enforced residency boundary.
+  - Backup replication depends on SLA; EU-only enterprise terms disable cross-region backup replication.
+  - Uncertainty remains for universal control-plane locality, legal/contract exceptions, non-EU backup geography, and the general audit-log window.
+
+Supersession:
+
+- `mem_hosted_api_retention_v2` explicitly supersedes `mem_hosted_api_retention_v1`.
+- V1 was removed atomically with the corrected policy publication.
+- Verification confirms V1 is no longer visible and only V2 is exposed.
+
+Principal evidence included:
+
+- `dsid_e51021765c694a65bd60b3d38b12db6e` — canonical retention policy
+- `dsid_b6fb2620d47d44e3b17b16b42f1e021f` — Security FAQ
+- `dsid_7c0ce3505c1d46d8a00aa6680c35fbd3` — Hosted security-questionnaire response
+- `dsid_eb9f7314dd10443fbf70a80306d5119a` — Hosted residency controls
+- `dsid_e86ea669ce674d9e87dd8712dd738349` — failover and cross-region boundaries
+- `dsid_c7f6ff2dcf674dd784e7f65c738d0724` — decommission playbook, cited specifically for its Hosted scope limitation
+
+Atomic correction publication `publish-hosted-api-retention-correction` committed 21 selected changes across documents, embeddings, memory, and files; nine draft-only changes were skipped.
+
+The unindexed draft `/artifacts/drafts/retention-evidence-matrix.md` was excluded from publication. The remaining task-to-person diff contained only that draft, confirming it did not leak. Deleting the correction task then removed its private copy.
+
+Final verification:
+
+- Corrected policy visible at `/knowledge/policies/hosted-api-retention.md`
+- Replacement memory visible with supersession metadata
+- Superseded memory absent
+- Draft absent from search and personal branch
+- Correction task branch deleted successfully

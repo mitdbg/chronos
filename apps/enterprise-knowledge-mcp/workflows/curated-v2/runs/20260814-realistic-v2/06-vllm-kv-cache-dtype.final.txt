@@ -1,0 +1,41 @@
+Resolved vLLM issue #34752 and published the validated changes to `person/jamal-pierce`.
+
+Precedence rule:
+
+1. Recognized checkpoint `kv_cache_quant_algo` is a storage contract.
+2. Implicit or explicit `auto` adopts the checkpoint dtype.
+3. Matching aliases such as `fp8` and `fp8_e4m3` are canonicalized.
+4. A conflicting explicit override is rejected during configuration with guidance to use `auto` or the checkpoint dtype.
+5. Without metadata, existing `auto`→model-dtype and explicit-dtype behavior remains unchanged.
+
+Changed areas:
+
+- [torch_utils.py](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/person-jamal-pierce/code/vllm/vllm/utils/torch_utils.py): metadata resolution, canonicalization, early validation.
+- [cache.py](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/person-jamal-pierce/code/vllm/vllm/config/cache.py): documented precedence contract.
+- [test_torch_utils.py](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/person-jamal-pierce/code/vllm/tests/utils_/test_torch_utils.py): CPU configuration tests for metadata present/absent, aliases, `auto`, and incompatible overrides.
+- [kv-cache-dtype-rollout.md](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/person-jamal-pierce/knowledge/runbooks/kv-cache-dtype-rollout.md): compatibility matrix, read-only precheck, staged canary, rollback, and evidence.
+
+Checks:
+
+- Python syntax compilation: passed.
+- Seven focused CPU configuration assertions: passed.
+- Diff and indexed-document consistency review: passed; no stale indexes.
+- Full pytest/ruff: not runnable because pytest/ruff were absent from the offline dependency cache.
+
+Publication:
+
+- Merge committed to `person/jamal-pierce`.
+- Operation: `merge:task/jamal-kv-cache-dtype-34752:person/jamal-pierce:75627cd0bd524baf99dac99172e33f06`.
+- Code, tests, runbook, and memory indexed.
+- Temporary task branch deleted.
+- No GitHub access, push, or upstream PR performed.
+
+Memory:
+
+- Saved playbook `playbook-kv-cache-dtype-checkpoint-precedence-v1`.
+
+Remaining risk:
+
+- GPU validation remains for CUDA FP8 E4M3 checkpoint load/allocation and prefill/decode, ROCm E4M3, backend selection, multi-node configuration convergence, and quality/latency canaries.
+- CPU FP8 kernel execution on supported x86 AMX/vector hardware was not available.
+- Unknown checkpoint metadata still follows the existing warning/fallback path; only recognized metadata receives the strict contract.

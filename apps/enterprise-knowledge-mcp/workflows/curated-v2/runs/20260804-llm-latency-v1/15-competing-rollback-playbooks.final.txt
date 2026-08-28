@@ -1,0 +1,73 @@
+Published the evidence-gate candidate intact to `person/aisha-bello`.
+
+### Candidates
+
+- Fast lane: minimal deterministic snapshot rollback optimized for sub-5-minute mitigation, compact evidence, warm fallback, and smoke validation.
+- Evidence gate: deterministic rollback plus staged execution, risk-based approvals, independent certification, signed evidence, and desired-versus-observed reconciliation.
+
+Selected: evidence gate. It covered all authoritative requirements and retained an emergency authorization path without weakening approval or reconciliation controls. No fast-lane content was incorporated.
+
+### Evidence
+
+Reviewed sources across four systems:
+
+- Confluence: `dsid_6c3cc0eee4074ee9beb0bc03affeeb32` — classification, approvals, snapshots, certification, and audit bundles.
+- GitHub: `dsid_7919c26fcfdb43a0b5f95bcb89f94d15` — merged deterministic handoff and snapshot rollback.
+- Linear: `dsid_a2e780bb9caf4b06927ba523305c90ae` — progressive rollout and consecutive-window rollback triggers.
+- GitHub incident tooling: `dsid_60d6829368164fca927ac3ee5562a41e` — incident-to-release provenance.
+- Google Drive: `dsid_465e8f67162348549c350e62072c564d` — compact signed evidence design; treated as draft input only.
+
+### Merge
+
+Operation: `rollback-evidence-gate-v3-reviewed-publish`
+
+Result: committed atomically; 19 changes selected, 10 skipped.
+
+Selected change IDs:
+
+```text
+filesystem:0e665926c92fd8babaa5de69
+filesystem:98a0a105f1855644f2054fcd
+filesystem:dd63d26886faa779903d2b14
+qdrant:0d4a63da237103cfaa9e51cc
+sqlite:c822fc2cad0cd680189a8248
+sqlite:dee6625e8268f0e8d19de86c
+filesystem:1891ec3d4bb7cff42e562542
+filesystem:1cf52f5f3d1c6a308f45525c
+filesystem:8546e7a7d32a8a3c33a08a06
+filesystem:8bbd6efe494c50d5e2ebfab6
+qdrant:0e4b537f3b4f02f34ff10fe2
+qdrant:5329ade96b7e47caa4bc3a80
+qdrant:d379e689c2f76bae7aac0b86
+qdrant:f79bcf8e325de8480c20811a
+sqlite:1d53b0e019bd400e52088c50
+sqlite:6f2c7c961dc168c7f63e75d0
+sqlite:774b2d0fa39e6e6d37715a62
+sqlite:af102a63d58eb6995ba0ea3a
+sqlite:d600c3c698795473147f4266
+```
+
+Explicitly excluded:
+
+- `/artifacts/experiments/rollback-fast-lane.md`
+- `/artifacts/experiments/rollback-evidence-gate.md`
+- All rejected-candidate state
+
+### Verification
+
+MCP readback confirmed:
+
+- Canonical runbook: `/knowledge/runbooks/private-deployment-rollback.md`
+- Title: `Private Deployment Rollback — Evidence Gate`
+- SHA-256: `71cf93ffad2a77e7ffbd8e48623154d25c77dfd7d27ceb9176d8bb0070f81a40`
+- Indexed chunks: 4
+- Memory ID: `memory_5a142f55b444a71a3b16bffc`
+- Memory path: `/memory/semantic_memory/accepted-private-deployment-rollback-contract-3b16bffc.md`
+- Memory indexed chunks: 1
+- Selected-branch residual diff contained only its experiment, proving it was excluded.
+- Rejected-branch diff showed its runbook still differed from the published policy and its experiment remained unmerged.
+
+Both task branches were deleted successfully:
+
+- `task/aisha-bello/rollback-fast-lane-v3`
+- `task/aisha-bello/rollback-evidence-gate-v3`

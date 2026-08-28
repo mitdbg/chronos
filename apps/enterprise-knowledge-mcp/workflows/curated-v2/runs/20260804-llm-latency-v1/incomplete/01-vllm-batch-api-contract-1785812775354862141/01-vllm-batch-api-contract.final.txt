@@ -1,0 +1,41 @@
+Resolved vLLM #50026 and merged the reviewed task branch into `person/marcus-reed`.
+
+Changed paths:
+
+- `/code/vllm/vllm/entrypoints/openai/chat_completion/protocol.py`
+- `/code/vllm/tests/entrypoints/openai/chat_completion/test_chat_error.py`
+- `/artifacts/reviews/vllm-50026.md`
+
+Implementation:
+
+- Rejects `stream: true` during batch request validation.
+- Rejects non-empty `tools`.
+- Preserves supported non-streaming batch requests.
+- Added focused regressions for both rejected fields and the valid path.
+
+Checks:
+
+- Python AST parsing passed for both changed Python files.
+- Focused pytest could not run:
+  - Checkout lacked `.venv/bin/python`.
+  - `uv run --no-sync ...` lacked `pytest`.
+- No pytest result is claimed. Endpoint/GPU integration remains residual validation.
+
+Merge:
+
+- Merged: `task/marcus-reed/vllm-batch-contract-v2` → `person/marcus-reed`
+- Operation: `merge:task/marcus-reed/vllm-batch-contract-v2:person/marcus-reed:7c1d67a6750642b582db4005e0fbd7b1`
+- Task branch deleted successfully.
+- No GitHub contact, commits, pushes, or upstream PR activity occurred.
+
+Semantic memory:
+
+- ID: `memory_19691cf52d6896185cb15829`
+
+Primary evidence:
+
+- Issue snapshot: `/code/upstream-issues/vllm-50026.md` — `enterprise_4a5b9ac74f2c790896a71b6d`
+- Redwood compatibility guidance: `dsid_f5c42b6b5adb4139b72f5a061e42a2f1`
+- Silent-failure policy: `dsid_1394f4a6cf644d1f819b17dd47270bad`
+- Tool validation requirements: `dsid_d826bbd328f14dfe97d15a3e01d42e3b`
+- Indexed review: `workspace_90e6c8ad59bc69f1ef3918d7`

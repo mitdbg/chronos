@@ -1,0 +1,54 @@
+Completed the parallel triage, reviewed merges, consolidation, verification, and cleanup. The incidents remain three independent diagnoses; no shared root cause is asserted.
+
+### Branch operations
+
+All branches were created from `person/aisha-bello` and mounted successfully:
+
+- `task/aisha-bello/streaming-handshake-v2`
+- `task/aisha-bello/predictive-headroom-v2`
+- `task/aisha-bello/throttling-race-v2`
+- `task/aisha-bello/incident-consolidation-v2`
+
+Initial diffs showed disjoint report and episodic-memory paths with no modifications or deletions. Selective indexed-document merges committed successfully:
+
+- Streaming: `merge:...:ce7db9d86f254113a4c144678a86199a`
+- Predictive: `merge:...:c7ed5e3bdfe349a2b48c1d593a1546cb`
+- Throttling: `merge:...:e9b4d198cc0a4497bb60ac2a07a7a77f`
+- Consolidation: `merge:...:7997536c57a94ab89bdcb77589b4350f`
+
+The final consolidation-to-person diff was empty. All four task branches returned `deleted: true`.
+
+### Documents and diagnoses
+
+- `/artifacts/incidents/cross-language-streaming-startup-hang.md`
+  - Document: `workspace_4102dd7f054b1b9ed0841955`
+  - Memory: `memory_3027725b3789d37da96be9ab`
+  - Diagnosis: Go SDK v0.12.1 can wait indefinitely for an ACK after loss of its auth-bearing Start frame; cancellation does not proactively close the transport.
+  - Evidence: `dsid_e0ca834bf3564579a9be2f8b820c7fdf`, `dsid_169dca195c96410b80ff166803a50512`, `dsid_57a048fffb1544098aa3fb097df08684`.
+
+- `/artifacts/incidents/predictive-headroom-late-known-ramp.md`
+  - Document: `workspace_df45f4186bd037fbdb988541`
+  - Memory: `memory_1d755545dbd33a06f1247fa8`
+  - Conditional diagnosis: stale or missing forecast input is rejected, causing reactive fallback to wait for queue or saturation signals. Telemetry must confirm forecast age/missing state and fallback reason.
+  - Evidence: `dsid_07daff0e8966460f86c297b6939b607a`, `dsid_8f2761458e4347cb83a684656ca5ee3c`, `dsid_992101fd06084cad8c8c47442e38830a`, `dsid_0b4d1600b1da4b289c81e59de2fa330c`.
+
+- `/artifacts/incidents/throttling-race-shard-reassignment-policy-reload.md`
+  - Document: `workspace_37380d520d49497850334239`
+  - Memory: `memory_ac52cbfedae66aafd32bb2cd`
+  - Diagnosis: overlapping sticky-shard reassignment and policy reload can retain a credit pointer validated by shard but not tenant, causing a 10–30 second over-allow window.
+  - Primary evidence: ENG-428317, `dsid_a3fdfc45905f46f3988ad13f55ecce93`.
+  - Explicitly distinct confounder: ENG-941617, `dsid_b8d726bb047445868c60064fe3dd589f`, causes duplicate-meter premature throttles.
+
+### Consolidated runbook
+
+- `/knowledge/runbooks/runtime-incident-triage.md`
+- Document: `workspace_faa55d769e149d629fc1b55e`
+- Playbook memory: `memory_184586d300013aae9cc7e0f3`
+
+The decision tree separates:
+
+1. Pre-ACK Go streaming hangs.
+2. Late predictive scaling with forecast-freshness validation.
+3. Over-allows during reassignment/reload overlap, while routing duplicate-meter premature throttles elsewhere.
+
+Final fetch verification confirmed all four documents and all four memories are present and readable on `person/aisha-bello`.

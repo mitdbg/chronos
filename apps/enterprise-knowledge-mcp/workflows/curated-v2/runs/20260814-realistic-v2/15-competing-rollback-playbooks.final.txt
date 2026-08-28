@@ -1,0 +1,64 @@
+Published exactly one policy: the evidence-gated candidate.
+
+## Candidates
+
+1. Fast recovery — rejected
+
+- Field operator immediately routes 100% to the last-known-good version.
+- No prerequisite evidence or approval gate during active impact.
+- Uses the latest available snapshot if needed.
+- Validates latency, errors, and smoke tests for 15 minutes.
+- Collects evidence and approvals after restoration.
+
+Primary weakness: it assumes universal operator authority, snapshot compatibility, and sufficient network state. Those assumptions conflict with approval, evidence-preservation, and restore-safety guidance.
+
+2. Evidence-gated — accepted
+
+- Immediately pauses rollout and permits IC-authorized traffic isolation for imminent harm.
+- Requires a pre-mutation evidence package covering telemetry, provenance, snapshots, schema compatibility, and—when applicable—network plans, routes, peering, DNS, and reachability.
+- Requires IC/SRE authorization plus applicable Release Owner, Security/Evidence Custodian, and customer-operator approvals.
+- Prohibits bypassing non-reversible downgrade gates.
+- Restores state only after snapshot identity, checksum, schema compatibility, and invariants are verified.
+- Requires 60 continuous minutes at baseline before closure.
+- Defines explicit stop-and-escalate conditions.
+
+This is the selected policy as written, not a hybrid with the fast candidate.
+
+## Evidence
+
+The decision was principally supported by:
+
+- `dsid_75393a098ca44803ae097c4b2d543199` — published staged-rollout contract: signed artifacts, pre-release snapshots, deterministic rollback gates, evidence retention, and 60-minute validation.
+- `dsid_a6e7e19f598943b692d84638aa9a9a6d` — compliance-anchored rollback: IC, evidence custodian, deployment lead, and evidence-preservation requirements.
+- `dsid_b928a31ac74644d2b70298634002bdff` — staged network rollout: DNS propagation, peering guardrails, preflight checks, and reversible checkpoints.
+- `dsid_67fd0fa35c704bcbac0e7aa23fcd6285` — snapshot guidance: incident approval, recovery-point selection, state locking, and air-gapped recovery considerations. This source was marked in review, so it was corroborative rather than the sole policy basis.
+- `dsid_499ce734c806422e980396966f03515b` — incident/cutover guidance: evidence before mutation, SRE approval for policy changes, checkpoint preservation, and post-rollback validation.
+
+## Publication and verification
+
+Atomic publication operation: `publish-private-rollback-evidence-v1`
+
+- Status: committed
+- Approved changes: 17
+- Applied: SQLite 6, vector index 4, filesystem 11
+- Excluded changes: 8, including the experiment artifact
+- Canonical runbook: `/knowledge/runbooks/private-deployment-rollback.md`
+- Runbook SHA-256: `0c7e47405a37bab12a3bf2317af4d235688d9841bb3690f3b29d8c42a9dc8f70`
+- Verified title: “Private Deployment Rollback — Evidence-Gated Policy”
+- Verified indexed chunks: 3
+- Experiment file on personal branch: absent
+- Rejected branch state published: none
+
+## Semantic memory
+
+Memory ID: `private-deployment-rollback-contract-v1`
+
+It records that private-deployment rollback is evidence-gated, permits immediate containment for imminent harm, requires applicable approvals and verified artifact/snapshot/schema/network compatibility, and requires 60-minute continuous baseline validation.
+
+Memory SHA-256: `f650b196ceed8d9b36e5c49022d75e5c286e219f08ef36fb31cd9f0005c3f6c7`
+
+## Cleanup
+
+- `task/aisha-private-rollback-fast`: deleted
+- `task/aisha-private-rollback-evidence`: deleted
+- Both private evaluation artifacts were discarded with their temporary branches.

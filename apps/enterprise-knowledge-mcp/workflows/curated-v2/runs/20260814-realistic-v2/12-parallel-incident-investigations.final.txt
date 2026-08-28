@@ -1,0 +1,34 @@
+Completed the three independent investigations and consolidation using enterprise-state only.
+
+- Published to `person/aisha-bello`:
+  - `/artifacts/incidents/cross-language-streaming-startup-hang.md`
+    - Diagnosis: reproduced SSE parser failure on first JSON event split across network chunks.
+    - Memory: `episodic-stream-sse-first-fragment-hang`
+    - Publication: `merge:task/aisha-streaming-startup-hang:person/aisha-bello:f0b1fc05c8ae41bfa074cbbc67ed0c49`
+  - `/artifacts/incidents/predictive-autoscaling-known-load-lag.md`
+    - Diagnosis: likely pre-warm lead shorter than end-to-end readiness; timezone displacement and stale-forecast fallback remain explicit alternatives.
+    - Memory: `episodic-predictive-known-load-late`
+    - Publication: `merge:task/aisha-predictive-autoscaling-lag:person/aisha-bello:dade69657a66459f97f249531236ee5e`
+  - `/artifacts/incidents/shard-reassignment-policy-reload-throttling.md`
+    - Diagnosis: tenant-unvalidated fast-path credit pointer during overlapping shard handoff and policy reload; deterministic evidence proves over-allow.
+    - Memory: `episodic-rateengine-shard-reload-pointer-race`
+    - Publication: `merge:task/aisha-shard-policy-throttling:person/aisha-bello:323d12b0d96d42e5b8651d15135bd3ed`
+
+Diff review confirmed each branch added only its own incident report and episodic memory, with no overlapping artifact paths.
+
+The reviewed runbook was published at `/knowledge/runbooks/runtime-incident-triage.md`. It distinguishes raw-byte/parser hangs, forecast-to-readiness timing variants, and the RateEngine overlap race using negative controls and signature-specific validation.
+
+- Playbook memory: `playbook-runtime-incident-triage-three-signatures`
+- Runbook publication: `merge:task/aisha-runtime-incident-triage-consolidation:person/aisha-bello:5958b849980b4ee1b4905b6e95bb54b4`
+
+Final search verified all three reports, three episodic memories, the runbook, and playbook memory are indexed and visible on `person/aisha-bello`. All four temporary branches were deleted; no `task/aisha-*` branches remain.
+
+Primary evidence IDs:
+
+- `dsid_bd52d657b63a4a4ba589e05e78182d9f`
+- `dsid_bced6413bb6f414a882fb9cbaf8c7448`
+- `dsid_28d4ab23e7c74795ac809e8d9deef9ad`
+- `dsid_07daff0e8966460f86c297b6939b607a`
+- `dsid_a3fdfc45905f46f3988ad13f55ecce93`
+
+Main uncertainty is confined to autoscaling because the original report lacked a UTC event timeline. Streaming is proven for the reproduced Python version but requires raw-byte confirmation before attributing every language. The throttling evidence proves over-allow, not every possible over-deny or metering symptom.

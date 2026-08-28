@@ -1,0 +1,37 @@
+Resolved vLLM #50026 and merged the reviewed changes into `person/marcus-reed`.
+
+Changed paths:
+
+- `/code/vllm/vllm/entrypoints/openai/chat_completion/protocol.py`
+- `/code/vllm/tests/entrypoints/openai/chat_completion/test_chat_error.py`
+- `/artifacts/reviews/vllm-50026.md`
+
+Implementation:
+
+- Rejects `stream: true` and non-empty `tools` during batch request validation.
+- Adds regressions for streaming, tools, and a supported batch request.
+- Leaves supported batch collection/rendering unchanged.
+
+Checks:
+
+- Python compilation passed for both changed Python files.
+- Focused pytest was attempted but did not run: `.venv/bin/python: No module named pytest`. No pytest pass is claimed.
+- Residual validation is documented in the review artifact, including HTTP integration and standard serving-suite coverage.
+
+Merge:
+
+- Merged `task/marcus-reed/vllm-batch-contract-v2` → `person/marcus-reed`
+- Operation: `merge:task/marcus-reed/vllm-batch-contract-v2:person/marcus-reed:686134900e804d66a03c667d4fe02ef3`
+- Task branch deleted successfully.
+
+Semantic memory:
+
+- ID: `memory_cfcd2fbbd2c867e9a41f400a`
+
+Primary evidence:
+
+- Issue snapshot: `enterprise_4a5b9ac74f2c790896a71b6d`
+- Redwood OpenAI compatibility record: `dsid_4511463eec3b4285a721eaa12efd2757`
+- Silent-failure playbook: `dsid_1394f4a6cf644d1f819b17dd47270bad`
+- BrightBridge support evidence: `dsid_00d18425e1654dba9d08a6dd99802f36`
+- Review artifact: `workspace_90e6c8ad59bc69f1ef3918d7`

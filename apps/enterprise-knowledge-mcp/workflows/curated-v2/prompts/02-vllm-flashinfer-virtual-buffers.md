@@ -1,39 +1,26 @@
-You are Lena Fischer, a staff scheduling engineer at Redwood Inference. Use
-the `chronos_enterprise_knowledge` MCP tools and mounted branch workspaces.
-Do not modify Chronos, contact GitHub, push commits, or open an upstream pull
-request. Do not inspect the MCP server's backing databases directly; access
-company state through MCP tools and mounted branch workspaces only.
-Use `knowledge_search` to discover company evidence and source paths. Read
-source code with targeted shell commands in the mounted workspace; do not call
-`knowledge_get_document` for source-code documents or load whole source files
-through an MCP response.
+You are Lena Fischer, a staff scheduling engineer at Redwood Inference. Assess
+the local snapshot of vLLM issue #49980 in the pinned `/code/vllm` checkout.
 
-Evaluate two implementations for open vLLM issue #49980 against the pinned
-company copy: https://github.com/vllm-project/vllm/issues/49980.
+The Redwood enterprise-state MCP server is the system of record for company
+evidence, source trees, branches, indexed documents, and engineering memory.
+Use its search, fetch, checkout, indexing, diff, and memory capabilities rather
+than inspecting backing databases or external services. Do not modify Chronos,
+contact GitHub, push changes, or open an upstream pull request.
 
-1. From `person/lena-fischer`, create and mount sibling branches
-   `task/lena-fischer/flashinfer-capacity-v2` and
-   `task/lena-fischer/flashinfer-grow-v2`.
-2. Search for the local issue snapshot, chunked-local-attention design,
-   FlashInfer metadata allocation, long-prefill incidents, and benchmark
-   evidence. Fetch the strongest sources. Read `/code/vllm/AGENTS.md`.
-3. On the capacity branch, add a CPU-level regression test and implement the
-   best safe initialization-time capacity design you can justify from the
-   code. Re-index every changed file and write an indexed candidate note under
-   `/artifacts/candidates/flashinfer-capacity.md`.
-4. On the grow branch, independently add the same observable regression
-   coverage and implement guarded grow-on-demand buffers without resizing the
-   common path. Re-index every changed file and write an indexed note under
-   `/artifacts/candidates/flashinfer-grow.md`.
-5. Run the narrowest CPU-compatible checks on both branches. Clearly separate
-   source-level validation from GPU validation that cannot run here.
-6. Diff both branches against `person/lena-fischer`. Compare correctness,
-   CUDA-graph safety, allocation frequency, complexity, and the issue's
-   acceptance criteria. Select one candidate based on evidence, merge only it
-   into `person/lena-fischer`, and delete both temporary branches.
-7. Store one semantic memory on the personal branch explaining the selected
-   design and why the other was rejected, citing both candidate artifacts,
-   changed files, tests, the issue snapshot, and internal evidence.
+Starting from `person/lena-fischer`, create two independent task branches so
+that the alternatives remain isolated: one for initialization-time capacity
+and one for guarded grow-on-demand buffers. Use company evidence about
+chunked-local attention, FlashInfer allocation, long-prefill incidents, and
+internal performance expectations to choose the designs. On each branch, add the same
+CPU-level regression coverage and implement the narrowest defensible change;
+keep CUDA-graph behavior and the common path in view.
 
-Report both candidates, checks, selected design, merge/deletion results, memory
-ID, and evidence.
+Run the available CPU checks and note GPU validation that cannot run here.
+Re-index changed files and leave a concise candidate note on each branch.
+Compare the candidates against correctness, graph safety, allocation cost, and
+the issue's acceptance criteria. Publish only the stronger candidate to
+`person/lena-fischer`, remove the temporary branches, and record why the other
+candidate was rejected as reusable engineering memory.
+
+Return the two designs, evidence, checks, selected result, and publication
+status.

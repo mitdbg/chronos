@@ -1,0 +1,44 @@
+Created and validated Maya’s isolated onboarding workspace.
+
+- Branch: `people/maya-desai`
+- Parent: `team/platform-console`
+- State: isolated, unmerged, unpublished, and retained
+- Review: parent diff contains only the two new indexed documents. The team playbook appears target-only because it was intentionally saved directly on the team branch after Maya’s checkout.
+
+Documents:
+
+- [Onboarding plan](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/people-maya-desai/knowledge/people/maya-desai/onboarding-plan.md)  
+  Document ID: `workspace_cbe95ce565c09faba676695f`
+- [LiteLLM/Langfuse codebase map](/mnt/chronos-enterprise-state-division-v2/codex-trace-capture-realistic-v2-20260814/state/checkouts/people-maya-desai/knowledge/teams/platform-console/codebase-map.md)  
+  Document ID: `workspace_e05ea799be50113d3adf3c55`
+
+Both files were indexed successfully and confirmed discoverable through enterprise-state search.
+
+Team memory:
+
+- Branch: `team/platform-console`
+- Memory ID: `playbook_platform_console_safe_onboarding_code_triage_v1`
+- Kind: `playbook`
+- Path: `/memory/playbook/safe-onboarding-and-upstream-code-triage-procedure-platform-cons-riage_v1.md`
+- Covers least-privilege onboarding, subsystem review routing, synthetic-data reproduction, evidence sanitization, private security escalation, upstream publication gates, and validation requirements.
+
+Outstanding approval gaps:
+
+- People Ops must confirm Maya’s identity/start record; she is not yet present in the authoritative employee directory.
+- Ethan must confirm the proposed Amara Diallo and Logan Wright mentor pairings.
+- LiteLLM and Langfuse GitHub write access is not evidenced as approved.
+- Security training, acceptable-use completion, and CI-trigger eligibility remain unverified.
+- Production console/telemetry, customer scopes, cloud/VPN, secrets, deployment, on-call, and incident-tool access remain denied by default.
+- No approval exists to publish upstream issues or PRs, or merge Maya’s branch.
+
+Principal evidence includes:
+
+- `/knowledge/curated/team-platform-console/brief.md` — `curated_024986ded9ae947c8913f2eb`
+- `/knowledge/company/employee_directory.yaml` — `enterprise_9fbbe916a1d8961396219789`
+- `/code/manifest.json` — `enterprise_3923c6b386416268c7e7f382`
+- `/code/litellm/CONTRIBUTING.md` — `enterprise_b9e03890a22cfc276b5468d4`
+- `/code/litellm/security.md` — `enterprise_dd1e0ebb4fcd33b86685309b`
+- `/code/langfuse/CONTRIBUTING.md` — `enterprise_30981ba0dc3b4760e378333b`
+- `/code/langfuse/SECURITY.md` — `enterprise_d5cbe5168df3a0be47a0123c`
+- New-hire tooling playbook — `dsid_426645772b534ac4a6af358830cf7982`
+- Support escalation and data-handling playbook — `dsid_92bc3577d2624a9cb294ab827ae60131`

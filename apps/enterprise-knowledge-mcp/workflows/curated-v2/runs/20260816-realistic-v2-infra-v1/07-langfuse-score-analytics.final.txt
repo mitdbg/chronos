@@ -1,0 +1,27 @@
+Both correctness fixes are present and published on `person/sana-farid`.
+
+- Histogram: raw-value binning, `0.857` regression coverage, three-decimal display labels, and narrow-range count preservation.
+- Pivot aggregation: count-weighted `avg_*`/`average_*` totals for unequal groups, with unweighted fallback when usable counts are unavailable.
+
+Evidence:
+
+- Issue: `/knowledge/company/sources/github_public/langfuse/langfuse/issues/15208.json` (`gh_b7c2771e61d2a66efeaf545db1482ea8`)
+- Dashboard/validation guidance: `/knowledge/company/sources/confluence/eng-infra/infra-v1-confluence-014.json`
+- Candidate notes:
+  - `/artifacts/issue-15208-histogram-candidate.md`
+  - `/artifacts/issue-15208-weighted-candidate.md`
+
+Checks:
+
+- Static analytics contract checks: `4 passed`.
+- Confirmed regression inputs include the actual `0.857` sentinel.
+- Both merge previews reported no conflicts, no stale indexes, and no unpublished changes—the reviewed candidates already exactly matched `person/sana-farid`.
+- All four changed source/test files are indexed.
+- Temporary audit branches were deleted.
+
+Semantic memory is saved:
+
+- `memory_d9cb5231c88864487780a72a` — numeric histogram contract.
+- `memory_d487a26745d91a3158ef8a71` — weighted pivot-average contract.
+
+Remaining validation: repository Vitest could not be rerun in this mounted snapshot because neither Node nor pnpm is installed. The indexed candidate history records the targeted regressions, but a bootstrapped checkout should rerun the two focused test files before any upstream publication. No GitHub access, push, database inspection, or upstream PR occurred.

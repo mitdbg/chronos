@@ -1,0 +1,66 @@
+Completed the reviewed EU residency failover workflow.
+
+- Indexed document: `/knowledge/runbooks/eu-residency-failover.md`
+  - Document ID: `workspace_a8999f9c18bb9db043105036`
+  - 8 indexed chunks
+- Semantic memory: `memory_9037bc6798cef04522c36d34`
+- Excluded unpublished path: `/artifacts/drafts/eu-residency-interview-notes.md`
+
+Evidence came from three authoritative source systems:
+
+- Confluence:
+  - `dsid_e86ea669ce674d9e87dd8712dd738349` — security failover boundaries
+  - `dsid_7373a5e70ae74cc59d6e87925ef7ffcc` — Hosted API failover runbook
+  - `dsid_261a4ade6f21403185d98805521b1e1d` — Hosted residency enforcement FAQ
+- GitHub:
+  - `dsid_dc53eb164da14c6ca5fe90eadc134e11` — merged residency, regional KMS, RBAC, and audit enforcement
+- Gmail:
+  - `dsid_2f34daefcf1544f58612fd2f91746ee4` — contract-consent and cross-border legal posture
+
+The reviewed rule requires Support to verify the executed agreement and live allowed-region policy. Out-of-boundary failover is denied by default; KMS bindings must match tenant and target region; boundary expansion requires Security and applicable customer approval; no generic retention or timing promises are allowed.
+
+Merge result:
+
+- Operation: `jada-eu-residency-runbook-v3-reviewed-merge`
+- Status: `committed`
+- Selected: 28 stable changes
+- Skipped: 15, including all draft-only changes
+- Applied: 11 SQLite, 9 vector-index, and 15 filesystem changes
+- No conflicts or stale indexes
+
+Selected change IDs:
+
+```text
+filesystem:144c76aa4c6068ab95c812e4
+filesystem:c5a466bbed7cc3041e557466
+filesystem:dcae218d299f4767cd8a46bd
+filesystem:e292e91401cbda87adb200bd
+filesystem:e85f9db5744dbb74fde4b612
+qdrant:057bfce8dc0d8f3b574d62ad
+qdrant:06f0127b4c8748d4c02ca01e
+qdrant:096d0dde880c399b7d030966
+qdrant:67776435a335886aa88db392
+qdrant:7c6bf1f4a76503e6ef4d272d
+qdrant:83d5699282091f0348f6fb04
+qdrant:da58890445b8068c87088744
+qdrant:f7eba5eaf0f228dc14728a12
+sqlite:16693f6e88fa4b9b3c6f3322
+sqlite:5a4c13edf2a34ea2b817d7ef
+sqlite:634527649a7aa8420263ad93
+sqlite:6f2bbad5c8779d2ee8204023
+sqlite:804e5149ed0c450576780c90
+sqlite:8aad67303cff9a470cf96f10
+sqlite:c51e61ed6f326b1fd5fb8cb6
+sqlite:cc7d4acf5afb22e8d33855d8
+sqlite:f41ba3fb0ea92cb43ece8835
+filesystem:1f9965750b480fd2dc7815a5
+filesystem:67ce8e20d2422e570984741f
+filesystem:d24bd3f5689963d29a96769a
+qdrant:b202be17a7645c22a1e584a4
+sqlite:71c5d0e24bccba74a6cc4aaa
+sqlite:d946dc97d8ff2826544073d8
+```
+
+Final MCP verification confirmed both the runbook and memory are present and searchable on `person/jada-williams`. The post-merge task-to-target diff contained only the excluded draft path and no document differences, proving the draft was not promoted.
+
+Task branch deletion succeeded: `task/jada-williams/eu-residency-runbook-v3` → `deleted: true`.

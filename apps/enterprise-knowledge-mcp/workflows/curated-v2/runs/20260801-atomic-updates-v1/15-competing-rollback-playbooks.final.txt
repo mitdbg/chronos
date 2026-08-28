@@ -1,0 +1,68 @@
+Published the evidence-gated rollback contract to `person/aisha-bello`.
+
+### Candidate review
+
+- Fast-lane: minimal reversible path prioritizing recovery time through pause, compact capture, kill flag/route reversal, exact prior bundle, and post-recovery reconciliation.
+- Evidence-gate: staged rollout and rollback with immutable snapshots, signed evidence, explicit approvals, bounded-cohort validation, deterministic replay, and reconciliation gates.
+
+Selected: evidence-gate. It covered all fetched requirements and better protects regulated private deployments against partial applies, provenance failures, state divergence, and premature recovery declarations. The fast-lane’s weaker approval and validation controls outweighed its recovery-time advantage. No content was combined after selection.
+
+### Evidence
+
+Authoritative documents were fetched from four source systems:
+
+- Google Drive — compact signed evidence, rollback lanes, deferred anchoring: `dsid_465e8f67162348549c350e62072c564d`
+- Linear — exact rollback artifacts, DB/KV restoration, cache-safe restart, reconciliation: `dsid_c15505d76b084fbb9704ba282a1f5196`
+- Slack incidents — rollout pause, kill switch, on-call approval, canary validation: `dsid_3860a24fd9f5408ea9d1cb678d366033`
+- Gmail — signed immutable model artifacts and deterministic replay inputs: `dsid_741491ba728d4fc683ce530bd3627c19`
+
+### Merge
+
+Preview token: `6c53cbdb106d2244b0f9b404f560c8b8f9821b489409956410adfe6c3cb622b2`
+
+Selected stable change IDs:
+
+```text
+filesystem:1643a65b9fd0202dc8cec505
+filesystem:2f58866ca13b8077b748b68e
+filesystem:8bbd6efe494c50d5e2ebfab6
+filesystem:f92466dc46437a02afbefb4e
+qdrant:04b0bec37775917415b6038e
+qdrant:100a6ff652ccb6294fce6fd6
+qdrant:490c7aee134c17812082f3f8
+sqlite:617cb94bc00ecb51d17ec340
+sqlite:6bdc0c4116a9dcce29b22e40
+sqlite:8be6289992fb72ee4453dcb6
+sqlite:d7459932b687296541ec424b
+filesystem:5fcfddfc513c74f4c8923caa
+filesystem:d2f89cade1d3c442b0f9f101
+filesystem:d3beb53f456b4a7fbe21a60f
+qdrant:65fd0adb50867e68b69be0eb
+sqlite:4daeb894c8fcdcaf02e99610
+sqlite:57a3fe506f71369af2b8c8db
+```
+
+Merge operation `aisha-rollback-evidence-gate-v3-publish` committed atomically: 17 selected changes, 15 skipped; SQLite 6, Qdrant 4, filesystem 14.
+
+Excluded paths:
+
+- `/artifacts/experiments/rollback-fast-lane.md`
+- `/artifacts/experiments/rollback-evidence-gate.md`
+
+No rejected-candidate state was merged.
+
+### Verification
+
+MCP document reads confirmed:
+
+- One coherent evidence-gated runbook at `/knowledge/runbooks/private-deployment-rollback.md`
+- Runbook SHA-256: `a72bb23f71404cc06ecf3d1d7c5db772c3f1451c082abbeb1aa46a83719b929b`
+- Semantic memory ID: `mem_private_rollback_contract_evidence_gate_v3`
+- Memory SHA-256: `ee4b2cd50e95295ef068633c009d774d4dca041267cef99f1e3c23c4bf641a51`
+- Both runbook and memory are searchable.
+- The remaining preview isolated the evidence-gate experiment artifact, confirming it was not promoted; the fast-lane experiment was never part of the selected branch.
+
+Both task branches were deleted successfully and are absent from the final branch status:
+
+- `task/aisha-bello/rollback-fast-lane-v3`
+- `task/aisha-bello/rollback-evidence-gate-v3`

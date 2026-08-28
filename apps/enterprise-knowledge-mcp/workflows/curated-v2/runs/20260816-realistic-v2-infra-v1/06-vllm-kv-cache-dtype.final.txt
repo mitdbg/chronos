@@ -1,0 +1,39 @@
+Resolved and published vLLM issue #34752 to `person/jamal-pierce`.
+
+Precedence rule:
+
+- Supported checkpoint `kv_cache_quant_algo` is authoritative.
+- Omitted dtype and explicit `auto` adopt checkpoint metadata.
+- Equivalent explicit values such as `fp8`/`fp8_e4m3` are accepted.
+- Conflicting overrides fail during configuration with corrective guidance.
+- Unsupported checkpoint metadata also fails early.
+- Without metadata, `auto` follows model dtype; explicit supported values win.
+
+Changed areas:
+
+- `/code/vllm/vllm/utils/torch_utils.py` — consistent resolution and early validation.
+- `/code/vllm/tests/utils_/test_torch_utils.py` — CPU configuration cases for metadata present/absent, aliases, conflicts, and unsupported metadata.
+- `/knowledge/runbooks/kv-cache-dtype-rollout.md` — compatibility matrix, precheck, canary, rollback, and evidence.
+- All three files were re-indexed.
+
+Checks:
+
+- Python syntax compilation passed for code and tests.
+- Line-length inspection passed for new lines.
+- Focused pytest was attempted but could not run: the snapshot lacks pytest and torch, and the offline package cache is empty.
+- Remaining GPU checks: exact-checkpoint smoke, quality/perplexity, eager/graph and prefix-cache coverage on H100/SM90 and B200/GB200/SM100; NVFP4 on its SM100 path; confirmation of clean rejection/fallback behavior on A100/SM80.
+
+Publication:
+
+- Atomic enterprise merge committed as `publish-vllm-34752-20260816`.
+- Published 238 reviewed changes to `person/jamal-pierce`.
+- Post-merge branch diff was empty.
+- Temporary task branch was deleted.
+- No GitHub contact, push, or upstream PR occurred.
+
+Memory:
+
+- Saved playbook `playbook_kv_cache_dtype_precedence_v1`.
+- Evidence includes issue document `gh_36ec2f8e340c6c23165329ce2a61a18a`, conflict-validation snapshot `gh_103916df5e5ca5074ec889e40bdeeb76`, and rollout standard `dsid_79aba7601ab24ca699516975ecd5dd86`.
+
+Remaining risk is limited chiefly to the unexecuted dependency-backed CPU pytest and hardware/backend-specific GPU validation.

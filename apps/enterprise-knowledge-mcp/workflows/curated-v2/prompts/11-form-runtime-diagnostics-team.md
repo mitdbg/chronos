@@ -1,36 +1,27 @@
 You are Rafael Mendes, head of Site Reliability Engineering at Redwood
-Inference. Use the `chronos_enterprise_knowledge` MCP tools and mounted branch
-workspaces. Do not modify the Chronos source repository. Do not inspect the
-MCP server's backing databases directly; access company state through MCP
-tools and mounted branch workspaces only.
+Inference. Redwood has approved a Runtime Diagnostics team within
+Infrastructure & SRE, and Priya Shah is joining as its first Senior Runtime
+Reliability Engineer. Carry out that organizational change using the
+enterprise-state MCP server.
 
-Redwood has approved a Runtime Diagnostics team within Infrastructure & SRE,
-and Priya Shah is joining as its first Senior Runtime Reliability Engineer.
-Perform the approved organizational change rather than merely proposing it.
+Use the server's search and fetch capabilities to ground the work in incident
+volume, ownership gaps, release safety, failover, escalation, and onboarding
+evidence. Do not inspect backing databases or modify the Chronos source.
 
-1. Search company knowledge for runtime incident volume, ownership gaps,
-   release safety, regional failover, escalation, and onboarding turnaround.
-   Fetch authoritative evidence from at least three source systems.
-2. Create and mount `team/runtime-diagnostics-v2` from
-   `department/infrastructure-sre`.
-3. Write and index
-   `/knowledge/teams/runtime-diagnostics/operating-charter.md` with the
-   mission, owned failure modes, boundaries with Runtime Scheduling and SRE,
-   intake, validation, escalation, and evidence-backed first-quarter goals.
-4. Fetch the strongest customer-availability and release evidence, revise the
-   existing charter in place to add measurable acceptance criteria, and
-   re-index the same path. Do not create a second charter document.
-5. Store the reviewed investigation-and-promotion procedure as playbook
-   memory on the team branch, citing the final charter and source evidence.
-6. Create and mount `person/priya-shah-v2` from
-   `team/runtime-diagnostics-v2`. Write and index
-   `/knowledge/people/priya-shah/onboarding-plan.md` with role boundaries,
-   first-week access, a 30-day investigation sequence, mentors, validation,
-   and approval gates. Do not include private employee details.
-7. Store the validated onboarding turnaround rule as semantic memory on
-   Priya's branch. Diff both new branches against their parents and leave them
-   isolated as the approved team and member state; do not merge or delete
-   either branch.
+Create `team/runtime-diagnostics` from `department/infrastructure-sre`. Write
+and index `/knowledge/teams/runtime-diagnostics/operating-charter.md` with the
+mission, owned failure modes, boundaries with neighboring teams, intake,
+validation, escalation, and evidence-backed first-quarter goals. Then use the
+strongest availability and release evidence to revise that same charter with
+measurable acceptance criteria; do not create a duplicate document.
 
-Report both branch creations, the charter replacement, indexed documents,
-memory IDs, diffs, and evidence.
+Store the reviewed investigation-and-promotion procedure as playbook memory
+on the team branch. Create `person/priya-shah` from the new team branch, write
+and index `/knowledge/people/priya-shah/onboarding-plan.md` with role
+boundaries, first-week access, a 30-day investigation sequence, mentors,
+validation, and approval gates, and store the validated onboarding turnaround
+rule as semantic memory on Priya's branch.
+
+Review both branches against their parents and leave the approved team and
+member state isolated. Return the branches, charter revision, documents,
+memories, diffs, and evidence.

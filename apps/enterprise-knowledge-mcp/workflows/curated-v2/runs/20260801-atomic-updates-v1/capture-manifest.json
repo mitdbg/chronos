@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "capture_corpus": {
+    "snapshot_manifests": [
+      {
+        "manifest": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-atomic-updates-v1/snapshot/manifest.json",
+        "selection_digest": "7c2c59c0d0bfb2560bf51053526b489b75827ed2b959011a6afb9ab2f6eb2cf9"
+      }
+    ],
+    "snapshot_schema_versions": [
+      3
+    ],
+    "selection_digest": "084f059fdaefe04e4e3eba63cbba226dc8785b3fb0647f3f772ae660ea1a772b",
+    "documents": 600,
+    "chunks": 8055,
+    "bytes": 3460190,
+    "embedding_dimensions": 384,
+    "embedding_models": [
+      "sentence-transformers/all-MiniLM-L6-v2"
+    ],
+    "embedding_mode": "forced-zero"
+  },
+  "workflows": [
+    {
+      "workflow": "14-selective-residency-runbook-promotion",
+      "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/14-selective-residency-runbook-promotion.md",
+      "prompt_sha256": "8b417d40cb22edf03385f29bd43c3bc6928fdb658a4c5092495e0d3067270d87",
+      "session_id": "019fbf41-8c9f-7f02-82ff-26036c5acdd9",
+      "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-atomic-updates-v1/codex-home/sessions/2026/08/01/rollout-2026-08-01T21-36-11-019fbf41-8c9f-7f02-82ff-26036c5acdd9.jsonl",
+      "rollout_sha256": "897ae40a8087b39332cccaca87c5ad8bc5e74c4a15ba5a2ade36958959da81e0",
+      "events": 26,
+      "mcp_events": 26,
+      "shell_events": 0,
+      "patch_events": 0,
+      "memory_timestamps_resolved": 1,
+      "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/atomic-updates-v1/14-selective-residency-runbook-promotion.jsonl",
+      "trace_sha256": "cb3cb7d9ab69914a148b54ef2fc064f82a5936a57c63de423359d6f20caa19e4",
+      "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/14-selective-residency-runbook-promotion.events.jsonl",
+      "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/14-selective-residency-runbook-promotion.stderr.log",
+      "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/14-selective-residency-runbook-promotion.final.txt"
+    },
+    {
+      "workflow": "15-competing-rollback-playbooks",
+      "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/15-competing-rollback-playbooks.md",
+      "prompt_sha256": "0a96f049b811af3008e9dff87da6d3c3d2f6f02e5fefebc8bc06e25dd8925949",
+      "session_id": "019fbf44-8cea-7542-8665-2d53bf0d2199",
+      "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-atomic-updates-v1/codex-home/sessions/2026/08/01/rollout-2026-08-01T21-39-28-019fbf44-8cea-7542-8665-2d53bf0d2199.jsonl",
+      "rollout_sha256": "ee01c3500bf6ee62641d68535ea6faf1b8b8256666e6f777ad4364c7521677e0",
+      "events": 30,
+      "mcp_events": 30,
+      "shell_events": 0,
+      "patch_events": 0,
+      "memory_timestamps_resolved": 0,
+      "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/atomic-updates-v1/15-competing-rollback-playbooks.jsonl",
+      "trace_sha256": "9e93cea2de72e6c096ec803e87426becd348faaf125071d705b47b4f6f135b6b",
+      "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/15-competing-rollback-playbooks.events.jsonl",
+      "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/15-competing-rollback-playbooks.stderr.log",
+      "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/15-competing-rollback-playbooks.final.txt"
+    },
+    {
+      "workflow": "16-retention-memory-supersession",
+      "prompt": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/prompts/16-retention-memory-supersession.md",
+      "prompt_sha256": "1a956be23a79bfd76f798c68d66cbab6d3746fb79fa312a3815a792f14a653e9",
+      "session_id": "019fbf38-4e96-7101-9c19-fb1974411c25",
+      "rollout": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-atomic-updates-v1/codex-home/sessions/2026/08/01/rollout-2026-08-01T21-26-06-019fbf38-4e96-7101-9c19-fb1974411c25.jsonl",
+      "rollout_sha256": "e48d303bba34274214b1bf5153a26285269d14796e160b2d5b25740306cf38f2",
+      "events": 39,
+      "mcp_events": 39,
+      "shell_events": 0,
+      "patch_events": 0,
+      "memory_timestamps_resolved": 0,
+      "trace": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/traces/atomic-updates-v1/16-retention-memory-supersession.jsonl",
+      "trace_sha256": "4f635f3b105cd10c6c9c5090e708dab4b7ae367bd449e68523e6730d40554d38",
+      "events_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/16-retention-memory-supersession.events.jsonl",
+      "stderr_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/16-retention-memory-supersession.stderr.log",
+      "final_output": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/runs/20260801-atomic-updates-v1/16-retention-memory-supersession.final.txt"
+    }
+  ]
+}
