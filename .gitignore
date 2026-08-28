@@ -28,6 +28,13 @@ dist/
 # Generated benchmark output
 .benchmarks/
 
+# Generated SQLite databases and journal files
+*.sqlite
+*.sqlite-*
+
+# Literal local workspace state directory
+/$state/
+
 # Editor and OS files
 .idea/
 .vscode/
@@ -35,5 +42,7 @@ dist/
 
 # Logs and local env
 *.log
+/strace-*.err
+/strace-err*
 .env
 .env.*
