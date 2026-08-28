@@ -12,6 +12,7 @@ from chronos_enterprise_knowledge.backends.btrfs_workspace import (
     _btrfs_dump_candidate_paths,
     _btrfs_dump_candidates,
     _btrfs_dump_candidates_with_presence,
+    _btrfs_find_new_candidates,
     _different_candidate_file_paths,
 )
 from chronos_enterprise_knowledge.backends.native_branching import (
@@ -308,6 +309,19 @@ unlink          ./left-token/old.txt
     }
     assert one_sided == {"/generated.txt", "/old.txt"}
     assert one_sided_files == {"/generated.txt", "/old.txt"}
+
+
+def test_btrfs_find_new_candidates_parse_file_paths() -> None:
+    output = """\
+inode 259 file offset 0 len 8 disk start 0 offset 0 gen 2451 flags INLINE knowledge/changed.md
+inode 260 file offset 0 len 4 disk start 0 offset 0 gen 2451 flags COMPRESS|INLINE path with spaces.txt
+transid marker was 2451
+"""
+
+    assert _btrfs_find_new_candidates(output) == {
+        "/knowledge/changed.md",
+        "/path with spaces.txt",
+    }
 
 
 def test_btrfs_candidate_diff_ignores_metadata_only_directories(

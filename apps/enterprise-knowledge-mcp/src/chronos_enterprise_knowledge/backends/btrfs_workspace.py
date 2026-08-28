@@ -205,6 +205,13 @@ class BtrfsWorkspaceStore:
         base = self.base_path(fork_branch)
         if not base.exists():
             raise ValueError(f"branch has no fork snapshot: {fork_branch}")
+        if self._use_native_incremental_diff:
+            try:
+                return self._btrfs_find_new_file_paths(source, base)
+            except (OSError, subprocess.CalledProcessError, ValueError):
+                # Keep the exact final-tree comparison available when the
+                # kernel or btrfs-progs does not expose find-new.
+                pass
         return self._different_file_paths(source, base)
 
     def differing_file_paths(
@@ -229,6 +236,30 @@ class BtrfsWorkspaceStore:
                 # changing its final-tree semantics.
                 pass
         return _different_file_paths(left, right)
+
+    def _btrfs_find_new_file_paths(
+        self,
+        left: Path,
+        right: Path,
+    ) -> set[str]:
+        generation = _btrfs_creation_generation(right, self._run_command)
+        result = self._run_command(
+            [
+                "sudo",
+                "-n",
+                "btrfs",
+                "subvolume",
+                "find-new",
+                str(left),
+                str(generation),
+            ]
+        )
+        candidates = _btrfs_find_new_candidates(result.stdout)
+        return {
+            path
+            for path in candidates
+            if _candidate_file_differs(left, right, path)
+        }
 
     def _btrfs_incremental_file_paths(
         self,
@@ -586,6 +617,35 @@ def _different_file_paths(left: Path, right: Path) -> set[str]:
         if not _same_file_contents(left_files[path], right_files[path]):
             changed.add(path)
     return changed
+
+
+def _btrfs_creation_generation(
+    path: Path,
+    run_command: CommandRunner,
+) -> int:
+    result = run_command(
+        ["sudo", "-n", "btrfs", "subvolume", "show", str(path)]
+    )
+    match = re.search(
+        r"^Gen at creation:\s*(\d+)\s*$",
+        result.stdout,
+        re.MULTILINE,
+    )
+    if match is None:
+        raise ValueError(f"could not determine Btrfs creation generation: {path}")
+    return int(match.group(1))
+
+
+def _btrfs_find_new_candidates(output: str) -> set[str]:
+    candidates: set[str] = set()
+    for line in output.splitlines():
+        match = re.search(r"\bflags\s+\S+\s+(.+?)\s*$", line)
+        if match is None:
+            continue
+        path = normalize_workspace_path(match.group(1).strip())
+        if path != "/":
+            candidates.add(path)
+    return candidates
 
 
 def _btrfs_dump_candidate_paths(
