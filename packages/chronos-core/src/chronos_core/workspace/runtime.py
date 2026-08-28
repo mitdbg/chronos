@@ -59,19 +59,31 @@ def _profile_merge_stage(
         yield
     finally:
         elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
-        print(
-            json.dumps(
-                {
-                    "chronos_workspace_profile": stage,
-                    "source": source,
-                    "target": target,
-                    "elapsed_ms": elapsed_ms,
-                },
-                sort_keys=True,
-            ),
-            file=sys.stderr,
-            flush=True,
+        payload = json.dumps(
+            {
+                "chronos_workspace_profile": stage,
+                "source": source,
+                "target": target,
+                "elapsed_ms": elapsed_ms,
+                "pid": os.getpid(),
+            },
+            sort_keys=True,
         )
+        profile_path = os.environ.get("CHRONOS_WORKSPACE_PROFILE_FILE")
+        if profile_path:
+            # O_APPEND makes each short JSON record an independent append when
+            # many replay processes profile the same workspace concurrently.
+            fd = os.open(
+                profile_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o644,
+            )
+            try:
+                os.write(fd, (payload + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+        else:
+            print(payload, file=sys.stderr, flush=True)
 
 
 class BranchStore(Protocol):
@@ -139,7 +151,15 @@ class WorkspaceBranchSession:
     @contextlib.contextmanager
     def transaction(self) -> Iterator[None]:
         with contextlib.ExitStack() as stack:
-            for session in (self.stores or {}).values():
+            sessions = sorted(
+                (self.stores or {}).values(),
+                key=lambda session: getattr(
+                    session,
+                    "_workspace_transaction_priority",
+                    0,
+                ),
+            )
+            for session in sessions:
                 stack.enter_context(session.transaction())
             yield
 
@@ -246,6 +266,13 @@ def _refresh_workspace_store(store: Any) -> None:
             invalidate()
 
 
+def _refresh_workspace_branch(store: Any, branch_id: str) -> None:
+    _refresh_workspace_store(store)
+    refresh_branch = getattr(store, "refresh_branch", None)
+    if callable(refresh_branch):
+        refresh_branch(branch_id)
+
+
 def _global_store_lock(key: tuple[str, str]) -> threading.RLock:
     with _GLOBAL_STORE_LOCKS_GUARD:
         lock = _GLOBAL_STORE_LOCKS.get(key)
@@ -295,15 +322,40 @@ class ChronosWorkspaceContext:
             )
         self.filesystem = filesystem
         self.stores = all_stores
+        filesystem_context = getattr(filesystem, "context", filesystem)
+        shared_context_lock: threading.RLock | None = None
+        if filesystem is not None:
+            for store in all_stores.values():
+                if getattr(store, "context", store) is filesystem_context:
+                    # ChronosFS and relational interval rows can share one
+                    # native branch store.  Use one process-local lock for
+                    # both facades so their calls cannot concurrently use the
+                    # same native database connection.
+                    shared_context_lock = _global_store_lock(
+                        ("shared-context", _workspace_store_identity(filesystem))
+                    )
+                    break
         self._filesystem_lock = (
-            _global_store_lock(("filesystem", _workspace_store_identity(filesystem)))
-            if filesystem is not None
-            else threading.RLock()
+            shared_context_lock
+            or (
+                _global_store_lock(
+                    ("filesystem", _workspace_store_identity(filesystem))
+                )
+                if filesystem is not None
+                else threading.RLock()
+            )
         )
-        self._store_locks = {
-            name: _global_store_lock((name, _workspace_store_identity(store)))
-            for name, store in all_stores.items()
-        }
+        self._store_locks = {}
+        for name, store in all_stores.items():
+            if (
+                shared_context_lock is not None
+                and getattr(store, "context", store) is filesystem_context
+            ):
+                self._store_locks[name] = shared_context_lock
+            else:
+                self._store_locks[name] = _global_store_lock(
+                    ("store", _workspace_store_identity(store))
+                )
         self._merge_lock_namespace = self._merge_namespace()
         self._atomic_control: Any | None = None
         if shared_metadata_url is not None:
@@ -372,8 +424,10 @@ class ChronosWorkspaceContext:
                 else self._store_locks[name]
             )
             with lock:
-                _refresh_workspace_store(store)
-                raw = preview_fn(source, target, policy=policy)
+                with _profile_merge_stage(f"preview.refresh:{name}", source, target):
+                    _refresh_workspace_store(store)
+                with _profile_merge_stage(f"preview.store:{name}", source, target):
+                    raw = preview_fn(source, target, policy=policy)
             changes = [self._atomic_change(name, change) for change in raw.changes]
             conflicts = [self._atomic_change(name, change) for change in raw.conflicts]
             previews[name] = MergePreview(
@@ -413,6 +467,53 @@ class ChronosWorkspaceContext:
             change_id=atomic_change_id(store, change),
         )
 
+    def _resolve_atomic_selection(
+        self,
+        preview: AtomicMergePreview,
+        selection: MergeSelection | None,
+        resolution: MergeResolution | dict[str, MergeResolution] | None,
+        policy: MergePolicyInput,
+    ) -> tuple[set[str], dict[str, list[RowDiff]], int]:
+        selected_ids = (
+            set(preview.change_ids) if selection is None else set(selection.change_ids)
+        )
+        unknown = selected_ids - set(preview.change_ids)
+        if unknown:
+            raise AtomicMergeError(
+                "atomic merge selection contains unknown or stale changes: "
+                + ", ".join(sorted(unknown))
+            )
+        self._validate_filesystem_selection(preview, selected_ids)
+        resolved: dict[str, list[RowDiff]] = {}
+        for name, store_preview in preview.stores.items():
+            filtered = MergePreview(
+                source=store_preview.source,
+                target=store_preview.target,
+                changes=[
+                    change
+                    for change in store_preview.changes
+                    if change.change_id in selected_ids
+                ],
+                conflicts=[
+                    change
+                    for change in store_preview.conflicts
+                    if change.change_id in selected_ids
+                ],
+                resolution=store_preview.resolution,
+            )
+            store_resolution = self._resolution_for_store(
+                name,
+                resolution,
+                filtered,
+            )
+            resolved[name] = _resolve_merge_changes(
+                filtered,
+                policy,
+                store_resolution,
+                backend=f"workspace.{name}",
+            )
+        return selected_ids, resolved, len(preview.change_ids) - len(selected_ids)
+
     def merge_atomic(
         self,
         source: str,
@@ -423,6 +524,8 @@ class ChronosWorkspaceContext:
         resolution: MergeResolution | dict[str, MergeResolution] | None = None,
         policy: MergePolicyInput = None,
         operation_id: str,
+        _prepared_preview: AtomicMergePreview | None = None,
+        _allow_stable_selection_rebase: bool = False,
     ) -> AtomicMergeResult:
         if self._atomic_control is None:
             raise AtomicMergeError(
@@ -430,79 +533,62 @@ class ChronosWorkspaceContext:
             )
         if not operation_id.strip():
             raise ValueError("operation_id must not be empty")
-        with self._merge_lock(target):
-            preview = self.merge_atomic_preview(source, target, policy=policy)
-            if preview_token is not None and preview_token != preview.preview_token:
+        with _profile_merge_stage("atomic.preview", source, target):
+            preview = _prepared_preview or self.merge_atomic_preview(
+                source,
+                target,
+                policy=policy,
+            )
+        if preview.source != source or preview.target != target:
+            raise AtomicMergeError(
+                "prepared atomic preview does not match the merge branches"
+            )
+        requested_ids = (
+            set(preview.change_ids) if selection is None else set(selection.change_ids)
+        )
+        if preview_token is not None and preview_token != preview.preview_token:
+            stable_selection = (
+                _allow_stable_selection_rebase
+                and selection is not None
+                and requested_ids <= preview.change_ids
+            )
+            if not stable_selection:
                 raise StaleAtomicMergePreviewError(
                     "source or target changed after atomic merge preview"
                 )
-            selected_ids = (
-                set(preview.change_ids)
-                if selection is None
-                else set(selection.change_ids)
+        with _profile_merge_stage("atomic.resolve", source, target):
+            selected_ids, resolved, skipped = self._resolve_atomic_selection(
+                preview,
+                selection,
+                resolution,
+                policy,
             )
-            unknown = selected_ids - set(preview.change_ids)
-            if unknown:
-                raise AtomicMergeError(
-                    "atomic merge selection contains unknown or stale changes: "
-                    + ", ".join(sorted(unknown))
-                )
-            self._validate_filesystem_selection(preview, selected_ids)
-            resolved: dict[str, list[RowDiff]] = {}
-            for name, store_preview in preview.stores.items():
-                filtered = MergePreview(
-                    source=store_preview.source,
-                    target=store_preview.target,
-                    changes=[
-                        change
-                        for change in store_preview.changes
-                        if change.change_id in selected_ids
-                    ],
-                    conflicts=[
-                        change
-                        for change in store_preview.conflicts
-                        if change.change_id in selected_ids
-                    ],
-                    resolution=store_preview.resolution,
-                )
-                store_resolution = self._resolution_for_store(
-                    name,
-                    resolution,
-                    filtered,
-                )
-                resolved[name] = _resolve_merge_changes(
-                    filtered,
-                    policy,
-                    store_resolution,
-                    backend=f"workspace.{name}",
-                )
-
-            skipped = len(preview.change_ids) - len(selected_ids)
-            if not selected_ids:
-                result = AtomicMergeResult(
-                    operation_id,
-                    source,
-                    target,
-                    "noop",
-                    preview.source_token,
-                    preview.target_token,
-                    preview.target_token,
-                    0,
-                    skipped,
-                    {},
-                )
-                return result
-
-            participants = [name for name, changes in resolved.items() if changes]
-            transaction = self._atomic_control.reserve_branch_transaction(
+        if not selected_ids:
+            return AtomicMergeResult(
+                operation_id,
                 source,
                 target,
-                participants,
-                metadata={
-                    "operation_id": operation_id,
-                    "preview_token": preview.preview_token,
-                },
+                "noop",
+                preview.source_token,
+                preview.target_token,
+                preview.target_token,
+                0,
+                skipped,
+                {},
             )
+
+        participants = [name for name, changes in resolved.items() if changes]
+        with self._merge_lock(target, source=source):
+            with _profile_merge_stage("atomic.reserve", source, target):
+                transaction = self._atomic_control.reserve_branch_transaction(
+                    source,
+                    target,
+                    participants,
+                    metadata={
+                        "operation_id": operation_id,
+                        "preview_token": preview.preview_token,
+                    },
+                )
             applied: dict[str, int] = {}
             publication_attempted = False
             try:
@@ -510,15 +596,33 @@ class ChronosWorkspaceContext:
                 # that guard so a writer that committed after the reviewed
                 # preview but before reservation cannot slip through merely
                 # because ordinary DML kept the same mutable segment head.
-                reserved_preview = self.merge_atomic_preview(
-                    source,
-                    target,
-                    policy=policy,
-                )
-                if reserved_preview.preview_token != preview.preview_token:
-                    raise StaleAtomicMergePreviewError(
-                        "source or target changed while reserving the merge"
+                with _profile_merge_stage("atomic.revalidate", source, target):
+                    reserved_preview = self.merge_atomic_preview(
+                        source,
+                        target,
+                        policy=policy,
                     )
+                if reserved_preview.preview_token != preview.preview_token:
+                    stable_selection = (
+                        _allow_stable_selection_rebase
+                        and selection is not None
+                        and selected_ids <= reserved_preview.change_ids
+                        and preview.change_ids == reserved_preview.change_ids
+                    )
+                    if not stable_selection:
+                        raise StaleAtomicMergePreviewError(
+                            "source or target changed while reserving the merge"
+                        )
+                    with _profile_merge_stage("atomic.resolve_rebased", source, target):
+                        selected_ids, resolved, skipped = (
+                            self._resolve_atomic_selection(
+                                reserved_preview,
+                                selection,
+                                resolution,
+                                policy,
+                            )
+                        )
+                    preview = reserved_preview
                 for name, changes in resolved.items():
                     if not changes:
                         continue
@@ -529,23 +633,29 @@ class ChronosWorkspaceContext:
                         else self._store_locks[name]
                     )
                     with lock:
-                        _refresh_workspace_store(store)
-                        stage = getattr(
-                            store,
-                            "stage_branch_transaction_changes",
-                            None,
-                        )
-                        context = getattr(store, "context", store)
-                        if store is not context and callable(stage):
-                            applied[name] = int(
-                                stage(transaction, source, target, changes)
+                        with _profile_merge_stage(
+                            f"stage.refresh:{name}", source, target
+                        ):
+                            _refresh_workspace_store(store)
+                        with _profile_merge_stage(
+                            f"stage.store:{name}", source, target
+                        ):
+                            stage = getattr(
+                                store,
+                                "stage_branch_transaction_changes",
+                                None,
                             )
-                        else:
-                            applied[name] = int(
-                                context.stage_branch_transaction_changes(
-                                    transaction, changes
+                            context = getattr(store, "context", store)
+                            if store is not context and callable(stage):
+                                applied[name] = int(
+                                    stage(transaction, source, target, changes)
                                 )
-                            )
+                            else:
+                                applied[name] = int(
+                                    context.stage_branch_transaction_changes(
+                                        transaction, changes
+                                    )
+                                )
                 pending_result = AtomicMergeResult(
                     operation_id,
                     source,
@@ -559,12 +669,16 @@ class ChronosWorkspaceContext:
                     applied,
                 )
                 publication_attempted = True
-                self._atomic_control.publish_branch_transaction(transaction)
-                for store in self._store_map().values():
-                    _refresh_workspace_store(store)
-                    refresh_branch = getattr(store, "refresh_branch", None)
-                    if callable(refresh_branch):
-                        refresh_branch(target)
+                with _profile_merge_stage("atomic.publish", source, target):
+                    self._atomic_control.publish_branch_transaction(transaction)
+                for name, store in self._store_map().items():
+                    with _profile_merge_stage(
+                        f"publish.refresh:{name}", source, target
+                    ):
+                        _refresh_workspace_store(store)
+                        refresh_branch = getattr(store, "refresh_branch", None)
+                        if callable(refresh_branch):
+                            refresh_branch(target)
                 return pending_result
             except Exception as exc:
                 if publication_attempted:
@@ -638,7 +752,7 @@ class ChronosWorkspaceContext:
                 metadata=metadata,
             )
             for store in self._store_map().values():
-                _refresh_workspace_store(store)
+                _refresh_workspace_branch(store, branch_id)
             return
         created_filesystem = False
         created_stores: list[str] = []
@@ -708,7 +822,7 @@ class ChronosWorkspaceContext:
         if self._atomic_control is not None:
             self._atomic_control.delete_branch(branch_id)
             for store in self._store_map().values():
-                _refresh_workspace_store(store)
+                _refresh_workspace_branch(store, branch_id)
             return
         with self.branch_write(branch_id):
             errors: list[Exception] = []
@@ -726,6 +840,37 @@ class ChronosWorkspaceContext:
                 raise errors[0]
 
     def checkout(self, branch_id: str = "main") -> WorkspaceBranchSession:
+        if self._atomic_control is not None:
+            # Capture the live branch interval once. Every participant then
+            # prepares its data-plane session from that same reference instead
+            # of independently rereading the shared branch head. The lock only
+            # protects local checkout construction from local publication; it
+            # is not held while the returned writable session is used.
+            with self._merge_lock(branch_id):
+                control_session = self._atomic_control.checkout(branch_id)
+                current_ref = control_session.current_ref
+                fs = self._checkout_shared_filesystem(
+                    branch_id,
+                    current_ref,
+                    control_session,
+                )
+                stores = {
+                    name: _SynchronizedSession(
+                        self._checkout_shared_store(
+                            store,
+                            branch_id,
+                            current_ref,
+                            control_session,
+                        ),
+                        self._store_locks[name],
+                    )
+                    for name, store in self.stores.items()
+                }
+                return WorkspaceBranchSession(
+                    branch_id=branch_id,
+                    fs=fs,
+                    stores=stores,
+                )
         fs = (
             _SynchronizedSession(
                 self.filesystem.checkout(branch_id),
@@ -742,6 +887,49 @@ class ChronosWorkspaceContext:
             for name, store in self.stores.items()
         }
         return WorkspaceBranchSession(branch_id=branch_id, fs=fs, stores=stores)
+
+    def _checkout_shared_filesystem(
+        self,
+        branch_id: str,
+        current_ref: str,
+        control_session: BranchSession,
+    ) -> _SynchronizedSession | None:
+        if self.filesystem is None:
+            return None
+        checkout_ref = getattr(self.filesystem, "checkout_ref", None)
+        if not callable(checkout_ref):
+            raise AtomicMergeError(
+                "atomic workspace filesystem does not support shared checkout"
+            )
+        return _SynchronizedSession(
+            checkout_ref(
+                branch_id,
+                current_ref,
+                control_session=control_session,
+            ),
+            self._filesystem_lock,
+        )
+
+    def _checkout_shared_store(
+        self,
+        store: Any,
+        branch_id: str,
+        current_ref: str,
+        control_session: BranchSession,
+    ) -> Any:
+        if store is self._atomic_control:
+            return control_session
+        if getattr(store, "context", None) is self._atomic_control:
+            checkout_control = getattr(store, "checkout_control", None)
+            if callable(checkout_control):
+                return checkout_control(control_session)
+        checkout_ref = getattr(store, "checkout_ref", None)
+        if callable(checkout_ref):
+            return checkout_ref(branch_id, current_ref)
+        raise AtomicMergeError(
+            "atomic workspace store does not support shared checkout: "
+            f"{type(store).__module__}.{type(store).__qualname__}"
+        )
 
     def checkout_checkpoint(self, checkpoint: str) -> WorkspaceBranchSession:
         fs = (
@@ -841,7 +1029,7 @@ class ChronosWorkspaceContext:
             raise AtomicMergeError(
                 "merge_apply is unsafe for an atomic workspace; use merge_atomic"
             )
-        with self._merge_lock(target):
+        with self._merge_lock(target, source=source):
             return self._merge_apply_locked(
                 source,
                 target,
@@ -850,15 +1038,26 @@ class ChronosWorkspaceContext:
             )
 
     @contextlib.contextmanager
-    def _merge_lock(self, target: str) -> Iterator[None]:
+    def _merge_lock(
+        self,
+        target: str,
+        *,
+        source: str | None = None,
+    ) -> Iterator[None]:
         key = (self._merge_lock_namespace, target)
         with _GLOBAL_MERGE_LOCKS_GUARD:
             lock = _GLOBAL_MERGE_LOCKS.get(key)
             if lock is None:
                 lock = threading.Lock()
                 _GLOBAL_MERGE_LOCKS[key] = lock
-        with lock:
-            yield
+        profile_source = target if source is None else source
+        with _profile_merge_stage("merge.lock_wait", profile_source, target):
+            lock.acquire()
+        try:
+            with _profile_merge_stage("merge.lock_held", profile_source, target):
+                yield
+        finally:
+            lock.release()
 
     def _merge_namespace(self) -> tuple[tuple[str, str], ...]:
         members: list[tuple[str, str]] = []

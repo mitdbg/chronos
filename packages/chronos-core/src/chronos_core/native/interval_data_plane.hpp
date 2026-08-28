@@ -81,6 +81,7 @@ class NativeBranchSession {
     void commit();
     void rollback();
     bool in_transaction() const;
+    void set_epoch_managed(bool managed);
 
   private:
     std::unique_ptr<NativeBranchSessionImpl> impl_;
@@ -118,6 +119,12 @@ class NativeBranchStore {
         const std::string &branch_point
     );
     void ensure(bool enable_schema_branching = false);
+    // PostgreSQL schema option for experiments; configure before ensure().
+    void set_interval_coordinate_bits(int bits);
+    // Configure the hybrid interval allocator.  The three reserve values are
+    // the shallow-level bit reservations r_0, r_1, and r_2; q controls the
+    // harmonic reserve used after those levels.
+    void set_interval_allocator(int r0, int r1, int r2, int q);
     void set_create_secondary_indexes(bool enabled);
     bool create_secondary_indexes() const;
     void set_create_writer_segment_index(bool enabled);
@@ -138,9 +145,8 @@ class NativeBranchStore {
         const std::string &from_branch,
         bool terminal = false,
         const std::string &metadata_json = "{}",
-        int continuation_percent = 95,
-        int child_width = 0,
-        const std::string &allocation_strategy = "adaptive"
+        int fanout = 0,
+        int child_width = 0
     );
     void create_branch_from_checkpoint(
         const std::string &branch_id,
@@ -156,8 +162,7 @@ class NativeBranchStore {
     NativeCheckpointInfo create_checkpoint(
         const std::string &checkpoint,
         const std::string &branch,
-        const std::string &metadata_json = "{}",
-        int continuation_percent = 95
+        const std::string &metadata_json = "{}"
     );
     NativeCheckpointInfo get_checkpoint(const std::string &checkpoint);
     std::vector<NativeCheckpointInfo> list_checkpoints(const std::string &branch = "");
@@ -201,7 +206,9 @@ class NativeBranchStore {
     std::int64_t apply_merge_changes(
         const std::string &source,
         const std::string &target,
-        const std::vector<NativeMergeChange> &changes
+        const std::vector<NativeMergeChange> &changes,
+        std::int64_t expected_source_segment_id = 0,
+        std::int64_t expected_target_segment_id = 0
     );
     std::int64_t merge_apply(const std::string &source, const std::string &target);
     std::int64_t merge_apply_excluding_first_key_values(

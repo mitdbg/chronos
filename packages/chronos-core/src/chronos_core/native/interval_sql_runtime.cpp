@@ -889,6 +889,9 @@ std::string temp_name(const std::string &prefix) {
 }
 
 std::string normalize_decimal(std::string value) {
+    if (value == "Infinity" || value == "+Infinity") {
+        return "Infinity";
+    }
     if (value.empty()) {
         return "0";
     }
@@ -907,6 +910,10 @@ std::string normalize_decimal(std::string value) {
 int compare_decimal(const std::string &left, const std::string &right) {
     const std::string a = normalize_decimal(left);
     const std::string b = normalize_decimal(right);
+    if (a == "Infinity" || b == "Infinity") {
+        if (a == b) return 0;
+        return a == "Infinity" ? 1 : -1;
+    }
     if (a.size() != b.size()) {
         return a.size() < b.size() ? -1 : 1;
     }

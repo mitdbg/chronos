@@ -10,12 +10,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -393,11 +395,13 @@ class CurlS3Backend {
         std::string endpoint,
         std::string access_key,
         std::string secret_key,
-        std::string region
+        std::string region,
+        std::size_t pool_size
     ) : endpoint_(std::move(endpoint)),
         access_key_(std::move(access_key)),
         secret_key_(std::move(secret_key)),
-        region_(std::move(region)) {
+        region_(std::move(region)),
+        pool_size_(std::max<std::size_t>(1, pool_size)) {
         while (!endpoint_.empty() && endpoint_.back() == '/') endpoint_.pop_back();
         static const int initialized = []() {
             return curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -405,6 +409,10 @@ class CurlS3Backend {
         if (initialized != CURLE_OK) {
             throw std::runtime_error("failed to initialize libcurl");
         }
+    }
+
+    ~CurlS3Backend() {
+        for (CURL *curl : idle_handles_) curl_easy_cleanup(curl);
     }
 
     UpstreamResponse request(
@@ -415,67 +423,259 @@ class CurlS3Backend {
         const std::string &body = "",
         const std::vector<std::string> &headers = {}
     ) const {
-        CURL *curl = curl_easy_init();
-        if (!curl) throw std::runtime_error("failed to initialize S3 request");
-        UpstreamResponse response;
         std::string url = endpoint_ + "/" + url_encode(bucket);
         if (!key.empty()) url += "/" + url_encode(key, true);
         if (!query.empty()) url += "?" + query;
         std::string credentials = access_key_ + ":" + secret_key_;
         std::string sigv4 = "aws:amz:" + region_ + ":s3";
-        curl_slist *header_list = nullptr;
-        for (const auto &header : headers) {
-            header_list = curl_slist_append(header_list, header.c_str());
-        }
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
-        curl_easy_setopt(curl, CURLOPT_USERPWD, credentials.c_str());
-        curl_easy_setopt(curl, CURLOPT_AWS_SIGV4, sigv4.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_body);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
-        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, append_header);
-        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response.headers);
-        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
-        if (header_list) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
-        if (method == "HEAD") {
-            curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-        } else if (method == "PUT" || method == "POST") {
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
-        }
-        CURLcode code = curl_easy_perform(curl);
-        if (code != CURLE_OK) {
-            std::string message = curl_easy_strerror(code);
+        const int max_attempts = method == "GET" || method == "HEAD" ? 8 : 1;
+        CURLcode last_code = CURLE_OK;
+        int attempts_made = 0;
+        HandleLease lease(*this);
+
+        for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+            attempts_made = attempt;
+            CURL *curl = lease.get();
+            curl_easy_reset(curl);
+            UpstreamResponse response;
+            curl_slist *header_list = nullptr;
+            for (const auto &header : headers) {
+                header_list = curl_slist_append(header_list, header.c_str());
+            }
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
+            curl_easy_setopt(curl, CURLOPT_USERPWD, credentials.c_str());
+            curl_easy_setopt(curl, CURLOPT_AWS_SIGV4, sigv4.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_body);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
+            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, append_header);
+            curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response.headers);
+            curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
+            if (header_list) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
+            if (method == "HEAD") {
+                curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+            } else if (method == "PUT" || method == "POST") {
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
+            }
+
+            last_code = curl_easy_perform(curl);
+            if (last_code == CURLE_OK) {
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
+                curl_slist_free_all(header_list);
+                return response;
+            }
             curl_slist_free_all(header_list);
-            curl_easy_cleanup(curl);
-            throw std::runtime_error("upstream S3 request failed: " + message);
+            if (attempt == max_attempts || !transient_error(last_code)) break;
+            const int backoff_ms = std::min(1000, 50 << (attempt - 1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
         }
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
-        curl_slist_free_all(header_list);
-        curl_easy_cleanup(curl);
-        return response;
+        throw std::runtime_error(
+            "upstream S3 request failed after " + std::to_string(attempts_made) +
+            " attempt(s): " + curl_easy_strerror(last_code)
+        );
+    }
+
+    UpstreamResponse stream_get(
+        const std::string &bucket,
+        const std::string &key,
+        const std::string &range,
+        const std::function<void(long, const std::unordered_map<std::string, std::string> &)> &start,
+        const std::function<void(const char *, std::size_t)> &write
+    ) const {
+        std::string url = endpoint_ + "/" + url_encode(bucket) + "/" + url_encode(key, true);
+        const std::string credentials = access_key_ + ":" + secret_key_;
+        const std::string sigv4 = "aws:amz:" + region_ + ":s3";
+        HandleLease lease(*this);
+        CURLcode last_code = CURLE_OK;
+        int attempts_made = 0;
+
+        for (int attempt = 1; attempt <= 8; ++attempt) {
+            attempts_made = attempt;
+            CURL *curl = lease.get();
+            curl_easy_reset(curl);
+            StreamState state{start, write};
+            curl_slist *header_list = nullptr;
+            if (!range.empty()) {
+                header_list = curl_slist_append(
+                    header_list,
+                    ("Range: " + range).c_str()
+                );
+            }
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "GET");
+            curl_easy_setopt(curl, CURLOPT_USERPWD, credentials.c_str());
+            curl_easy_setopt(curl, CURLOPT_AWS_SIGV4, sigv4.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_stream_body);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
+            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, append_stream_header);
+            curl_easy_setopt(curl, CURLOPT_HEADERDATA, &state);
+            curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
+            if (header_list) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
+
+            last_code = curl_easy_perform(curl);
+            curl_slist_free_all(header_list);
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &state.response.status);
+            if (state.callback_error) std::rethrow_exception(state.callback_error);
+            if (last_code == CURLE_OK) {
+                if (state.response.status != 200 && state.response.status != 206) {
+                    throw std::runtime_error(
+                        "upstream object GET failed with status " +
+                        std::to_string(state.response.status)
+                    );
+                }
+                if (!state.started) {
+                    start(state.response.status, state.response.headers);
+                }
+                return state.response;
+            }
+            if (state.started || attempt == 8 || !transient_error(last_code)) break;
+            const int backoff_ms = std::min(1000, 50 << (attempt - 1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+        }
+        throw std::runtime_error(
+            "upstream streaming S3 request failed after " +
+            std::to_string(attempts_made) + " attempt(s): " +
+            curl_easy_strerror(last_code)
+        );
     }
 
   private:
+    class HandleLease {
+      public:
+        explicit HandleLease(const CurlS3Backend &backend)
+            : backend_(backend), handle_(backend_.acquire_handle()) {}
+        ~HandleLease() { backend_.release_handle(handle_); }
+        CURL *get() const { return handle_; }
+      private:
+        const CurlS3Backend &backend_;
+        CURL *handle_;
+    };
+
+    struct StreamState {
+        const std::function<void(long, const std::unordered_map<std::string, std::string> &)> &start;
+        const std::function<void(const char *, std::size_t)> &write;
+        UpstreamResponse response;
+        bool started = false;
+        std::exception_ptr callback_error;
+    };
+
+    static std::size_t append_stream_header(
+        char *data,
+        std::size_t size,
+        std::size_t count,
+        void *target
+    ) {
+        auto *state = static_cast<StreamState *>(target);
+        const std::size_t bytes = size * count;
+        std::string line(data, bytes);
+        if (line.rfind("HTTP/", 0) == 0) {
+            state->response.headers.clear();
+            std::istringstream status_line(line);
+            std::string version;
+            status_line >> version >> state->response.status;
+        } else {
+            append_header(data, size, count, &state->response.headers);
+        }
+        return bytes;
+    }
+
+    static std::size_t append_stream_body(
+        char *data,
+        std::size_t size,
+        std::size_t count,
+        void *target
+    ) {
+        auto *state = static_cast<StreamState *>(target);
+        const std::size_t bytes = size * count;
+        if (state->response.status != 200 && state->response.status != 206) return bytes;
+        try {
+            if (!state->started) {
+                state->start(state->response.status, state->response.headers);
+                state->started = true;
+            }
+            state->write(data, bytes);
+            return bytes;
+        } catch (...) {
+            state->callback_error = std::current_exception();
+            return 0;
+        }
+    }
+
+    CURL *acquire_handle() const {
+        std::unique_lock<std::mutex> lock(pool_mutex_);
+        pool_condition_.wait(lock, [this]() {
+            return !idle_handles_.empty() || handle_count_ < pool_size_;
+        });
+        if (!idle_handles_.empty()) {
+            CURL *curl = idle_handles_.back();
+            idle_handles_.pop_back();
+            return curl;
+        }
+        ++handle_count_;
+        lock.unlock();
+        CURL *curl = curl_easy_init();
+        if (curl) return curl;
+        lock.lock();
+        --handle_count_;
+        lock.unlock();
+        pool_condition_.notify_one();
+        throw std::runtime_error("failed to initialize S3 request");
+    }
+
+    void release_handle(CURL *curl) const {
+        if (!curl) return;
+        std::lock_guard<std::mutex> guard(pool_mutex_);
+        idle_handles_.push_back(curl);
+        pool_condition_.notify_one();
+    }
+
+    static bool transient_error(CURLcode code) {
+        switch (code) {
+            case CURLE_COULDNT_CONNECT:
+            case CURLE_OPERATION_TIMEDOUT:
+            case CURLE_PARTIAL_FILE:
+            case CURLE_SEND_ERROR:
+            case CURLE_RECV_ERROR:
+            case CURLE_GOT_NOTHING:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     std::string endpoint_;
     std::string access_key_;
     std::string secret_key_;
     std::string region_;
+    std::size_t pool_size_;
+    mutable std::mutex pool_mutex_;
+    mutable std::condition_variable pool_condition_;
+    mutable std::vector<CURL *> idle_handles_;
+    mutable std::size_t handle_count_ = 0;
 };
 
 class BranchableObjectStore {
+    class StoreLease;
+
   public:
     BranchableObjectStore(
         std::string database_path,
-        std::shared_ptr<CurlS3Backend> upstream
+        std::shared_ptr<CurlS3Backend> upstream,
+        std::size_t pool_size
     ) : database_url_(sqlite_url(database_path)),
         database_path_(sqlite_file_path(database_path)),
-        upstream_(std::move(upstream)) {
-        NativeBranchStore store(database_url_);
-        store.ensure();
-        store.execute_sql(
+        upstream_(std::move(upstream)),
+        store_pool_size_(std::max<std::size_t>(1, pool_size)) {
+        NativeBranchStore initial_store(database_url_);
+        initial_store.ensure();
+        initial_store.execute_sql(
             "CREATE TABLE IF NOT EXISTS chronos_s3_objects ("
             "bucket TEXT NOT NULL, object_key TEXT NOT NULL, "
             "physical_bucket TEXT NOT NULL, physical_key TEXT NOT NULL, "
@@ -485,7 +685,7 @@ class BranchableObjectStore {
             "user_metadata TEXT NOT NULL, ownership TEXT NOT NULL, "
             "generation BIGINT NOT NULL, PRIMARY KEY (bucket, object_key))"
         );
-        store.register_table(kObjectTable, kObjectPrimaryKey);
+        initial_store.register_table(kObjectTable, kObjectPrimaryKey);
         with_operational_db([&](sqlite3 *database) {
             char *error = nullptr;
             const char *sql =
@@ -524,8 +724,8 @@ class BranchableObjectStore {
 
         try {
             std::lock_guard<std::mutex> guard(write_mutex_);
-            NativeBranchStore store(database_url_);
-            auto session = store.checkout(branch);
+            StoreLease store(*this);
+            auto session = store->checkout(branch);
             session.begin();
             auto existing = lookup(session, bucket, key);
             if (if_none_match && existing) {
@@ -572,9 +772,36 @@ class BranchableObjectStore {
         const std::string &bucket,
         const std::string &key
     ) const {
-        NativeBranchStore store(database_url_);
-        auto session = store.checkout(branch);
+        std::shared_lock<std::shared_mutex> topology_guard(topology_mutex_);
+        StoreLease store(*this);
+        auto session = checkout_read_session(store, branch);
         return lookup(session, bucket, key);
+    }
+
+    bool stream_get(
+        const std::string &branch,
+        const std::string &bucket,
+        const std::string &key,
+        const std::string &range,
+        const std::function<void(
+            const ObjectMapping &,
+            long,
+            const std::unordered_map<std::string, std::string> &
+        )> &start,
+        const std::function<void(const char *, std::size_t)> &write
+    ) const {
+        auto mapping = head(branch, bucket, key);
+        if (!mapping) return false;
+        upstream_->stream_get(
+            mapping->physical_bucket,
+            mapping->physical_key,
+            range,
+            [&](long status, const auto &headers) {
+                start(*mapping, status, headers);
+            },
+            write
+        );
+        return true;
     }
 
     std::optional<std::pair<ObjectMapping, UpstreamResponse>> get(
@@ -602,8 +829,8 @@ class BranchableObjectStore {
         const std::string &key
     ) {
         std::lock_guard<std::mutex> guard(write_mutex_);
-        NativeBranchStore store(database_url_);
-        auto session = store.checkout(branch);
+        StoreLease store(*this);
+        auto session = store->checkout(branch);
         auto existing = lookup(session, bucket, key);
         if (!existing) return false;
         session.delete_rows(
@@ -622,8 +849,9 @@ class BranchableObjectStore {
         const std::string &start_after,
         std::size_t limit
     ) const {
-        NativeBranchStore store(database_url_);
-        auto session = store.checkout(branch);
+        std::shared_lock<std::shared_mutex> topology_guard(topology_mutex_);
+        StoreLease store(*this);
+        auto session = checkout_read_session(store, branch);
         std::string where = "bucket = ? AND object_key LIKE ?";
         std::vector<IntervalValue> params = {bucket, prefix + "%"};
         if (!start_after.empty()) {
@@ -644,18 +872,24 @@ class BranchableObjectStore {
     }
 
     void create_branch(const std::string &branch, const std::string &from_branch) {
-        NativeBranchStore store(database_url_);
-        store.create_branch(branch, from_branch);
+        std::unique_lock<std::shared_mutex> topology_guard(topology_mutex_);
+        std::lock_guard<std::mutex> guard(write_mutex_);
+        StoreLease store(*this);
+        store->create_branch(branch, from_branch);
+        invalidate_segment_cache();
     }
 
     void delete_branch(const std::string &branch) {
-        NativeBranchStore store(database_url_);
-        store.delete_branch(branch);
+        std::unique_lock<std::shared_mutex> topology_guard(topology_mutex_);
+        std::lock_guard<std::mutex> guard(write_mutex_);
+        StoreLease store(*this);
+        store->delete_branch(branch);
+        invalidate_segment_cache();
     }
 
     std::vector<std::string> branches() const {
-        NativeBranchStore store(database_url_);
-        return store.branches();
+        StoreLease store(*this);
+        return store->branches();
     }
 
     std::size_t bootstrap(const std::string &branch, const std::string &bucket) {
@@ -699,8 +933,8 @@ class BranchableObjectStore {
             }
             if (!batch.empty()) {
                 std::lock_guard<std::mutex> guard(write_mutex_);
-                NativeBranchStore store(database_url_);
-                auto session = store.checkout(branch);
+                StoreLease store(*this);
+                auto session = store->checkout(branch);
                 IntervalRows rows;
                 rows.reserve(batch.size());
                 for (const auto &mapping : batch) rows.push_back(mapping_rows(mapping).front());
@@ -723,9 +957,11 @@ class BranchableObjectStore {
 
     std::size_t collect_garbage(std::int64_t grace_ms) {
         std::lock_guard<std::mutex> gc_guard(gc_mutex_);
-        NativeBranchStore control(database_url_);
-        if (!control.list_checkpoints().empty()) {
-            return 0;
+        std::vector<std::string> branch_names;
+        {
+            StoreLease control(*this);
+            if (!control->list_checkpoints().empty()) return 0;
+            branch_names = control->branches();
         }
         std::vector<std::tuple<std::string, std::string, std::int64_t>> candidates;
         with_operational_db([&](sqlite3 *database) {
@@ -755,7 +991,7 @@ class BranchableObjectStore {
             (void)created;
             buckets.insert(bucket);
         }
-        for (const auto &branch : control.branches()) {
+        for (const auto &branch : branch_names) {
             for (const auto &bucket : buckets) {
                 std::string start_after;
                 while (true) {
@@ -782,6 +1018,110 @@ class BranchableObjectStore {
     }
 
   private:
+    class StoreLease {
+      public:
+        explicit StoreLease(const BranchableObjectStore &owner)
+            : owner_(owner), store_(owner_.acquire_store()) {}
+        ~StoreLease() {
+            if (store_ && store_->in_transaction()) {
+                try {
+                    store_->rollback();
+                } catch (...) {
+                    store_.reset();
+                    owner_.discard_store();
+                }
+            }
+            owner_.release_store(std::move(store_));
+        }
+        NativeBranchStore *operator->() const { return store_.get(); }
+      private:
+        const BranchableObjectStore &owner_;
+        std::unique_ptr<NativeBranchStore> store_;
+    };
+
+    std::unique_ptr<NativeBranchStore> acquire_store() const {
+        std::unique_lock<std::mutex> lock(store_pool_mutex_);
+        store_pool_condition_.wait(lock, [this]() {
+            return !idle_stores_.empty() || store_count_ < store_pool_size_;
+        });
+        if (!idle_stores_.empty()) {
+            auto store = std::move(idle_stores_.back());
+            idle_stores_.pop_back();
+            return store;
+        }
+        ++store_count_;
+        lock.unlock();
+        try {
+            return std::make_unique<NativeBranchStore>(database_url_);
+        } catch (...) {
+            lock.lock();
+            --store_count_;
+            lock.unlock();
+            store_pool_condition_.notify_one();
+            throw;
+        }
+    }
+
+    void release_store(std::unique_ptr<NativeBranchStore> store) const {
+        if (!store) return;
+        std::lock_guard<std::mutex> guard(store_pool_mutex_);
+        idle_stores_.push_back(std::move(store));
+        store_pool_condition_.notify_one();
+    }
+
+    void discard_store() const {
+        std::lock_guard<std::mutex> guard(store_pool_mutex_);
+        --store_count_;
+        store_pool_condition_.notify_one();
+    }
+
+    NativeBranchSession checkout_read_session(
+        StoreLease &store,
+        const std::string &branch
+    ) const {
+        std::size_t observed_epoch = 0;
+        {
+            std::lock_guard<std::mutex> guard(segment_cache_mutex_);
+            observed_epoch = segment_cache_epoch_;
+            auto cached = segment_cache_.find(branch);
+            if (cached != segment_cache_.end()) {
+                const auto &segment = cached->second;
+                return store->checkout_segment(
+                    branch,
+                    segment.segment_id,
+                    segment.live_lo,
+                    segment.live_hi,
+                    segment.branch_point
+                );
+            }
+        }
+
+        const auto branch_info = store->get_branch(branch);
+        const auto prepared = store->prepare_ref_info(
+            std::stoll(branch_info.current_ref),
+            false
+        );
+        {
+            std::lock_guard<std::mutex> guard(segment_cache_mutex_);
+            if (segment_cache_epoch_ == observed_epoch) {
+                segment_cache_[branch] = prepared.segment;
+            }
+        }
+        return store->checkout_segment(
+            branch,
+            prepared.segment.segment_id,
+            prepared.segment.live_lo,
+            prepared.segment.live_hi,
+            prepared.segment.branch_point
+        );
+    }
+
+    void invalidate_segment_cache() {
+        std::lock_guard<std::mutex> guard(segment_cache_mutex_);
+        ++segment_cache_epoch_;
+        segment_cache_.clear();
+    }
+
     static std::string strip_quotes(std::string value) {
         value = trim(std::move(value));
         if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
@@ -872,6 +1212,15 @@ class BranchableObjectStore {
     std::string database_url_;
     std::string database_path_;
     std::shared_ptr<CurlS3Backend> upstream_;
+    std::size_t store_pool_size_;
+    mutable std::mutex store_pool_mutex_;
+    mutable std::condition_variable store_pool_condition_;
+    mutable std::vector<std::unique_ptr<NativeBranchStore>> idle_stores_;
+    mutable std::size_t store_count_ = 0;
+    mutable std::mutex segment_cache_mutex_;
+    mutable std::unordered_map<std::string, NativeSegmentInfo> segment_cache_;
+    mutable std::size_t segment_cache_epoch_ = 0;
+    mutable std::shared_mutex topology_mutex_;
     mutable std::mutex write_mutex_;
     mutable std::mutex gc_mutex_;
 };
@@ -1815,9 +2164,10 @@ class ChronosLakeServer {
             upstream_endpoint,
             upstream_access_key,
             upstream_secret_key,
-            region
+            region,
+            std::max<std::size_t>(1, worker_threads)
         )),
-        objects_(database_path, upstream_),
+        objects_(database_path, upstream_, std::max<std::size_t>(1, worker_threads)),
         multipart_(database_path, upstream_, objects_),
         catalog_(objects_, std::move(warehouse_location)),
         worker_count_(std::max<std::size_t>(1, worker_threads)),
@@ -2700,6 +3050,121 @@ class ChronosLakeServer {
         }
     }
 
+    bool handle_streaming_s3_get(
+        beast::tcp_stream &stream,
+        const http::request<http::string_body> &request,
+        boost::system::error_code &error
+    ) {
+        if (request.method() != http::verb::get) return false;
+        std::string target = std::string(request.target());
+        const std::size_t question = target.find('?');
+        std::string path = question == std::string::npos ? target : target.substr(0, question);
+        const std::string query_text = question == std::string::npos
+            ? "" : target.substr(question + 1);
+        const auto query = parse_query(query_text);
+        if (query.find("uploadId") != query.end()) return false;
+        if (path.rfind("/iceberg/", 0) == 0) return false;
+        if (!path.empty() && path.front() == '/') path.erase(path.begin());
+        const std::size_t slash = path.find('/');
+        if (slash == std::string::npos) return false;
+
+        std::string branch;
+        try {
+            branch = authenticate_s3(request);
+        } catch (const std::exception &exception) {
+            auto response = s3_error(
+                request,
+                http::status::forbidden,
+                "SignatureDoesNotMatch",
+                exception.what()
+            );
+            response.keep_alive(false);
+            http::write(stream, response, error);
+            return true;
+        }
+
+        const std::string bucket = url_decode(path.substr(0, slash));
+        const std::string key = url_decode(path.substr(slash + 1));
+        bool response_started = false;
+        try {
+            stream.expires_after(std::chrono::seconds(120));
+            const bool found = objects_.stream_get(
+                branch,
+                bucket,
+                key,
+                request_header(request, "range"),
+                [&](const ObjectMapping &mapping, long upstream_status, const auto &headers) {
+                    http::response<http::empty_body> response(
+                        upstream_status == 206
+                            ? http::status::partial_content
+                            : http::status::ok,
+                        request.version()
+                    );
+                    // A server worker owns each open client socket. Close after
+                    // streamed reads so idle client connections cannot exhaust
+                    // the worker pool; upstream curl connections remain pooled.
+                    response.keep_alive(false);
+                    response.set(http::field::server, "chronos-lake");
+                    response.set(http::field::etag, "\"" + mapping.etag + "\"");
+                    response.set(http::field::last_modified, http_date(mapping.last_modified_ms));
+                    response.set(http::field::content_type, mapping.content_type);
+                    if (!mapping.content_encoding.empty()) {
+                        response.set(http::field::content_encoding, mapping.content_encoding);
+                    }
+                    if (!mapping.cache_control.empty()) {
+                        response.set(http::field::cache_control, mapping.cache_control);
+                    }
+                    auto copy_header = [&](http::field field, const char *name) {
+                        auto found_header = headers.find(name);
+                        if (found_header != headers.end()) response.set(field, found_header->second);
+                    };
+                    copy_header(http::field::content_length, "content-length");
+                    copy_header(http::field::content_range, "content-range");
+                    http::response_serializer<http::empty_body> serializer(response);
+                    http::write_header(stream, serializer, error);
+                    if (error) {
+                        throw std::runtime_error(
+                            "failed to write streaming S3 response headers: " + error.message()
+                        );
+                    }
+                    response_started = true;
+                },
+                [&](const char *data, std::size_t bytes) {
+                    asio::write(stream, asio::buffer(data, bytes), error);
+                    if (error) {
+                        throw std::runtime_error(
+                            "failed to write streaming S3 response body: " + error.message()
+                        );
+                    }
+                }
+            );
+            if (!found) {
+                auto response = s3_error(
+                    request,
+                    http::status::not_found,
+                    "NoSuchKey",
+                    "object does not exist"
+                );
+                response.keep_alive(false);
+                http::write(stream, response, error);
+            }
+        } catch (const std::exception &exception) {
+            if (!response_started) {
+                auto response = s3_error(
+                    request,
+                    http::status::internal_server_error,
+                    "InternalError",
+                    exception.what()
+                );
+                response.keep_alive(false);
+                http::write(stream, response, error);
+            } else {
+                error = asio::error::operation_aborted;
+            }
+        }
+        return true;
+    }
+
     void handle(tcp::socket socket) {
         beast::tcp_stream stream(std::move(socket));
         const int descriptor = stream.socket().native_handle();
@@ -2725,6 +3190,10 @@ class ChronosLakeServer {
             if (error == beast::error::timeout) break;
             if (error) return;
             auto request = parser.release();
+
+            if (handle_streaming_s3_get(stream, request, error)) {
+                break;
+            }
 
             http::response<http::string_body> response;
             if (request.method() == http::verb::get && request.target() == "/healthz") {

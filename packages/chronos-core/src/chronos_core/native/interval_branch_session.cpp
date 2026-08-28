@@ -205,6 +205,7 @@ class NativeBranchSessionImpl {
         branch_private_guard_cache_.reset();
     }
     bool in_transaction() const { return in_transaction_; }
+    void set_epoch_managed(bool managed) { epoch_managed_ = managed; }
 
     void commit_if_started(bool started_tx) {
         if (started_tx) {
@@ -224,6 +225,9 @@ class NativeBranchSessionImpl {
 
   private:
     bool begin_branch_write_guard() {
+        if (epoch_managed_ && store_.metadata_dialect() == "postgres") {
+            return false;
+        }
         const bool started = !store_.metadata_driver().in_transaction();
         if (started) {
             store_.metadata_driver().execute(
@@ -232,12 +236,28 @@ class NativeBranchSessionImpl {
         }
         try {
             std::string lock_sql =
-                "SELECT current_segment_id FROM _chronos_branch_interval_branches "
-                "WHERE branch_id = ?";
-            if (store_.metadata_dialect() == "postgres") lock_sql += " FOR SHARE";
+                "SELECT branch.current_segment_id, barrier.barrier_id "
+                "FROM _chronos_branch_interval_branches branch "
+                "LEFT JOIN _chronos_branch_session_barriers barrier "
+                "ON barrier.branch_id = branch.branch_id "
+                "WHERE branch.branch_id = ?";
+            if (store_.metadata_dialect() == "postgres") {
+                lock_sql += " FOR SHARE OF branch";
+            }
             auto branch = store_.metadata_driver().query(lock_sql, {branch_id_});
             if (branch.empty()) {
                 throw std::runtime_error("branch not found: " + branch_id_);
+            }
+            if (!std::holds_alternative<std::monostate>(branch[0][1])) {
+                throw std::runtime_error(
+                    "chronos_session_barrier_in_progress: " +
+                    native_as_string(branch[0][1])
+                );
+            }
+            const std::int64_t current_segment_id = native_as_int(branch[0][0]);
+            if (current_segment_id != segment_.segment_id) {
+                segment_ = store_.load_segment(branch_id_);
+                clear_schema_caches();
             }
             assert_branch_has_no_active_transaction();
             return started;
@@ -2217,6 +2237,7 @@ class NativeBranchSessionImpl {
     NativeBranchSegment segment_;
     bool in_transaction_ = false;
     bool metadata_guard_owned_ = false;
+    bool epoch_managed_ = false;
     std::optional<std::vector<NativeTableMeta>> table_metas_cache_;
     std::optional<std::unordered_set<std::string>> known_table_names_cache_;
     std::optional<bool> branch_private_guard_cache_;

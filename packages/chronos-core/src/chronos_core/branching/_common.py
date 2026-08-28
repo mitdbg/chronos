@@ -17,7 +17,7 @@ from sqlglot import exp
 from chronos_core.branching.sql_adapters import SQLDatabaseAdapter, connect_sql_database
 
 BranchBackendName = Literal["interval", "log", "copy", "orpheus", "litetree"]
-IntervalAllocationStrategy = Literal["adaptive", "percentage"]
+IntervalReserveBits = tuple[int, int, int]
 
 # Interval backends assign branches/subtrees numeric visibility ranges. SQLite
 # is limited to signed 64-bit integers. PostgreSQL can use exact NUMERIC
@@ -25,21 +25,19 @@ IntervalAllocationStrategy = Literal["adaptive", "percentage"]
 _MAX_INTERVAL = 9_000_000_000_000_000_000
 _POSTGRES_INTERVAL_PRECISION = 32
 _POSTGRES_MAX_INTERVAL = 10**31
-# Preserve most of the source branch's range for future siblings. The default
-# large-range split allocates 5% to the child and retains 95% for the source.
-_INTERVAL_CONTINUATION_PERCENT = 95
-_INTERVAL_PERCENT_DENOMINATOR = 100
+# The default shallow reservations scale with the coordinate domain.  These
+# ratios preserve the 64-bit policy while avoiding a fixed root-width budget at
+# wider coordinates.
+INTERVAL_RESERVE_RATIOS: tuple[tuple[int, int], ...] = (
+    (5, 16),
+    (5, 32),
+    (3, 32),
+)
+_INTERVAL_HARMONIC_RESERVE = 8
 _MIN_SPLIT_WIDTH = 2
 _INTERVAL_TERMINAL_CHILD_WIDTH = 2
 _META_PREFIX = "_chronos_branch_"
 _CURRENT_TIMESTAMP_PARAM = "__chronos_current_timestamp"
-
-
-def _validate_interval_continuation_percent(value: int) -> int:
-    percent = int(value)
-    if not 1 <= percent <= 99:
-        raise ValueError("interval_continuation_percent must be between 1 and 99")
-    return percent
 
 
 def _validate_interval_child_width(value: int | None) -> int | None:
@@ -51,12 +49,50 @@ def _validate_interval_child_width(value: int | None) -> int | None:
     return width
 
 
-def _validate_interval_allocation_strategy(value: str) -> IntervalAllocationStrategy:
-    if value not in {"adaptive", "percentage"}:
-        raise ValueError(
-            "interval_allocation_strategy must be 'adaptive' or 'percentage'"
+def _validate_interval_reserve_bits(value: IntervalReserveBits) -> IntervalReserveBits:
+    try:
+        bits = tuple(int(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("interval_reserve_bits must contain three integers") from exc
+    if len(bits) != 3 or any(item < 1 for item in bits):
+        raise ValueError("interval_reserve_bits must contain three positive integers")
+    if not (bits[0] >= bits[1] >= bits[2]):
+        raise ValueError("interval_reserve_bits must be non-increasing")
+    return bits  # type: ignore[return-value]
+
+
+def interval_reserve_bits_for_coordinate_width(
+    coordinate_bits: int = 0,
+    dialect: str | None = None,
+) -> IntervalReserveBits:
+    """Return shallow reserve bits scaled to the configured interval domain.
+
+    A zero coordinate width means the backend's native default domain: a
+    103-bit PostgreSQL NUMERIC range or a signed 63-bit integer range for
+    SQLite and other supported native stores.
+    """
+
+    width = int(coordinate_bits)
+    if width < 0:
+        raise ValueError("interval coordinate width must be non-negative")
+    if width == 0:
+        width = (
+            (_POSTGRES_MAX_INTERVAL - 1).bit_length()
+            if dialect == "postgres"
+            else (_MAX_INTERVAL - 1).bit_length()
         )
-    return value  # type: ignore[return-value]
+    bits = tuple(
+        max(1, (width * numerator + denominator - 1) // denominator)
+        for numerator, denominator in INTERVAL_RESERVE_RATIOS
+    )
+    return _validate_interval_reserve_bits(bits)  # type: ignore[arg-type]
+
+
+def _validate_interval_harmonic_reserve(value: int) -> int:
+    reserve = int(value)
+    if reserve < 1:
+        raise ValueError("interval_harmonic_reserve must be positive")
+    return reserve
 
 
 class BranchingError(Exception):

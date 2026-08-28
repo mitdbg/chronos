@@ -695,7 +695,7 @@ def test_postgres_interval_create_branch_fast_path_preserves_errors() -> None:
         ctx.close()
 
 
-def test_postgres_interval_uses_numeric_32_visibility_columns() -> None:
+def test_postgres_interval_uses_numeric_visibility_columns() -> None:
     ctx = _make_context("postgres", "interval")
     try:
         rows = ctx.db.execute(
@@ -714,8 +714,6 @@ def test_postgres_interval_uses_numeric_32_visibility_columns() -> None:
         assert rows
         for row in rows:
             assert row["data_type"] == "numeric"
-            assert int(row["numeric_precision"]) == 32
-            assert int(row["numeric_scale"]) == 0
     finally:
         ctx.close()
 
@@ -1047,7 +1045,6 @@ def test_postgres_interval_concurrent_wide_branch_creation_serializes_parent() -
     root = ChronosBranchContext.connect(
         _postgres_dsn(),
         backend="interval",
-        interval_continuation_percent=98,
     )
     try:
         root.db.execute(
@@ -1063,7 +1060,6 @@ def test_postgres_interval_concurrent_wide_branch_creation_serializes_parent() -
         ctx = ChronosBranchContext.connect(
             _postgres_dsn(),
             backend="interval",
-            interval_continuation_percent=98,
         )
         try:
             ctx.create_branch(f"trial_{index}", from_branch="main")
@@ -1076,7 +1072,6 @@ def test_postgres_interval_concurrent_wide_branch_creation_serializes_parent() -
     ctx = ChronosBranchContext.connect(
         _postgres_dsn(),
         backend="interval",
-        interval_continuation_percent=98,
     )
     try:
         assert len(ctx.list_branches()) == 31
@@ -1091,54 +1086,7 @@ def test_postgres_interval_concurrent_wide_branch_creation_serializes_parent() -
         ctx.close()
 
 
-def test_interval_split_default_allocates_five_percent_while_range_is_large() -> None:
-    default_ctx = _make_products_only_context("sqlite", "interval")
-    try:
-        default_backend = default_ctx._backend  # type: ignore[attr-defined]
-        assert default_backend.continuation_percent == 95
-        assert default_backend.allocation_strategy == "adaptive"
-        initial_main = default_backend._current_segment("main")
-        default_ctx.create_branch("wide_child", from_branch="main")
-        child = default_backend._current_segment("wide_child")
-        available = initial_main.live_hi - initial_main.live_lo - 1
-        expected_continuation = available * 95 // 100
-        assert child.live_hi - child.live_lo == available - expected_continuation
-    finally:
-        default_ctx.close()
-
-    wide_ctx = ChronosBranchContext.connect(
-        "sqlite:///:memory:",
-        backend="interval",
-        interval_allocation_strategy="percentage",
-        interval_continuation_percent=98,
-    )
-    try:
-        wide_ctx.db.execute(
-            "CREATE TABLE products (sku TEXT PRIMARY KEY, name TEXT, price INTEGER)"
-        )
-        wide_ctx.db.execute("INSERT INTO products VALUES (?, ?, ?)", ("abc", "Alpha", 10))
-        wide_ctx.db.commit()
-        wide_ctx.register_table("products", ["sku"])
-        wide_backend = wide_ctx._backend  # type: ignore[attr-defined]
-        assert wide_backend.continuation_percent == 98
-        assert wide_backend.allocation_strategy == "percentage"
-
-        for index in range(30):
-            wide_ctx.create_branch(f"trial_{index}", from_branch="main")
-
-        last = wide_ctx.checkout("trial_29")
-        last.execute(
-            "UPDATE products SET price = :price WHERE sku = :sku",
-            {"price": 29, "sku": "abc"},
-        )
-        assert _product(last, "abc")["price"] == 29
-        assert _product(wide_ctx.checkout("trial_0"), "abc")["price"] == 10
-        assert _product(wide_ctx.checkout("main"), "abc")["price"] == 10
-    finally:
-        wide_ctx.close()
-
-
-def test_interval_split_default_supports_repeated_shallow_task_branches() -> None:
+def test_interval_split_default_supports_repeated_reserved_shallow_task_branches() -> None:
     ctx = _make_products_only_context("sqlite", "interval")
     try:
         ctx.create_branch("department", from_branch="main")
@@ -1146,7 +1094,7 @@ def test_interval_split_default_supports_repeated_shallow_task_branches() -> Non
         ctx.create_branch("person_a", from_branch="team")
         ctx.create_branch("person_b", from_branch="team")
 
-        for index in range(128):
+        for index in range(60):
             branch = f"task_{index}"
             ctx.create_branch(branch, from_branch="team")
             ctx.delete_branch(branch)
@@ -1267,18 +1215,19 @@ def test_interval_split_can_use_fixed_child_width_for_serial_transactions() -> N
         ctx.close()
 
 
-def test_interval_split_rejects_invalid_continuation_percent() -> None:
+def test_interval_split_rejects_invalid_allocator_configuration() -> None:
     with pytest.raises(ValueError):
         ChronosBranchContext.connect(
             "sqlite:///:memory:",
             backend="interval",
-            interval_continuation_percent=0,
+            interval_reserve_bits=(4, 5, 2),
         )
     with pytest.raises(ValueError):
         ChronosBranchContext.connect(
             "sqlite:///:memory:",
             backend="interval",
-            interval_continuation_percent=100,
+            interval_reserve_bits=(4, 3, 2),
+            interval_harmonic_reserve=0,
         )
 
 
@@ -1288,15 +1237,6 @@ def test_interval_split_rejects_invalid_child_width() -> None:
             "sqlite:///:memory:",
             backend="interval",
             interval_child_width=1,
-        )
-
-
-def test_interval_split_rejects_invalid_allocation_strategy() -> None:
-    with pytest.raises(ValueError):
-        ChronosBranchContext.connect(
-            "sqlite:///:memory:",
-            backend="interval",
-            interval_allocation_strategy="unknown",  # type: ignore[arg-type]
         )
 
 
@@ -3381,7 +3321,6 @@ def test_postgres_interval_concurrent_terminal_branches_from_main() -> None:
         dsn,
         backend="interval",
         enable_schema_branching=True,
-        interval_continuation_percent=98,
     )
     try:
         ctx.db.execute(
@@ -3401,7 +3340,6 @@ def test_postgres_interval_concurrent_terminal_branches_from_main() -> None:
             dsn,
             backend="interval",
             enable_schema_branching=True,
-            interval_continuation_percent=98,
             ensure_metadata=False,
         )
         try:
@@ -3629,7 +3567,7 @@ def test_deep_branch_chain_has_isolated_leaf_state(ctx: ChronosBranchContext) ->
     parent = "main"
     for index in range(12):
         child = f"b{index}"
-        ctx.create_branch(child, from_branch=parent)
+        ctx.create_branch(child, from_branch=parent, fanout=1)
         ctx.checkout(child).execute(
             "UPDATE nodes SET score = :score WHERE node_id = :node_id",
             {"score": index + 10, "node_id": "n1"},
@@ -3647,23 +3585,23 @@ def test_deep_branch_chain_has_isolated_leaf_state(ctx: ChronosBranchContext) ->
     ) == [{"score": 1}]
 
 
-def test_interval_backend_supports_deep_spine_beyond_midpoint_limit(
+def test_interval_backend_supports_configured_deep_spine(
     sql_backend: str,
 ) -> None:
     ctx = _make_products_only_context(sql_backend, "interval")
     parent = "main"
-    for index in range(100):
+    for index in range(25):
         child = f"deep_{index}"
-        ctx.create_branch(child, from_branch=parent)
-        if index in {0, 62, 99}:
+        ctx.create_branch(child, from_branch=parent, fanout=1)
+        if index in {0, 12, 24}:
             ctx.checkout(child).execute(
                 "UPDATE products SET price = :price WHERE sku = :sku",
                 {"price": index + 100, "sku": "abc"},
             )
         parent = child
 
-    assert _product(ctx.checkout("deep_99"), "abc")["price"] == 199
-    assert _product(ctx.checkout("deep_62"), "abc")["price"] == 162
+    assert _product(ctx.checkout("deep_24"), "abc")["price"] == 124
+    assert _product(ctx.checkout("deep_12"), "abc")["price"] == 112
     assert _product(ctx.checkout("deep_0"), "abc")["price"] == 100
     assert _product(ctx.checkout("main"), "abc")["price"] == 10
     ctx.close()

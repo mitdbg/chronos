@@ -122,6 +122,66 @@ def test_s3_protocol_multipart_copy_delete_and_parallel_requests():
 
 
 @pytest.mark.chronos_lake
+def test_s3_streaming_get_preserves_ranges_metadata_and_branch_visibility():
+    bucket = _bucket("chronos-stream")
+    server = _server(bucket)
+    try:
+        endpoint = f"http://127.0.0.1:{server.port}"
+        main = _client(endpoint, "minioadmin", "minioadmin")
+        payload = bytes(range(256)) * (1024 * 32)
+        put = main.put_object(
+            Bucket=bucket,
+            Key="data/stream.bin",
+            Body=payload,
+            ContentType="application/x-chronos-test",
+            CacheControl="max-age=60",
+        )
+        main.put_object(Bucket=bucket, Key="data/empty.bin", Body=b"")
+
+        full = main.get_object(Bucket=bucket, Key="data/stream.bin")
+        assert full["Body"].read() == payload
+        assert full["ContentLength"] == len(payload)
+        assert full["ContentType"] == "application/x-chronos-test"
+        assert full["CacheControl"] == "max-age=60"
+        assert full["ETag"] == put["ETag"]
+        assert main.get_object(Bucket=bucket, Key="data/empty.bin")["Body"].read() == b""
+
+        ranges = [(0, 16_383), (17, 65_552), (1_000_000, 2_048_575)]
+
+        def read_range(bounds: tuple[int, int]) -> bytes:
+            start, end = bounds
+            client = _client(endpoint, "minioadmin", "minioadmin")
+            response = client.get_object(
+                Bucket=bucket,
+                Key="data/stream.bin",
+                Range=f"bytes={start}-{end}",
+            )
+            assert response["ContentRange"] == f"bytes {start}-{end}/{len(payload)}"
+            assert response["ContentLength"] == end - start + 1
+            return response["Body"].read()
+
+        with ThreadPoolExecutor(max_workers=len(ranges)) as executor:
+            actual = list(executor.map(read_range, ranges))
+        assert actual == [payload[start : end + 1] for start, end in ranges]
+
+        server.create_branch("stream-trial", "main")
+        server.bind_credentials("stream-key", "stream-secret", "stream-trial")
+        trial = _client(endpoint, "stream-key", "stream-secret")
+        assert trial.get_object(Bucket=bucket, Key="data/stream.bin")["Body"].read() == payload
+        main.put_object(Bucket=bucket, Key="data/after-fork.bin", Body=b"main")
+        assert main.get_object(Bucket=bucket, Key="data/after-fork.bin")["Body"].read() == b"main"
+        trial.put_object(Bucket=bucket, Key="data/stream.bin", Body=b"trial")
+        assert trial.get_object(Bucket=bucket, Key="data/stream.bin")["Body"].read() == b"trial"
+        assert main.get_object(Bucket=bucket, Key="data/stream.bin")["Body"].read() == payload
+        trial.delete_object(Bucket=bucket, Key="data/stream.bin")
+        with pytest.raises(Exception):
+            trial.get_object(Bucket=bucket, Key="data/stream.bin")
+        assert main.get_object(Bucket=bucket, Key="data/stream.bin")["Body"].read() == payload
+    finally:
+        server.stop()
+
+
+@pytest.mark.chronos_lake
 def test_s3_branch_credentials_isolate_overwrites_and_deletes():
     bucket = _bucket("chronos-branch")
     server = _server(bucket)

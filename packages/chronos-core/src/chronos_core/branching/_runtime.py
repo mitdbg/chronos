@@ -1,13 +1,28 @@
 from __future__ import annotations
 
+import functools
+
 from chronos_core.branching._common import *
 from chronos_core.branching._copy_backend import _CopyBackend
 from chronos_core.branching._interval_backend import _IntervalBackend
 from chronos_core.branching._litetree_backend import _LiteTreeBackend
 from chronos_core.branching._log_backend import _LogBackend
 from chronos_core.branching._orpheus_backend import _OrpheusBackend
+from chronos_core.branching._session_epoch import (
+    SessionEpochCoordinator,
+    SessionEpochHandle,
+)
 
 _INTERVAL_UNIQUE_RETRY_LIMIT = 3
+
+
+def _session_epoch_operation(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: BranchSession, *args: Any, **kwargs: Any) -> Any:
+        with self._operation_epoch():
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 def _is_retryable_interval_unique_violation(exc: Exception) -> bool:
@@ -30,17 +45,22 @@ class BranchSession:
         self._context = context
         self._ref = ref
         self._transaction_depth = 0
+        self._epoch_handle: SessionEpochHandle | None = None
+        self._closed = False
 
     @property
     def branch_id(self) -> str:
         return self._ref.branch_id
 
     @property
+    @_session_epoch_operation
     def current_ref(self) -> str:
-        """Stable backend reference captured by this checkout."""
+        """Current writable branch reference observed by this live session."""
 
+        self._ensure_fresh()
         return self._ref.ref
 
+    @_session_epoch_operation
     def query(
         self, sql: str, params: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
@@ -55,6 +75,7 @@ class BranchSession:
             self._context._commit_autocommit()
         return rows
 
+    @_session_epoch_operation
     def explain(
         self, sql: str, params: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
@@ -71,6 +92,7 @@ class BranchSession:
             self._context._commit_autocommit()
         return rows
 
+    @_session_epoch_operation
     def rewrite_query(self, sql: str, params: dict[str, Any] | None = None) -> str:
         self._ensure_fresh()
         try:
@@ -82,6 +104,7 @@ class BranchSession:
                 self._context._rollback_autocommit()
             raise
 
+    @_session_epoch_operation
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> ExecuteResult:
         self._ensure_fresh()
         if self._transaction_depth == 0 and self._context._db.in_transaction:
@@ -119,6 +142,13 @@ class BranchSession:
     @contextlib.contextmanager
     def transaction(self) -> Iterator[None]:
         """Group several session writes in one underlying SQL transaction."""
+
+        with self._operation_epoch():
+            with self._transaction_impl():
+                yield
+
+    @contextlib.contextmanager
+    def _transaction_impl(self) -> Iterator[None]:
 
         root = self._transaction_depth == 0
         shared_root = root and self._context._shared_transaction_depth == 0
@@ -188,6 +218,7 @@ class BranchSession:
     def branch_info(self) -> BranchInfo:
         return self._context.get_branch(self.branch_id)
 
+    @_session_epoch_operation
     def upsert_rows(self, table: str, rows: list[dict[str, Any]]) -> ExecuteResult:
         self._ensure_fresh()
         if self._ref.readonly:
@@ -207,6 +238,7 @@ class BranchSession:
             self._context._commit_autocommit()
         return ExecuteResult(len(rows))
 
+    @_session_epoch_operation
     def delete_keys(self, table: str, keys: list[dict[str, Any]]) -> ExecuteResult:
         self._ensure_fresh()
         if self._ref.readonly:
@@ -237,6 +269,54 @@ class BranchSession:
                 _BranchRef(self._ref.branch_id, current_ref, self._ref.readonly)
             )
 
+    def _refresh_after_epoch(self) -> None:
+        if self._ref.readonly:
+            return
+        current_ref = self._context.get_branch(self.branch_id).current_ref
+        self._ref = self._context._prepare_ref(
+            _BranchRef(self.branch_id, current_ref, self._ref.readonly)
+        )
+
+    @contextlib.contextmanager
+    def _operation_epoch(self) -> Iterator[None]:
+        if self._closed:
+            raise RuntimeError("Chronos branch session is closed")
+        coordinator = self._context._session_epochs
+        if (
+            self._epoch_handle is None
+            and coordinator is not None
+            and not self._ref.readonly
+        ):
+            self._epoch_handle = coordinator.register(self.branch_id)
+            self._epoch_handle._needs_refresh = True
+        if self._epoch_handle is None:
+            self._ensure_fresh()
+            yield
+            return
+        with self._epoch_handle.operation(self._refresh_after_epoch):
+            self._ensure_fresh()
+            yield
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._epoch_handle is not None:
+            self._epoch_handle.close()
+            self._epoch_handle = None
+
+    def __enter__(self) -> BranchSession:
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 class ChronosBranchContext:
     """Branch manager for SQL-backed relational data."""
@@ -247,6 +327,7 @@ class ChronosBranchContext:
         backend: _SQLBranchBackend,
         autocommit: bool = True,
         metadata_db: SQLDatabaseAdapter | None = None,
+        enable_session_epochs: bool = True,
     ):
         self._db = db
         self._metadata_db = metadata_db or db
@@ -258,6 +339,26 @@ class ChronosBranchContext:
         self._merge_table_scope: tuple[str, ...] | None = None
         self._shared_transaction_depth = 0
         self._shared_transaction_failed = False
+        # A workspace can expose the same interval context through multiple
+        # participating stores (for example, relational rows and ChronosFS).
+        # Make context teardown idempotent so closing one store does not try
+        # to close the shared adapters and native backend a second time.
+        self._closed = False
+        self._session_epochs_enabled = bool(enable_session_epochs)
+        self._session_epochs = (
+            SessionEpochCoordinator.for_context(
+                backend.name,
+                self._metadata_db,
+            )
+            if self._session_epochs_enabled
+            else None
+        )
+        set_epoch_managed = getattr(backend, "set_session_epoch_managed", None)
+        if callable(set_epoch_managed):
+            set_epoch_managed(
+                self._session_epochs is not None
+                and self._metadata_db.dialect == "postgres"
+            )
 
     @classmethod
     def connect(
@@ -265,28 +366,32 @@ class ChronosBranchContext:
         database_url: str,
         backend: BranchBackendName = "interval",
         autocommit: bool = True,
-        interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         interval_child_width: int | None = None,
-        interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
+        interval_reserve_bits: IntervalReserveBits | None = None,
+        interval_harmonic_reserve: int = _INTERVAL_HARMONIC_RESERVE,
+        interval_coordinate_bits: int = 0,
         interval_create_secondary_indexes: bool = True,
         interval_create_writer_segment_index: bool = True,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
         enable_diff_merge_tracking: bool = False,
+        enable_session_epochs: bool = True,
     ) -> ChronosBranchContext:
         db = connect_sql_database(database_url)
         return cls.from_database_adapter(
             db,
             backend=backend,
             autocommit=autocommit,
-            interval_continuation_percent=interval_continuation_percent,
             interval_child_width=interval_child_width,
-            interval_allocation_strategy=interval_allocation_strategy,
+            interval_reserve_bits=interval_reserve_bits,
+            interval_harmonic_reserve=interval_harmonic_reserve,
+            interval_coordinate_bits=interval_coordinate_bits,
             interval_create_secondary_indexes=interval_create_secondary_indexes,
             interval_create_writer_segment_index=interval_create_writer_segment_index,
             ensure_metadata=ensure_metadata,
             enable_schema_branching=enable_schema_branching,
             enable_diff_merge_tracking=enable_diff_merge_tracking,
+            enable_session_epochs=enable_session_epochs,
         )
 
     @classmethod
@@ -296,14 +401,16 @@ class ChronosBranchContext:
         backend: BranchBackendName = "interval",
         autocommit: bool = True,
         metadata_db: SQLDatabaseAdapter | None = None,
-        interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         interval_child_width: int | None = None,
-        interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
+        interval_reserve_bits: IntervalReserveBits | None = None,
+        interval_harmonic_reserve: int = _INTERVAL_HARMONIC_RESERVE,
+        interval_coordinate_bits: int = 0,
         interval_create_secondary_indexes: bool = True,
         interval_create_writer_segment_index: bool = True,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
         enable_diff_merge_tracking: bool = False,
+        enable_session_epochs: bool = True,
     ) -> ChronosBranchContext:
         if backend == "interval" and db.dialect == "duckdb" and metadata_db is None:
             raise ValueError(
@@ -330,9 +437,10 @@ class ChronosBranchContext:
             if backend == "interval":
                 return _IntervalBackend(
                     db,
-                    continuation_percent=interval_continuation_percent,
                     child_width=interval_child_width,
-                    allocation_strategy=interval_allocation_strategy,
+                    reserve_bits=interval_reserve_bits,
+                    harmonic_reserve=interval_harmonic_reserve,
+                    interval_coordinate_bits=interval_coordinate_bits,
                     enable_schema_branching=enable_schema_branching,
                     create_secondary_indexes=interval_create_secondary_indexes,
                     create_writer_segment_index=interval_create_writer_segment_index,
@@ -355,16 +463,28 @@ class ChronosBranchContext:
                 return _LiteTreeBackend(db)
             raise ValueError(f"unknown branch backend: {backend}")
 
+        impl = build_backend()
         if ensure_metadata:
-            with _chronos_metadata_lock(metadata_db or db):
-                impl = build_backend()
+            # The native interval store owns a separate PostgreSQL connection.
+            # Its bootstrap lock therefore has to be acquired by the native
+            # metadata driver; holding the Python adapter lock here would not
+            # serialize the native DDL connection.
+            if backend == "interval":
                 impl.ensure()
+            else:
+                with _chronos_metadata_lock(metadata_db or db):
+                    impl.ensure()
         else:
-            impl = build_backend()
             initialize_native = getattr(impl, "_initialize_native_branch_store", None)
             if callable(initialize_native):
                 initialize_native()
-        return cls(db, impl, autocommit=autocommit, metadata_db=metadata_db)
+        return cls(
+            db,
+            impl,
+            autocommit=autocommit,
+            metadata_db=metadata_db,
+            enable_session_epochs=enable_session_epochs,
+        )
 
     @classmethod
     def connect_split(
@@ -373,13 +493,15 @@ class ChronosBranchContext:
         metadata_url: str,
         backend: BranchBackendName = "interval",
         autocommit: bool = True,
-        interval_continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         interval_child_width: int | None = None,
-        interval_allocation_strategy: IntervalAllocationStrategy = "adaptive",
+        interval_reserve_bits: IntervalReserveBits | None = None,
+        interval_harmonic_reserve: int = _INTERVAL_HARMONIC_RESERVE,
+        interval_coordinate_bits: int = 0,
         interval_create_secondary_indexes: bool = True,
         interval_create_writer_segment_index: bool = True,
         ensure_metadata: bool = True,
         enable_schema_branching: bool = False,
+        enable_session_epochs: bool = True,
     ) -> ChronosBranchContext:
         data_db = connect_sql_database(data_url)
         metadata_db = connect_sql_database(metadata_url)
@@ -392,13 +514,15 @@ class ChronosBranchContext:
             backend=backend,
             autocommit=autocommit,
             metadata_db=metadata_db,
-            interval_continuation_percent=interval_continuation_percent,
             interval_child_width=interval_child_width,
-            interval_allocation_strategy=interval_allocation_strategy,
+            interval_reserve_bits=interval_reserve_bits,
+            interval_harmonic_reserve=interval_harmonic_reserve,
+            interval_coordinate_bits=interval_coordinate_bits,
             interval_create_secondary_indexes=interval_create_secondary_indexes,
             interval_create_writer_segment_index=interval_create_writer_segment_index,
             ensure_metadata=ensure_metadata,
             enable_schema_branching=enable_schema_branching,
+            enable_session_epochs=enable_session_epochs,
         )
 
     @property
@@ -432,10 +556,26 @@ class ChronosBranchContext:
         return self._metadata_db.raw_connection
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._session_epochs is not None:
+            self._session_epochs.close()
+            self._session_epochs = None
         close_backend = getattr(self._backend, "close", None)
         if callable(close_backend):
             close_backend()
         self._db.close()
+
+    @contextlib.contextmanager
+    def _local_session_branch_operation(
+        self, branches: list[str]
+    ) -> Iterator[None]:
+        if self._session_epochs is None:
+            yield
+            return
+        with self._session_epochs.local_branch_operation(branches):
+            yield
 
     def wait_for_background_work(self) -> None:
         if self._db.in_transaction:
@@ -482,11 +622,22 @@ class ChronosBranchContext:
         metadata: dict[str, Any] | None = None,
         *,
         terminal: bool = False,
+        fanout: int | None = None,
     ) -> None:
         try:
-            self._backend.create_branch(
-                branch_id, from_branch, metadata, terminal=terminal
-            )
+            with self._local_session_branch_operation([from_branch]):
+                if self._backend.name == "interval":
+                    self._backend.create_branch(
+                        branch_id,
+                        from_branch,
+                        metadata,
+                        terminal=terminal,
+                        fanout=fanout,
+                    )
+                else:
+                    self._backend.create_branch(
+                        branch_id, from_branch, metadata, terminal=terminal
+                    )
         except Exception:
             self._rollback_autocommit()
             raise
@@ -532,7 +683,24 @@ class ChronosBranchContext:
     def checkout(self, branch_id: str) -> BranchSession:
         try:
             info = self._backend.get_branch(branch_id)
-            prepared = self._prepare_ref(_BranchRef(branch_id, info.current_ref))
+            return self.checkout_ref(branch_id, info.current_ref)
+        except Exception:
+            self._rollback_autocommit()
+            raise
+
+    def checkout_ref(self, branch_id: str, current_ref: str | int) -> BranchSession:
+        """Check out a known current branch reference without rereading its head.
+
+        Workspace coordination reads the shared branch head once and passes the
+        resulting interval reference to every participating store.  The
+        returned session remains writable and retains the normal lazy refresh
+        behavior when this context later observes branch metadata changes.
+        """
+
+        try:
+            prepared = self._prepare_ref(
+                _BranchRef(branch_id, str(current_ref))
+            )
         except Exception:
             self._rollback_autocommit()
             raise
@@ -557,7 +725,8 @@ class ChronosBranchContext:
         metadata: dict[str, Any] | None = None,
     ) -> CheckpointInfo:
         try:
-            info = self._backend.create_checkpoint(checkpoint, branch, metadata)
+            with self._local_session_branch_operation([branch]):
+                info = self._backend.create_checkpoint(checkpoint, branch, metadata)
         except Exception:
             self._rollback_autocommit()
             raise
@@ -678,7 +847,10 @@ class ChronosBranchContext:
         )
         if can_use_backend_direct_apply:
             try:
-                backend_result = self._backend.merge_apply(source, target, resolution)
+                with self._local_session_branch_operation([source, target]):
+                    backend_result = self._backend.merge_apply(
+                        source, target, resolution
+                    )
             except Exception:
                 self._rollback_autocommit()
                 raise
@@ -686,6 +858,42 @@ class ChronosBranchContext:
                 self._commit_autocommit()
                 self._metadata_epoch += 1
                 return backend_result
+        if self._backend.name == "interval":
+            for attempt in range(3):
+                source_ref = self.get_branch(source).current_ref
+                target_ref = self.get_branch(target).current_ref
+                preview = self.merge_preview(source, target)
+                changes = _resolve_merge_changes(
+                    preview,
+                    normalized_policy,
+                    resolution,
+                    backend=self._backend.name,
+                )
+                try:
+                    with self._local_session_branch_operation([source, target]):
+                        backend_applied = self._backend.apply_merge_changes(
+                            source,
+                            target,
+                            changes,
+                            expected_source_ref=source_ref,
+                            expected_target_ref=target_ref,
+                        )
+                except BranchingError as exc:
+                    if (
+                        "merge preview became stale" in str(exc)
+                        and attempt < 2
+                    ):
+                        continue
+                    raise
+                if backend_applied is not None:
+                    self._metadata_epoch += 1
+                    return MergeResult(
+                        source=source,
+                        target=target,
+                        applied=backend_applied,
+                    )
+                break
+
         applied = 0
         target_session = self.checkout(target)
         with target_session.transaction():
@@ -694,11 +902,7 @@ class ChronosBranchContext:
             changes = _resolve_merge_changes(
                 preview, normalized_policy, resolution, backend=self._backend.name
             )
-            backend_applied = self._backend.apply_merge_changes(source, target, changes)
-            if backend_applied is None:
-                applied = self._apply_merge_changes(target_session, changes)
-            else:
-                applied = backend_applied
+            applied = self._apply_merge_changes(target_session, changes)
         self._metadata_epoch += 1
         return MergeResult(source=source, target=target, applied=applied)
 
@@ -735,7 +939,8 @@ class ChronosBranchContext:
             raise UnsupportedSQLError(
                 "branch transactions require the interval backend"
             )
-        transaction = reserve(source, target, participant_stores, metadata)
+        with self._local_session_branch_operation([source, target]):
+            transaction = reserve(source, target, participant_stores, metadata)
         self._metadata_epoch += 1
         return transaction
 

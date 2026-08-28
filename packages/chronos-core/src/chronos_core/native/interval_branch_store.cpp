@@ -39,8 +39,16 @@ class NativeSqlConnectionImpl {
 
 class NativeBranchStoreImpl {
   public:
+    ~NativeBranchStoreImpl() {
+        if (external_session_barrier_.has_value()) {
+            abort_session_barrier(*external_session_barrier_);
+        }
+        release_external_transaction_lock();
+    }
+
     explicit NativeBranchStoreImpl(const std::string &database_url)
         : metadata_driver_(open_native_sql_driver(database_url)), driver_(metadata_driver_.get()) {
+        initialize_default_interval_allocator();
         if (driver_->dialect() == "duckdb") {
             throw std::invalid_argument(
                 "DuckDB is a Chronos interval data plane; branch metadata must live in SQLite/PostgreSQL"
@@ -51,6 +59,7 @@ class NativeBranchStoreImpl {
         : metadata_driver_(open_native_sql_driver(metadata_url)),
           data_driver_(open_native_sql_driver(data_url)),
           driver_(metadata_driver_.get()) {
+        initialize_default_interval_allocator();
         if (driver_->dialect() == "duckdb") {
             throw std::invalid_argument("split interval metadata store must be SQLite/PostgreSQL");
         }
@@ -59,16 +68,19 @@ class NativeBranchStoreImpl {
         : metadata_driver_(std::make_unique<NativeSQLiteDriver>(metadata_db)),
           data_driver_(open_native_sql_driver(data_url)),
           driver_(metadata_driver_.get()) {
+        initialize_default_interval_allocator();
     }
     NativeBranchStoreImpl(const std::string &data_url, PGconn *metadata_conn)
         : metadata_driver_(std::make_unique<NativePostgresDriver>(metadata_conn)),
           data_driver_(open_native_sql_driver(data_url)),
           driver_(metadata_driver_.get()) {
+        initialize_default_interval_allocator();
     }
     NativeBranchStoreImpl(NativeSqlConnectionImpl &data_conn, const std::string &metadata_url)
         : metadata_driver_(open_native_sql_driver(metadata_url)),
           borrowed_data_driver_(&data_conn.driver()),
           driver_(metadata_driver_.get()) {
+        initialize_default_interval_allocator();
         if (driver_->dialect() == "duckdb") {
             throw std::invalid_argument("split interval metadata store must be SQLite/PostgreSQL");
         }
@@ -76,15 +88,23 @@ class NativeBranchStoreImpl {
     NativeBranchStoreImpl(NativeSqlConnectionImpl &data_conn, sqlite3 *metadata_db)
         : metadata_driver_(std::make_unique<NativeSQLiteDriver>(metadata_db)),
           borrowed_data_driver_(&data_conn.driver()),
-          driver_(metadata_driver_.get()) {}
+          driver_(metadata_driver_.get()) {
+        initialize_default_interval_allocator();
+    }
     NativeBranchStoreImpl(NativeSqlConnectionImpl &data_conn, PGconn *metadata_conn)
         : metadata_driver_(std::make_unique<NativePostgresDriver>(metadata_conn)),
           borrowed_data_driver_(&data_conn.driver()),
-          driver_(metadata_driver_.get()) {}
+          driver_(metadata_driver_.get()) {
+        initialize_default_interval_allocator();
+    }
     explicit NativeBranchStoreImpl(sqlite3 *db)
-        : metadata_driver_(std::make_unique<NativeSQLiteDriver>(db)), driver_(metadata_driver_.get()) {}
+        : metadata_driver_(std::make_unique<NativeSQLiteDriver>(db)), driver_(metadata_driver_.get()) {
+        initialize_default_interval_allocator();
+    }
     explicit NativeBranchStoreImpl(PGconn *conn)
-        : metadata_driver_(std::make_unique<NativePostgresDriver>(conn)), driver_(metadata_driver_.get()) {}
+        : metadata_driver_(std::make_unique<NativePostgresDriver>(conn)), driver_(metadata_driver_.get()) {
+        initialize_default_interval_allocator();
+    }
 
     NativeSqlDriver *data_driver_ptr() const {
         if (data_driver_) return data_driver_.get();
@@ -102,6 +122,48 @@ class NativeBranchStoreImpl {
     NativeSqlDriver &driver() { return data_driver(); }
     NativeSqlDriver &metadata_driver() { return *driver_; }
     bool split_store() const { return data_driver_ptr() != nullptr; }
+    static int scaled_reserve_bits(int width, int numerator, int denominator) {
+        const int value = (width * numerator + denominator - 1) / denominator;
+        return value < 1 ? 1 : value;
+    }
+    static std::array<int, 3> reserve_bits_for_coordinate_width(int width) {
+        return {
+            scaled_reserve_bits(width, 5, 16),
+            scaled_reserve_bits(width, 5, 32),
+            scaled_reserve_bits(width, 3, 32),
+        };
+    }
+    void initialize_default_interval_allocator() {
+        const int width = dialect() == "postgres" ? 103 : 63;
+        reserve_bits_ = reserve_bits_for_coordinate_width(width);
+    }
+    void set_interval_coordinate_bits(int bits) {
+        static const std::unordered_set<int> supported = {32, 64, 128, 256, 512, 1024};
+        if (dialect() != "postgres") {
+            throw std::invalid_argument(
+                "configurable interval-coordinate widths require a PostgreSQL data store"
+            );
+        }
+        if (supported.find(bits) == supported.end()) {
+            throw std::invalid_argument(
+                "interval-coordinate width must be one of 32, 64, 128, 256, 512, or 1024 bits"
+            );
+        }
+        interval_coordinate_bits_ = bits;
+        reserve_bits_ = reserve_bits_for_coordinate_width(bits);
+    }
+    void set_interval_allocator(int r0, int r1, int r2, int q) {
+        if (r0 < 1 || r1 < 1 || r2 < 1 || r0 < r1 || r1 < r2) {
+            throw std::invalid_argument(
+                "interval allocator reserve bits must be positive and non-increasing"
+            );
+        }
+        if (q < 1) {
+            throw std::invalid_argument("interval allocator harmonic reserve must be positive");
+        }
+        reserve_bits_ = {r0, r1, r2};
+        harmonic_reserve_ = q;
+    }
     void set_create_secondary_indexes(bool enabled) { create_secondary_indexes_ = enabled; }
     bool create_secondary_indexes() const { return create_secondary_indexes_; }
     void set_create_writer_segment_index(bool enabled) { create_writer_segment_index_ = enabled; }
@@ -220,6 +282,11 @@ class NativeBranchStoreImpl {
     NativeSqlDriver *driver_ = nullptr;
     bool create_secondary_indexes_ = true;
     bool create_writer_segment_index_ = true;
+    int interval_coordinate_bits_ = 0;
+    std::array<int, 3> reserve_bits_;
+    int harmonic_reserve_ = 8;
+    std::optional<std::pair<std::int32_t, std::string>> external_transaction_lock_;
+    std::optional<NativeSessionBarrierGuard> external_session_barrier_;
     std::mutex statement_plan_cache_mutex_;
     std::unordered_map<std::string, CachedNativeStatement> statement_plan_cache_;
 };

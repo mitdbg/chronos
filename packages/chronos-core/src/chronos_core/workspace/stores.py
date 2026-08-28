@@ -8,7 +8,7 @@ from chronos_core.branching import (
     ChronosBranchContext,
     MergeResolution,
 )
-from chronos_core.branching._common import MergePolicyInput
+from chronos_core.branching._common import IntervalReserveBits, MergePolicyInput
 
 
 @dataclass
@@ -24,9 +24,10 @@ class ChronosPostgresStore:
     metadata_url: str | None = None
     autocommit: bool = True
     ensure_metadata: bool = True
-    interval_continuation_percent: int = 95
     interval_child_width: int | None = None
-    interval_allocation_strategy: str = "adaptive"
+    interval_reserve_bits: IntervalReserveBits | None = None
+    interval_harmonic_reserve: int = 8
+    interval_coordinate_bits: int = 0
 
     def __post_init__(self) -> None:
         if self.metadata_url is None:
@@ -35,9 +36,10 @@ class ChronosPostgresStore:
                 backend="interval",
                 autocommit=self.autocommit,
                 ensure_metadata=self.ensure_metadata,
-                interval_continuation_percent=self.interval_continuation_percent,
                 interval_child_width=self.interval_child_width,
-                interval_allocation_strategy=self.interval_allocation_strategy,  # type: ignore[arg-type]
+                interval_coordinate_bits=self.interval_coordinate_bits,
+                interval_reserve_bits=self.interval_reserve_bits,
+                interval_harmonic_reserve=self.interval_harmonic_reserve,
             )
         else:
             self.context = ChronosBranchContext.connect_split(
@@ -46,9 +48,10 @@ class ChronosPostgresStore:
                 backend="interval",
                 autocommit=self.autocommit,
                 ensure_metadata=self.ensure_metadata,
-                interval_continuation_percent=self.interval_continuation_percent,
                 interval_child_width=self.interval_child_width,
-                interval_allocation_strategy=self.interval_allocation_strategy,  # type: ignore[arg-type]
+                interval_coordinate_bits=self.interval_coordinate_bits,
+                interval_reserve_bits=self.interval_reserve_bits,
+                interval_harmonic_reserve=self.interval_harmonic_reserve,
             )
 
     @property
@@ -124,9 +127,10 @@ class ChronosDuckDBStore:
     metadata_url: str
     autocommit: bool = True
     ensure_metadata: bool = True
-    interval_continuation_percent: int = 95
     interval_child_width: int | None = None
-    interval_allocation_strategy: str = "adaptive"
+    interval_reserve_bits: IntervalReserveBits | None = None
+    interval_harmonic_reserve: int = 8
+    interval_coordinate_bits: int = 0
 
     def __post_init__(self) -> None:
         self.context = ChronosBranchContext.connect_split(
@@ -135,9 +139,10 @@ class ChronosDuckDBStore:
             backend="interval",
             autocommit=self.autocommit,
             ensure_metadata=self.ensure_metadata,
-            interval_continuation_percent=self.interval_continuation_percent,
             interval_child_width=self.interval_child_width,
-            interval_allocation_strategy=self.interval_allocation_strategy,  # type: ignore[arg-type]
+            interval_coordinate_bits=self.interval_coordinate_bits,
+            interval_reserve_bits=self.interval_reserve_bits,
+            interval_harmonic_reserve=self.interval_harmonic_reserve,
             enable_schema_branching=False,
         )
 

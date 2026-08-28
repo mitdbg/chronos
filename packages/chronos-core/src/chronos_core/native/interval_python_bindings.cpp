@@ -586,6 +586,9 @@ void NativeBranchSession::begin() { impl_->begin(); }
 void NativeBranchSession::commit() { impl_->commit(); }
 void NativeBranchSession::rollback() { impl_->rollback(); }
 bool NativeBranchSession::in_transaction() const { return impl_->in_transaction(); }
+void NativeBranchSession::set_epoch_managed(bool managed) {
+    impl_->set_epoch_managed(managed);
+}
 
 NativeBranchStore::NativeBranchStore(const std::string &database_url)
     : impl_(std::make_unique<NativeBranchStoreImpl>(database_url)) {}
@@ -632,6 +635,14 @@ void NativeBranchStore::ensure(bool enable_schema_branching) {
     impl_->ensure_metadata(enable_schema_branching);
 }
 
+void NativeBranchStore::set_interval_coordinate_bits(int bits) {
+    impl_->set_interval_coordinate_bits(bits);
+}
+
+void NativeBranchStore::set_interval_allocator(int r0, int r1, int r2, int q) {
+    impl_->set_interval_allocator(r0, r1, r2, q);
+}
+
 void NativeBranchStore::set_create_secondary_indexes(bool enabled) {
     impl_->set_create_secondary_indexes(enabled);
 }
@@ -671,18 +682,16 @@ void NativeBranchStore::create_branch(
     const std::string &from_branch,
     bool terminal,
     const std::string &metadata_json,
-    int continuation_percent,
-    int child_width,
-    const std::string &allocation_strategy
+    int fanout,
+    int child_width
 ) {
     impl_->create_branch(
         branch_id,
         from_branch,
         terminal,
         metadata_json,
-        continuation_percent,
-        child_width,
-        allocation_strategy
+        fanout,
+        child_width
     );
 }
 
@@ -715,10 +724,9 @@ std::vector<NativeBranchInfo> NativeBranchStore::list_branches() {
 NativeCheckpointInfo NativeBranchStore::create_checkpoint(
     const std::string &checkpoint,
     const std::string &branch,
-    const std::string &metadata_json,
-    int continuation_percent
+    const std::string &metadata_json
 ) {
-    return impl_->create_checkpoint(checkpoint, branch, metadata_json, continuation_percent);
+    return impl_->create_checkpoint(checkpoint, branch, metadata_json);
 }
 
 NativeCheckpointInfo NativeBranchStore::get_checkpoint(const std::string &checkpoint) {
@@ -798,9 +806,17 @@ void NativeBranchStore::abort_branch_transaction(
 std::int64_t NativeBranchStore::apply_merge_changes(
     const std::string &source,
     const std::string &target,
-    const std::vector<NativeMergeChange> &changes
+    const std::vector<NativeMergeChange> &changes,
+    std::int64_t expected_source_segment_id,
+    std::int64_t expected_target_segment_id
 ) {
-    return impl_->apply_merge_changes(source, target, changes);
+    return impl_->apply_merge_changes(
+        source,
+        target,
+        changes,
+        expected_source_segment_id,
+        expected_target_segment_id
+    );
 }
 
 std::int64_t NativeBranchStore::merge_apply(const std::string &source, const std::string &target) {
@@ -1132,7 +1148,8 @@ void bind_interval_data_plane(py::module_ &m) {
         .def("begin", &NativeBranchSession::begin, py::call_guard<py::gil_scoped_release>())
         .def("commit", &NativeBranchSession::commit, py::call_guard<py::gil_scoped_release>())
         .def("rollback", &NativeBranchSession::rollback, py::call_guard<py::gil_scoped_release>())
-        .def("in_transaction", &NativeBranchSession::in_transaction);
+        .def("in_transaction", &NativeBranchSession::in_transaction)
+        .def("set_epoch_managed", &NativeBranchSession::set_epoch_managed);
 
     auto native_sql_connection_class = py::class_<NativeSqlConnection>(m, "NativeSqlConnection");
 
@@ -1235,6 +1252,19 @@ void bind_interval_data_plane(py::module_ &m) {
             py::call_guard<py::gil_scoped_release>()
         )
         .def(
+            "set_interval_coordinate_bits",
+            &NativeBranchStore::set_interval_coordinate_bits,
+            py::arg("bits")
+        )
+        .def(
+            "set_interval_allocator",
+            &NativeBranchStore::set_interval_allocator,
+            py::arg("r0"),
+            py::arg("r1"),
+            py::arg("r2"),
+            py::arg("q")
+        )
+        .def(
             "set_create_secondary_indexes",
             &NativeBranchStore::set_create_secondary_indexes,
             py::arg("enabled")
@@ -1270,9 +1300,8 @@ void bind_interval_data_plane(py::module_ &m) {
             py::arg("from_branch"),
             py::arg("terminal") = false,
             py::arg("metadata_json") = "{}",
-            py::arg("continuation_percent") = 95,
+            py::arg("fanout") = 0,
             py::arg("child_width") = 0,
-            py::arg("allocation_strategy") = "adaptive",
             py::call_guard<py::gil_scoped_release>()
         )
         .def(
@@ -1333,19 +1362,17 @@ void bind_interval_data_plane(py::module_ &m) {
             [](NativeBranchStore &store,
                const std::string &checkpoint,
                const std::string &branch,
-               const std::string &metadata_json,
-               int continuation_percent) {
+               const std::string &metadata_json) {
                 NativeCheckpointInfo info;
                 {
                     py::gil_scoped_release release;
-                    info = store.create_checkpoint(checkpoint, branch, metadata_json, continuation_percent);
+                    info = store.create_checkpoint(checkpoint, branch, metadata_json);
                 }
                 return checkpoint_info_to_py(info);
             },
             py::arg("checkpoint"),
             py::arg("branch"),
-            py::arg("metadata_json") = "{}",
-            py::arg("continuation_percent") = 95
+            py::arg("metadata_json") = "{}"
         )
         .def(
             "get_checkpoint_info",
@@ -1478,14 +1505,24 @@ void bind_interval_data_plane(py::module_ &m) {
             [](NativeBranchStore &store,
                const std::string &source,
                const std::string &target,
-               const py::list &changes) {
+               const py::list &changes,
+               std::int64_t expected_source_segment_id,
+               std::int64_t expected_target_segment_id) {
                 auto native_changes = merge_changes_from_py(changes);
                 py::gil_scoped_release release;
-                return store.apply_merge_changes(source, target, native_changes);
+                return store.apply_merge_changes(
+                    source,
+                    target,
+                    native_changes,
+                    expected_source_segment_id,
+                    expected_target_segment_id
+                );
             },
             py::arg("source"),
             py::arg("target"),
-            py::arg("changes")
+            py::arg("changes"),
+            py::arg("expected_source_segment_id") = 0,
+            py::arg("expected_target_segment_id") = 0
         )
         .def("merge_apply", &NativeBranchStore::merge_apply, py::call_guard<py::gil_scoped_release>())
         .def("lock_branches_for_merge", &NativeBranchStore::lock_branches_for_merge, py::call_guard<py::gil_scoped_release>())

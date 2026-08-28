@@ -51,6 +51,26 @@ def test_qdrant_store_upsert_get_and_search(
     assert results[0].score == pytest.approx(1.0)
 
 
+def test_qdrant_search_passes_explicit_server_timeout(
+    qdrant_store: ChronosQdrantStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    original = qdrant_store.client.query_points
+
+    def record_query(**kwargs: object):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(qdrant_store.client, "query_points", record_query)
+    session = qdrant_store.checkout("main")
+    session.upsert("documents", "runtime", [1.0, 0.0, 0.0])
+    session.search("documents", [1.0, 0.0, 0.0], limit=1)
+
+    assert calls
+    assert calls[-1]["timeout"] == 600
+
+
 def test_qdrant_store_isolates_updates_and_deletes(
     qdrant_store: ChronosQdrantStore,
 ) -> None:
@@ -268,81 +288,109 @@ def test_qdrant_store_persists_local_data(tmp_path: Path) -> None:
         second.close()
 
 
-def test_qdrant_store_repairs_dirty_payloads_on_reopen(tmp_path: Path) -> None:
-    metadata_url = f"sqlite:///{tmp_path / 'metadata.sqlite'}"
+def test_register_collection_reuses_metadata_physical_name(tmp_path: Path) -> None:
+    metadata_url = f"sqlite:///{tmp_path / 'qdrant-metadata.sqlite'}"
     qdrant_path = tmp_path / "qdrant"
-    first = ChronosQdrantStore.local(metadata_url, path=qdrant_path)
-    info = first.register_collection("documents", 3)
-    first.checkout("main").upsert(
-        "documents",
-        "doc",
-        [1.0, 0.0, 0.0],
-        {"value": "recover"},
+
+    first = ChronosQdrantStore.local(
+        metadata_url,
+        path=qdrant_path,
+        collection_prefix="first_",
     )
-    records, _ = first.client.scroll(
-        collection_name=info.physical_name,
-        limit=20,
-        with_payload=True,
-    )
-    first.client.set_payload(
-        collection_name=info.physical_name,
-        payload={"_chronos_active": False},
-        points=[record.id for record in records],
-        wait=True,
-    )
-    first.context.db.execute(
-        "UPDATE chronos_qdrant_state SET dirty = 1 WHERE state_key = 'default'"
-    )
-    first.context.db.commit()
+    first_info = first.register_collection("documents", 3)
     first.close()
 
-    repaired = ChronosQdrantStore.local(metadata_url, path=qdrant_path)
+    second = ChronosQdrantStore.local(
+        metadata_url,
+        path=qdrant_path,
+        collection_prefix="second_",
+    )
     try:
-        point = repaired.checkout("main").get("documents", "doc")
-        assert point is not None
-        assert point.payload == {"value": "recover"}
+        second_info = second.register_collection("documents", 3)
+        assert second_info.physical_name == first_info.physical_name
     finally:
-        repaired.close()
+        second.close()
 
 
-def test_qdrant_reconcile_deactivates_uncataloged_points(
+def test_register_collection_rejects_missing_physical_collection(
+    tmp_path: Path,
+) -> None:
+    store = ChronosQdrantStore.local(
+        f"sqlite:///{tmp_path / 'metadata.sqlite'}",
+        path=tmp_path / "qdrant",
+    )
+    try:
+        info = store.register_collection("documents", 3)
+        store.client.delete_collection(info.physical_name)
+
+        with pytest.raises(QdrantStoreError, match="missing Qdrant collection"):
+            store.register_collection("documents", 3)
+    finally:
+        store.close()
+
+
+def test_qdrant_versions_live_only_in_qdrant(
     qdrant_store: ChronosQdrantStore,
 ) -> None:
     info = qdrant_store.collection_info("documents")
-    qdrant_store.checkout("main").upsert(
-        "documents",
-        "cataloged",
-        [1.0, 0.0, 0.0],
-        {"value": "retained"},
+    main = qdrant_store.checkout("main")
+    main.upsert("documents", "doc", [1.0, 0.0, 0.0], {"value": "main"})
+    qdrant_store.create_branch("team", from_branch="main")
+    qdrant_store.checkout("team").upsert(
+        "documents", "doc", [0.0, 1.0, 0.0], {"value": "team"}
     )
-    qdrant_store.client.upsert(
-        collection_name=info.physical_name,
-        points=[
-            models.PointStruct(
-                id="07e0ca1e-9ed7-44c8-bbf6-3db8b8179cc0",
-                vector=[0.0, 1.0, 0.0],
-                payload={
-                    "_chronos_logical_id": "orphan",
-                    "_chronos_revision": "failed-write",
-                    "_chronos_active": True,
-                },
-            )
-        ],
-        wait=True,
-    )
-    qdrant_store._set_dirty(True)
 
-    qdrant_store.reconcile()
-
-    records = qdrant_store._scroll_all(  # noqa: SLF001 - recovery invariant
-        info.physical_name,
-        scroll_filter=qdrant_store._logical_filter("orphan"),  # noqa: SLF001
-    )
-    assert len(records) == 1
-    assert records[0].payload["_chronos_active"] is False
+    sql_objects = {
+        row["name"]
+        for row in qdrant_store.context.db.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        )
+    }
+    assert "chronos_qdrant_points" not in sql_objects
+    assert "chronos_qdrant_state" not in sql_objects
     assert (
-        qdrant_store.checkout("main").get("documents", "cataloged") is not None
+        qdrant_store.context.db.execute(
+            "SELECT 1 FROM _chronos_branch_tables WHERE table_name = ?",
+            ("chronos_qdrant_points",),
+        ).fetchone()
+        is None
     )
+
+    records = qdrant_store._scroll_all(  # noqa: SLF001 - storage invariant
+        info.physical_name,
+        scroll_filter=qdrant_store._logical_filter("doc"),  # noqa: SLF001
+    )
+    assert len(records) == 3
+    for record in records:
+        assert "_chronos_low" in record.payload
+        assert "_chronos_high" in record.payload
+        assert "_chronos_writer" in record.payload
+        assert "_chronos_active" not in record.payload
+
+
+def test_qdrant_splice_uses_one_batch_operation(
+    qdrant_store: ChronosQdrantStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = qdrant_store.checkout("main")
+    main.upsert("documents", "doc", [1.0, 0.0, 0.0])
+    qdrant_store.create_branch("team", from_branch="main")
+    calls: list[dict[str, object]] = []
+    original = qdrant_store.client.batch_update_points
+
+    def record_batch(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(qdrant_store.client, "batch_update_points", record_batch)
+    qdrant_store.checkout("team").upsert("documents", "doc", [0.0, 1.0, 0.0])
+
+    assert len(calls) == 1
+    operations = calls[0]["update_operations"]
+    assert isinstance(operations, list)
+    assert [type(operation).__name__ for operation in operations] == ["UpsertOperation"]
+    assert calls[0]["wait"] is True
+    assert calls[0]["ordering"] == models.WriteOrdering.STRONG
 
 
 def test_qdrant_store_composes_with_sqlite_and_chronosfs(
@@ -413,20 +461,68 @@ def test_qdrant_store_composes_with_sqlite_and_chronosfs(
         workspace.close()
 
 
-def test_qdrant_store_rejects_reads_while_marked_dirty(
-    qdrant_store: ChronosQdrantStore,
+def test_atomic_workspace_reuses_relational_session_for_qdrant(
+    tmp_path: Path,
 ) -> None:
-    qdrant_store.checkout("main").upsert(
-        "documents",
-        "doc",
-        [1.0, 0.0, 0.0],
+    from chronos_core.branching import ChronosBranchContext
+
+    metadata_url = f"sqlite:///{tmp_path / 'knowledge.sqlite'}"
+    sqlite = ChronosBranchContext.connect(metadata_url, backend="interval")
+    sqlite.db.execute("CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT)")
+    sqlite.db.commit()
+    sqlite.register_table("documents", ["id"])
+    qdrant = ChronosQdrantStore.local(
+        metadata_url,
+        path=tmp_path / "qdrant",
+        context=sqlite,
     )
-    qdrant_store._set_dirty(True)
+    qdrant.register_collection("documents", 3)
+    workspace = ChronosWorkspaceContext(
+        sqlite=sqlite,
+        qdrant=qdrant,
+        shared_metadata_url=metadata_url,
+    )
     try:
-        with pytest.raises(QdrantStoreError, match="recovering"):
-            qdrant_store.checkout("main").get("documents", "doc")
+        session = workspace.checkout("main")
+
+        # Relational queries and Qdrant visibility use the exact same live
+        # interval-control session, not two separately sampled branch heads.
+        assert session.qdrant._session._control is session.sqlite._session
+
+        with session.transaction():
+            session.sqlite.upsert_rows("documents", [{"id": "doc", "title": "Shared"}])
+            session.qdrant.upsert(
+                "documents",
+                "doc",
+                [1.0, 0.0, 0.0],
+                {"title": "Shared"},
+            )
+
+        assert session.sqlite.query("SELECT title FROM documents") == [
+            {"title": "Shared"}
+        ]
+        assert session.qdrant.get("documents", "doc").payload == {"title": "Shared"}
+
+        with pytest.raises(RuntimeError, match="abort shared transaction"):
+            with session.transaction():
+                session.sqlite.upsert_rows(
+                    "documents", [{"id": "aborted", "title": "Aborted"}]
+                )
+                session.qdrant.upsert(
+                    "documents",
+                    "aborted",
+                    [0.0, 1.0, 0.0],
+                    {"title": "Aborted"},
+                )
+                raise RuntimeError("abort shared transaction")
+
+        assert (
+            session.sqlite.query("SELECT title FROM documents WHERE id = 'aborted'")
+            == []
+        )
+        assert session.qdrant.get("documents", "aborted") is None
     finally:
-        qdrant_store.reconcile()
+        workspace.close()
 
 
 def test_qdrant_bulk_load_upsert_and_delete_preserve_branch_isolation(

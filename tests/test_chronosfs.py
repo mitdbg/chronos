@@ -15,6 +15,7 @@ from typing import Iterator
 import pytest
 
 from chronos_core.branching import ChronosBranchContext, MergeResolution
+from chronos_core.workspace import ChronosWorkspaceContext
 from chronos_core.workspace.chronosfs import (
     ChronosFSError,
     ChronosFSStore,
@@ -51,6 +52,71 @@ def test_direct_file_operations_are_branch_isolated(chronosfs: ChronosFSStore) -
     assert "notes/plan.txt" in main
     assert "notes/agent.txt" not in main
     assert "notes/agent.txt" in agent
+
+
+def test_workspace_checkout_reuses_chronosfs_interval_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_url = f"sqlite:///{tmp_path / 'knowledge.sqlite'}"
+    filesystem = ChronosFSStore.connect(
+        f"sqlite:///{tmp_path / 'chronosfs.sqlite'}",
+        metadata_url=metadata_url,
+        block_size=8,
+    )
+    filesystem.ensure()
+    relational = ChronosBranchContext.connect(metadata_url)
+    workspace = ChronosWorkspaceContext(
+        filesystem=filesystem,
+        relational=relational,
+        shared_metadata_url=metadata_url,
+    )
+    checkout_calls = 0
+    metadata_checkout_calls = 0
+
+    class CountedNative:
+        def __getattr__(self, name: str):
+            return getattr(native, name)
+
+        def checkout_segment(self, *args, **kwargs):
+            nonlocal checkout_calls
+            checkout_calls += 1
+            return native.checkout_segment(*args, **kwargs)
+
+    native = filesystem._native
+    monkeypatch.setattr(filesystem, "_native", CountedNative())
+    filesystem_checkout_ref = filesystem.context.checkout_ref
+
+    def counted_metadata_checkout_ref(*args, **kwargs):
+        nonlocal metadata_checkout_calls
+        metadata_checkout_calls += 1
+        return filesystem_checkout_ref(*args, **kwargs)
+
+    monkeypatch.setattr(
+        filesystem.context,
+        "checkout_ref",
+        counted_metadata_checkout_ref,
+    )
+    try:
+        first = workspace.checkout("main")
+        second = workspace.checkout("main")
+
+        # Repeated checkout at the same head must not reconstruct the native
+        # filesystem view or create a separate filesystem metadata session.
+        # Both handles remain writable live branch handles.
+        assert checkout_calls == 1
+        assert metadata_checkout_calls == 0
+        first.fs.write_file("/one.txt", b"one")
+        second.fs.write_file("/two.txt", b"two")
+        assert first.fs.read_file("/two.txt") == b"two"
+
+        workspace.create_branch("child", "main")
+        current = workspace.checkout("main")
+        assert checkout_calls == 2
+        current.fs.write_file("/main-only.txt", b"main")
+        assert not workspace.checkout("child").fs.exists("/main-only.txt")
+    finally:
+        workspace.close()
 
 
 def test_fixed_blocks_use_chronos_interval_cow(chronosfs: ChronosFSStore) -> None:
@@ -426,6 +492,76 @@ def test_rename_symlink_and_merge_apply(chronosfs: ChronosFSStore) -> None:
     assert chronosfs.read_text("main", "/renamed.txt") == "main target\n"
     assert chronosfs.readlink("main", "/link.txt") == "dir/nested.txt"
     assert chronosfs.read_text("main", "/link.txt") == "changed\n"
+
+
+def test_merge_preview_omits_created_then_deleted_tree(
+    chronosfs: ChronosFSStore,
+) -> None:
+    chronosfs.create_branch("agent", from_branch="main")
+    chronosfs.mkdir("agent", "/.venv")
+    chronosfs.mkdir("agent", "/.venv/lib")
+    chronosfs.write_file(
+        "agent",
+        "/.venv/lib/transient.py",
+        b"temporary dependency\n" * 32,
+    )
+    chronosfs.unlink("agent", "/.venv/lib/transient.py")
+    chronosfs.rmdir("agent", "/.venv/lib")
+    chronosfs.rmdir("agent", "/.venv")
+
+    preview = chronosfs.merge_preview("agent", "main")
+
+    assert preview.changes == []
+    assert preview.conflicts == []
+
+
+def test_merge_preview_does_not_use_a_live_stat_side_read(
+    chronosfs: ChronosFSStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Path metadata comes from the preview's pinned interval sessions."""
+
+    chronosfs.write_file("main", "/incident.md", b"base")
+    chronosfs.create_branch("worker", from_branch="main")
+    chronosfs.write_file("worker", "/incident.md", b"worker")
+
+    def forbidden_stat(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("merge preview must not perform a live stat lookup")
+
+    monkeypatch.setattr(chronosfs, "stat", forbidden_stat)
+
+    preview = chronosfs.merge_preview("worker", "main")
+
+    assert any(change.key.get("path") == "/incident.md" for change in preview.changes)
+
+
+def test_merge_preview_holds_metadata_snapshot_lock_during_path_resolution(
+    chronosfs: ChronosFSStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chronosfs.write_file("main", "/incident.md", b"base")
+    chronosfs.create_branch("worker", from_branch="main")
+    chronosfs.write_file("worker", "/incident.md", b"worker-v1")
+
+    original_path_for_inode = chronosfs._path_for_inode_in_branch
+    observed_lock = False
+
+    def observe_lock(
+        branch_id: str,
+        inode_id: int,
+        *,
+        session: object,
+    ) -> str | None:
+        nonlocal observed_lock
+        observed_lock = observed_lock or chronosfs.context.metadata_db.in_transaction
+        return original_path_for_inode(branch_id, inode_id, session=session)
+
+    monkeypatch.setattr(chronosfs, "_path_for_inode_in_branch", observe_lock)
+
+    preview = chronosfs.merge_preview("worker", "main")
+
+    assert observed_lock
+    assert any(change.key.get("path") == "/incident.md" for change in preview.changes)
 
 
 def test_policy_merge_resolves_chronosfs_content_at_block_granularity(
@@ -1154,6 +1290,20 @@ def test_shared_daemon_identity_is_store_scoped() -> None:
         "database_url",
         "block_size",
     ]
+
+
+def test_shared_daemon_shutdown_waits_for_mounts() -> None:
+    from chronos_core.workspace.chronosfs.daemon import _DaemonState
+
+    state = _DaemonState()
+    state.request_shutdown()
+    state.active_mounts = 1
+    assert not state.should_exit(0.0, 0.0)
+    state.active_mounts = 0
+    state.retain()
+    assert not state.should_exit(0.0, 0.0)
+    state.request_shutdown(force=True)
+    assert state.should_exit(0.0, 0.0)
 
 
 def test_fuse_large_scale_blocks_and_unix_tools(tmp_path: Path) -> None:

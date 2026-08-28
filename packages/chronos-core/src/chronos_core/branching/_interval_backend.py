@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from chronos_core.branching._common import *
 
+import os
 import time
 import threading
 from decimal import Decimal
@@ -32,21 +33,26 @@ class _IntervalBackend(_SQLBranchBackend):
     def __init__(
         self,
         db: SQLDatabaseAdapter,
-        continuation_percent: int = _INTERVAL_CONTINUATION_PERCENT,
         child_width: int | None = None,
-        allocation_strategy: IntervalAllocationStrategy = "adaptive",
+        reserve_bits: IntervalReserveBits | None = None,
+        harmonic_reserve: int = _INTERVAL_HARMONIC_RESERVE,
+        interval_coordinate_bits: int = 0,
         enable_schema_branching: bool = False,
         create_secondary_indexes: bool = True,
         create_writer_segment_index: bool = True,
     ):
         super().__init__(db)
-        self.continuation_percent = _validate_interval_continuation_percent(
-            continuation_percent
-        )
         self.child_width = _validate_interval_child_width(child_width)
-        self.allocation_strategy = _validate_interval_allocation_strategy(
-            allocation_strategy
-        )
+        self.interval_coordinate_bits = int(interval_coordinate_bits)
+        if self.interval_coordinate_bits < 0:
+            raise ValueError("interval_coordinate_bits must be non-negative")
+        if reserve_bits is None:
+            reserve_bits = interval_reserve_bits_for_coordinate_width(
+                self.interval_coordinate_bits,
+                self.db.dialect,
+            )
+        self.reserve_bits = _validate_interval_reserve_bits(reserve_bits)
+        self.harmonic_reserve = _validate_interval_harmonic_reserve(harmonic_reserve)
         self.enable_schema_branching = bool(enable_schema_branching)
         self.create_secondary_indexes = bool(create_secondary_indexes)
         self.create_writer_segment_index = bool(create_writer_segment_index)
@@ -55,6 +61,7 @@ class _IntervalBackend(_SQLBranchBackend):
         self._interval_gc_running = False
         self._interval_gc_shutdown = False
         self._interval_gc_thread: threading.Thread | None = None
+        self._interval_gc_init_lock = threading.Lock()
         self._interval_gc_lock = threading.Lock()
         self._interval_gc_condition = threading.Condition(self._interval_gc_lock)
         self._interval_gc_ready = threading.Event()
@@ -63,13 +70,31 @@ class _IntervalBackend(_SQLBranchBackend):
         self._native_branch_store = None
         self._native_branch_sessions: dict[tuple[str, int], Any] = {}
         self._native_branch_session_segment_hints: dict[str, int] = {}
+        # ChronosFS can borrow this native store when both stores share one
+        # database.  Keep the store object stable while it is borrowed;
+        # replacing it during an ordinary visibility refresh would leave the
+        # filesystem facade holding the old connection alive through its
+        # keep-alive edge and silently reintroduce the duplicate session.
+        self._native_store_borrowers = 0
         self._native_branch_transaction_active = False
+        self._session_epoch_managed = False
         self._initialize_native_branch_store()
         database_url = str(getattr(self.db, "database_url", "") or "")
-        self._interval_gc_async = self.db.dialect == "postgres" or (
-            self.db.dialect == "sqlite"
-            and database_url
-            and ":memory:" not in database_url
+        # Background reclamation normally uses a dedicated native connection.
+        # High-fan-out process runs can opt into synchronous reclamation so a
+        # deleted worker branch reuses its existing native connection instead
+        # of opening one additional PostgreSQL session per worker.  The
+        # setting changes only when reclamation runs, not what is reclaimed.
+        synchronous_gc = os.environ.get(
+            "CHRONOS_INTERVAL_GC_SYNCHRONOUS", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._interval_gc_async = not synchronous_gc and (
+            self.db.dialect == "postgres"
+            or (
+                self.db.dialect == "sqlite"
+                and database_url
+                and ":memory:" not in database_url
+            )
         )
         if self.db.dialect == "postgres":
             try:
@@ -77,8 +102,11 @@ class _IntervalBackend(_SQLBranchBackend):
                 self.db._chronos_after_rollback = self._rollback_native_branch_store  # type: ignore[attr-defined]
             except Exception:
                 pass
-        if self._interval_gc_async:
-            self._initialize_interval_gc_worker()
+        # Do not open a second native PostgreSQL connection merely to wait for
+        # garbage-collection work that may never be requested.  The worker is
+        # started on the first committed branch deletion instead; this keeps
+        # read-only/check-out processes connection-light while preserving the
+        # same asynchronous GC boundary once reclamation is needed.
 
     def _initialize_native_branch_store(self) -> None:
         if self._native_branch_store is None:
@@ -97,11 +125,33 @@ class _IntervalBackend(_SQLBranchBackend):
             )
             if callable(set_create_writer_segment_index):
                 set_create_writer_segment_index(self.create_writer_segment_index)
+            set_interval_coordinate_bits = getattr(
+                self._native_branch_store, "set_interval_coordinate_bits", None
+            )
+            if callable(set_interval_coordinate_bits) and self.interval_coordinate_bits:
+                set_interval_coordinate_bits(self.interval_coordinate_bits)
+            set_interval_allocator = getattr(
+                self._native_branch_store, "set_interval_allocator", None
+            )
+            if callable(set_interval_allocator):
+                set_interval_allocator(*self.reserve_bits, self.harmonic_reserve)
 
     def refresh_native_connections(self) -> None:
         self._invalidate_native_branch_sessions()
+        if self._native_store_borrowers:
+            # Visibility refreshes only need to invalidate prepared native
+            # sessions.  A borrowed store must remain stable so all users keep
+            # the same native database connection.  Explicit context teardown
+            # still destroys it normally.
+            return
         self._native_branch_store = None
         self._initialize_native_branch_store()
+
+    def register_native_store_borrower(self) -> None:
+        self._native_store_borrowers += 1
+
+    def unregister_native_store_borrower(self) -> None:
+        self._native_store_borrowers = max(0, self._native_store_borrowers - 1)
 
     def _commit_native_branch_store(self) -> None:
         if self._native_branch_store is not None:
@@ -148,6 +198,7 @@ class _IntervalBackend(_SQLBranchBackend):
         finally:
             self._shutdown_interval_gc_worker()
             self._invalidate_native_branch_sessions()
+            self._native_store_borrowers = 0
             self._native_branch_store = None
 
     def _start_async_schema_indexes(self) -> None:
@@ -222,6 +273,7 @@ class _IntervalBackend(_SQLBranchBackend):
             cache_key = (branch_id, segment_id)
             cached = self._native_branch_sessions.get(cache_key)
             if cached is not None:
+                self._configure_native_session(cached)
                 return cached
         try:
             session = self._native_branch_store.checkout(branch_id)
@@ -233,7 +285,18 @@ class _IntervalBackend(_SQLBranchBackend):
             if len(self._native_branch_sessions) >= _SQL_CACHE_MAX_ENTRIES:
                 self._native_branch_sessions.clear()
             self._native_branch_sessions[(branch_id, segment_id)] = session
+        self._configure_native_session(session)
         return session
+
+    def set_session_epoch_managed(self, enabled: bool) -> None:
+        self._session_epoch_managed = bool(enabled)
+        for session in self._native_branch_sessions.values():
+            self._configure_native_session(session)
+
+    def _configure_native_session(self, session: Any) -> None:
+        configure = getattr(session, "set_epoch_managed", None)
+        if callable(configure):
+            configure(self._session_epoch_managed)
 
     def _native_branch_session_for_segment(
         self,
@@ -245,6 +308,7 @@ class _IntervalBackend(_SQLBranchBackend):
         cache_key = (branch_id, segment.segment_id)
         cached = self._native_branch_sessions.get(cache_key)
         if cached is not None:
+            self._configure_native_session(cached)
             return cached
         try:
             checkout_segment = getattr(
@@ -272,6 +336,7 @@ class _IntervalBackend(_SQLBranchBackend):
         if len(self._native_branch_sessions) >= _SQL_CACHE_MAX_ENTRIES:
             self._native_branch_sessions.clear()
         self._native_branch_sessions[cache_key] = session
+        self._configure_native_session(session)
         return session
 
     def refresh_registries(self) -> None:
@@ -301,6 +366,8 @@ class _IntervalBackend(_SQLBranchBackend):
     def wait_for_interval_gc(self) -> None:
         if not self._interval_gc_async:
             return
+        if self._interval_gc_thread is None:
+            return
         with self._interval_gc_condition:
             while self._interval_gc_pending or self._interval_gc_running:
                 self._interval_gc_condition.wait()
@@ -319,6 +386,9 @@ class _IntervalBackend(_SQLBranchBackend):
                 return
             raise BranchingError("native interval branch store is unavailable")
 
+        with self._interval_gc_init_lock:
+            if self._interval_gc_thread is None:
+                self._initialize_interval_gc_worker()
         with self._interval_gc_condition:
             self._interval_gc_pending = True
             self._interval_gc_condition.notify()
@@ -458,9 +528,10 @@ class _IntervalBackend(_SQLBranchBackend):
         metadata: dict[str, Any] | None = None,
         *,
         terminal: bool = False,
+        fanout: int | None = None,
     ) -> None:
         self._create_branch_unlocked(
-            branch_id, from_branch, metadata, terminal=terminal
+            branch_id, from_branch, metadata, terminal=terminal, fanout=fanout
         )
 
     def _create_branch_unlocked(
@@ -470,6 +541,7 @@ class _IntervalBackend(_SQLBranchBackend):
         metadata: dict[str, Any] | None = None,
         *,
         terminal: bool = False,
+        fanout: int | None = None,
     ) -> None:
         if self._native_branch_store is not None:
             for attempt in range(8):
@@ -479,9 +551,8 @@ class _IntervalBackend(_SQLBranchBackend):
                         from_branch,
                         terminal,
                         _json_dumps(metadata),
-                        self.continuation_percent,
+                        int(fanout or 0),
                         self.child_width or 0,
-                        self.allocation_strategy,
                     )
                     self._invalidate_native_branch_sessions()
                     return
@@ -622,7 +693,6 @@ class _IntervalBackend(_SQLBranchBackend):
                     checkpoint,
                     branch,
                     _json_dumps(metadata),
-                    self.continuation_percent,
                 )
             except Exception as exc:
                 message = str(exc)
@@ -1238,6 +1308,9 @@ class _IntervalBackend(_SQLBranchBackend):
         source: str,
         target: str,
         changes: list[RowDiff],
+        *,
+        expected_source_ref: str | None = None,
+        expected_target_ref: str | None = None,
     ) -> int | None:
         if self._native_branch_store is None:
             raise BranchingError("native interval branch store is unavailable")
@@ -1247,6 +1320,8 @@ class _IntervalBackend(_SQLBranchBackend):
                     source,
                     target,
                     [self._row_diff_to_native_dict(change) for change in changes],
+                    int(expected_source_ref or 0),
+                    int(expected_target_ref or 0),
                 )
             )
             self._invalidate_native_branch_sessions()
@@ -1255,6 +1330,8 @@ class _IntervalBackend(_SQLBranchBackend):
             message = str(exc)
             if "chronos_native_merge_unsupported" in message:
                 raise UnsupportedSQLError(message) from exc
+            if "chronos_native_merge_preview_stale" in message:
+                raise BranchingError("merge preview became stale before apply") from exc
             raise
 
     def upsert_row(self, branch_id: str, table: str, row: dict[str, Any]) -> None:

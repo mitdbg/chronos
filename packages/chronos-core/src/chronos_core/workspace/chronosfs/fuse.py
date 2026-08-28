@@ -163,18 +163,25 @@ def start_chronosfs_daemon(
         )
 
 
-def shutdown_chronosfs_daemon(store: ChronosFSStore) -> None:
+def shutdown_chronosfs_daemon(
+    store: ChronosFSStore,
+    *,
+    force: bool = False,
+) -> None:
     """Stop the shared local mount daemon for ``store``.
 
     Callers must unmount every mount point first.  The daemon is otherwise
     self-cleaning after its idle timeout, but run-scoped integrations use this
-    explicit hook so a completed job cannot leave a service behind.
+    explicit hook so a completed job cannot leave a service behind.  A normal
+    request is advisory while another owner keeps the daemon alive; ``force``
+    is reserved for the control plane after it has detached all mounts.
     """
     database_url, metadata_url = _database_urls_for_mount(store)
     _shutdown_shared_chronosfs_daemon(
         database_url,
         metadata_url,
         store.block_size,
+        force=force,
     )
 
 
@@ -248,12 +255,16 @@ def _with_default_cache_options(options: set[str]) -> list[str]:
         # contents.  Invalidate file data on open by default; inode and dentry
         # metadata remain cached through attr_timeout and entry_timeout.
         merged.add("noauto_cache")
+    metadata_cache_disabled = os.environ.get(
+        "CHRONOSFS_DISABLE_METADATA_CACHE", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
     defaults = {
-        # ChronosFS explicitly invalidates changed paths and their parent
-        # directories across local mounts. Keep stable positive entries in the
-        # kernel long enough for metadata-heavy traversals to reuse them.
-        "entry_timeout": "60",
-        "attr_timeout": "60",
+        # ChronosFS normally keeps stable positive entries in the kernel long
+        # enough for metadata-heavy traversals to reuse them.  Concurrency
+        # experiments can disable that cache together with the native metadata
+        # cache so every lookup observes the current interval state.
+        "entry_timeout": "0" if metadata_cache_disabled else "60",
+        "attr_timeout": "0" if metadata_cache_disabled else "60",
         "negative_timeout": "0",
     }
     for name, value in defaults.items():
@@ -469,13 +480,24 @@ def _shutdown_shared_chronosfs_daemon(
     database_url: str,
     metadata_url: str,
     block_size: int,
+    *,
+    force: bool = False,
 ) -> None:
     key = _daemon_key(_daemon_identity(database_url, metadata_url), block_size)
     socket_path = _runtime_dir() / f"{key}.sock"
     if not socket_path.exists():
         return
     with suppress(Exception):
-        _socket_request(socket_path, {"shutdown": True}, timeout=0.2)
+        _socket_request(
+            socket_path,
+            {"shutdown": True, "force": force},
+            timeout=5.0 if force else 0.2,
+        )
+    if not force:
+        return
+    deadline = time.monotonic() + 30.0
+    while socket_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 def _mount_via_shared_daemon(

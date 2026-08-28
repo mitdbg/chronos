@@ -232,8 +232,10 @@
             driver_->execute(
                 "SELECT setval("
                 "'_chronos_branch_interval_segment_id_seq', "
-                "GREATEST(2, COALESCE((SELECT MAX(segment_id) + 1 "
-                "FROM _chronos_branch_interval_segments), 2)), false)"
+                "GREATEST(2, "
+                "COALESCE((SELECT MAX(segment_id) + 1 "
+                "FROM _chronos_branch_interval_segments), 2), "
+                "(SELECT last_value FROM _chronos_branch_interval_segment_id_seq)), true)"
             );
             return;
         }
@@ -267,10 +269,42 @@
         );
     }
 
+    void ensure_session_epoch_tables() {
+        driver_->execute(
+            "CREATE TABLE IF NOT EXISTS _chronos_branch_session_barriers ("
+            "branch_id TEXT PRIMARY KEY, "
+            "barrier_id TEXT NOT NULL, "
+            "operation TEXT NOT NULL, "
+            "created_at_ms BIGINT NOT NULL)"
+        );
+        driver_->execute(
+            "CREATE TABLE IF NOT EXISTS _chronos_branch_sessions ("
+            "session_id TEXT PRIMARY KEY, "
+            "branch_id TEXT NOT NULL, "
+            "session_epoch BIGINT NOT NULL DEFAULT 0, "
+            "required_epoch BIGINT NOT NULL DEFAULT 0, "
+            "barrier_id TEXT, "
+            "status TEXT NOT NULL DEFAULT 'active', "
+            "lease_expires_ms BIGINT NOT NULL)"
+        );
+        driver_->execute(
+            "CREATE INDEX IF NOT EXISTS _chronos_idx_branch_sessions_live "
+            "ON _chronos_branch_sessions (branch_id, lease_expires_ms)"
+        );
+        driver_->execute(
+            "CREATE INDEX IF NOT EXISTS _chronos_idx_branch_sessions_barrier "
+            "ON _chronos_branch_sessions (barrier_id, status)"
+        );
+    }
+
     void ensure_metadata(bool enable_schema_branching) {
         const bool started_tx = !driver_->in_transaction();
         if (started_tx) driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
         try {
+            // The Python adapter and the native store can use different
+            // PostgreSQL connections.  Serialize bootstrap on the connection
+            // that actually issues the CREATE TABLE statements.
+            lock_schema_metadata();
             const std::string interval_type = interval_sql_type();
             // Logical table registry.  Each user-facing table name maps to one
             // physical interval table plus JSON-encoded schema/PK metadata.
@@ -313,6 +347,7 @@
                 "ON _chronos_branch_interval_branches (parent_branch_id)"
             );
             ensure_branch_transaction_commit_table();
+            ensure_session_epoch_tables();
             // Segment allocation tree.  [live_lo, live_hi) is the write interval
             // owned by the segment; branch_point is the read timestamp that
             // resolves inherited rows.  Forks and merges only add segment rows
@@ -492,7 +527,7 @@
                 " (" + comma_join_quoted(target_columns) + ") "
                 "SELECT " + comma_join_quoted(columns) +
                 ", 0, ?, 1, FALSE FROM " + quote_table_name(table),
-                {max_interval_value()}
+                {initial_record_live_hi_value()}
             );
             driver_->execute(
                 "INSERT INTO _chronos_branch_tables "
@@ -1026,14 +1061,425 @@
         return ids;
     }
 
+    int branch_depth(const std::string &branch_id) {
+        auto rows = driver_->query(
+            "WITH RECURSIVE ancestry(branch_id, parent_branch_id, depth) AS ("
+            "  SELECT branch_id, parent_branch_id, 0 "
+            "  FROM _chronos_branch_interval_branches WHERE branch_id = ? "
+            "UNION ALL "
+            "  SELECT parent.branch_id, parent.parent_branch_id, ancestry.depth + 1 "
+            "  FROM _chronos_branch_interval_branches AS parent "
+            "  JOIN ancestry ON parent.branch_id = ancestry.parent_branch_id "
+            ") SELECT COALESCE(MAX(depth), 0) FROM ancestry",
+            {branch_id}
+        );
+        if (rows.empty()) throw std::runtime_error("branch not found: " + branch_id);
+        return static_cast<int>(native_as_int(rows[0][0]));
+    }
+
+    NativeDirectMergeSegment initial_branch_segment(
+        const std::string &branch_id,
+        const NativeDirectMergeSegment &fallback
+    ) {
+        auto rows = driver_->query(
+            "SELECT segment_id, COALESCE(parent_segment_id, 0), segment_kind, "
+            "       live_lo, live_hi, branch_point "
+            "FROM _chronos_branch_interval_segments "
+            "WHERE owner_branch_id = ? ORDER BY segment_id LIMIT 1",
+            {branch_id}
+        );
+        if (rows.empty()) return fallback;
+        return {
+            native_as_int(rows[0][0]),
+            native_as_int(rows[0][1]),
+            native_as_string(rows[0][2]),
+            native_as_string(rows[0][3]),
+            native_as_string(rows[0][4]),
+            native_as_string(rows[0][5]),
+        };
+    }
+
+    cpp_int choose_interval_child_width(
+        const NativeDirectMergeSegment &source_segment,
+        const NativeDirectMergeSegment &initial_segment,
+        int depth,
+        int children_created,
+        int fanout,
+        bool terminal,
+        int fixed_child_width
+    ) const {
+        const cpp_int active = cpp_int_from_decimal(source_segment.live_hi) -
+            cpp_int_from_decimal(source_segment.live_lo) - 1;
+        if (active < 2) throw std::runtime_error("interval space exhausted");
+        cpp_int child_width;
+        if (terminal) {
+            child_width = 2;
+        } else if (fixed_child_width > 0) {
+            child_width = fixed_child_width;
+        } else {
+            const cpp_int initial = cpp_int_from_decimal(initial_segment.live_hi) -
+                cpp_int_from_decimal(initial_segment.live_lo) - 1;
+            if (depth < 3) {
+                child_width = initial >> reserve_bits_[static_cast<std::size_t>(depth)];
+            } else if (fanout > 0) {
+                child_width = initial / (fanout + 1);
+            } else {
+                child_width = active / (harmonic_reserve_ + children_created + 1);
+            }
+        }
+        if (child_width < 2) throw std::runtime_error("interval space exhausted");
+        if (child_width > active - 2) child_width = active - 2;
+        if (child_width < 2) throw std::runtime_error("interval space exhausted");
+        return child_width;
+    }
+
+    struct NativeSessionBarrierGuard {
+        std::vector<std::string> branches;
+        std::string barrier_id;
+        std::string delete_parent;
+        bool installed = false;
+        bool transaction_open = false;
+        bool delete_leaf_fast_path = false;
+    };
+
+    static std::int64_t session_epoch_now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+    }
+
+    static std::string next_session_barrier_id(const std::string &operation) {
+        static std::atomic<std::uint64_t> counter{1};
+        const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto sequence = counter.fetch_add(1, std::memory_order_relaxed);
+        return operation + "_" + hex_u64(
+            static_cast<std::uint64_t>(tick) ^
+            (sequence * 0x9e3779b97f4a7c15ULL),
+            16
+        );
+    }
+
+    std::vector<std::string> session_barrier_branches(
+        const std::vector<std::string> &roots,
+        bool include_descendants
+    ) {
+        std::set<std::string> branches(roots.begin(), roots.end());
+        if (include_descendants) {
+            for (const auto &root : roots) {
+                auto rows = driver_->query(
+                    "WITH RECURSIVE subtree(branch_id) AS ("
+                    "  SELECT branch_id FROM _chronos_branch_interval_branches WHERE branch_id = ? "
+                    "UNION ALL "
+                    "  SELECT child.branch_id "
+                    "  FROM _chronos_branch_interval_branches child "
+                    "  JOIN subtree ON child.parent_branch_id = subtree.branch_id"
+                    ") SELECT branch_id FROM subtree",
+                    {root}
+                );
+                for (const auto &row : rows) branches.insert(native_as_string(row[0]));
+            }
+        }
+        return {branches.begin(), branches.end()};
+    }
+
+    void lock_session_barrier_branches(const std::vector<std::string> &branches) {
+        if (branches.empty()) return;
+        std::vector<Value> params;
+        params.reserve(branches.size());
+        for (const auto &branch : branches) params.push_back(branch);
+        std::string sql =
+            "SELECT branch_id FROM _chronos_branch_interval_branches "
+            "WHERE branch_id IN (" + placeholders(params.size()) + ") ORDER BY branch_id";
+        if (metadata_dialect() == "postgres") sql += " FOR UPDATE";
+        auto rows = driver_->query(sql, params);
+        if (rows.size() != branches.size()) {
+            throw std::runtime_error("branch not found while establishing session barrier");
+        }
+    }
+
+    void notify_session_barrier(const std::string &barrier_id) {
+        if (metadata_dialect() == "postgres") {
+            driver_->query("SELECT pg_notify('chronos_session_epoch', ?)", {barrier_id});
+        }
+    }
+
+    NativeSessionBarrierGuard begin_session_barrier(
+        const std::vector<std::string> &roots,
+        const std::string &operation,
+        bool include_descendants = false
+    ) {
+        if (driver_->in_transaction()) {
+            throw std::runtime_error(
+                "branch management cannot begin inside an existing metadata transaction"
+            );
+        }
+        driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+        NativeSessionBarrierGuard guard;
+        guard.transaction_open = true;
+        try {
+            guard.branches = session_barrier_branches(roots, include_descendants);
+            lock_session_barrier_branches(guard.branches);
+            const std::int64_t now_ms = session_epoch_now_ms();
+            std::vector<Value> params;
+            params.reserve(guard.branches.size() + 1);
+            for (const auto &branch : guard.branches) params.push_back(branch);
+            params.push_back(now_ms);
+            if (metadata_dialect() != "postgres") {
+                driver_->execute(
+                    "DELETE FROM _chronos_branch_sessions "
+                    "WHERE branch_id IN (" + placeholders(guard.branches.size()) + ") "
+                    "AND lease_expires_ms <= ?",
+                    params
+                );
+            }
+            params.pop_back();
+            auto existing = driver_->query(
+                "SELECT branch_id FROM _chronos_branch_session_barriers "
+                "WHERE branch_id IN (" + placeholders(guard.branches.size()) + ") LIMIT 1",
+                params
+            );
+            if (!existing.empty()) {
+                throw std::runtime_error(
+                    "chronos_session_barrier_in_progress: " + native_as_string(existing[0][0])
+                );
+            }
+            if (metadata_dialect() == "postgres") {
+                bool all_quiescent = true;
+                for (const auto &branch : guard.branches) {
+                    auto acquired = driver_->query(
+                        "SELECT pg_try_advisory_xact_lock("
+                        "hashtext('_chronos_session_epoch'), hashtext(?))",
+                        {branch}
+                    );
+                    all_quiescent = all_quiescent && !acquired.empty() &&
+                        native_as_int(acquired[0][0]) != 0;
+                }
+                if (all_quiescent) {
+                    return guard;
+                }
+            } else {
+                params.push_back(now_ms);
+                auto sessions = driver_->query(
+                    "SELECT session_id FROM _chronos_branch_sessions "
+                    "WHERE branch_id IN (" + placeholders(guard.branches.size()) + ") "
+                    "AND lease_expires_ms > ? LIMIT 1",
+                    params
+                );
+                if (sessions.empty()) return guard;
+            }
+
+            guard.installed = true;
+            guard.barrier_id = next_session_barrier_id(operation);
+            for (const auto &branch : guard.branches) {
+                driver_->execute(
+                    "INSERT INTO _chronos_branch_session_barriers "
+                    "(branch_id, barrier_id, operation, created_at_ms) VALUES (?, ?, ?, ?)",
+                    {branch, guard.barrier_id, operation, now_ms}
+                );
+            }
+            std::vector<Value> update_params{guard.barrier_id};
+            for (const auto &branch : guard.branches) update_params.push_back(branch);
+            if (metadata_dialect() != "postgres") update_params.push_back(now_ms);
+            driver_->execute(
+                "UPDATE _chronos_branch_sessions "
+                "SET required_epoch = session_epoch + 1, barrier_id = ?, status = 'draining' "
+                "WHERE barrier_id IS NULL "
+                "AND branch_id IN (" + placeholders(guard.branches.size()) + ") " +
+                (metadata_dialect() == "postgres" ? "" : "AND lease_expires_ms > ?"),
+                update_params
+            );
+            notify_session_barrier(guard.barrier_id);
+            driver_->execute("COMMIT");
+            guard.transaction_open = false;
+
+            if (metadata_dialect() == "postgres") {
+                driver_->execute("BEGIN");
+                guard.transaction_open = true;
+                // Wait for every session's shared advisory fence before
+                // taking branch-row locks.  A session can still be finishing
+                // a write that holds one of those rows; taking the row lock
+                // first would make the barrier wait on the session while the
+                // session waits on the barrier's row lock.
+                for (const auto &branch : guard.branches) {
+                    driver_->query(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtext('_chronos_session_epoch'), hashtext(?))",
+                        {branch}
+                    );
+                }
+                lock_session_barrier_branches(guard.branches);
+                return guard;
+            }
+
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+            while (true) {
+                const std::int64_t poll_ms = session_epoch_now_ms();
+                driver_->execute(
+                    "DELETE FROM _chronos_branch_sessions "
+                    "WHERE barrier_id = ? AND lease_expires_ms <= ?",
+                    {guard.barrier_id, poll_ms}
+                );
+                auto pending = driver_->query(
+                    "SELECT 1 FROM _chronos_branch_sessions "
+                    "WHERE barrier_id = ? AND status <> 'quiescent' LIMIT 1",
+                    {guard.barrier_id}
+                );
+                if (pending.empty()) break;
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    throw std::runtime_error(
+                        "timed out waiting for sessions to cross barrier: " + guard.barrier_id
+                    );
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+
+            driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+            guard.transaction_open = true;
+            lock_session_barrier_branches(guard.branches);
+            return guard;
+        } catch (...) {
+            abort_session_barrier(guard);
+            throw;
+        }
+    }
+
+    NativeSessionBarrierGuard begin_delete_session_barrier(
+        const std::string &branch_id
+    ) {
+        if (metadata_dialect() != "postgres" || driver_->in_transaction()) {
+            return begin_session_barrier({branch_id}, "delete", true);
+        }
+        NativeSessionBarrierGuard guard;
+        driver_->execute("BEGIN");
+        guard.transaction_open = true;
+        try {
+            auto rows = driver_->query(
+                "SELECT parent.parent_branch_id, parent.child_count, "
+                "       NOT EXISTS ("
+                "         SELECT 1 FROM _chronos_branch_session_barriers barrier "
+                "         WHERE barrier.branch_id = parent.branch_id"
+                "       ), "
+                "       pg_try_advisory_xact_lock("
+                "         hashtext('_chronos_session_epoch'), hashtext(parent.branch_id)) "
+                "FROM _chronos_branch_interval_branches parent "
+                "WHERE parent.branch_id = ? FOR UPDATE",
+                {branch_id}
+            );
+            if (rows.empty()) {
+                throw std::runtime_error("branch not found while establishing session barrier");
+            }
+            const bool leaf = native_as_int(rows[0][1]) == 0;
+            const bool no_barrier = native_as_int(rows[0][2]) != 0;
+            const bool fence_acquired = native_as_int(rows[0][3]) != 0;
+            if (leaf && no_barrier && fence_acquired) {
+                guard.branches = {branch_id};
+                guard.delete_parent = native_as_string(rows[0][0]);
+                guard.delete_leaf_fast_path = true;
+                return guard;
+            }
+            driver_->execute("ROLLBACK");
+            guard.transaction_open = false;
+        } catch (...) {
+            if (guard.transaction_open && driver_->in_transaction()) {
+                try { driver_->execute("ROLLBACK"); } catch (...) {}
+                guard.transaction_open = false;
+            }
+            throw;
+        }
+        return begin_session_barrier({branch_id}, "delete", true);
+    }
+
+    void finish_session_barrier(NativeSessionBarrierGuard &guard) {
+        if (!guard.transaction_open) {
+            driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+            guard.transaction_open = true;
+        }
+        if (guard.installed) {
+            if (metadata_dialect() != "postgres") {
+                driver_->execute(
+                    "UPDATE _chronos_branch_sessions "
+                    "SET barrier_id = NULL, status = 'active', required_epoch = session_epoch "
+                    "WHERE barrier_id = ?",
+                    {guard.barrier_id}
+                );
+            } else {
+                driver_->execute(
+                    "DELETE FROM _chronos_branch_sessions WHERE lease_expires_ms <= ?",
+                    {session_epoch_now_ms()}
+                );
+            }
+            driver_->execute(
+                "DELETE FROM _chronos_branch_session_barriers WHERE barrier_id = ?",
+                {guard.barrier_id}
+            );
+            notify_session_barrier(guard.barrier_id);
+        }
+        driver_->execute("COMMIT");
+        guard.transaction_open = false;
+    }
+
+    void suspend_session_barrier_transaction(NativeSessionBarrierGuard &guard) {
+        if (!guard.transaction_open) return;
+        driver_->execute("COMMIT");
+        guard.transaction_open = false;
+    }
+
+    void abort_session_barrier(NativeSessionBarrierGuard &guard) {
+        if (guard.transaction_open && driver_->in_transaction()) {
+            try { driver_->execute("ROLLBACK"); } catch (...) {}
+            guard.transaction_open = false;
+        }
+        if (!guard.installed) return;
+        try {
+            driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+            if (metadata_dialect() != "postgres") {
+                driver_->execute(
+                    "UPDATE _chronos_branch_sessions "
+                    "SET barrier_id = NULL, status = 'active', required_epoch = session_epoch "
+                    "WHERE barrier_id = ?",
+                    {guard.barrier_id}
+                );
+            }
+            driver_->execute(
+                "DELETE FROM _chronos_branch_session_barriers WHERE barrier_id = ?",
+                {guard.barrier_id}
+            );
+            notify_session_barrier(guard.barrier_id);
+            driver_->execute("COMMIT");
+        } catch (...) {
+            if (driver_->in_transaction()) {
+                try { driver_->execute("ROLLBACK"); } catch (...) {}
+            }
+        }
+    }
+
     void create_branch(
         const std::string &branch_id,
         const std::string &from_branch,
         bool terminal,
         const std::string &metadata_json,
-        int continuation_percent,
-        int child_width,
-        const std::string &allocation_strategy
+        int fanout,
+        int child_width
+    ) {
+        NativeSessionBarrierGuard guard = begin_session_barrier({from_branch}, "fork");
+        try {
+            create_branch_unfenced(
+                branch_id, from_branch, terminal, metadata_json, fanout, child_width
+            );
+            finish_session_barrier(guard);
+        } catch (...) {
+            abort_session_barrier(guard);
+            throw;
+        }
+    }
+
+    void create_branch_unfenced(
+        const std::string &branch_id,
+        const std::string &from_branch,
+        bool terminal,
+        const std::string &metadata_json,
+        int fanout,
+        int child_width
     ) {
         const bool started_tx = !driver_->in_transaction();
         if (started_tx) driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
@@ -1045,6 +1491,7 @@
         std::vector<std::vector<Value>> source_rows;
         std::vector<Value> source_segment_row;
         std::string source_branch_kind;
+        int children_created = 0;
         if (metadata_dialect() == "postgres") {
             // Lock the source branch head first, then read its segment in a
             // separate statement.  Under READ COMMITTED, a concurrent fork can
@@ -1054,7 +1501,7 @@
             // the statement snapshot, falsely reporting that the source branch
             // does not exist.
             source_rows = driver_->query(
-                "SELECT b.current_segment_id, b.branch_kind, "
+                "SELECT b.current_segment_id, b.branch_kind, b.child_count, "
                 "       (SELECT COUNT(*) FROM _chronos_branch_interval_branches WHERE branch_id = ?), "
                 "       nextval('_chronos_branch_interval_segment_id_seq')::bigint, "
                 "       nextval('_chronos_branch_interval_segment_id_seq')::bigint, "
@@ -1066,12 +1513,13 @@
             if (source_rows.empty()) {
                 throw std::runtime_error("branch not found: " + from_branch);
             }
-            if (native_as_int(source_rows[0][2]) > 0) {
+            if (native_as_int(source_rows[0][3]) > 0) {
                 throw std::runtime_error("branch already exists: " + branch_id);
             }
-            continuation_id = native_as_int(source_rows[0][3]);
-            child_id = native_as_int(source_rows[0][4]);
-            fork_base_id = native_as_int(source_rows[0][5]);
+            children_created = static_cast<int>(native_as_int(source_rows[0][2]));
+            continuation_id = native_as_int(source_rows[0][4]);
+            child_id = native_as_int(source_rows[0][5]);
+            fork_base_id = native_as_int(source_rows[0][6]);
             source_branch_kind = native_as_string(source_rows[0][1]);
             auto segment_rows = driver_->query(
                 "SELECT segment_id, COALESCE(parent_segment_id, 0), segment_kind, "
@@ -1093,7 +1541,7 @@
                 throw std::runtime_error("branch already exists: " + branch_id);
             }
             source_rows = driver_->query(
-                "SELECT b.current_segment_id, b.branch_kind, "
+                "SELECT b.current_segment_id, b.branch_kind, b.child_count, "
                 "       s.segment_id, COALESCE(s.parent_segment_id, 0), s.segment_kind, "
                 "       s.live_lo, s.live_hi, s.branch_point "
                 "FROM _chronos_branch_interval_branches b "
@@ -1106,7 +1554,8 @@
                 throw std::runtime_error("branch not found: " + from_branch);
             }
             source_branch_kind = native_as_string(source_rows[0][1]);
-            source_segment_row.assign(source_rows[0].begin() + 2, source_rows[0].begin() + 8);
+            children_created = static_cast<int>(native_as_int(source_rows[0][2]));
+            source_segment_row.assign(source_rows[0].begin() + 3, source_rows[0].begin() + 9);
         }
         if (source_branch_kind == "terminal") {
             throw std::runtime_error("terminal branch is not branchable: " + from_branch);
@@ -1120,6 +1569,7 @@
             native_as_string(source_segment_row[5]),
         };
 
+        if (fanout < 0) throw std::invalid_argument("fanout must be non-negative");
         const cpp_int lo = cpp_int_from_decimal(source_segment.live_lo);
         const cpp_int hi = cpp_int_from_decimal(source_segment.live_hi);
         if (hi - lo < 5) {
@@ -1133,30 +1583,21 @@
         // points at the child segment.  terminal=true simply gives the child a
         // minimal width, useful for short-lived branch transactions.
         const cpp_int fork_base_hi = lo + 1;
-        const cpp_int width = hi - fork_base_hi;
-        cpp_int native_child_width;
-        if (terminal) {
-            native_child_width = 2;
-        } else if (child_width > 0) {
-            native_child_width = child_width;
-        } else if (allocation_strategy == "adaptive") {
-            if (width > cpp_int(1ULL << 32)) {
-                // Favor shallow fanout while the range is large: the default
-                // 95% continuation leaves 5% for the child.
-                cpp_int continuation_width = (width * continuation_percent) / 100;
-                native_child_width = width - continuation_width;
-            } else {
-                // Once the range is narrow, favor depth by giving the child
-                // the larger share. This prevents a deep spine from losing
-                // 95% of its remaining range at every level.
-                native_child_width = (width * continuation_percent) / 100;
-            }
-        } else {
-            cpp_int continuation_width = (width * continuation_percent) / 100;
-            native_child_width = width - continuation_width;
+        const bool needs_depth = !terminal && child_width <= 0;
+        const int depth = needs_depth ? branch_depth(from_branch) : 0;
+        NativeDirectMergeSegment initial_segment = source_segment;
+        if (needs_depth && (depth < 3 || fanout > 0)) {
+            initial_segment = initial_branch_segment(from_branch, source_segment);
         }
-        if (native_child_width < 2) native_child_width = 2;
-        if (native_child_width > width - 2) native_child_width = width - 2;
+        const cpp_int native_child_width = choose_interval_child_width(
+            source_segment,
+            initial_segment,
+            depth,
+            children_created,
+            fanout,
+            terminal,
+            child_width
+        );
         const cpp_int child_hi = fork_base_hi + native_child_width;
         if (metadata_dialect() != "postgres") {
             std::vector<std::int64_t> ids = allocate_segment_ids(3);
@@ -1327,6 +1768,33 @@
         if (branch_id == "main") {
             throw std::runtime_error("main cannot be deleted");
         }
+        NativeSessionBarrierGuard guard = begin_delete_session_barrier(branch_id);
+        try {
+            if (guard.delete_leaf_fast_path) {
+                driver_->execute(
+                    "DELETE FROM _chronos_branch_interval_branches WHERE branch_id = ?",
+                    {branch_id}
+                );
+                if (!guard.delete_parent.empty()) {
+                    driver_->execute(
+                        "UPDATE _chronos_branch_interval_branches "
+                        "SET child_count = CASE "
+                        "  WHEN child_count > 0 THEN child_count - 1 ELSE 0 END "
+                        "WHERE branch_id = ?",
+                        {guard.delete_parent}
+                    );
+                }
+            } else {
+                delete_branch_unfenced(branch_id);
+            }
+            finish_session_barrier(guard);
+        } catch (...) {
+            abort_session_barrier(guard);
+            throw;
+        }
+    }
+
+    void delete_branch_unfenced(const std::string &branch_id) {
         const bool started_tx = !driver_->in_transaction();
         if (started_tx) driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
         try {
@@ -1485,8 +1953,25 @@
     chronos::native::NativeCheckpointInfo create_checkpoint(
         const std::string &checkpoint,
         const std::string &branch,
-        const std::string &metadata_json,
-        int continuation_percent
+        const std::string &metadata_json
+    ) {
+        NativeSessionBarrierGuard guard = begin_session_barrier(
+            {branch}, "checkpoint"
+        );
+        try {
+            auto info = create_checkpoint_unfenced(checkpoint, branch, metadata_json);
+            finish_session_barrier(guard);
+            return info;
+        } catch (...) {
+            abort_session_barrier(guard);
+            throw;
+        }
+    }
+
+    chronos::native::NativeCheckpointInfo create_checkpoint_unfenced(
+        const std::string &checkpoint,
+        const std::string &branch,
+        const std::string &metadata_json
     ) {
         const bool started_tx = !driver_->in_transaction();
         if (started_tx) driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
@@ -1500,10 +1985,12 @@
             }
             const std::string lock_suffix = metadata_dialect() == "postgres" ? " FOR UPDATE" : "";
             auto source_rows = driver_->query(
-                "SELECT current_segment_id, branch_kind "
+                "SELECT current_segment_id, branch_kind, "
+                "       (SELECT COUNT(*) FROM _chronos_branch_interval_checkpoints "
+                "        WHERE branch_id = ?) "
                 "FROM _chronos_branch_interval_branches "
                 "WHERE branch_id = ?" + lock_suffix,
-                {branch}
+                {branch, branch}
             );
             if (source_rows.empty()) {
                 throw std::runtime_error("branch not found: " + branch);
@@ -1512,7 +1999,11 @@
                 throw std::runtime_error("terminal branch cannot be checkpointed: " + branch);
             }
             NativeDirectMergeSegment source_segment = load_direct_segment_by_id(native_as_int(source_rows[0][0]));
-            auto [continuation, snapshot] = split_checkpoint_segment(source_segment, continuation_percent);
+            const int checkpoints_created = static_cast<int>(native_as_int(source_rows[0][2]));
+            auto [continuation, snapshot] = split_checkpoint_segment(
+                source_segment,
+                checkpoints_created
+            );
             const std::string now = current_timestamp_string();
             insert_interval_segment(continuation, source_segment.segment_id, branch, "mutable", now);
             insert_interval_segment(snapshot, source_segment.segment_id, "", "checkpoint", now);
@@ -1588,15 +2079,54 @@
 // Source: interval_branch_store_schema.cpp
 // -----------------------------------------------------------------------------
     std::string interval_sql_type() const {
-        return dialect() == "postgres" ? "NUMERIC(32,0)" : "BIGINT";
+        if (dialect() != "postgres") return "BIGINT";
+        switch (interval_coordinate_bits_) {
+        case 32:
+            return "INTEGER";
+        case 64:
+            // Use the same PostgreSQL numeric representation as wider domains;
+            // it also lets physical record bounds use Infinity for open ends.
+            return "NUMERIC(20,0)";
+        case 128:
+            return "NUMERIC(39,0)";
+        case 256:
+            return "NUMERIC(78,0)";
+        case 512:
+            return "NUMERIC(155,0)";
+        case 1024:
+            return "NUMERIC(309,0)";
+        default:
+            return "NUMERIC(32,0)";
+        }
+    }
+
+    bool uses_postgres_numeric_intervals() const {
+        return dialect() == "postgres" &&
+            interval_coordinate_bits_ != 32;
+    }
+
+    std::string physical_live_hi_sql_type() const {
+        // PostgreSQL accepts Infinity only in an unconstrained NUMERIC column.
+        // Branch allocation metadata remains finite and uses interval_sql_type().
+        return uses_postgres_numeric_intervals() ? "NUMERIC" : interval_sql_type();
+    }
+
+    std::string initial_record_live_hi_value() const {
+        // Record intervals can be open-ended. Branch intervals retain a finite
+        // ceiling because fork placement performs integer arithmetic on them.
+        return uses_postgres_numeric_intervals() ? "Infinity" : max_interval_value();
     }
 
     std::string max_interval_value() const {
-        return dialect() == "postgres" ? "10000000000000000000000000000000" : "9000000000000000000";
+        if (dialect() != "postgres") return "9000000000000000000";
+        if (interval_coordinate_bits_ == 0) return "10000000000000000000000000000000";
+        return cpp_int_to_decimal((cpp_int(1) << (interval_coordinate_bits_ - 1)) - 1);
     }
 
     std::string root_branch_point_value() const {
-        return dialect() == "postgres" ? "5000000000000000000000000000000" : "4500000000000000000";
+        if (dialect() != "postgres") return "4500000000000000000";
+        if (interval_coordinate_bits_ == 0) return "5000000000000000000000000000000";
+        return cpp_int_to_decimal(((cpp_int(1) << (interval_coordinate_bits_ - 1)) - 1) / 2);
     }
 
     std::string schema_version_id(const std::string &table) {
@@ -1704,7 +2234,7 @@
             "CREATE TABLE " + quote_ident(physical) + " ("
             + join_strings(column_defs, ", ") +
             ", live_lo " + interval_sql_type() + " NOT NULL"
-            ", live_hi " + interval_sql_type() + " NOT NULL"
+            ", live_hi " + physical_live_hi_sql_type() + " NOT NULL"
             ", writer_segment_id INTEGER NOT NULL"
             ", deleted BOOLEAN NOT NULL DEFAULT FALSE";
         if (create_primary_key) {
@@ -1989,6 +2519,28 @@
         const std::string &excluded_table,
         const std::vector<std::int64_t> &excluded_values
     ) {
+        NativeSessionBarrierGuard guard = begin_session_barrier(
+            {source, target}, "merge"
+        );
+        try {
+            if (guard.installed) suspend_session_barrier_transaction(guard);
+            const auto applied = merge_apply_excluding_first_key_values_unfenced(
+                source, target, excluded_table, excluded_values
+            );
+            finish_session_barrier(guard);
+            return applied;
+        } catch (...) {
+            abort_session_barrier(guard);
+            throw;
+        }
+    }
+
+    std::int64_t merge_apply_excluding_first_key_values_unfenced(
+        const std::string &source,
+        const std::string &target,
+        const std::string &excluded_table,
+        const std::vector<std::int64_t> &excluded_values
+    ) {
         const std::unordered_set<std::int64_t> excluded_first_keys(
             excluded_values.begin(),
             excluded_values.end()
@@ -2205,17 +2757,91 @@
         }
     }
 
+    void acquire_external_transaction_lock(const std::string &target) {
+        if (metadata_dialect() != "postgres") return;
+        const std::int32_t key = static_cast<std::int32_t>(
+            stable_fnv1a64(target) & 0xffffffffULL
+        );
+        if (external_transaction_lock_.has_value()) {
+            if (external_transaction_lock_->second == target) return;
+            throw std::runtime_error(
+                "chronos_native_merge_conflict: connection already owns a target reservation"
+            );
+        }
+        // A session-level advisory lock blocks at the relational metadata
+        // plane until the previous publisher releases the target.  It is
+        // deliberately held across reservation, staging, and publication;
+        // the active commit row remains the crash-visible recovery record.
+        driver_->execute(
+            "SELECT pg_advisory_lock(1720812903, ?::int)",
+            {key}
+        );
+        external_transaction_lock_ = std::make_pair(key, target);
+    }
+
+    void release_external_transaction_lock() {
+        if (!external_transaction_lock_.has_value()) return;
+        const std::int32_t key = external_transaction_lock_->first;
+        external_transaction_lock_.reset();
+        if (metadata_dialect() != "postgres") return;
+        try {
+            driver_->execute(
+                "SELECT pg_advisory_unlock(1720812903, ?::int)",
+                {key}
+            );
+        } catch (...) {
+            // Connection teardown releases session locks even if the unlock
+            // itself cannot be issued after an earlier SQL error.
+        }
+    }
+
+    void wait_for_external_commit_slot(const std::string &target) {
+        if (metadata_dialect() == "postgres") return;
+        constexpr auto wait_step = std::chrono::milliseconds(10);
+        constexpr auto wait_limit = std::chrono::seconds(60);
+        const auto deadline = std::chrono::steady_clock::now() + wait_limit;
+        while (true) {
+            auto active = driver_->query(
+                "SELECT merge_segment_id "
+                "FROM _chronos_branch_transaction_commits "
+                "WHERE target_branch_id = ? LIMIT 1",
+                {target}
+            );
+            if (active.empty()) return;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error(
+                    "chronos_native_merge_conflict: timed out waiting for target branch commit"
+                );
+            }
+            std::this_thread::sleep_for(wait_step);
+        }
+    }
+
     chronos::native::NativeBranchTransaction reserve_external_branch_transaction(
         const std::string &source,
         const std::string &target,
         const std::string &participant_stores,
         const std::string &metadata_json
     ) {
-        const bool started_tx = !driver_->in_transaction();
-        if (started_tx) {
-            driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+        if (external_session_barrier_.has_value()) {
+            throw std::runtime_error(
+                "chronos_native_merge_conflict: connection already owns a session barrier"
+            );
         }
+        NativeSessionBarrierGuard session_guard = begin_session_barrier(
+            {source, target}, "merge"
+        );
+        // The reservation must be durable while participant stores stage data.
+        // The barrier rows, rather than this transaction, retain the fence.
+        suspend_session_barrier_transaction(session_guard);
+        bool started_tx = false;
         try {
+            acquire_external_transaction_lock(target);
+            wait_for_external_commit_slot(target);
+            started_tx = !driver_->in_transaction();
+            if (started_tx) {
+                driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+            }
             NativeMergePlan merge_plan = load_merge_plan(source, target, true);
             NativeBranchCommitReservation reservation = reserve_branch_transaction_commit(
                 merge_plan.target,
@@ -2226,6 +2852,7 @@
                 metadata_json
             );
             if (started_tx) driver_->execute("COMMIT");
+            external_session_barrier_ = std::move(session_guard);
             return {
                 reservation.merge_segment.segment_id,
                 reservation.continuation_segment.segment_id,
@@ -2241,6 +2868,8 @@
             if (started_tx && driver_->in_transaction()) {
                 try { driver_->execute("ROLLBACK"); } catch (...) {}
             }
+            release_external_transaction_lock();
+            abort_session_barrier(session_guard);
             throw;
         }
     }
@@ -2349,9 +2978,19 @@
         try {
             publish_branch_transaction_commit(external_reservation(transaction), target);
             if (started_tx) driver_->execute("COMMIT");
+            release_external_transaction_lock();
+            if (external_session_barrier_.has_value()) {
+                finish_session_barrier(*external_session_barrier_);
+                external_session_barrier_.reset();
+            }
         } catch (...) {
             if (started_tx && driver_->in_transaction()) {
                 try { driver_->execute("ROLLBACK"); } catch (...) {}
+            }
+            release_external_transaction_lock();
+            if (external_session_barrier_.has_value()) {
+                abort_session_barrier(*external_session_barrier_);
+                external_session_barrier_.reset();
             }
             throw;
         }
@@ -2361,10 +3000,24 @@
         const std::string &target,
         const chronos::native::NativeBranchTransaction &transaction
     ) {
-        cleanup_branch_transaction_commit_reservation(
-            external_reservation(transaction),
-            target
-        );
+        try {
+            cleanup_branch_transaction_commit_reservation(
+                external_reservation(transaction),
+                target
+            );
+        } catch (...) {
+            release_external_transaction_lock();
+            if (external_session_barrier_.has_value()) {
+                abort_session_barrier(*external_session_barrier_);
+                external_session_barrier_.reset();
+            }
+            throw;
+        }
+        release_external_transaction_lock();
+        if (external_session_barrier_.has_value()) {
+            finish_session_barrier(*external_session_barrier_);
+            external_session_barrier_.reset();
+        }
     }
 
   private:
@@ -2591,18 +3244,18 @@
 
     std::pair<NativeDirectMergeSegment, NativeDirectMergeSegment> split_checkpoint_segment(
         const NativeDirectMergeSegment &segment,
-        int continuation_percent
+        int checkpoints_created
     ) {
         const cpp_int lo = cpp_int_from_decimal(segment.live_lo);
         const cpp_int hi = cpp_int_from_decimal(segment.live_hi);
-        if (hi - lo < 4) {
+        const cpp_int active = hi - lo - 1;
+        if (active < 2) {
             throw std::runtime_error("interval space exhausted");
         }
         const cpp_int width = hi - lo;
-        cpp_int continuation_width = (width * continuation_percent) / 100;
-        cpp_int snapshot_width = width - continuation_width;
-        if (snapshot_width < 2) snapshot_width = 2;
-        if (snapshot_width > width - 2) snapshot_width = width - 2;
+        cpp_int snapshot_width = active / (harmonic_reserve_ + checkpoints_created + 1);
+        if (snapshot_width < 2) throw std::runtime_error("interval space exhausted");
+        if (snapshot_width > active - 2) snapshot_width = active - 2;
         const cpp_int split = lo + snapshot_width;
         std::vector<std::int64_t> ids = allocate_segment_ids(2);
         NativeDirectMergeSegment continuation{
@@ -3642,14 +4295,51 @@
     std::int64_t apply_merge_changes(
         const std::string &source,
         const std::string &target,
-        const std::vector<chronos::native::NativeMergeChange> &changes
+        const std::vector<chronos::native::NativeMergeChange> &changes,
+        std::int64_t expected_source_segment_id = 0,
+        std::int64_t expected_target_segment_id = 0
     ) {
         if (changes.empty()) return 0;
+        NativeSessionBarrierGuard guard = begin_session_barrier(
+            {source, target}, "merge"
+        );
+        try {
+            if (guard.installed) suspend_session_barrier_transaction(guard);
+            const auto applied = apply_merge_changes_unfenced(
+                source,
+                target,
+                changes,
+                expected_source_segment_id,
+                expected_target_segment_id
+            );
+            finish_session_barrier(guard);
+            return applied;
+        } catch (...) {
+            abort_session_barrier(guard);
+            throw;
+        }
+    }
+
+    std::int64_t apply_merge_changes_unfenced(
+        const std::string &source,
+        const std::string &target,
+        const std::vector<chronos::native::NativeMergeChange> &changes,
+        std::int64_t expected_source_segment_id,
+        std::int64_t expected_target_segment_id
+    ) {
         const bool started_tx = !driver_->in_transaction();
         if (started_tx) driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
         bool metadata_tx_open = started_tx;
         try {
             NativeMergePlan merge_plan = load_merge_plan(source, target, true);
+            if (
+                (expected_source_segment_id != 0 &&
+                 merge_plan.source.segment_id != expected_source_segment_id) ||
+                (expected_target_segment_id != 0 &&
+                 merge_plan.target.segment_id != expected_target_segment_id)
+            ) {
+                throw std::runtime_error("chronos_native_merge_preview_stale");
+            }
             const NativeDirectMergeSegment original_target_segment = merge_plan.target;
             NativeBranchCommitReservation reservation = reserve_branch_transaction_commit(
                 original_target_segment,

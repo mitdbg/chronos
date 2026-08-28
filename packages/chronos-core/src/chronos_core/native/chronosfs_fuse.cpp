@@ -11,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -440,6 +441,28 @@ std::string chronosfs_object_dir(const std::string &database_url) {
     return database_path + ".chronosfs-objects";
 }
 
+// ChronosFS and relational interval tables can be backed by the same native
+// branch store.  Keep a non-owning shared pointer for that case; the Python
+// binding adds a keep-alive edge from the filesystem wrapper to the borrowed
+// NativeBranchStore, so the underlying driver outlives every filesystem
+// operation without opening another database connection.
+std::shared_ptr<chronos::native::NativeBranchStore> borrowed_branch_store(
+    chronos::native::NativeBranchStore &store) {
+    return std::shared_ptr<chronos::native::NativeBranchStore>(
+        &store,
+        [](chronos::native::NativeBranchStore *) {});
+}
+
+bool chronosfs_metadata_cache_enabled() {
+    const char *raw = std::getenv("CHRONOSFS_DISABLE_METADATA_CACHE");
+    if (raw == nullptr || *raw == '\0') return true;
+    std::string value(raw);
+    for (char &ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value != "1" && value != "true" && value != "yes" && value != "on";
+}
+
 class NativeChronosFS {
   public:
     NativeChronosFS(std::string database_url, std::string branch_id, std::int64_t block_size)
@@ -447,7 +470,8 @@ class NativeChronosFS {
           branch_id_(std::move(branch_id)),
           session_(store_->checkout(branch_id_)),
           block_size_(block_size),
-          object_dir_(chronosfs_object_dir(database_url)) {
+          object_dir_(chronosfs_object_dir(database_url)),
+          cache_enabled_(chronosfs_metadata_cache_enabled()) {
         if (block_size_ <= 0) throw FsError(EINVAL, "block size must be positive");
         if (store_->dialect() == "sqlite") {
             // A successful close publishes data to the filesystem but, like
@@ -470,7 +494,31 @@ class NativeChronosFS {
           branch_id_(std::move(branch_id)),
           session_(store_->checkout(branch_id_)),
           block_size_(block_size),
-          object_dir_(std::move(object_dir)) {
+          object_dir_(std::move(object_dir)),
+          cache_enabled_(chronosfs_metadata_cache_enabled()) {
+        if (block_size_ <= 0) throw FsError(EINVAL, "block size must be positive");
+    }
+
+    NativeChronosFS(
+        std::shared_ptr<chronos::native::NativeBranchStore> store,
+        std::string branch_id,
+        std::int64_t segment_id,
+        std::string live_lo,
+        std::string live_hi,
+        std::string branch_point,
+        std::int64_t block_size,
+        std::string object_dir = {})
+        : store_(std::move(store)),
+          branch_id_(std::move(branch_id)),
+          session_(store_->checkout_segment(
+              branch_id_,
+              segment_id,
+              live_lo,
+              live_hi,
+              branch_point)),
+          block_size_(block_size),
+          object_dir_(std::move(object_dir)),
+          cache_enabled_(chronosfs_metadata_cache_enabled()) {
         if (block_size_ <= 0) throw FsError(EINVAL, "block size must be positive");
     }
 
@@ -590,9 +638,11 @@ class NativeChronosFS {
         if (dir == nullptr) throw FsError(ENOENT, "path not found");
         if (dir->kind != "directory") throw FsError(ENOTDIR, "not a directory");
         const std::int64_t dir_id = dir->id;
-        auto cached_children = directory_children_cache_.find(dir_id);
-        if (cached_children != directory_children_cache_.end()) {
-            return cached_children->second;
+        if (cache_enabled_) {
+            auto cached_children = directory_children_cache_.find(dir_id);
+            if (cached_children != directory_children_cache_.end()) {
+                return cached_children->second;
+            }
         }
         auto rows = visible("chronosfs_dirents", {"name", "inode_id"}, "parent_inode_id = ?", {dir_id}, "ORDER BY name");
         std::vector<std::pair<std::string, std::int64_t>> children;
@@ -604,15 +654,23 @@ class NativeChronosFS {
             std::int64_t inode_id = as_int(row[1]);
             children.emplace_back(name, inode_id);
             inode_ids.push_back(inode_id);
-            dirent_cache_[dirent_key(dir_id, name)] = {true, inode_id};
-            cache_path(path == "/" ? "/" + name : path + "/" + name, inode_id);
+            if (cache_enabled_) {
+                dirent_cache_[dirent_key(dir_id, name)] = {true, inode_id};
+                cache_path(path == "/" ? "/" + name : path + "/" + name, inode_id);
+            }
         }
-        loaded_dirents_.insert(dir_id);
-        cache_inodes_by_id(inode_ids);
+        if (cache_enabled_) {
+            loaded_dirents_.insert(dir_id);
+            cache_inodes_by_id(inode_ids);
+        }
         std::vector<DirectoryEntry> entries;
         entries.reserve(children.size());
         for (const auto &[name, inode_id] : children) {
             entries.push_back({name, inode_by_id(inode_id)});
+        }
+        if (!cache_enabled_) {
+            uncached_directory_entries_ = std::move(entries);
+            return uncached_directory_entries_;
         }
         auto inserted =
             directory_children_cache_.emplace(dir_id, std::move(entries));
@@ -1028,9 +1086,11 @@ class NativeChronosFS {
         } else {
             forget_path(path);
         }
-        inode_cache_.erase(inode_id);
-        invalidate_directory_cache(parent_id);
-        dirent_cache_.erase(dirent_key(parent_id, name));
+        if (cache_enabled_) {
+            inode_cache_.erase(inode_id);
+            invalidate_directory_cache(parent_id);
+            dirent_cache_.erase(dirent_key(parent_id, name));
+        }
     }
 
     void rename_path(const std::string &from, const std::string &to) {
@@ -1053,13 +1113,15 @@ class NativeChronosFS {
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {new_parent.id, nn, source.second, now_text()}, false);
         touch(old_parent.id);
         touch(new_parent.id);
-        invalidate_directory_cache(old_parent.id);
-        invalidate_directory_cache(new_parent.id);
-        forget_path_tree(from);
-        forget_path_tree(to);
-        dirent_cache_[dirent_key(old_parent.id, on)] = {false, 0};
-        dirent_cache_[dirent_key(new_parent.id, nn)] = {true, source.second};
-        if (repl.first) inode_cache_.erase(repl.second);
+        if (cache_enabled_) {
+            invalidate_directory_cache(old_parent.id);
+            invalidate_directory_cache(new_parent.id);
+            forget_path_tree(from);
+            forget_path_tree(to);
+            dirent_cache_[dirent_key(old_parent.id, on)] = {false, 0};
+            dirent_cache_[dirent_key(new_parent.id, nn)] = {true, source.second};
+            if (repl.first) inode_cache_.erase(repl.second);
+        }
     }
 
     void chmod_path(const std::string &path, mode_t mode) {
@@ -1300,9 +1362,11 @@ class NativeChronosFS {
             upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), true);
             touch(parent.id);
         });
-        inode_cache_.erase(inode_id);
-        invalidate_directory_cache(parent_inode_id);
-        dirent_cache_[dirent_key(parent_inode_id, name)] = {false, 0};
+        if (cache_enabled_) {
+            inode_cache_.erase(inode_id);
+            invalidate_directory_cache(parent_inode_id);
+            dirent_cache_[dirent_key(parent_inode_id, name)] = {false, 0};
+        }
     }
 
     void rename_at_public(
@@ -1322,16 +1386,18 @@ class NativeChronosFS {
                 {"parent_inode_id", "name"},
                 {new_parent.id, new_name, repl.second, now_text()},
                 true);
-            inode_cache_.erase(repl.second);
+            if (cache_enabled_) inode_cache_.erase(repl.second);
         }
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {old_parent.id, old_name, source.second, now_text()}, true);
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {new_parent.id, new_name, source.second, now_text()}, false);
         touch(old_parent.id);
         touch(new_parent.id);
-        invalidate_directory_cache(old_parent.id);
-        invalidate_directory_cache(new_parent.id);
-        dirent_cache_[dirent_key(old_parent.id, old_name)] = {false, 0};
-        dirent_cache_[dirent_key(new_parent.id, new_name)] = {true, source.second};
+        if (cache_enabled_) {
+            invalidate_directory_cache(old_parent.id);
+            invalidate_directory_cache(new_parent.id);
+            dirent_cache_[dirent_key(old_parent.id, old_name)] = {false, 0};
+            dirent_cache_[dirent_key(new_parent.id, new_name)] = {true, source.second};
+        }
     }
 
     std::int64_t mkdir_path(const std::string &path, mode_t mode, bool parents) {
@@ -1394,6 +1460,7 @@ class NativeChronosFS {
     }
 
     void invalidate_cached_paths_public(const std::vector<std::string> &paths) {
+        if (!cache_enabled_) return;
         for (const auto &path : paths) {
             if (path.empty()) continue;
             if (path == "/") {
@@ -2073,7 +2140,7 @@ class NativeChronosFS {
         touch(parent.id);
         invalidate_directory_cache(parent.id);
         cache_inode(inode);
-        dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
+        if (cache_enabled_) dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
         return inode;
     }
 
@@ -2088,7 +2155,7 @@ class NativeChronosFS {
         touch(parent.id);
         invalidate_directory_cache(parent.id);
         cache_inode(inode);
-        dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
+        if (cache_enabled_) dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
         return inode;
     }
 
@@ -2103,7 +2170,7 @@ class NativeChronosFS {
         touch(parent.id);
         invalidate_directory_cache(parent.id);
         cache_inode(inode);
-        dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
+        if (cache_enabled_) dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
         return inode;
     }
 
@@ -2145,7 +2212,7 @@ class NativeChronosFS {
         touch(parent.id);
         invalidate_directory_cache(parent.id);
         cache_inode(inode);
-        dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
+        if (cache_enabled_) dirent_cache_[dirent_key(parent.id, name)] = {true, inode.id};
         return inode;
     }
 
@@ -2331,8 +2398,10 @@ class NativeChronosFS {
     }
 
     Inode inode_by_id(std::int64_t id) {
-        auto cached = inode_cache_.find(id);
-        if (cached != inode_cache_.end()) return cached->second;
+        if (cache_enabled_) {
+            auto cached = inode_cache_.find(id);
+            if (cached != inode_cache_.end()) return cached->second;
+        }
         auto rows = visible("chronosfs_inodes", inode_cols(), "inode_id = ?", {id});
         if (rows.empty()) throw FsError(ENOENT, "inode not found");
         Inode inode = inode_from_row(rows[0]);
@@ -2341,6 +2410,7 @@ class NativeChronosFS {
     }
 
     void cache_inodes_by_id(const std::vector<std::int64_t> &inode_ids) {
+        if (!cache_enabled_) return;
         std::vector<std::int64_t> missing;
         missing.reserve(inode_ids.size());
         for (std::int64_t id : inode_ids) {
@@ -2398,10 +2468,12 @@ class NativeChronosFS {
             result = inode_by_id(1);
             return true;
         }
-        auto cached = path_inode_cache_.find(path);
-        if (cached != path_inode_cache_.end()) {
-            result = inode_by_id(cached->second);
-            return true;
+        if (cache_enabled_) {
+            auto cached = path_inode_cache_.find(path);
+            if (cached != path_inode_cache_.end()) {
+                result = inode_by_id(cached->second);
+                return true;
+            }
         }
         std::int64_t current = 1;
         std::string current_path;
@@ -2410,14 +2482,16 @@ class NativeChronosFS {
             std::size_t slash = path.find('/', start);
             std::string part = path.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
             current_path += "/" + part;
-            auto path_cached = path_inode_cache_.find(current_path);
-            if (path_cached != path_inode_cache_.end()) {
+            auto path_cached = cache_enabled_
+                ? path_inode_cache_.find(current_path)
+                : path_inode_cache_.end();
+            if (cache_enabled_ && path_cached != path_inode_cache_.end()) {
                 current = path_cached->second;
             } else {
                 auto entry = dirent(current, part);
                 if (!entry.first) return false;
                 current = entry.second;
-                cache_path(current_path, current);
+                if (cache_enabled_) cache_path(current_path, current);
             }
             if (slash == std::string::npos) break;
             start = slash + 1;
@@ -2429,18 +2503,23 @@ class NativeChronosFS {
     const Inode *try_inode_ref_for_path(const std::string &path) {
         const std::int64_t inode_id = [&] {
             if (path == "/" || path.empty()) return std::int64_t{1};
+            if (!cache_enabled_) return std::int64_t{0};
             auto path_cached = path_inode_cache_.find(path);
             return path_cached == path_inode_cache_.end()
                 ? std::int64_t{0}
                 : path_cached->second;
         }();
-        if (inode_id != 0) {
+        if (cache_enabled_ && inode_id != 0) {
             auto inode_cached = inode_cache_.find(inode_id);
             if (inode_cached != inode_cache_.end()) return &inode_cached->second;
         }
 
         Inode loaded;
         if (!try_inode_for_path(path, loaded)) return nullptr;
+        if (!cache_enabled_) {
+            uncached_inode_ = std::move(loaded);
+            return &uncached_inode_;
+        }
         auto inode_cached = inode_cache_.find(loaded.id);
         if (inode_cached == inode_cache_.end()) {
             cache_inode(loaded);
@@ -2459,14 +2538,16 @@ class NativeChronosFS {
 
     std::pair<bool, std::int64_t> dirent(std::int64_t parent, const std::string &name) {
         std::string key = dirent_key(parent, name);
-        auto cached = dirent_cache_.find(key);
-        if (cached != dirent_cache_.end()) return cached->second;
-        if (loaded_dirents_.find(parent) != loaded_dirents_.end()) {
+        if (cache_enabled_) {
+            auto cached = dirent_cache_.find(key);
+            if (cached != dirent_cache_.end()) return cached->second;
+        }
+        if (cache_enabled_ && loaded_dirents_.find(parent) != loaded_dirents_.end()) {
             return {false, 0};
         }
         auto rows = visible("chronosfs_dirents", {"inode_id"}, "parent_inode_id = ? AND name = ?", {parent, name});
         auto resolved = rows.empty() ? std::pair<bool, std::int64_t>{false, 0} : std::pair<bool, std::int64_t>{true, as_int(rows[0][0])};
-        dirent_cache_[std::move(key)] = resolved;
+        if (cache_enabled_) dirent_cache_[std::move(key)] = resolved;
         return resolved;
     }
 
@@ -2481,6 +2562,7 @@ class NativeChronosFS {
     }
 
     void cache_inode(const Inode &inode) {
+        if (!cache_enabled_) return;
         Inode cached = inode;
         cached.cached_atime = parse_time_text(cached.atime).tv_sec;
         cached.cached_mtime = parse_time_text(cached.mtime).tv_sec;
@@ -2490,6 +2572,7 @@ class NativeChronosFS {
     }
 
     void remember_created_path(const std::string &path, std::int64_t parent, const std::string &name, const Inode &inode) {
+        if (!cache_enabled_) return;
         invalidate_directory_cache(parent);
         cache_inode(inode);
         cache_path(path, inode.id);
@@ -2504,6 +2587,7 @@ class NativeChronosFS {
     }
 
     void cache_path(const std::string &path, std::int64_t inode_id) {
+        if (!cache_enabled_) return;
         if (path.empty()) return;
         path_inode_cache_[path] = inode_id;
         if (path != "/") {
@@ -2512,6 +2596,7 @@ class NativeChronosFS {
     }
 
     void forget_path(const std::string &path) {
+        if (!cache_enabled_) return;
         path_inode_cache_.erase(path);
         if (path != "/") {
             const std::string parent = cached_parent_path(path);
@@ -2525,6 +2610,7 @@ class NativeChronosFS {
     }
 
     void forget_path_tree(const std::string &path) {
+        if (!cache_enabled_) return;
         std::vector<std::string> stack{path};
         while (!stack.empty()) {
             std::string current = std::move(stack.back());
@@ -2558,6 +2644,7 @@ class NativeChronosFS {
     }
 
     void invalidate_directory_cache(std::int64_t inode_id) {
+        if (!cache_enabled_) return;
         loaded_dirents_.erase(inode_id);
         directory_children_cache_.erase(inode_id);
     }
@@ -3064,6 +3151,8 @@ class NativeChronosFS {
     chronos::native::NativeBranchSession session_;
     std::int64_t block_size_;
     std::string object_dir_;
+    bool cache_enabled_ = true;
+    Inode uncached_inode_;
     std::unordered_set<std::string> pending_object_paths_;
     std::uint64_t transaction_savepoint_id_ = 0;
     std::int64_t next_reserved_inode_id_ = 0;
@@ -3075,6 +3164,7 @@ class NativeChronosFS {
     std::unordered_set<std::int64_t> loaded_dirents_;
     std::unordered_map<std::int64_t, std::vector<DirectoryEntry>>
         directory_children_cache_;
+    std::vector<DirectoryEntry> uncached_directory_entries_;
     std::unordered_set<std::int64_t> private_created_inodes_;
 };
 
@@ -3516,6 +3606,22 @@ class NativeChronosFSStoreApi {
         }
     }
 
+    NativeChronosFSStoreApi(
+        chronos::native::NativeBranchStore &store,
+        std::string database_url,
+        std::int64_t block_size
+    )
+        : database_url_(std::move(database_url)),
+          store_(borrowed_branch_store(store)),
+          block_size_(block_size),
+          object_dir_(chronosfs_object_dir(database_url_)),
+          gc_thread_(&NativeChronosFSStoreApi::run_gc_worker, this) {
+        if (block_size_ <= 0) throw FsError(EINVAL, "block size must be positive");
+        if (store_->dialect() == "sqlite") {
+            store_->execute_sql("PRAGMA wal_autocheckpoint=0", {});
+        }
+    }
+
     ~NativeChronosFSStoreApi() {
         {
             std::lock_guard<std::mutex> guard(gc_mutex_);
@@ -3766,6 +3872,31 @@ class NativeChronosFSStoreApi {
         fs_for(branch).clear_cache_public();
     }
 
+    void refresh_branch(const std::string &branch) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        filesystems_.erase(branch);
+    }
+
+    void checkout_segment(
+        const std::string &branch,
+        std::int64_t segment_id,
+        const std::string &live_lo,
+        const std::string &live_hi,
+        const std::string &branch_point
+    ) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        filesystems_[branch] = std::make_unique<NativeChronosFS>(
+            store_,
+            branch,
+            segment_id,
+            live_lo,
+            live_hi,
+            branch_point,
+            block_size_,
+            object_dir_
+        );
+    }
+
   private:
     void collect_unreferenced_objects(
         chronos::native::NativeBranchStore &gc_store) {
@@ -3849,11 +3980,12 @@ class NativeChronosFSStoreApi {
 
     void run_gc_worker() {
         try {
-            std::unique_ptr<chronos::native::NativeBranchStore> gc_store =
-                metadata_url_.empty()
-                ? std::make_unique<chronos::native::NativeBranchStore>(database_url_)
-                : std::make_unique<chronos::native::NativeBranchStore>(
-                    database_url_, metadata_url_);
+            // Branch deletion is uncommon compared with reads and writes.
+            // Keep the worker thread, but defer its independent SQL
+            // connection until the first actual reclamation request.  A
+            // read-only checkout therefore does not consume a database
+            // connection solely for an idle GC queue.
+            std::unique_ptr<chronos::native::NativeBranchStore> gc_store;
             while (true) {
                 {
                     std::unique_lock<std::mutex> lock(gc_mutex_);
@@ -3865,6 +3997,12 @@ class NativeChronosFSStoreApi {
                     gc_running_ = true;
                 }
                 try {
+                    if (!gc_store) {
+                        gc_store = metadata_url_.empty()
+                            ? std::make_unique<chronos::native::NativeBranchStore>(database_url_)
+                            : std::make_unique<chronos::native::NativeBranchStore>(
+                                database_url_, metadata_url_);
+                    }
                     gc_store->collect_interval_garbage();
                     collect_unreferenced_objects(*gc_store);
                     gc_store->execute_sql(
@@ -4553,15 +4691,45 @@ int mount_chronosfs_native(
     for (std::size_t index = 0; index < read_slots; ++index) {
         state.read_slots.push_back(std::make_unique<FuseReadSlot>());
     }
-    std::vector<std::string> args{"chronosfs", "-f", "-o"};
+    // The mountpoint is supplied separately to fuse_mount(); only pass
+    // filesystem options through fuse_new().  Supplying ``-f`` and the
+    // mountpoint here makes fuse_new() treat them as unknown command-line
+    // options (fuse_main normally removes those before constructing a handle).
+    std::vector<std::string> args{"chronosfs", "-o"};
     std::string opts = "fsname=chronosfs";
-    for (const auto &option : options) opts += "," + option;
+    for (const auto &option : options) {
+        // clone_fd configures fuse_loop_mt rather than fuse_new and is not a
+        // valid mount option when the session is constructed directly.
+        if (option == "clone_fd") continue;
+        opts += "," + option;
+    }
     args.push_back(opts);
-    args.push_back(mountpoint);
     std::vector<char *> argv;
     for (auto &arg : args) argv.push_back(arg.data());
     py::gil_scoped_release release;
-    return fuse_main(static_cast<int>(argv.size()), argv.data(), &ops, &state);
+    // ``fuse_main`` installs and removes process-global signal handlers.  The
+    // shared ChronosFS daemon hosts many independent sessions concurrently,
+    // so concurrent fuse_main calls race in libfuse and produce
+    // ``fuse_remove_signal_handlers: unknown session`` followed by daemon
+    // termination.  Construct the session directly instead: this preserves
+    // the same mount/event-loop behavior without touching global signal state.
+    fuse_args fuse_args = FUSE_ARGS_INIT(
+        static_cast<int>(argv.size()), argv.data());
+    struct fuse *fuse = fuse_new(&fuse_args, &ops, sizeof(ops), &state);
+    if (fuse == nullptr) {
+        fuse_opt_free_args(&fuse_args);
+        return 3;
+    }
+    if (fuse_mount(fuse, mountpoint.c_str()) != 0) {
+        fuse_destroy(fuse);
+        fuse_opt_free_args(&fuse_args);
+        return 4;
+    }
+    const int loop_rc = fuse_loop_mt(fuse, 1);
+    fuse_unmount(fuse);
+    fuse_destroy(fuse);
+    fuse_opt_free_args(&fuse_args);
+    return loop_rc == 0 ? 0 : 7;
 }
 
 } // namespace
@@ -4576,6 +4744,13 @@ void bind_chronosfs_fuse(py::module_ &m) {
             py::arg("database_url"),
             py::arg("metadata_url"),
             py::arg("block_size")
+        )
+        .def(
+            py::init<chronos::native::NativeBranchStore &, std::string, std::int64_t>(),
+            py::arg("branch_store"),
+            py::arg("database_url"),
+            py::arg("block_size"),
+            py::keep_alive<1, 2>()
         )
         .def("ensure", &NativeChronosFSStoreApi::ensure)
         .def("branches", &NativeChronosFSStoreApi::branches)
@@ -4612,7 +4787,17 @@ void bind_chronosfs_fuse(py::module_ &m) {
         .def("rmdir_at", &NativeChronosFSStoreApi::rmdir_at, py::arg("branch"), py::arg("parent_inode_id"), py::arg("name"))
         .def("rename", &NativeChronosFSStoreApi::rename, py::arg("branch"), py::arg("old_path"), py::arg("new_path"))
         .def("rename_at", &NativeChronosFSStoreApi::rename_at, py::arg("branch"), py::arg("old_parent_inode_id"), py::arg("old_name"), py::arg("new_parent_inode_id"), py::arg("new_name"))
-        .def("clear_cache", &NativeChronosFSStoreApi::clear_cache, py::arg("branch"));
+        .def("clear_cache", &NativeChronosFSStoreApi::clear_cache, py::arg("branch"))
+        .def("refresh_branch", &NativeChronosFSStoreApi::refresh_branch, py::arg("branch"))
+        .def(
+            "checkout_segment",
+            &NativeChronosFSStoreApi::checkout_segment,
+            py::arg("branch"),
+            py::arg("segment_id"),
+            py::arg("live_lo"),
+            py::arg("live_hi"),
+            py::arg("branch_point")
+        );
 
     m.def(
         "flush_chronosfs_native",

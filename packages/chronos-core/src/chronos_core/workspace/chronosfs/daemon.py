@@ -78,6 +78,7 @@ class _DaemonState:
         self.active_mountpoints: set[str] = set()
         self.last_idle_at = time.monotonic()
         self.shutdown_requested = False
+        self.force_shutdown = False
         self.keep_alive = False
         self.unmounted_since: float | None = None
         self.last_mount_error: str | None = None
@@ -90,6 +91,18 @@ class _DaemonState:
         with self.active_guard:
             now = time.monotonic()
             if self.shutdown_requested:
+                # A worker may finish before its peers and send a normal
+                # shutdown request.  Never tear down the shared daemon while a
+                # FUSE session is still active; doing so leaves disconnected
+                # mountpoints and turns later reads into ENOTCONN.  The parent
+                # control plane can request a forced shutdown after it has
+                # detached every mount.
+                if self.active_mounts > 0 or any(
+                    os.path.ismount(path) for path in self.active_mountpoints
+                ):
+                    return False
+                if self.keep_alive and not self.force_shutdown:
+                    return False
                 return True
             if self.active_mounts == 0:
                 self.unmounted_since = None
@@ -105,9 +118,10 @@ class _DaemonState:
                 return False
             return now - self.unmounted_since >= stale_unmounted_timeout_s
 
-    def request_shutdown(self) -> None:
+    def request_shutdown(self, *, force: bool = False) -> None:
         with self.active_guard:
             self.shutdown_requested = True
+            self.force_shutdown = self.force_shutdown or force
         self.stop_maintenance.set()
 
     def retain(self) -> None:
@@ -179,7 +193,7 @@ def _handle_client(
                 conn.sendall(b'{"status":"ok"}\n')
                 return
             if request.get("shutdown") is True:
-                state.request_shutdown()
+                state.request_shutdown(force=bool(request.get("force")))
                 conn.sendall(b'{"status":"ok"}\n')
                 return
             if request.get("keep_alive") is True:
