@@ -221,10 +221,35 @@ class BtrfsWorkspaceStore:
     ) -> set[str]:
         """Return regular files whose final contents differ between heads."""
 
-        return self._different_file_paths(
-            self.require_branch(left_branch),
-            self.require_branch(right_branch),
-        )
+        left = self.require_branch(left_branch)
+        right = self.require_branch(right_branch)
+        if self._use_native_incremental_diff:
+            left_base = self.base_path(left_branch)
+            right_base = self.base_path(right_branch)
+            try:
+                if (
+                    left_base.exists()
+                    and right_base.exists()
+                    and _btrfs_branches_are_adjacent(
+                        left,
+                        right,
+                        self._run_command,
+                    )
+                ):
+                    candidates = self._btrfs_find_new_file_paths(left, left_base)
+                    candidates.update(
+                        self._btrfs_find_new_file_paths(right, right_base)
+                    )
+                    return {
+                        path
+                        for path in candidates
+                        if _candidate_file_differs(left, right, path)
+                    }
+            except (OSError, subprocess.CalledProcessError, ValueError):
+                # The full final-tree comparison remains the correctness
+                # fallback for unrelated branches or older btrfs-progs.
+                pass
+        return self._different_file_paths(left, right)
 
     def _different_file_paths(self, left: Path, right: Path) -> set[str]:
         if self._use_native_incremental_diff:
@@ -255,6 +280,9 @@ class BtrfsWorkspaceStore:
             ]
         )
         candidates = _btrfs_find_new_candidates(result.stdout)
+        candidates.update(
+            _regular_file_paths(left) ^ _regular_file_paths(right)
+        )
         return {
             path
             for path in candidates
@@ -560,7 +588,22 @@ class BtrfsWorkspaceStore:
                 )
             except subprocess.CalledProcessError:
                 pass
-            self._run_command(["btrfs", "subvolume", "delete", str(path)])
+            try:
+                self._run_command(["btrfs", "subvolume", "delete", str(path)])
+            except subprocess.CalledProcessError:
+                # Large cleanups can leave a deletion pending in the current
+                # Btrfs transaction.  Commit only on the exceptional path.
+                if not path.exists():
+                    return
+                self._run_command(
+                    [
+                        "btrfs",
+                        "subvolume",
+                        "delete",
+                        "--commit-after",
+                        str(path),
+                    ]
+                )
         elif path.is_dir():
             shutil.rmtree(path)
         else:
@@ -627,13 +670,41 @@ def _btrfs_creation_generation(
         ["sudo", "-n", "btrfs", "subvolume", "show", str(path)]
     )
     match = re.search(
-        r"^Gen at creation:\s*(\d+)\s*$",
+        r"^\s*Gen at creation:\s*(\d+)\s*$",
         result.stdout,
         re.MULTILINE,
     )
     if match is None:
         raise ValueError(f"could not determine Btrfs creation generation: {path}")
     return int(match.group(1))
+
+
+def _btrfs_branches_are_adjacent(
+    left: Path,
+    right: Path,
+    run_command: CommandRunner,
+) -> bool:
+    left_uuid, left_parent_uuid = _btrfs_subvolume_uuids(left, run_command)
+    right_uuid, right_parent_uuid = _btrfs_subvolume_uuids(right, run_command)
+    return left_parent_uuid == right_uuid or right_parent_uuid == left_uuid
+
+
+def _btrfs_subvolume_uuids(
+    path: Path,
+    run_command: CommandRunner,
+) -> tuple[str, str]:
+    result = run_command(
+        ["sudo", "-n", "btrfs", "subvolume", "show", str(path)]
+    )
+    uuid_match = re.search(r"^\s*UUID:\s*(\S+)\s*$", result.stdout, re.MULTILINE)
+    parent_match = re.search(
+        r"^\s*Parent UUID:\s*(\S+)\s*$",
+        result.stdout,
+        re.MULTILINE,
+    )
+    if uuid_match is None or parent_match is None:
+        raise ValueError(f"could not determine Btrfs ancestry: {path}")
+    return uuid_match.group(1), parent_match.group(1)
 
 
 def _btrfs_find_new_candidates(output: str) -> set[str]:
@@ -646,6 +717,22 @@ def _btrfs_find_new_candidates(output: str) -> set[str]:
         if path != "/":
             candidates.add(path)
     return candidates
+
+
+def _regular_file_paths(root: Path) -> set[str]:
+    paths: set[str] = set()
+    root_path = os.fspath(root)
+    pending = [(root_path, "")]
+    while pending:
+        directory, relative_directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                relative = os.path.join(relative_directory, entry.name)
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append((entry.path, relative))
+                elif entry.is_file(follow_symlinks=False):
+                    paths.add("/" + relative.replace(os.sep, "/"))
+    return paths
 
 
 def _btrfs_dump_candidate_paths(

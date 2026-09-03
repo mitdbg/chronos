@@ -102,6 +102,38 @@ def test_btrfs_branch_delete_does_not_force_a_filesystem_commit(
     assert ["btrfs", "subvolume", "delete", str(branch)] in calls
 
 
+def test_btrfs_branch_delete_commits_after_a_failed_delete(
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(command: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        if command[:3] == ["btrfs", "subvolume", "delete"]:
+            if "--commit-after" not in command:
+                raise subprocess.CalledProcessError(1, command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    store = BtrfsWorkspaceStore(
+        tmp_path / "workspaces",
+        command_runner=run,
+        filesystem_type="btrfs",
+    )
+    branch = store.branch_path("task")
+    branch.mkdir(parents=True)
+    store._is_subvolume = lambda path: path == branch  # type: ignore[method-assign]
+
+    store._delete_if_subvolume(branch)
+
+    assert calls[-1] == [
+        "btrfs",
+        "subvolume",
+        "delete",
+        "--commit-after",
+        str(branch),
+    ]
+
+
 def test_btrfs_filesystem_used_bytes_counts_shared_storage_once(
     tmp_path: Path,
 ) -> None:

@@ -370,6 +370,10 @@ class _OrpheusBackend(_SQLBranchBackend):
         if self._branch_row(branch_id) is None:
             raise BranchNotFoundError(branch_id)
         self.db.execute(
+            "DELETE FROM _chronos_branch_orpheus_workspace WHERE branch_id = ?",
+            (branch_id,),
+        )
+        self.db.execute(
             "DELETE FROM _chronos_branch_orpheus_branches WHERE branch_id = ?",
             (branch_id,),
         )

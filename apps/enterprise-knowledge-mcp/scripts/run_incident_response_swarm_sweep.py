@@ -380,7 +380,7 @@ def _write_summary(root: Path, rows: list[dict[str, Any]]) -> None:
     # throughput remains available in the machine-readable sweep results.
     from matplotlib.ticker import PercentFormatter
 
-    fig, axis = plt.subplots(figsize=(2.28, 1.95))
+    fig, axis = plt.subplots(figsize=(2.28, 1.365))
     for system in SYSTEMS:
         values = sorted(
             (row for row in rows if row["system"] == system),
@@ -401,9 +401,9 @@ def _write_summary(root: Path, rows: list[dict[str, Any]]) -> None:
             "label": labels[system],
         }
         axis.plot(x, success, **style)
-    axis.set_ylabel("Workflow success rate")
+    axis.set_ylabel("Success rate")
     axis.set_xlabel("Concurrent Workflows")
-    axis.set_ylim(-0.03, 1.03)
+    axis.set_ylim(-0.03, 1.08)
     axis.yaxis.set_major_formatter(PercentFormatter(1.0))
     axis.set_xscale("log", base=2)
     axis.set_xticks(list(WORKER_COUNTS))
@@ -411,12 +411,13 @@ def _write_summary(root: Path, rows: list[dict[str, Any]]) -> None:
     axis.grid(axis="y", color="#d0d0d0", linewidth=0.45)
     axis.grid(axis="x", visible=False)
     axis.set_axisbelow(True)
-    fig.subplots_adjust(left=0.21, right=0.99, bottom=0.23, top=0.90)
+    fig.subplots_adjust(left=0.21, right=0.99, bottom=0.29, top=0.97)
     fig.savefig(summary / "worker_sweep.pdf")
     fig.savefig(summary / "worker_sweep.png", dpi=180)
     plt.close(fig)
 
-    runtime_fig, runtime_axis = plt.subplots(figsize=(2.28, 1.95))
+    runtime_fig, runtime_axis = plt.subplots(figsize=(2.28, 1.365))
+    runtime_max = 0.0
     for system in SYSTEMS:
         values = sorted(
             (row for row in rows if row["system"] == system),
@@ -431,6 +432,7 @@ def _write_summary(root: Path, rows: list[dict[str, Any]]) -> None:
             continue
         x = [int(row["workers"]) for row in values]
         elapsed = [float(row["elapsed_seconds"]) for row in values]
+        runtime_max = max(runtime_max, *elapsed)
         style = {
             "color": colors[system],
             "marker": "o",
@@ -442,13 +444,15 @@ def _write_summary(root: Path, rows: list[dict[str, Any]]) -> None:
     runtime_axis.set_ylabel("Runtime (s)")
     runtime_axis.set_xlabel("Concurrent Workflows")
     runtime_axis.set_yscale("log")
+    runtime_axis.set_ylim(1e2, runtime_max * 1.12)
+    runtime_axis.set_yticks((1e2, 1e3, 1e4))
     runtime_axis.set_xscale("log", base=2)
     runtime_axis.set_xticks(list(WORKER_COUNTS))
     runtime_axis.set_xticklabels([str(value) for value in WORKER_COUNTS])
     runtime_axis.grid(axis="y", color="#d0d0d0", linewidth=0.45)
     runtime_axis.grid(axis="x", visible=False)
     runtime_axis.set_axisbelow(True)
-    runtime_fig.subplots_adjust(left=0.21, right=0.99, bottom=0.23, top=0.90)
+    runtime_fig.subplots_adjust(left=0.21, right=0.99, bottom=0.29, top=0.97)
     runtime_fig.savefig(summary / "worker_runtime.pdf")
     runtime_fig.savefig(summary / "worker_runtime.png", dpi=180)
     plt.close(runtime_fig)

@@ -822,6 +822,38 @@ def test_postgres_orpheus_materializes_version_on_checkpoint() -> None:
         ctx.close()
 
 
+def test_postgres_orpheus_delete_clears_workspace_before_name_reuse() -> None:
+    ctx = _make_context("postgres", "orpheus")
+    try:
+        ctx.create_branch("work", from_branch="main")
+        work = ctx.checkout("work")
+        work.execute(
+            "UPDATE products SET price = :price WHERE sku = :sku",
+            {"price": 99, "sku": "abc"},
+        )
+        assert ctx.db.execute(
+            "SELECT COUNT(*) AS count "
+            "FROM _chronos_branch_orpheus_workspace WHERE branch_id = ?",
+            ("work",),
+        ).fetchone()["count"] == 1
+
+        ctx.delete_branch("work")
+        assert ctx.db.execute(
+            "SELECT COUNT(*) AS count "
+            "FROM _chronos_branch_orpheus_workspace WHERE branch_id = ?",
+            ("work",),
+        ).fetchone()["count"] == 0
+
+        ctx.create_branch("work", from_branch="main")
+        recreated = ctx.checkout("work")
+        assert recreated.query(
+            "SELECT price FROM products WHERE sku = :sku",
+            {"sku": "abc"},
+        ) == [{"price": 10}]
+    finally:
+        ctx.close()
+
+
 def test_postgres_orpheus_tracking_records_durable_version_deltas() -> None:
     ctx = _make_orpheus_tracking_context()
     try:
