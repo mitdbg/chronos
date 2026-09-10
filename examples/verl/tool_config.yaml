@@ -1,0 +1,23 @@
+tools:
+  - class_name: chronos_verl.tool.ChronosTicketTool
+    config:
+      type: native
+      database_url: ${oc.env:CHRONOS_DATABASE_URL}
+      checkpoint: tickets_baseline
+    tool_schema:
+      type: function
+      function:
+        name: tickets
+        description: Inspect support tickets or change one ticket's priority in this rollout's database.
+        parameters:
+          type: object
+          properties:
+            operation:
+              type: string
+              enum: [list, set_priority]
+            ticket_id:
+              type: integer
+            priority:
+              type: string
+              enum: [low, normal, high]
+          required: [operation]

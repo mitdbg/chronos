@@ -1,0 +1,2 @@
+- name: chronos_db_agent
+  _target_: chronos_verl.agent_loop.ChronosDatabaseAgentLoop
