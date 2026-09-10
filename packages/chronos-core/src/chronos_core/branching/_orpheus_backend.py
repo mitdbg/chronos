@@ -2126,9 +2126,10 @@ class _OrpheusBackend(_SQLBranchBackend):
     ) -> ExecuteResult:
         if str(tree.args.get("kind", "")).upper() != "TABLE":
             raise UnsupportedSQLError("only DROP TABLE is supported")
-        if not isinstance(tree.this, exp.Table):
-            raise UnsupportedSQLError("DROP TABLE must target a table")
-        table = _table_key(tree.this)
+        targets = tree.args.get("tables") or ([tree.this] if tree.this is not None else [])
+        if len(targets) != 1 or not isinstance(targets[0], exp.Table):
+            raise UnsupportedSQLError("DROP TABLE must target exactly one table")
+        table = _table_key(targets[0])
         if self._meta_for_owner("branch", ref.branch_id, table) is None:
             raise TableNotRegisteredError(table)
         self._record_tombstone("branch", ref.branch_id, table)
@@ -2237,7 +2238,10 @@ class _OrpheusBackend(_SQLBranchBackend):
         return str(identifier)
 
     def _drop_column_name(self, action: exp.Drop) -> str:
-        target = action.this
+        targets = action.args.get("tables") or ([action.this] if action.this is not None else [])
+        if len(targets) != 1:
+            raise UnsupportedSQLError("DROP COLUMN must target exactly one column")
+        target = targets[0]
         if isinstance(target, exp.Column):
             identifier = target.this
             if isinstance(identifier, exp.Identifier):
