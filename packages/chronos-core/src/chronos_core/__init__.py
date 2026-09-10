@@ -1,2 +1,1 @@
-"""Core Transactional Agent Runtime package."""
-
+"""Interval-based branching for application state."""

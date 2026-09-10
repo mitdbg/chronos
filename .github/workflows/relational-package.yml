@@ -1,0 +1,25 @@
+name: Relational package
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  wheel:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libpq-dev libboost-dev
+      - run: python -m pip install build pytest pytest-asyncio pytest-timeout
+      - name: Build from source distribution and install the wheel
+        run: |
+          python -m build packages/chronos-core --outdir /tmp/chronos-wheel -Cbuild-dir=/tmp/chronos-build -Cbuild.tool-args=-j2
+          python -m pip install /tmp/chronos-wheel/*.whl
+      - name: Test the installed relational artifact
+        run: |
+          python -I -m pytest tests/test_build_features.py tests/test_native_interval.py tests/test_interval_allocator.py tests/test_checkpoint_forks.py tests/test_reused_session_transactions.py -k 'not postgres' -q --timeout=60
+          python -I examples/single_store_branching.py

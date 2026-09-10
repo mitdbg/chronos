@@ -203,6 +203,11 @@ class ChronosFSStore:
     ):
         if block_size <= 0:
             raise ValueError("block_size must be positive")
+        if not hasattr(_native_interval, "NativeChronosFSStore"):
+            raise ChronosFSError(
+                "ChronosFS was not built. Install a full Linux wheel or rebuild "
+                "with -Ccmake.define.CHRONOS_WITH_FILESYSTEM=ON."
+            )
         self.context = context
         self.block_size = int(block_size)
         self._workspace_refs: dict[str, str] = {}

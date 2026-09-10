@@ -1,4 +1,5 @@
 import sqlite3
+import pytest
 
 import chronos_core._native_interval as native_interval
 from chronos_core.branching import ChronosBranchContext, MergeResolution
@@ -638,6 +639,7 @@ def test_interval_backend_applies_explicit_resolution_via_native_store(tmp_path)
         ctx.close()
 
 
+@pytest.mark.skipif(not native_interval.has_duckdb, reason="DuckDB driver disabled in this build")
 def test_native_duckdb_sql_connection_executes_data_plane_sql(tmp_path):
     db_path = tmp_path / "branch_sql.duckdb"
     conn = native_interval.NativeSqlConnection(f"duckdb:///{db_path}")

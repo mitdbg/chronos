@@ -1332,6 +1332,7 @@ std::string duckdb_path_from_url(const std::string &database_url) {
     return database_url;
 }
 
+#ifdef CHRONOS_WITH_DUCKDB
 class NativeDuckDBError : public std::runtime_error {
   public:
     explicit NativeDuckDBError(const std::string &message) : std::runtime_error(message) {}
@@ -1463,6 +1464,8 @@ Value duckdb_column_value(duckdb_result *result, idx_t column, idx_t row) {
     }
     }
 }
+
+#endif // CHRONOS_WITH_DUCKDB
 
 std::int64_t native_as_int(const Value &value) {
     if (auto ptr = std::get_if<std::int64_t>(&value)) return *ptr;
@@ -2909,6 +2912,7 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
     SQLiteStatementCache interval_upsert_statements_;
 };
 
+#ifdef CHRONOS_WITH_DUCKDB
 class NativeDuckDBDriver final : public NativeSqlDriver {
   public:
     explicit NativeDuckDBDriver(const std::string &database_url) : dialect_("duckdb") {
@@ -3370,6 +3374,8 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
     std::unordered_map<std::string, duckdb_prepared_statement> statements_;
 };
 
+#endif // CHRONOS_WITH_DUCKDB
+
 class NativePostgresDriver final : public NativeSqlDriver {
   public:
     explicit NativePostgresDriver(const std::string &database_url) : dialect_("postgres"), conn_(PQconnectdb(database_url.c_str())) {
@@ -3595,7 +3601,11 @@ std::unique_ptr<NativeSqlDriver> open_native_sql_driver(const std::string &datab
         return std::make_unique<NativePostgresDriver>(database_url);
     }
     if (database_url.rfind("duckdb://", 0) == 0 || database_url.rfind("duckdb:", 0) == 0) {
+#ifdef CHRONOS_WITH_DUCKDB
         return std::make_unique<NativeDuckDBDriver>(database_url);
+#else
+        throw std::runtime_error("DuckDB support was not built; rebuild with -DCHRONOS_WITH_DUCKDB=ON");
+#endif
     }
     return std::make_unique<NativeSQLiteDriver>(database_url);
 }

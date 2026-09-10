@@ -1,10 +1,6 @@
 [tool.uv.workspace]
 members = [
   "packages/chronos-core",
-  "packages/chronos-langchain",
-  "packages/chronos-langgraph",
-  "packages/chronos-code",
-  "apps/enterprise-knowledge-mcp",
 ]
 
 [tool.pytest.ini_options]

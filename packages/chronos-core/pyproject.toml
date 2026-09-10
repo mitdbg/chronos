@@ -4,14 +4,15 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "chronos-core"
-version = "0.1.0"
-description = "Core Transactional Agent Runtime primitives and shims"
+version = "0.2.0a1"
+description = "Interval-based branching for relational data, files, and application state"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
   "psycopg[binary]>=3.1",
-  "sqlglot[c]>=25",
+  "sqlglot>=25",
 ]
 
 [project.optional-dependencies]
@@ -22,20 +23,22 @@ qdrant = [
   "qdrant-client>=1.18,<2",
 ]
 mcp = [
-  "mcp[cli]>=1.9.0",
+  "mcp[cli]>=1.9.0,<2",
   "tomli>=2.0; python_version < '3.11'",
 ]
 test = [
   "boto3>=1.35",
   "duckdb>=1.0",
-  "mcp[cli]>=1.9.0",
+  "mcp[cli]>=1.9.0,<2",
   "pytest>=7.0",
   "pytest-asyncio>=0.21",
   "qdrant-client>=1.18,<2",
   "tomli>=2.0; python_version < '3.11'",
 ]
-fuse = [
-]
+
+[project.urls]
+Repository = "https://github.com/mitdbg/chronos"
+Documentation = "https://github.com/mitdbg/chronos/blob/main/docs/README.md"
 
 [project.scripts]
 chronos-mcp = "chronos_core.mcp.cli:main"
@@ -46,3 +49,4 @@ chronos-lake = "chronos_core.lake.cli:main"
 wheel.packages = ["src/chronos_core"]
 cmake.source-dir = "."
 build-dir = "build/{wheel_tag}"
+sdist.exclude = ["build", "dist", "**/__pycache__"]

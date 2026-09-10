@@ -34,7 +34,9 @@
 #include <vector>
 
 #include <boost/multiprecision/cpp_int.hpp>
+#ifdef CHRONOS_WITH_DUCKDB
 #include <duckdb.h>
+#endif
 #include <libpq-fe.h>
 #include <pg_query.h>
 #include <protobuf/pg_query.pb-c.h>

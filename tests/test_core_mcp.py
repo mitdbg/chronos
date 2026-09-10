@@ -275,7 +275,8 @@ database_url = "{_sqlite_url(tmp_path / '.chronos' / 'app.sqlite')}"
 """,
     )
     env = os.environ.copy()
-    src_path = str(Path.cwd() / "packages" / "chronos-core" / "src")
+    import chronos_core
+    src_path = str(Path(chronos_core.__file__).resolve().parent.parent)
     env["PYTHONPATH"] = src_path + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     params = StdioServerParameters(
         command=sys.executable,

@@ -1450,7 +1450,8 @@ def _mounted_chronosfs_database(
         )
     )
     env = os.environ.copy()
-    src = Path(__file__).resolve().parents[1] / "packages" / "chronos-core" / "src"
+    import chronos_core
+    src = Path(chronos_core.__file__).resolve().parent.parent
     tests = Path(__file__).resolve().parents[0]
     env["PYTHONPATH"] = os.pathsep.join(
         [str(src), str(tests), env.get("PYTHONPATH", "")]
