@@ -1,19 +1,24 @@
 # Chronos
 
-Chronos gives application state named, writable branches. Fork a dataset, run an
-experiment, inspect its changes, and merge or discard the result. Forks change
-interval metadata without copying existing records.
+Chronos is a branching abstraction for databases, filesystems, and object stores.
+It lets applications create writable branches of their data. Changes made
+in a branch are isolated from its parent and other branches. An application can
+inspect those changes, merge them back, or delete the branch when it is done.
+This is useful for testing changes to code and data, or for giving each agent
+training rollout its own database.
 
-This repository contains the Python library and C++ implementation for SQLite,
-PostgreSQL, DuckDB, ChronosFS, Qdrant, and the S3 gateway. The separate PostgreSQL
-source tree implements the same versioning approach inside the database engine.
+You can create a branch without copying the entire dataset. Chronos works with
+SQLite, PostgreSQL, and DuckDB, and also supports files through ChronosFS,
+Qdrant collections, and S3-compatible storage. This repository provides the
+Python library for using Chronos with your existing applications and databases.
 
-Version **0.2.0a1** is an experimental release candidate prepared locally.
-These instructions do not assume a public package upload.
+Chronos is experimental. See the [compatibility guide](docs/compatibility.md)
+for supported operations and current limitations.
 
 ## Install
 
-The base source build supports SQLite and PostgreSQL. On Ubuntu:
+The default build supports SQLite and PostgreSQL. From the repository root on
+Ubuntu, install the build dependencies and the Python package:
 
 ```sh
 sudo apt-get install build-essential python3-dev libsqlite3-dev libpq-dev libboost-dev
@@ -22,11 +27,15 @@ python3 -m venv .venv
 python -m pip install ./packages/chronos-core
 ```
 
-Pip installs Python build dependencies. The build downloads pinned C++ dependencies
-and needs internet access. A compatible wheel avoids compilation.
-See [installation](docs/installation.md) for optional filesystem, DuckDB, and S3 builds.
+Installation requires an internet connection to download dependencies.
+The [installation guide](docs/installation.md) explains how to enable DuckDB,
+filesystem, and S3 support.
 
-## Branch some data
+## Create your first branch
+
+This example creates a table in SQLite and registers it with Chronos. It then
+updates a row in a new branch, checks that the original data is unchanged, and
+merges the update back into `main`.
 
 ```python
 from chronos_core.branching import ChronosBranchContext
@@ -50,27 +59,35 @@ finally:
     ctx.close()
 ```
 
-Registration imports existing rows into a physical version table. After registration,
-access managed data through branch sessions. Direct access to the original table
-does not participate in branching.
+Use `register_table` to choose which tables to branch, then use `checkout` to
+read and write data in a particular branch. Accessing the database directly
+does not use the selected branch.
 
-## Learn and integrate
+## Tutorials and documentation
 
-- [Documentation](docs/README.md) and [existing applications](docs/integration.md).
-- [Software development](docs/tutorials/software-development.md): isolate code and
-  data, reproduce a failure, test a fix, and merge both.
-- [verl database sandbox](docs/tutorials/rl-data-sandbox.md): one isolated
-  database branch per multi-turn rollout, final-state rewards, and cleanup.
-- [Atomic multi-store merge](docs/multi-store-branching.md).
-- [Implementation](docs/bolt-on-branching.md) and [compatibility](docs/compatibility.md).
+The [software development tutorial](docs/tutorials/software-development.md)
+shows how to reproduce a bug, test a fix in a branch, and merge the changes to
+both code and data. The [verl tutorial](docs/tutorials/rl-data-sandbox.md)
+shows how to give each training rollout a separate database branch, calculate
+its reward from the resulting data, and delete the branch afterward.
 
-Single-store merge uses `merge_apply`. With shared metadata across stores, use
-`merge_atomic_preview` and `merge_atomic`. Independent metadata stores have
-separate commits and no atomic cross-store visibility guarantee.
+To add Chronos to an existing application, start with the
+[integration guide](docs/integration.md). Applications that need branches across
+more than one store should also read the
+[multi-store branching guide](docs/multi-store-branching.md), which explains
+how to configure them and when their changes can be merged together atomically.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for tests and [RELEASING.md](RELEASING.md)
-for local artifacts. Reference backends and small branching benchmarks remain for
-testing. The old agent harness, transaction shims, and framework wrappers are removed.
+The [documentation index](docs/README.md) links to the API guides and further
+reading. If you want to understand how Chronos works, see the
+[implementation guide](docs/bolt-on-branching.md).
 
-Chronos isolates managed state. Use a container or another execution sandbox
-for untrusted code and restrict external services during speculative work.
+Chronos isolates changes to the data it manages. It does not sandbox code or
+external services. Run untrusted code in a separate execution sandbox and
+control which services it can reach.
+
+## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build and test instructions.
+The [experimental release notes](EXPERIMENTAL_RELEASE.md) describe the tests run
+so far and known failures; [RELEASING.md](RELEASING.md) describes the release
+process.
