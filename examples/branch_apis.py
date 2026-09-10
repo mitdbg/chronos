@@ -15,17 +15,21 @@ def main() -> None:
             backend="interval",
         )
         filesystem = ChronosFSStore.connect(
-            f"sqlite:///{root / 'chronosfs.sqlite'}",
+            sqlite.db.database_url,
             backend="interval",
         )
         filesystem.ensure()
-        chronos = ChronosWorkspaceContext(sqlite=sqlite, filesystem=filesystem)
+        chronos = ChronosWorkspaceContext(
+            sqlite=sqlite, filesystem=filesystem,
+            shared_metadata_url=sqlite.db.database_url,
+        )
 
         try:
             sqlite.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, body TEXT)")
             sqlite.db.execute("INSERT INTO docs VALUES (?, ?)", ("d1", "main"))
             sqlite.db.commit()
             sqlite.register_table("docs", ["id"])
+            sqlite.set_merge_table_scope(["docs"])
             filesystem.write_file("main", "/reports/summary.md", "main\n", parents=True)
 
             chronos.create_branch("agent", from_branch="main")
@@ -51,11 +55,11 @@ def main() -> None:
             )
             retry.fs.write_file("/reports/summary.md", "retry\n", parents=True)
 
-            preview = chronos.merge_preview("retry", "main", policy="manual_review")
-            assert preview["sqlite"].changes
-            assert preview["filesystem"].changes
+            preview = chronos.merge_atomic_preview("retry", "main", policy="manual_review")
+            assert preview.stores["sqlite"].changes
+            assert preview.stores["filesystem"].changes
 
-            chronos.merge_apply("retry", "main", policy="snapshot_isolation")
+            chronos.merge_atomic("retry", "main", policy="snapshot_isolation", operation_id="example-merge")
             merged = chronos.checkout("main")
             assert merged.sqlite.query("SELECT body FROM docs WHERE id = :id", {"id": "d1"}) == [
                 {"body": "retry"}

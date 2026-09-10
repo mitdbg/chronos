@@ -15,11 +15,14 @@ def main() -> None:
             backend="interval",
         )
         filesystem = ChronosFSStore.connect(
-            f"sqlite:///{root / 'chronosfs.sqlite'}",
+            sqlite.db.database_url,
             backend="interval",
         )
         filesystem.ensure()
-        chronos = ChronosWorkspaceContext(sqlite=sqlite, filesystem=filesystem)
+        chronos = ChronosWorkspaceContext(
+            sqlite=sqlite, filesystem=filesystem,
+            shared_metadata_url=sqlite.db.database_url,
+        )
 
         try:
             sqlite.db.execute(
@@ -34,6 +37,7 @@ def main() -> None:
             sqlite.db.execute("INSERT INTO orders VALUES (?, ?, ?)", (7, "new", 3))
             sqlite.db.commit()
             sqlite.register_table("orders", ["id"])
+            sqlite.set_merge_table_scope(["orders"])
             filesystem.write_file("main", "/reports/order-7.md", "new\n", parents=True)
 
             chronos.create_branch("txn_42", from_branch="main")
@@ -54,11 +58,11 @@ def main() -> None:
             ]
             assert main.fs.read_text("/reports/order-7.md") == "new\n"
 
-            preview = chronos.merge_preview("txn_42", "main", policy="manual_review")
-            assert preview["sqlite"].changes
-            assert preview["filesystem"].changes
+            preview = chronos.merge_atomic_preview("txn_42", "main", policy="manual_review")
+            assert preview.stores["sqlite"].changes
+            assert preview.stores["filesystem"].changes
 
-            chronos.merge_apply("txn_42", "main", policy="snapshot_isolation")
+            chronos.merge_atomic("txn_42", "main", policy="snapshot_isolation", operation_id="example-merge")
             committed = chronos.checkout("main")
             assert committed.sqlite.query(
                 "SELECT status, stock FROM orders WHERE id = :id",

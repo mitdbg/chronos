@@ -11,6 +11,7 @@ EXAMPLES = [
     "branch_apis.py",
     "chronosfs_direct.py",
     "branch_transactions.py",
+    "software_development.py",
     "chronosfs_fuse_control.py",
 ]
 

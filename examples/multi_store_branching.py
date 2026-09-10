@@ -15,17 +15,21 @@ def main() -> None:
             backend="interval",
         )
         filesystem = ChronosFSStore.connect(
-            f"sqlite:///{root / 'chronosfs.sqlite'}",
+            sqlite.db.database_url,
             backend="interval",
         )
         filesystem.ensure()
 
-        chronos = ChronosWorkspaceContext(sqlite=sqlite, filesystem=filesystem)
+        chronos = ChronosWorkspaceContext(
+            sqlite=sqlite, filesystem=filesystem,
+            shared_metadata_url=sqlite.db.database_url,
+        )
         try:
             sqlite.db.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, body TEXT)")
             sqlite.db.execute("INSERT INTO docs VALUES (?, ?)", ("d1", "main"))
             sqlite.db.commit()
             sqlite.register_table("docs", ["id"])
+            sqlite.set_merge_table_scope(["docs"])
             filesystem.write_file("main", "/reports/summary.md", "main\n", parents=True)
 
             chronos.create_branch("agent", from_branch="main")
@@ -43,13 +47,13 @@ def main() -> None:
             ) == [{"body": "main"}]
             assert main.fs.read_text("/reports/summary.md") == "main\n"
 
-            preview = chronos.merge_preview("agent", "main", policy="manual_review")
-            assert len(preview["sqlite"].changes) == 1
-            assert len(preview["filesystem"].changes) >= 1
+            preview = chronos.merge_atomic_preview("agent", "main", policy="manual_review")
+            assert len(preview.stores["sqlite"].changes) == 1
+            assert len(preview.stores["filesystem"].changes) >= 1
 
-            result = chronos.merge_apply("agent", "main", policy="snapshot_isolation")
-            assert result["sqlite"].applied == 1
-            assert result["filesystem"].applied >= 1
+            result = chronos.merge_atomic("agent", "main", policy="snapshot_isolation", operation_id="example-merge")
+            assert result.stores["sqlite"] == 1
+            assert result.stores["filesystem"] >= 1
 
             refreshed = chronos.checkout("main")
             assert refreshed.sqlite.query(
