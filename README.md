@@ -1,433 +1,76 @@
 # Chronos
 
-Chronos is a bolt-on branching layer for application state. It lets an
-application fork, mutate, inspect, merge, checkpoint, or discard state while
-the underlying stores keep their native access model: SQL for relational data
-and POSIX for applications that rely on Unix tools, Python scripts, compilers,
-and other filesystem-facing runtimes.
+Chronos gives application state named, writable branches. Fork a dataset, run an
+experiment, inspect its changes, and merge or discard the result. Forks change
+interval metadata without copying existing records.
 
-Chronos is built for agentic and exploratory workflows where speculative work
-must be isolated until it is approved: data repair, feature engineering,
-sandboxed execution, RAG index updates, debugging, and multi-step tool plans.
+This repository contains the Python library and C++ implementation for SQLite,
+PostgreSQL, DuckDB, ChronosFS, Qdrant, and the S3 gateway. The separate PostgreSQL
+source tree implements the same versioning approach inside the database engine.
 
-## What Chronos Provides
+Version **0.2.0a1** is an experimental release candidate prepared locally.
+These instructions do not assume a public package upload.
 
-- **Named branches:** create, check out, query, mutate, diff, merge, checkpoint,
-  and delete application-state branches.
-- **Store-native access:** branch sessions expose normal SQL for relational
-  stores and POSIX execution for tools and runtimes that expect a filesystem.
-- **Efficient versioning:** branch creation does not copy data, and storage
-  cost grows with the amount of data changed between branches rather than the
-  size of the whole database or filesystem.
-- **Multi-store branching:** coordinate the same branch names across named
-  stores such as `postgresql`, `duckdb`, and `filesystem`.
-- **Branch transactions:** run work in a branch, inspect the resulting diff, and
-  merge approved changes with `merge_apply` atomically.
+## Install
 
-Chronos does not require applications to hold a database transaction open
-across LLM calls or long-running tool execution. A branch is durable application
-state, not a temporary connection-local transaction.
+The base source build supports SQLite and PostgreSQL. On Ubuntu:
 
-## Core Model
-
-```text
-create_branch("attempt", from_branch="main")
-  checkout("attempt")
-  use store-native APIs: SQL, POSIX tools, Python scripts, etc.
-  diff("main", "attempt")
-merge_apply("attempt", "main") or delete_branch("attempt")
+```sh
+sudo apt-get install build-essential python3-dev libsqlite3-dev libpq-dev libboost-dev
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install ./packages/chronos-core
 ```
 
-For relational stores, applications register logical tables once. After that,
-SQL continues to use the logical table names through a branch-bound
-`BranchSession`. Chronos keeps branches isolated while preserving normal SQL
-access.
+Pip installs Python build dependencies. The build downloads pinned C++ dependencies
+and needs internet access. A compatible wheel avoids compilation.
+See [installation](docs/installation.md) for optional filesystem, DuckDB, and S3 builds.
 
-## Installation
-
-From this directory:
-
-```bash
-uv sync --all-extras
-```
-
-Editable install without `uv`:
-
-```bash
-python -m pip install -e packages/chronos-core
-```
-
-DuckDB support is optional:
-
-```bash
-python -m pip install -e 'packages/chronos-core[duckdb]'
-```
-
-MCP server support for Codex is optional:
-
-```bash
-python -m pip install -e 'packages/chronos-core[mcp]'
-```
-
-If the package is not installed, run commands with:
-
-```bash
-PYTHONPATH=packages/chronos-core/src
-```
-
-Run every README example:
-
-```bash
-PYTHONPATH=packages/chronos-core/src python3 examples/run_all.py
-```
-
-Each script in [examples/](examples/) creates temporary state, checks the
-expected branch behavior with assertions, and prints a success line. The
-snippets below are excerpts from those runnable files.
-
-## Codex MCP Server
-
-Chronos can run as a Codex MCP server. Codex asks Chronos to prepare a source
-directory, create a branch sandbox, and return a ChronosFS mount path. Codex
-then uses its normal shell and file tools inside that mounted directory, while
-SQL goes through branch-aware MCP tools.
-
-Deploy the MCP server entry to Codex:
-
-```bash
-./scripts/chronos-mcp-deploy-codex --project .
-```
-
-The same helper can also be run as a Python module:
-
-```bash
-PYTHONPATH=packages/chronos-core/src python3 -m chronos_core.mcp.deploy_codex --project .
-```
-
-After an editable install, it is available as a console command:
-
-```bash
-chronos-mcp-deploy-codex --project .
-```
-
-The deploy helper adds a `[mcp_servers.chronos]` entry to
-`~/.codex/config.toml` and creates a starter `chronos.toml` when it is missing.
-If a `chronos` MCP server already exists, it leaves that entry unchanged unless
-`--overwrite` is passed. Restart Codex after deployment so the MCP server is
-loaded.
-
-Example `chronos.toml`:
-
-```toml
-[workspace]
-name = "my-project"
-default_branch = "main"
-state_dir = ".chronos"
-mount_root = ".chronos/mounts"
-allowed_source_roots = ["."]
-
-[filesystem]
-database_url = "sqlite:///.chronos/chronosfs.sqlite"
-block_size = 8192
-
-[stores.sqlite]
-kind = "sqlite"
-database_url = "sqlite:///.chronos/app.sqlite"
-
-[[stores.sqlite.tables]]
-name = "docs"
-primary_key = ["id"]
-```
-
-Repo-local development writes a Codex config entry like:
-
-```toml
-[mcp_servers.chronos]
-command = "/path/to/project/scripts/chronos-mcp-server"
-args = [
-    "--config",
-    "chronos.toml",
-    "--transport",
-    "stdio",
-]
-cwd = "/path/to/project"
-startup_timeout_sec = 30
-tool_timeout_sec = 300
-```
-
-The MCP tool flow is:
-
-```text
-chronos_prepare_source(source_dir=".", branch_id="main")
-chronos_create_sandbox(branch_id="codex-run-1", from_branch="main")
-run Codex commands inside the returned mount_path
-chronos_sql_query(branch_id="codex-run-1", store="sqlite", sql="...")
-chronos_merge_preview(source="codex-run-1", target="main")
-chronos_merge_apply(source="codex-run-1", target="main")
-```
-
-## Multi-Store Branching
-
-Chronos is designed for branches that span multiple systems:
-relational data, analytical data, and POSIX-dependent execution state.
-
-```bash
-PYTHONPATH=packages/chronos-core/src python3 examples/multi_store_branching.py
-```
-
-Core excerpt:
+## Branch some data
 
 ```python
-chronos = ChronosWorkspaceContext(sqlite=sqlite, filesystem=filesystem)
+from chronos_core.branching import ChronosBranchContext
 
-chronos.create_branch("agent", from_branch="main")
-agent = chronos.checkout("agent")
-agent.sqlite.execute(
-    "UPDATE docs SET body = :body WHERE id = :id",
-    {"id": "d1", "body": "candidate"},
-)
-agent.fs.write_file("/reports/summary.md", "candidate\n", parents=True)
-
-preview = chronos.merge_preview("agent", "main", policy="manual_review")
-chronos.merge_apply("agent", "main", policy="snapshot_isolation")
+ctx = ChronosBranchContext.connect("sqlite:///:memory:")
+try:
+    ctx.db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, quantity INTEGER)")
+    ctx.db.execute("INSERT INTO items VALUES (1, 10)")
+    ctx.db.commit()
+    ctx.register_table("items", ["id"])
+    ctx.create_branch("trial", from_branch="main")
+    with ctx.checkout("trial") as trial:
+        trial.execute("UPDATE items SET quantity = :n WHERE id = :id",
+                      {"n": 7, "id": 1})
+        assert trial.query("SELECT quantity FROM items") == [{"quantity": 7}]
+    with ctx.checkout("main") as main:
+        assert main.query("SELECT quantity FROM items") == [{"quantity": 10}]
+    ctx.merge_apply("trial", "main", policy="snapshot_isolation")
+    ctx.delete_branch("trial")
+finally:
+    ctx.close()
 ```
 
-The example creates one branch across a SQLite relational store and ChronosFS,
-mutates both stores privately, previews the cross-store diff, and commits it.
-Cross-store branch commits keep speculative changes private until commit, then
-publish the approved branch state atomically from the user's point of view. The
-internal protocol and its polystore assumptions are covered in
-[docs/multi-store-branching.md](docs/multi-store-branching.md).
+Registration imports existing rows into a physical version table. After registration,
+access managed data through branch sessions. Direct access to the original table
+does not participate in branching.
 
-## Branch APIs
+## Learn and integrate
 
-The branch lifecycle is the main Chronos API. The same operations apply whether
-a branch contains one store or spans multiple stores. The examples below use
-`chronos` for the object that manages branches.
+- [Documentation](docs/README.md) and [existing applications](docs/integration.md).
+- [Software development](docs/tutorials/software-development.md): isolate code and
+  data, reproduce a failure, test a fix, and merge both.
+- [verl database sandbox](docs/tutorials/rl-data-sandbox.md): one isolated
+  database branch per multi-turn rollout, final-state rewards, and cleanup.
+- [Atomic multi-store merge](docs/multi-store-branching.md).
+- [Implementation](docs/bolt-on-branching.md) and [compatibility](docs/compatibility.md).
 
-```bash
-PYTHONPATH=packages/chronos-core/src python3 examples/branch_apis.py
-```
+Single-store merge uses `merge_apply`. With shared metadata across stores, use
+`merge_atomic_preview` and `merge_atomic`. Independent metadata stores have
+separate commits and no atomic cross-store visibility guarantee.
 
-Core excerpt:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for tests and [RELEASING.md](RELEASING.md)
+for local artifacts. Reference backends and small branching benchmarks remain for
+testing. The old agent harness, transaction shims, and framework wrappers are removed.
 
-```python
-chronos.create_branch("agent", from_branch="main")
-branch = chronos.checkout("agent")
-branch.sqlite.execute(
-    "UPDATE docs SET body = :body WHERE id = :id",
-    {"id": "d1", "body": "agent"},
-)
-branch.fs.write_file("/reports/summary.md", "agent\n", parents=True)
-
-chronos.create_checkpoint("before_merge", branch="agent")
-readonly = chronos.checkout_checkpoint("before_merge")
-chronos.create_branch_from_checkpoint("retry", checkpoint="before_merge")
-chronos.merge_apply("retry", "main", policy="snapshot_isolation")
-```
-
-The example exercises branch creation, checkout, checkpointing, branch creation
-from a checkpoint, merge preview, merge commit, and branch deletion.
-`checkout()` returns a reusable branch session. Reusing the session is usually
-faster than repeatedly checking out the same branch because branch state can be
-reused.
-
-## POSIX Workloads With ChronosFS
-
-ChronosFS stores files in Chronos versioned storage and exposes them through a
-FUSE mount for apps that rely on POSIX. Use it when Unix tools, Python
-programs, compilers, generated artifacts, and relational state should share the
-same branch abstraction.
-
-```bash
-PYTHONPATH=packages/chronos-core/src python3 examples/chronosfs_direct.py
-```
-
-Core excerpt:
-
-```python
-fs.write_file("main", "/src/solution.py", "print('main')\n", parents=True)
-fs.create_branch("agent", from_branch="main")
-fs.write_file("agent", "/src/solution.py", "print('agent')\n", parents=True)
-fs.write_file("agent", "/reports/result.txt", "candidate\n", parents=True)
-
-preview = fs.merge_preview("agent", "main", policy="manual_review")
-fs.merge_apply("agent", "main", policy="snapshot_isolation")
-```
-
-FUSE mounting is available when a process needs to run against a branch through
-POSIX. Parallel branch execution should use separate mount points per active
-branch. Inside a mount, `.chronos/` exposes a small POSIX control plane for
-branch checkout, preview, and merge commit:
-
-```bash
-PYTHONPATH=packages/chronos-core/src python3 examples/chronosfs_fuse_control.py
-```
-
-Inside a mounted branch, the control-plane flow looks like this:
-
-```bash
-mkdir .chronos/branches/agent
-printf 'agent\n' > .chronos/current
-
-cat .chronos/merge-preview/agent..main.json
-cat > .chronos/merge-apply/agent..main <<'JSON'
-{"policy":"weak_snapshot_isolation"}
-JSON
-```
-
-`merge-preview` reports ChronosFS conflicts at path and byte-range granularity
-with text diffs for textual blocks. It does not expose internal inode ids or
-block indexes.
-
-## Single-Store Branching
-
-Single-store branching uses the same lifecycle without multi-store setup.
-Use `ChronosBranchContext` when one SQL store owns the application state.
-
-```bash
-PYTHONPATH=packages/chronos-core/src python3 examples/single_store_branching.py
-```
-
-Core excerpt:
-
-```python
-chronos = ChronosBranchContext.connect("sqlite:///:memory:", backend="interval")
-chronos.db.execute(
-    """
-    CREATE TABLE products (
-      sku TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      price INTEGER NOT NULL,
-      stock INTEGER NOT NULL
-    )
-    """
-)
-chronos.db.execute(
-    "INSERT INTO products VALUES (?, ?, ?, ?)",
-    ("abc", "Keyboard", 100, 5),
-)
-chronos.db.commit()
-chronos.register_table("products", primary_key=["sku"])
-
-chronos.create_branch("agent", from_branch="main")
-agent = chronos.checkout("agent")
-agent.execute(
-    "UPDATE products SET price = :price WHERE sku = :sku",
-    {"price": 90, "sku": "abc"},
-)
-chronos.merge_apply(source="agent", target="main")
-```
-
-PostgreSQL is the OLTP row-store path. DuckDB support is available for
-fixed-schema OLAP tables. PostgreSQL has the strongest schema-branching
-coverage. Detailed store setup is covered in
-[docs/multi-store-branching.md](docs/multi-store-branching.md).
-
-## Branch Transactions
-
-A Chronos branch transaction is a durable private branch plus a merge-time
-commit decision. Long-running tools and LLM calls happen outside physical
-database transactions; only the final branch transaction commit is short.
-
-```bash
-PYTHONPATH=packages/chronos-core/src python3 examples/branch_transactions.py
-```
-
-Core excerpt:
-
-```python
-chronos.create_branch("txn_42", from_branch="main")
-txn = chronos.checkout("txn_42")
-txn.sqlite.execute(
-    """
-    UPDATE orders
-    SET status = :status, stock = stock - 1
-    WHERE id = :id
-    """,
-    {"id": 7, "status": "reviewed"},
-)
-txn.fs.write_file("/reports/order-7.md", "reviewed\n", parents=True)
-
-preview = chronos.merge_preview("txn_42", "main", policy="manual_review")
-chronos.merge_apply("txn_42", "main", policy="snapshot_isolation")
-```
-
-The example commits one private branch across SQL rows and ChronosFS files.
-In the commit path, readers see either the old target branch state or the fully
-committed branch state, not a partial merge. The internal protocol is described
-in [docs/branching-transaction.md](docs/branching-transaction.md).
-
-## Versioning Model
-
-Chronos uses a record-oriented versioning technique for relational rows and
-ChronosFS file blocks. Forking a branch does not copy the database or
-filesystem. Chronos pays for changed records and changed file blocks, so small
-branch edits stay small even when the parent state is large.
-
-The implementation details live in the design docs:
-
-- [docs/bolt-on-branching.md](docs/bolt-on-branching.md)
-- [docs/branching-transaction.md](docs/branching-transaction.md)
-- [docs/multi-store-branching.md](docs/multi-store-branching.md)
-- [docs/filesystem-on-chronos.md](docs/filesystem-on-chronos.md)
-
-## Running Tests
-
-Run the core test suite:
-
-```bash
-PYTHONPATH=packages/chronos-core/src pytest -q
-```
-
-Run only branching and filesystem-focused tests:
-
-```bash
-PYTHONPATH=packages/chronos-core/src \
-pytest -q \
-  tests/test_branching.py \
-  tests/test_branching_schema.py \
-  tests/test_interval_stores.py \
-  tests/test_workspace_filesystem.py
-```
-
-Some tests require PostgreSQL. A local test database can be started with:
-
-```bash
-docker run --rm -d --name chronos-postgres-test \
-  -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=chronos_test \
-  -p 55432:5432 \
-  postgres:18-alpine
-
-CHRONOS_POSTGRES_DSN=postgresql://postgres:postgres@localhost:55432/chronos_test \
-PYTHONPATH=packages/chronos-core/src \
-pytest -q tests/test_branching.py tests/test_branching_schema.py tests/test_interval_stores.py
-
-docker stop chronos-postgres-test
-```
-
-## Limitations
-
-- Cross-store branch operations are best-effort in v1; there is no global
-  distributed commit protocol across independent stores.
-- DuckDB supports fixed-schema data operations in v1. Branch-local schema
-  branching is disabled for DuckDB.
-- Branch-local schema changes are opt-in with `enable_schema_branching=True`.
-  PostgreSQL has the strongest schema-branching coverage.
-- Branch write SQL supports a focused DML subset: `INSERT ... VALUES`, simple
-  `UPDATE` assignments and expressions, `DELETE`, `upsert_rows`, and
-  `delete_keys`. Branch reads can use richer `SELECT` statements.
-- FUSE-based ChronosFS mounting requires Linux FUSE 3 runtime support and
-  `/dev/fuse`.
-
-## Design Notes
-
-The design documents in `docs/` describe the broader branch model:
-
-- `docs/branching-introduction.md`
-- `docs/bolt-on-branching.md`
-- `docs/branching-transaction.md`
-- `docs/multi-store-branching.md`
-- `docs/filesystem-on-chronos.md`
-- `docs/related-work.md`
+Chronos isolates managed state. Use a container or another execution sandbox
+for untrusted code and restrict external services during speculative work.

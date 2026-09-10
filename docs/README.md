@@ -11,9 +11,14 @@ parent, merged if approved, or deleted if rejected.
   schema branching is enabled.
 - Filesystem branches for code edits, generated artifacts, and command output.
 - Checkpoints, diffs, merge preview, merge apply, and branch deletion.
-- A lower-level transaction runtime for short-lived isolated operations.
+- SQL transactions within a checked-out branch session.
 
 ## Install
+
+Start with [installation](installation.md) for native build dependencies and
+optional filesystem support. For complete applications, see the
+[software development tutorial](tutorials/software-development.md) and the
+[verl database sandbox tutorial](tutorials/rl-data-sandbox.md).
 
 ```bash
 python -m venv .venv
@@ -22,11 +27,8 @@ pip install -U pip
 pip install -e packages/chronos-core
 ```
 
-If the package is not installed, run examples with:
-
-```bash
-PYTHONPATH=packages/chronos-core/src
-```
+Install the package before running examples. Setting `PYTHONPATH` alone does
+not build the C++ extension.
 
 ## Branch Transaction
 
@@ -119,6 +121,10 @@ See `filesystem-on-chronos.md` for the SQL-backed filesystem design,
 `bolt-on-branching.md` for the relational interval backend.
 See `related-work.md` for a research log of papers and systems related to
 Chronos branching.
+
+For atomic merges of SQL data and files, use shared metadata and
+`merge_atomic_preview` / `merge_atomic`, as in the software development tutorial.
+Ordinary `merge_apply` across independent stores commits each store separately.
 
 When mounted through ChronosFS, agents can use POSIX paths and the `.chronos`
 control plane:
