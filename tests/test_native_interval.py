@@ -278,6 +278,57 @@ def test_native_branch_session_executes_branch_aware_sql(tmp_path):
         ctx.close()
 
 
+def test_native_branch_write_guard_is_transaction_scoped(tmp_path):
+    db_path = tmp_path / "branch_guard_scope.sqlite"
+    ctx = ChronosBranchContext.connect(f"sqlite:///{db_path}", backend="interval")
+    try:
+        ctx.conn.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)"
+        )
+        ctx.conn.execute("INSERT INTO items VALUES (1, 10)")
+        ctx.conn.commit()
+        ctx.register_table("items", ["id"])
+        ctx.create_branch("child")
+
+        native_store = native_interval.NativeBranchStore(
+            "sqlite", ctx.db.raw_connection
+        )
+        child = native_store.checkout("child")
+        trace: list[str] = []
+        ctx.db.raw_connection.set_trace_callback(trace.append)
+        try:
+            child.begin()
+            child.execute(
+                "INSERT INTO items (id, value) VALUES (:id, :value)",
+                {"id": 2, "value": 20},
+            )
+            child.execute(
+                "UPDATE items SET value = :value WHERE id = :id",
+                {"id": 1, "value": 11},
+            )
+            child.execute("DELETE FROM items WHERE id = :id", {"id": 2})
+            child.commit()
+
+            # Autocommit remains a one-statement scope and therefore takes one
+            # fresh guard after the explicit transaction has released its lock.
+            child.execute(
+                "UPDATE items SET value = :value WHERE id = :id",
+                {"id": 1, "value": 12},
+            )
+        finally:
+            ctx.db.raw_connection.set_trace_callback(None)
+
+        guard_selects = [
+            sql
+            for sql in trace
+            if "SELECT branch.current_segment_id, barrier.barrier_id" in sql
+        ]
+        assert len(guard_selects) == 2
+        assert child.query("SELECT value FROM items WHERE id = 1") == [{"value": 12}]
+    finally:
+        ctx.close()
+
+
 def test_native_branch_session_supports_null_predicates(tmp_path):
     db_path = tmp_path / "branch_null_predicate.sqlite"
     ctx = ChronosBranchContext.connect(f"sqlite:///{db_path}", backend="interval")

@@ -47,7 +47,8 @@ class NativeBranchSessionImpl {
     }
 
     std::int64_t execute(const std::string &sql, const std::vector<Value> &params) {
-        const bool metadata_guard = begin_branch_write_guard();
+        bool metadata_guard = false;
+        const bool statement_guard = acquire_write_guard_for_statement(metadata_guard);
         try {
             PgProtobufParseResult parsed(sql);
             PgQuery__Node *stmt = parsed.single_statement();
@@ -76,23 +77,24 @@ class NativeBranchSessionImpl {
                 }
             }
             }
-            commit_branch_write_guard(metadata_guard);
+            commit_statement_write_guard(statement_guard, metadata_guard);
             return result;
         } catch (...) {
-            rollback_branch_write_guard(metadata_guard);
+            rollback_statement_write_guard(statement_guard, metadata_guard);
             throw;
         }
     }
 
     std::int64_t execute_schema(const std::string &sql) {
-        const bool metadata_guard = begin_branch_write_guard();
+        bool metadata_guard = false;
+        const bool statement_guard = acquire_write_guard_for_statement(metadata_guard);
         try {
             PgProtobufParseResult parsed(sql);
             std::int64_t result = execute_schema_statement(parsed.single_statement());
-            commit_branch_write_guard(metadata_guard);
+            commit_statement_write_guard(statement_guard, metadata_guard);
             return result;
         } catch (...) {
-            rollback_branch_write_guard(metadata_guard);
+            rollback_statement_write_guard(statement_guard, metadata_guard);
             throw;
         }
     }
@@ -105,7 +107,8 @@ class NativeBranchSessionImpl {
         bool deleted
     ) {
         if (rows.empty()) return;
-        const bool metadata_guard = begin_branch_write_guard();
+        bool metadata_guard = false;
+        const bool statement_guard = acquire_write_guard_for_statement(metadata_guard);
         const bool started_data_tx = !store_.driver().in_transaction();
         if (started_data_tx) store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
         try {
@@ -126,10 +129,10 @@ class NativeBranchSessionImpl {
                 private_exact_key_upsert_allowed
             );
             commit_if_started(started_data_tx);
-            commit_branch_write_guard(metadata_guard);
+            commit_statement_write_guard(statement_guard, metadata_guard);
         } catch (...) {
             rollback_if_started(started_data_tx);
-            rollback_branch_write_guard(metadata_guard);
+            rollback_statement_write_guard(statement_guard, metadata_guard);
             throw;
         }
     }
@@ -142,7 +145,8 @@ class NativeBranchSessionImpl {
         bool ignore_conflicts
     ) {
         if (rows.empty()) return 0;
-        const bool metadata_guard = begin_branch_write_guard();
+        bool metadata_guard = false;
+        const bool statement_guard = acquire_write_guard_for_statement(metadata_guard);
         const bool started_data_tx = !store_.driver().in_transaction();
         if (started_data_tx) store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
         try {
@@ -161,29 +165,46 @@ class NativeBranchSessionImpl {
                 false
             );
             commit_if_started(started_data_tx);
-            commit_branch_write_guard(metadata_guard);
+            commit_statement_write_guard(statement_guard, metadata_guard);
             return result.logical_rows_written;
         } catch (...) {
             rollback_if_started(started_data_tx);
-            rollback_branch_write_guard(metadata_guard);
+            rollback_statement_write_guard(statement_guard, metadata_guard);
             throw;
         }
     }
 
     void begin() {
-        if (store_.driver().in_transaction()) {
+        // A caller may have opened the data transaction already (for example
+        // to choose PostgreSQL's isolation level before entering the native
+        // session).  The branch guard still has to be acquired here so that
+        // branch creation cannot race this transaction.  The guard is held
+        // until commit/rollback, rather than being reacquired for each DML.
+        // Python can finish the shared connection through the store rather
+        // than this session. A cached session must not mistake its old flag
+        // for an active transaction and silently autocommit the next write.
+        if (in_transaction_ && store_.driver().in_transaction() &&
+            write_guard_generation_ == store_.transaction_generation()) return;
+        in_transaction_ = false;
+        write_guard_active_ = false;
+        metadata_guard_owned_ = false;
+        try {
+            metadata_guard_owned_ = begin_branch_write_guard();
+            if (!store_.driver().in_transaction()) {
+                store_.driver().execute(
+                    store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN"
+                );
+            }
+            write_guard_active_ = true;
+            write_guard_generation_ = store_.transaction_generation();
             in_transaction_ = true;
             branch_private_guard_cache_.reset();
-            return;
+        } catch (...) {
+            rollback_branch_write_guard(metadata_guard_owned_);
+            metadata_guard_owned_ = false;
+            write_guard_active_ = false;
+            throw;
         }
-        metadata_guard_owned_ = begin_branch_write_guard();
-        if (!store_.driver().in_transaction()) {
-            store_.driver().execute(
-                store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN"
-            );
-        }
-        in_transaction_ = true;
-        branch_private_guard_cache_.reset();
     }
     void commit() {
         if (store_.driver().in_transaction()) {
@@ -191,6 +212,7 @@ class NativeBranchSessionImpl {
         }
         commit_branch_write_guard(metadata_guard_owned_);
         metadata_guard_owned_ = false;
+        write_guard_active_ = false;
         in_transaction_ = false;
         branch_private_guard_cache_.reset();
     }
@@ -201,6 +223,7 @@ class NativeBranchSessionImpl {
         }
         rollback_branch_write_guard(metadata_guard_owned_);
         metadata_guard_owned_ = false;
+        write_guard_active_ = false;
         in_transaction_ = false;
         branch_private_guard_cache_.reset();
     }
@@ -224,6 +247,45 @@ class NativeBranchSessionImpl {
     }
 
   private:
+    // Acquire the branch write guard once for an autocommit statement.  Nested
+    // helpers (e.g. execute_update -> upsert_rows) observe the active flag and
+    // reuse the same lock.  Explicit session transactions acquire the guard in
+    // begin() and therefore never take this statement path.
+    bool acquire_write_guard_for_statement(bool &metadata_guard) {
+        if (write_guard_active_ && (!store_.driver().in_transaction() ||
+            write_guard_generation_ != store_.transaction_generation())) {
+            write_guard_active_ = false;
+            in_transaction_ = false;
+            metadata_guard_owned_ = false;
+            branch_private_guard_cache_.reset();
+        }
+        if (write_guard_active_) {
+            metadata_guard = false;
+            return false;
+        }
+        metadata_guard = begin_branch_write_guard();
+        write_guard_active_ = true;
+        write_guard_generation_ = store_.transaction_generation();
+        return true;
+    }
+
+    void commit_statement_write_guard(bool statement_guard, bool metadata_guard) {
+        if (!statement_guard) return;
+        try {
+            commit_branch_write_guard(metadata_guard);
+        } catch (...) {
+            write_guard_active_ = false;
+            throw;
+        }
+        write_guard_active_ = false;
+    }
+
+    void rollback_statement_write_guard(bool statement_guard, bool metadata_guard) {
+        if (!statement_guard) return;
+        rollback_branch_write_guard(metadata_guard);
+        write_guard_active_ = false;
+    }
+
     bool begin_branch_write_guard() {
         if (epoch_managed_ && store_.metadata_dialect() == "postgres") {
             return false;
@@ -1831,11 +1893,28 @@ class NativeBranchSessionImpl {
             "(SELECT COUNT(*) FROM private_update) + "
             "(SELECT COUNT(*) FROM replacement)";
 
-        QueryResult result = store_.driver().query_result(sql, bound);
-        if (result.rows.empty() || result.rows[0].empty()) {
-            return std::int64_t{0};
+        for (int attempt = 0; attempt < 16; ++attempt) {
+            QueryResult result = store_.driver().query_result(sql, bound);
+            const std::int64_t changed = result.rows.empty() || result.rows[0].empty()
+                ? 0 : native_as_int(result.rows[0][0]);
+            if (changed != 0) return changed;
+
+            // A concurrent sibling can replace the inherited physical tuple
+            // while SELECT FOR UPDATE waits. PostgreSQL then drops that tuple
+            // from this statement's result, without visiting the newly inserted
+            // fragments. This is a physical conflict, not a missing logical key.
+            // Recheck with a fresh READ COMMITTED snapshot before reporting zero.
+            std::vector<Value> visible_bound(point_key->begin(), point_key->end());
+            visible_bound.push_back(segment_.branch_point);
+            visible_bound.push_back(segment_.branch_point);
+            auto visible = store_.driver().query(
+                "SELECT 1 FROM " + table + " WHERE " + key_where +
+                " AND live_lo <= ? AND ? < live_hi AND deleted = FALSE LIMIT 1",
+                visible_bound
+            );
+            if (visible.empty()) return std::int64_t{0};
         }
-        return native_as_int(result.rows[0][0]);
+        throw std::runtime_error("concurrent interval row replacement: retry the transaction");
     }
 
     std::string replace_column_type_sql(
@@ -2237,6 +2316,8 @@ class NativeBranchSessionImpl {
     NativeBranchSegment segment_;
     bool in_transaction_ = false;
     bool metadata_guard_owned_ = false;
+    bool write_guard_active_ = false;
+    std::uint64_t write_guard_generation_ = 0;
     bool epoch_managed_ = false;
     std::optional<std::vector<NativeTableMeta>> table_metas_cache_;
     std::optional<std::unordered_set<std::string>> known_table_names_cache_;

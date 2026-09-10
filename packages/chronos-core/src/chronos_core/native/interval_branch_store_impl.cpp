@@ -287,14 +287,21 @@
             "status TEXT NOT NULL DEFAULT 'active', "
             "lease_expires_ms BIGINT NOT NULL)"
         );
-        driver_->execute(
-            "CREATE INDEX IF NOT EXISTS _chronos_idx_branch_sessions_live "
-            "ON _chronos_branch_sessions (branch_id, lease_expires_ms)"
-        );
-        driver_->execute(
-            "CREATE INDEX IF NOT EXISTS _chronos_idx_branch_sessions_barrier "
-            "ON _chronos_branch_sessions (barrier_id, status)"
-        );
+        for (const auto &[name, columns] : std::vector<std::pair<std::string, std::string>>{
+            {"_chronos_idx_branch_sessions_live", "branch_id, lease_expires_ms"},
+            {"_chronos_idx_branch_sessions_barrier", "barrier_id, status"}
+        }) {
+            // PostgreSQL locks the table for CREATE INDEX even with IF NOT
+            // EXISTS. A stopped client's heartbeat transaction can then block
+            // a new manager before it has a chance to recover that client.
+            // Bootstrap is already serialized by lock_schema_metadata().
+            if (metadata_dialect() == "postgres" && !driver_->query(
+                "SELECT 1 FROM pg_index WHERE indexrelid = to_regclass(?) AND indisvalid",
+                {name}
+            ).empty()) continue;
+            driver_->execute("CREATE INDEX IF NOT EXISTS " + name +
+                " ON _chronos_branch_sessions (" + columns + ")");
+        }
     }
 
     void ensure_metadata(bool enable_schema_branching) {
@@ -397,6 +404,12 @@
                 "segment_id INTEGER NOT NULL, "
                 "created_at TEXT NOT NULL, "
                 "metadata TEXT NOT NULL)"
+            );
+            driver_->execute(
+                "CREATE TABLE IF NOT EXISTS _chronos_branch_interval_checkpoint_alloc ("
+                "checkpoint_id TEXT PRIMARY KEY, "
+                "next_lo " + interval_type + " NOT NULL, "
+                "allocated_count BIGINT NOT NULL)"
             );
             driver_->execute(
                 "UPDATE _chronos_branch_interval_segments "
@@ -1116,6 +1129,18 @@
             child_width = 2;
         } else if (fixed_child_width > 0) {
             child_width = fixed_child_width;
+        } else if (fanout == 1) {
+            // A spine still needs a live continuation after the fork.  Keep
+            // one 1/256th of the current interval for delete/recreate and
+            // later siblings; this is negligible for the configured
+            // coordinate widths but prevents a zero-width parent head.
+            cpp_int reserve = active / 256;
+            if (reserve < 8) reserve = 8;
+            if (reserve >= active - 2) {
+                child_width = active / 2;
+            } else {
+                child_width = active - reserve;
+            }
         } else {
             const cpp_int initial = cpp_int_from_decimal(initial_segment.live_hi) -
                 cpp_int_from_decimal(initial_segment.live_lo) - 1;
@@ -1128,7 +1153,14 @@
             }
         }
         if (child_width < 2) throw std::runtime_error("interval space exhausted");
-        if (child_width > active - 2) child_width = active - 2;
+        if (child_width > active - 2) {
+            // A known fanout is a capacity hint, not a lifetime quota.  Once
+            // setup has consumed the planned slices, split the remaining
+            // head instead of clamping to a width that can overflow on the
+            // next fork.
+            child_width = active / 2;
+            if (child_width > active - 2) child_width = active - 2;
+        }
         if (child_width < 2) throw std::runtime_error("interval space exhausted");
         return child_width;
     }
@@ -1706,8 +1738,11 @@
             if (!existing.empty()) {
                 throw std::runtime_error("branch already exists: " + branch_id);
             }
+            // Serialize reservations per checkpoint on PostgreSQL. SQLite's
+            // BEGIN IMMEDIATE already serializes metadata writers.
+            const std::string lock_suffix = metadata_dialect() == "postgres" ? " FOR UPDATE" : "";
             auto cp_rows = driver_->query(
-                "SELECT branch_id, segment_id FROM _chronos_branch_interval_checkpoints WHERE checkpoint_id = ?",
+                "SELECT branch_id, segment_id FROM _chronos_branch_interval_checkpoints WHERE checkpoint_id = ?" + lock_suffix,
                 {checkpoint}
             );
             if (cp_rows.empty()) {
@@ -1716,13 +1751,46 @@
 
             const std::string parent_branch_id = native_as_string(cp_rows[0][0]);
             NativeDirectMergeSegment segment = load_direct_segment_by_id(native_as_int(cp_rows[0][1]));
-            const cpp_int lo = cpp_int_from_decimal(segment.live_lo);
             const cpp_int hi = cpp_int_from_decimal(segment.live_hi);
-            if (hi - lo < 4) {
+            auto allocation = driver_->query(
+                "SELECT next_lo, allocated_count FROM _chronos_branch_interval_checkpoint_alloc "
+                "WHERE checkpoint_id = ?", {checkpoint}
+            );
+            cpp_int next_lo = cpp_int_from_decimal(segment.branch_point) + 1;
+            std::int64_t count = 0;
+            if (allocation.empty()) {
+                // Account for reservations made by older implementations. Do
+                // not recycle deleted children: their tuple versions can still
+                // exist, and segment GC must not reset allocation progress.
+                auto children = driver_->query(
+                    "SELECT live_hi FROM _chronos_branch_interval_segments WHERE parent_segment_id = ?",
+                    {segment.segment_id}
+                );
+                for (const auto &child : children) {
+                    const cpp_int child_end = cpp_int_from_decimal(native_as_string(child[0]));
+                    if (child_end > next_lo) next_lo = child_end;
+                    ++count;
+                }
+                driver_->execute(
+                    "INSERT INTO _chronos_branch_interval_checkpoint_alloc "
+                    "(checkpoint_id, next_lo, allocated_count) VALUES (?, ?, ?)",
+                    {checkpoint, cpp_int_to_decimal(next_lo), count}
+                );
+            } else {
+                next_lo = cpp_int_from_decimal(native_as_string(allocation[0][0]));
+                count = native_as_int(allocation[0][1]);
+            }
+            const cpp_int child_width = (hi - next_lo) / (harmonic_reserve_ + count + 1);
+            if (child_width < 2) {
                 throw std::runtime_error("interval space exhausted for checkpoint branch");
             }
-            const cpp_int child_lo = lo + (hi - lo) / 2;
-            const cpp_int child_hi = hi;
+            const cpp_int child_lo = next_lo;
+            const cpp_int child_hi = child_lo + child_width;
+            driver_->execute(
+                "UPDATE _chronos_branch_interval_checkpoint_alloc "
+                "SET next_lo = ?, allocated_count = ? WHERE checkpoint_id = ?",
+                {cpp_int_to_decimal(child_hi), count + 1, checkpoint}
+            );
             const std::int64_t child_segment_id = allocate_segment_id();
             const std::string now = current_timestamp_string();
             driver_->execute(

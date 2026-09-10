@@ -172,12 +172,15 @@ class NativeBranchStoreImpl {
         NativeSqlDriver *data = data_driver_ptr();
         return driver_->in_transaction() || (data != nullptr && data->in_transaction());
     }
+    std::uint64_t transaction_generation() const { return transaction_generation_; }
     void commit() {
+        ++transaction_generation_;
         if (driver_->in_transaction()) driver_->execute("COMMIT");
         NativeSqlDriver *data = data_driver_ptr();
         if (data != nullptr && data->in_transaction()) data->execute("COMMIT");
     }
     void rollback() {
+        ++transaction_generation_;
         if (driver_->in_transaction()) {
             try {
                 driver_->execute("ROLLBACK");
@@ -284,6 +287,7 @@ class NativeBranchStoreImpl {
     bool create_writer_segment_index_ = true;
     int interval_coordinate_bits_ = 0;
     std::array<int, 3> reserve_bits_;
+    std::uint64_t transaction_generation_ = 0;
     int harmonic_reserve_ = 8;
     std::optional<std::pair<std::int32_t, std::string>> external_transaction_lock_;
     std::optional<NativeSessionBarrierGuard> external_session_barrier_;

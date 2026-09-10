@@ -3394,11 +3394,14 @@ class NativePostgresDriver final : public NativeSqlDriver {
 
     QueryResult query_result(const std::string &sql, const std::vector<Value> &params = {}) override {
         const std::string &pg_sql = pg_sql_cached(sql);
-        // Branch-visible SELECT predicates are dominated by segment-specific
-        // interval bounds. Using unnamed execution keeps PostgreSQL on a
-        // value-specific custom plan instead of eventually switching a prepared
-        // statement to a generic plan that scans too many interval rows.
-        PgResult result = pg_exec_params(conn_, pg_sql, params);
+        // The rewritten interval bounds are literals fixed by this branch
+        // session, not bind parameters.  A named prepared statement therefore
+        // preserves branch selectivity while avoiding repeated PostgreSQL
+        // parse/rewrite/plan work.  This cache is also used by direct
+        // PostgreSQL sessions, keeping the OLTP comparison symmetric.
+        PgResult result = pg_can_prepare_statement(pg_sql)
+            ? statements_.exec(conn_, pg_sql, params)
+            : pg_exec_params(conn_, pg_sql, params);
         result.require(PGRES_TUPLES_OK);
         return query_result_from_pg(result.get());
     }

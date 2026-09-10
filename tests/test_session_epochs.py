@@ -502,6 +502,22 @@ def test_postgres_rapid_fork_delete_does_not_leak_session_fence() -> None:
         context.close()
 
 
+def test_postgres_connect_does_not_rebuild_existing_session_indexes() -> None:
+    import psycopg
+    context, dsn = _seed_postgres()
+    context.close()
+    with psycopg.connect(dsn) as blocker:
+        blocker.execute("LOCK TABLE _chronos_branch_sessions IN ROW EXCLUSIVE MODE")
+        result = subprocess.run(
+            [sys.executable, "-I", "-c",
+             "import sys; from chronos_core.branching import ChronosBranchContext; "
+             "c=ChronosBranchContext.connect(sys.argv[1]); c.close(); print('ready')", dsn],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "ready"
+
+
 def test_postgres_process_crash_releases_session_fence() -> None:
     bootstrap, dsn = _seed_postgres()
     bootstrap.close()
