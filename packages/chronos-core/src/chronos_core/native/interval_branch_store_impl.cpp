@@ -220,6 +220,93 @@
         return {columns, defs};
     }
 
+    struct ExistingLogicalIndex {
+        std::string name;
+        std::vector<std::string> columns;
+    };
+
+    std::vector<ExistingLogicalIndex> existing_logical_indexes(
+        const std::string &table,
+        const std::vector<std::string> &primary_key
+    ) {
+        std::vector<ExistingLogicalIndex> indexes;
+        if (driver().dialect() == "postgres") {
+            auto [schema, table_name] = split_postgres_table_name(table);
+            auto rows = driver().query(
+                "SELECT index_class.relname, attribute.attname "
+                "FROM pg_catalog.pg_class table_class "
+                "JOIN pg_catalog.pg_namespace namespace "
+                "  ON namespace.oid = table_class.relnamespace "
+                "JOIN pg_catalog.pg_index index_meta "
+                "  ON index_meta.indrelid = table_class.oid "
+                "JOIN pg_catalog.pg_class index_class "
+                "  ON index_class.oid = index_meta.indexrelid "
+                "JOIN pg_catalog.pg_am access_method "
+                "  ON access_method.oid = index_class.relam "
+                "CROSS JOIN LATERAL unnest(index_meta.indkey) WITH ORDINALITY "
+                "  AS index_key(attnum, position) "
+                "JOIN pg_catalog.pg_attribute attribute "
+                "  ON attribute.attrelid = table_class.oid "
+                " AND attribute.attnum = index_key.attnum "
+                "WHERE namespace.nspname = ? AND table_class.relname = ? "
+                "  AND NOT index_meta.indisprimary "
+                "  AND index_meta.indisvalid AND index_meta.indisready "
+                "  AND index_meta.indexprs IS NULL AND index_meta.indpred IS NULL "
+                "  AND access_method.amname = 'btree' "
+                "  AND index_key.position <= index_meta.indnkeyatts "
+                "ORDER BY index_class.relname, index_key.position",
+                {schema, table_name}
+            );
+            for (const auto &row : rows) {
+                const std::string name = native_as_string(row[0]);
+                if (indexes.empty() || indexes.back().name != name) {
+                    indexes.push_back({name, {}});
+                }
+                indexes.back().columns.push_back(native_as_string(row[1]));
+            }
+        } else if (driver().dialect() == "sqlite") {
+            auto rows = driver().query("PRAGMA index_list(" + quote_table_name(table) + ")");
+            for (const auto &row : rows) {
+                if (row.size() < 5 || native_as_string(row[3]) == "pk" || native_as_int(row[4]) != 0) {
+                    continue;
+                }
+                const std::string name = native_as_string(row[1]);
+                std::vector<std::string> columns;
+                bool simple_columns = true;
+                for (const auto &column_row : driver().query(
+                         "PRAGMA index_info(" + quote_ident(name) + ")")) {
+                    if (column_row.size() < 3 || std::holds_alternative<std::monostate>(column_row[2])) {
+                        simple_columns = false;
+                        break;
+                    }
+                    columns.push_back(native_as_string(column_row[2]));
+                }
+                if (simple_columns && !columns.empty()) {
+                    indexes.push_back({name, std::move(columns)});
+                }
+            }
+        }
+        indexes.erase(
+            std::remove_if(
+                indexes.begin(), indexes.end(),
+                [&](const ExistingLogicalIndex &index) {
+                    return index.columns.empty() || index.columns == primary_key;
+                }
+            ),
+            indexes.end()
+        );
+        return indexes;
+    }
+
+    void preserve_existing_logical_indexes(
+        const std::string &table,
+        const std::vector<ExistingLogicalIndex> &indexes
+    ) {
+        for (const auto &index : indexes) {
+            create_index(table, index.columns, index.name);
+        }
+    }
+
     void ensure_segment_id_allocator() {
         if (metadata_dialect() == "postgres") {
             // Segment ids are globally monotonic inside the metadata plane.
@@ -474,6 +561,9 @@
         try {
             driver().refresh_catalog();
             auto [columns, defs] = table_defs(table);
+            const auto source_indexes = create_secondary_indexes()
+                ? existing_logical_indexes(table, primary_key)
+                : std::vector<ExistingLogicalIndex>{};
             std::unordered_set<std::string> column_set(columns.begin(), columns.end());
             for (const auto &pk : primary_key) {
                 if (column_set.find(pk) == column_set.end()) {
@@ -523,6 +613,7 @@
                     if (create_writer_segment_index()) {
                         driver().execute(writer_segment_index_sql(meta.physical_name, meta.pk_columns));
                     }
+                    preserve_existing_logical_indexes(table, source_indexes);
                 }
                 if (started_tx) driver_->execute("COMMIT");
                 return;
@@ -557,6 +648,9 @@
             NativeTableMeta meta{table, physical, columns, primary_key, defs, "", "", false};
             if (enable_schema_branching) {
                 ensure_base_schema_version(meta, "register");
+            }
+            if (create_secondary_indexes()) {
+                preserve_existing_logical_indexes(table, source_indexes);
             }
             if (started_tx) driver_->execute("COMMIT");
         } catch (...) {

@@ -151,6 +151,52 @@ def test_interval_register_table_adds_new_source_columns(sql_backend: str) -> No
 
 
 @pytest.mark.parametrize("sql_backend", SQL_BACKENDS)
+def test_interval_register_table_preserves_existing_secondary_indexes(sql_backend: str) -> None:
+    if sql_backend == "postgres":
+        _reset_postgres_schema()
+    ctx = ChronosBranchContext.connect(_database_url(sql_backend), backend="interval")
+    try:
+        ctx.db.execute(
+            "CREATE TABLE docs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, revision INTEGER NOT NULL)"
+        )
+        ctx.db.execute("CREATE INDEX docs_kind_revision ON docs (kind, revision)")
+        ctx.db.executemany(
+            "INSERT INTO docs VALUES (?, ?, ?)",
+            [("d1", "report", 1), ("d2", "memo", 1), ("d3", "report", 2)],
+        )
+        ctx.db.commit()
+
+        ctx.register_table("docs", ["id"])
+        ctx.register_table("docs", ["id"])
+
+        indexes = {index.name: index for index in ctx.list_indexes("docs")}
+        assert indexes["docs_kind_revision"].columns == ("kind", "revision")
+        assert list(indexes) == ["docs_kind_revision"]
+        physical_name = "_chronos_idx_interval_docs_kind_revision"
+        if sql_backend == "postgres":
+            definition = ctx.db.execute(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE schemaname = 'public' AND indexname = :name",
+                {"name": physical_name},
+            ).fetchone()
+            assert definition is not None
+            assert "(kind, revision, live_lo, live_hi, deleted)" in definition["indexdef"]
+        else:
+            columns = [
+                row["name"]
+                for row in ctx.db.execute(f'PRAGMA index_info("{physical_name}")').fetchall()
+            ]
+            assert columns == ["kind", "revision", "live_lo", "live_hi", "deleted"]
+
+        assert ctx.checkout("main").query(
+            "SELECT id FROM docs WHERE kind = :kind AND revision = :revision",
+            {"kind": "report", "revision": 2},
+        ) == [{"id": "d3"}]
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("sql_backend", SQL_BACKENDS)
 def test_interval_batched_upsert_rows_bulk_insert_and_replace(sql_backend: str) -> None:
     if sql_backend == "postgres":
         _reset_postgres_schema()
