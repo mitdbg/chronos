@@ -1,164 +1,72 @@
-# Chronos Quickstart: Branch State, Review Changes, Merge
+# Chronos documentation
 
-Chronos gives applications a branch API for state-changing work. A branch can be
-forked from `main`, mutated through the store's normal API, compared against its
-parent, merged if approved, or deleted if rejected.
+These pages describe the Python implementation in this repository. Unless a
+page says otherwise, commands and APIs apply to Chronos 0.2.0a1.
 
-## What You Get
+## Start here
 
-- Named branches for speculative work.
-- SQL branches for relational data, including branch-local schema changes when
-  schema branching is enabled.
-- Filesystem branches for code edits, generated artifacts, and command output.
-- Checkpoints, diffs, merge preview, merge apply, and branch deletion.
-- SQL transactions within a checked-out branch session.
+- [Installation](installation.md) covers the minimal relational build and the
+  optional DuckDB, filesystem, and S3 features.
+- [Integration](integration.md) explains how to adopt existing tables and route
+  application access through Chronos.
+- [Compatibility and limits](compatibility.md) states what is supported and
+  where direct database access can bypass branch isolation.
+- [Branching introduction](branching-introduction.md) explains the data model
+  and interval visibility rules without requiring implementation knowledge.
 
-## Install
+The runnable examples in [`examples/`](../examples/) are the shortest way to
+exercise the API. Start with the single-store example from the repository root:
 
-Start with [installation](installation.md) for native build dependencies and
-optional filesystem support. For complete applications, see the
-[software development tutorial](tutorials/software-development.md) and the
-[verl database sandbox tutorial](tutorials/rl-data-sandbox.md).
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e packages/chronos-core
+```sh
+python examples/single_store_branching.py
 ```
 
-Install the package before running examples. Setting `PYTHONPATH` alone does
-not build the C++ extension.
+The other examples require optional database or FUSE support as applicable;
+their corresponding guides describe that setup.
 
-## Branch Transaction
+## Tutorials
 
-Use this pattern for long-running agent workflows. The agent works inside a
-branch. The application validates the final state and merges only approved
-changes.
+- [Software development](tutorials/software-development.md): isolate code and
+  data changes, inspect them, and publish an accepted fix.
+- [Data sandboxes for verl rollouts](tutorials/rl-data-sandbox.md): give each
+  rollout a private database branch, compute a reward, and discard the branch.
 
-```python
-from chronos_core.branching import ChronosBranchContext
+The verl tutorial demonstrates the environment and tool lifecycle with scripted
+generation. It does not claim to reproduce a published GPU training run.
 
-ctx = ChronosBranchContext.connect("sqlite:///:memory:", backend="interval")
-conn = ctx.conn
+## User guides
 
-conn.execute(
-    """
-    CREATE TABLE tickets (
-      id TEXT PRIMARY KEY,
-      status TEXT NOT NULL,
-      note TEXT NOT NULL
-    )
-    """
-)
-conn.execute("INSERT INTO tickets VALUES ('t1', 'open', 'initial report')")
-conn.commit()
+- [Branch transactions](branching-transaction.md) explains long-running,
+  reviewable speculative work and the atomic shared-metadata merge protocol.
+- [Multi-store branching](multi-store-branching.md) configures relational stores
+  and ChronosFS under one workspace branch.
+- [ChronosFS](filesystem-on-chronos.md) covers direct filesystem operations and
+  POSIX access through FUSE.
+- [MCP integration](mcp-integration.md) configures the agent-facing control
+  plane and states its isolation boundary.
 
-ctx.register_table("tickets", primary_key=["id"])
-ctx.create_branch("agent_fix", from_branch="main")
+## Technical design
 
-agent = ctx.checkout("agent_fix")
-with agent.transaction():
-    agent.execute(
-        "UPDATE tickets SET status = :status, note = :note WHERE id = :id",
-        {"status": "resolved", "note": "validated fix", "id": "t1"},
-    )
+- [Bolt-on relational branching](bolt-on-branching.md) is the detailed design
+  and implementation guide for interval-versioned relational tables.
+- [Multi-store applications](multi-store-branching-applications.md) and the
+  [multi-store abstract](multi-store-branching-abstract.md) motivate the broader
+  model. They are research material, not API specifications.
+- [Related work](related-work.md) is a research reading log.
+- [`diagrams/`](diagrams/) contains the Mermaid sources used by the design
+  documentation.
 
-diff = ctx.diff("main", "agent_fix")
+The two PDFs in this directory are retained project artifacts. The Markdown
+pages above are the maintained source for current behavior.
 
-# App-level guardrails go here: tests, policy checks, reviewers, etc.
-approved = bool(diff.changes)
+## Two PostgreSQL integration modes
 
-if approved:
-    ctx.merge_apply(source="agent_fix", target="main")
-else:
-    ctx.delete_branch("agent_fix")
-```
+This repository is a bolt-on Python library. Applications explicitly use
+`ChronosBranchContext`, `BranchSession`, or `ChronosWorkspaceContext`; it is not
+a PostgreSQL wire proxy or a drop-in DB-API driver.
 
-The branch gives snapshot-style isolation without holding a database transaction
-open across model calls or long-running tools.
-
-## Schema Changes On A Branch
-
-Relational branches can diverge in schema when schema branching is enabled. When
-a branch changes schema, Chronos uses a branch-local physical schema version
-while preserving branch semantics for future forks.
-
-```python
-# Create the context with schema branching enabled, then create/register the
-# table as in the previous example before branching.
-ctx = ChronosBranchContext.connect(
-    "sqlite:///:memory:",
-    backend="interval",
-    enable_schema_branching=True,
-)
-
-ctx.create_branch("schema_exp", from_branch="main")
-session = ctx.checkout("schema_exp")
-
-with session.transaction():
-    session.execute("ALTER TABLE tickets ADD COLUMN severity INTEGER DEFAULT 0")
-    session.execute(
-        "UPDATE tickets SET severity = :severity WHERE id = :id",
-        {"severity": 3, "id": "t1"},
-    )
-
-assert "severity" not in ctx.checkout("main").query("SELECT * FROM tickets")[0]
-assert session.query("SELECT severity FROM tickets WHERE id = :id", {"id": "t1"}) == [
-    {"severity": 3}
-]
-```
-
-## Filesystem Branches
-
-Filesystem branches expose normal paths. Code and command-line tools read and
-write the branch directory directly; they do not need a Chronos-specific file
-API. The current design stores filesystem state in Chronos interval-managed SQL
-tables, with fixed-size file blocks versioned by the interval backend.
-
-See `filesystem-on-chronos.md` for the SQL-backed filesystem design,
-`multi-store-branching.md` for the broader multi-store design, and
-`bolt-on-branching.md` for the relational interval backend.
-See `related-work.md` for a research log of papers and systems related to
-Chronos branching.
-
-For atomic merges of SQL data and files, use shared metadata and
-`merge_atomic_preview` / `merge_atomic`, as in the software development tutorial.
-Ordinary `merge_apply` across independent stores commits each store separately.
-
-When mounted through ChronosFS, agents can use POSIX paths and the `.chronos`
-control plane:
-
-```bash
-mkdir .chronos/branches/agent
-printf 'agent\n' > .chronos/current
-cat .chronos/merge-preview/agent..main.json
-cat > .chronos/merge-apply/agent..main <<'JSON'
-{"policy":"weak_snapshot_isolation"}
-JSON
-```
-
-Mermaid diagrams live in `docs/diagrams/`, including:
-
-- `interval-architecture-overview.mmd`
-- `interval-dml-processing.mmd`
-- `interval-merge-publish.mmd`
-- `polystore-session-processing.mmd`
-- `polystore-workspace-processing.mmd`
-- `chronosfs-posix-control-plane.mmd`
-
-## Branch Transactions Versus Database Transactions
-
-A normal database transaction is fast, but holding it open while an LLM thinks
-or a tool runs can reduce concurrency and still does not isolate filesystem
-effects. A saga avoids a long transaction, but it exposes intermediate state and
-needs compensation logic. A Chronos branch transaction keeps the attempt private
-until merge:
-
-```text
-branch = fork(application_state)
-agent mutates files and relational data inside the branch
-system computes the diff
-policy checks the final state
-merge approved changes or delete the branch
-```
+The separate PostgreSQL engine implementation makes a database branch visible
+to ordinary PostgreSQL clients and supports a broader SQL surface. It has a
+different feature set, including no branch merge today. Do not assume that an
+API or limitation documented for one mode applies to the other; the
+[compatibility table](compatibility.md) summarizes the distinction.

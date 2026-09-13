@@ -1,6 +1,6 @@
 # Filesystem on Chronos
 
-**Status:** v1 implemented in `chronos_core.workspace.chronosfs`
+**Status:** Current behavior in Chronos 0.2.0a1
 
 ## Summary
 
@@ -43,9 +43,9 @@ rows and lets Chronos intervals version those rows.
 
 - Do not build an independent CoW filesystem inside Chronos.
 - Do not add content-addressed blocks, extent trees, refcounts, or filesystem
-  block garbage collection in v1.
+  block garbage collection in the current implementation.
 - Do not implement a materialized worktree import/export adapter.
-- Do not target complete POSIX behavior in v1. Hardlinks, writable `mmap`
+- Do not target complete POSIX behavior in the current implementation. Hardlinks, writable `mmap`
   correctness, device files, mandatory locks, quotas, xattrs, and full Unix ACLs
   are out of scope.
 
@@ -100,7 +100,7 @@ transaction.
 ### File Blocks
 
 File contents are stored in fixed-size logical blocks. The default block size is
-`3072` bytes.
+`4096` bytes.
 
 ```sql
 CREATE TABLE chronosfs_file_blocks (
@@ -115,8 +115,8 @@ CREATE TABLE chronosfs_file_blocks (
 The logical mapping is:
 
 ```text
-block_index = floor(offset / 3072)
-block_offset = offset % 3072
+block_index = floor(offset / 4096)
+block_offset = offset % 4096
 ```
 
 The block table is a Chronos interval table. Updating a block means upserting
@@ -125,7 +125,7 @@ session. Chronos writes a new physical row version over the writer branch
 segment and interval-splices older physical rows. Parent and sibling branches
 continue to see their previous block rows through their branch points.
 
-This is the only v1 copy-on-write mechanism. Blocks are not content-addressed,
+This is the current copy-on-write mechanism. Blocks are not content-addressed,
 not refcounted, and not shared through a separate filesystem allocator. Sharing
 comes from unchanged Chronos row versions remaining visible across branches.
 
@@ -151,7 +151,7 @@ branch point, and table reads use the standard interval visibility predicate.
 `mount_chronosfs(store, mountpoint, branch_id="main")` starts a blocking FUSE
 mount. The adapter has one active branch id per mount.
 
-Implemented v1 operations:
+Implemented operations:
 
 - `lookup`, `getattr`, `readdir`
 - `open`, `create`, `mknod`, `read`, `write`, `flush`, `fsync`, `release`
@@ -170,7 +170,7 @@ implemented so tools that call them receive normal responses.
 
 ## POSIX Semantics
 
-The v1 target is a practical agent workspace filesystem, not a complete
+The current target is a practical agent workspace filesystem, not a complete
 general-purpose POSIX filesystem.
 
 Implemented or partially implemented:
@@ -284,7 +284,7 @@ ctx = ChronosBranchContext.connect(
     backend="interval",
 )
 
-fs = ChronosFSStore(ctx, block_size=3072)
+fs = ChronosFSStore(ctx)
 fs.ensure()
 
 fs.create_branch("agent_run_1", from_branch="main")
@@ -325,7 +325,7 @@ source conflict rows; `manual_review` requires explicit choices by
 
 ## Performance Notes
 
-The `3072`-byte default block size is intentionally small enough to make branch
+The `4096`-byte default block size is intentionally small enough to make branch
 isolation fine-grained while keeping row payloads modest. The block size is
 stored as filesystem metadata and should be treated as fixed for a filesystem
 instance.

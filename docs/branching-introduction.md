@@ -1,30 +1,24 @@
 # Chronos Branching: High-Level Introduction
 
-**Status:** Draft
+**Status:** Current overview for Chronos 0.2.0a1
 
 ## Summary
 
-Chronos branching is a state management layer for agentic applications. Its
-vision is to provide one unified branching abstraction across many state stores:
-relational databases, filesystems, sandboxes, vector stores, object stores, and
-other application-managed state. Agents should be able to fork, mutate,
-evaluate, compare, discard, and merge speculative execution paths without
-reasoning separately about each store's native snapshot mechanism.
-
-Chronos is designed to layer on top of TAR, the Transactional Agent Runtime. TAR
-provides the execution substrate: tool coordination, transaction boundaries,
-commit/abort, savepoints, and recovery across stateful tools. Chronos adds a
-branching abstraction above that substrate: instead of treating an agent run as
-one linear transaction, Chronos exposes a logical history tree of states.
+Chronos is a branching abstraction for databases, filesystems, and object
+stores. It gives an application named, writable states that it can fork,
+mutate, compare, discard, and merge. A workspace can apply the same branch
+lifecycle to multiple stores without exposing each store's physical snapshot
+mechanism to application code.
 
 The key design choice is to decouple branching from database transactions.
 Databases still provide the serial, durable, isolated execution primitive.
 Chronos uses those transactions to update branch metadata and branch-local data
 atomically, while presenting agents with Git-like branching semantics.
 
-For relational data, Chronos is bolt-on: applications keep using SQL over
-logical tables, and Chronos rewrites queries to expose the state of the
-checked-out branch.
+For relational data, this repository provides a bolt-on library. Applications
+send supported SQL through a checked-out `BranchSession`; Chronos rewrites the
+statement to expose the state of that branch. Direct database access bypasses
+this routing.
 
 ## Why Agentic Systems Need Branching
 
@@ -106,10 +100,10 @@ losers. But that is still a poor fit for general agentic branching:
 Chronos therefore treats transactions as an implementation primitive, not as the
 user-facing branching abstraction.
 
-## Layering With TAR
+## Current Components
 
-TAR provides reliable execution over tools and state systems. Chronos branching
-layers on top of TAR to give agents a persistent logical state tree.
+Chronos separates application orchestration from branch management and
+store-specific data access.
 
 ```text
 Agentic application
@@ -125,17 +119,16 @@ Chronos branching layer
   - diff, compare, merge
   - branch garbage collection
 
-Predicate rewrite and state adapters
+Branch sessions and store adapters
   - SQL query rewrite
-  - filesystem/sandbox overlays
-  - vector or memory overlays
+  - interval-versioned filesystem data
+  - object and vector-store adapters
   - store-specific visibility rules
 
-TAR transaction layer
+Database transaction layer
   - begin / commit / abort
   - savepoints
-  - tool enrollment
-  - recovery and coordination
+  - locks and recovery
 
 Underlying state systems
   - PostgreSQL / SQLite
@@ -144,15 +137,17 @@ Underlying state systems
   - external services
 ```
 
-The branching layer gives agents one logical model across many physical storage
-systems. The TAR layer ensures each mutation to that model is applied safely.
+The Python library provides the branch and workspace APIs. The underlying
+databases provide local transaction durability. A workspace configured with a
+shared metadata database can publish a multi-store merge with one branch-head
+change after every participant has staged its data.
 
 ## System Model
 
 Chronos separates two concerns:
 
 ```text
-Database/TAR transaction layer
+Database transaction layer
   - serial execution
   - atomic commit and rollback
   - isolation and durability
@@ -246,10 +241,10 @@ Before:
 
 After fork:
 
-  parent continuation
+  child segment
   [------------------)
 
-  child segment
+  parent continuation
                     [-----------------)
 ```
 
@@ -337,8 +332,8 @@ Chronos aims to provide:
 - Transactional branch mutation: each branch-local SQL transaction commits or
   rolls back atomically.
 - Unified branching: agents use one branch/checkpoint/diff/merge abstraction
-  across relational data, files, sandboxes, vector stores, and other state
-  state systems.
+  across relational data, files, object stores, vector stores, and other state
+  systems.
 - Constant-form read visibility: reads use a fixed predicate independent of
   branch depth.
 - Shared physical storage: unchanged rows are shared across branches.
@@ -351,7 +346,8 @@ Chronos and accessed through branch-bound sessions.
 ## Trade-Offs
 
 Chronos intentionally chooses a bolt-on design. That makes it deployable over
-existing databases and compatible with ordinary SQL, but it creates trade-offs:
+existing databases without replacing their storage engines, but it creates
+trade-offs:
 
 - Query performance depends on the SQL optimizer and indexes over visibility
   metadata.
@@ -363,7 +359,9 @@ existing databases and compatible with ordinary SQL, but it creates trade-offs:
   while schemas match, then branch-local physical schema-version tables when a
   branch diverges. This keeps the common case cheap while preserving correct
   future forks from the divergent branch.
-- Cross-store consistency depends on TAR coordination and state adapters.
+- Atomic cross-store publication requires a shared metadata database and all
+  managed writes to pass through Chronos. Workspaces without shared metadata
+  merge each store independently.
 
 These are different trade-offs from systems that implement branching in the
 storage layer, WAL layer, or a custom content-addressed storage engine. Chronos

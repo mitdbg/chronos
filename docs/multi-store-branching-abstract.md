@@ -1,5 +1,7 @@
 # Chronos Multi-Store Branching Abstract
 
+**Status:** Research abstract; not an API specification
+
 Chronos is a state management layer for agentic applications. Its
 vision is to provide one unified branching abstraction across many state stores:
 relational databases, filesystems, sandboxes, vector stores, object stores, and

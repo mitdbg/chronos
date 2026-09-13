@@ -1,10 +1,11 @@
 # Local experimental candidate, 2026-09-09
 
 This candidate remains local. No repository was pushed, no tag or public release
-was created, and no Docker image was uploaded. The original branching documents
-and PDFs are preserved. The design documents have not undergone a complete
-consistency review; the new installation, integration, and tutorial pages describe
-the interfaces exercised in this preparation.
+was created, and no Docker image was uploaded. The maintained branching documents
+and PDFs are preserved. The Markdown documentation was reviewed against the
+0.2.0a1 interfaces on 2026-09-12. Four obsolete pre-release documents describing
+the removed TAR, TMCP, and LangChain implementation were deleted rather than
+published as current guidance.
 
 ## Source changes
 
@@ -69,6 +70,11 @@ control example. The locally built PostgreSQL image passed its initialization,
 branch isolation, schema change, metadata hiding, and restart-persistence smoke
 test. This was not a new run of the full upstream PostgreSQL suite.
 
+During the 2026-09-12 documentation review, the six non-FUSE examples passed.
+The FUSE control example passed when run alone but failed its data-read assertion
+when run last through `examples/run_all.py`. Treat the aggregate example run as
+unresolved until this ordering-sensitive failure is fixed.
+
 Focused regression tests after the last correction passed 48 cases with two
 disabled-feature skips, including the deterministic initialization-lock test and
 the stopped-process recovery test. Results are recorded in
@@ -94,5 +100,5 @@ datasets and traces that secret scanning cannot classify. Git history is
 unchanged.
 
 Before public distribution, complete dependency-license and binary-portability
-review, test clean-container wheel installation, finish the documentation
-consistency review, and resolve the retained history. See [RELEASING.md](RELEASING.md).
+review, test clean-container wheel installation, and resolve the retained
+history. See [RELEASING.md](RELEASING.md).

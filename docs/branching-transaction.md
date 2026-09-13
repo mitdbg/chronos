@@ -1,6 +1,6 @@
 # Branching Transactions for Agentic Workflows
 
-**Status:** Draft
+**Status:** Current behavior and research context for Chronos 0.2.0a1
 
 ## Summary
 
@@ -12,8 +12,8 @@ unit of work is the whole attempt, not each individual database statement.
 Traditional ACID transactions are a poor fit for this use case because the
 workflow includes slow model calls and external tool execution. Saga-style
 transactions avoid holding one large database transaction open, but they expose
-intermediate states and rely on compensation logic after failure. Chronos can
-offer a third option: treat a branch as a durable private transaction workspace,
+intermediate states and rely on compensation logic after failure. Chronos
+offers a third option: treat a branch as a durable private transaction workspace,
 validate the final state, then merge approved changes back to the main branch.
 
 ## Big Transaction
@@ -383,10 +383,15 @@ workspace.create_branch("agent", from_branch="main")
 branch = workspace.checkout("agent")
 branch.postgresql.execute("UPDATE graph_nodes SET score = :score WHERE id = :id", {"score": 0.9, "id": "n1"})
 branch.duckdb.execute("INSERT INTO run_metrics VALUES (:id, :score)", {"id": "n1", "score": 0.9})
-filesystem.write_file("agent", "/reports/n1.md", "score: 0.9\n", parents=True)
+branch.fs.write_file("/reports/n1.md", "score: 0.9\n", parents=True)
 
-preview = workspace.merge_preview("agent", "main", policy="manual_review")
-workspace.merge_apply("agent", "main", policy="weak_snapshot_isolation")
+preview = workspace.merge_atomic_preview("agent", "main", policy="manual_review")
+workspace.merge_atomic(
+    "agent",
+    "main",
+    policy="weak_snapshot_isolation",
+    operation_id="publish-agent-run",
+)
 ```
 
 ChronosFS also exposes POSIX control files for agents that only have shell or
@@ -447,7 +452,13 @@ payments, webhooks, and other irreversible actions still need explicit effect
 policies. A practical pattern is to stage such effects inside the branch as
 intent records or outbox entries, then execute them only after merge approval.
 
-## Open Design Questions
+## Current Limits and Open Work
+
+The implemented merge path detects conflicting writes. It does not track read
+sets or predicates and therefore does not provide serializable validation for
+arbitrary application logic. External effects remain outside branch isolation,
+and checkpoint retention currently requires application-level lifecycle
+management. The following questions are future work, not supported behavior:
 
 - What is the default merge policy: source-over-target, reject on row conflict,
   column-level merge, or application-defined?

@@ -1,6 +1,6 @@
 # Chronos Multi-Store Branching Design
 
-**Status:** Draft, aligned with the ChronosFS direction
+**Status:** Implemented workspace and ChronosFS behavior in Chronos 0.2.0a1
 
 ## Summary
 
@@ -37,30 +37,30 @@ Applications that need files and multiple stores use a workspace API:
 
 ```python
 from chronos_core.branching import ChronosBranchContext
-from chronos_core.workspace import ChronosPostgresStore, ChronosWorkspaceContext
+from chronos_core.workspace import ChronosWorkspaceContext
 from chronos_core.workspace.chronosfs import ChronosFSStore
 
-postgresql = ChronosPostgresStore("postgresql://postgres:postgres@localhost/app")
-fs_context = ChronosBranchContext.connect(
-    "postgresql://postgres:postgres@localhost/app_fs",
+sqlite = ChronosBranchContext.connect(
+    "sqlite:///app.sqlite",
     backend="interval",
 )
-filesystem = ChronosFSStore(fs_context)
+filesystem = ChronosFSStore.connect(sqlite.db.database_url, backend="interval")
 filesystem.ensure()
 
 workspace = ChronosWorkspaceContext(
-    postgresql=postgresql,
+    sqlite=sqlite,
     filesystem=filesystem,
+    shared_metadata_url=sqlite.db.database_url,
 )
 
 workspace.create_branch("agent_run_1", from_branch="main")
 branch = workspace.checkout("agent_run_1")
 
-branch.postgresql.execute(
+branch.sqlite.execute(
     "UPDATE graph_nodes SET score = :score WHERE node_id = :node_id",
     {"score": 0.9, "node_id": "n1"},
 )
-filesystem.write_file("agent_run_1", "/reports/summary.md", "# Summary\n", parents=True)
+branch.fs.write_file("/reports/summary.md", "# Summary\n", parents=True)
 ```
 
 For subprocess execution, mount the ChronosFS branch and run tools inside that
@@ -72,7 +72,7 @@ from chronos_core.workspace.chronosfs import mount_chronosfs
 mount_chronosfs(filesystem, "/mnt/chronosfs-agent", branch_id="agent_run_1")
 ```
 
-## Goals
+## Implemented Scope
 
 - Preserve `ChronosBranchContext` and `BranchSession` as stable relational APIs.
 - Let one Chronos branch include relational state and filesystem state.
@@ -84,7 +84,7 @@ mount_chronosfs(filesystem, "/mnt/chronosfs-agent", branch_id="agent_run_1")
 - Keep branch creation metadata-only for both relational stores and ChronosFS.
 - Support checkpoints, diff, merge apply, and branch deletion across all
   enrolled stores.
-- Keep speculative agent writes private until `merge_apply`.
+- Keep speculative agent writes private until merge publication.
 
 ## Non-Goals
 
@@ -140,6 +140,7 @@ class ChronosWorkspaceContext:
         self,
         filesystem: ChronosFSStore | None = None,
         stores: dict[str, BranchStore] | None = None,
+        shared_metadata_url: str | None = None,
         **named_stores: BranchStore,
     ): ...
 
@@ -150,7 +151,8 @@ class ChronosWorkspaceContext:
     def checkout_checkpoint(self, checkpoint: str) -> "WorkspaceBranchSession": ...
     def create_checkpoint(self, checkpoint: str, branch: str = "main", ...) -> dict[str, Any]: ...
     def diff(self, left: str, right: str) -> dict[str, Any]: ...
-    def merge_apply(self, source: str, target: str) -> dict[str, Any]: ...
+    def merge_atomic_preview(self, source: str, target: str, ...) -> WorkspaceMergePreview: ...
+    def merge_atomic(self, source: str, target: str, ...) -> WorkspaceMergeResult: ...
 ```
 
 `WorkspaceBranchSession` exposes relational stores by system name. ChronosFS
@@ -161,7 +163,7 @@ a workspace adapter or a mounted POSIX path:
 branch = workspace.checkout("agent")
 branch.postgresql.query("SELECT ...")
 branch.duckdb.query("SELECT ...")
-filesystem.write_file("agent", "/artifact.txt", "...")
+branch.fs.write_file("/artifact.txt", "...")
 ```
 
 This keeps old relational code stable while giving new agent runtimes an
@@ -291,7 +293,7 @@ unique across branches so independently-created files cannot collide during
 merge.
 
 File content is stored as fixed-size logical block rows. The default block size
-is `3072` bytes:
+is `4096` bytes:
 
 ```text
 block_index = floor(offset / block_size)
@@ -308,7 +310,8 @@ When a branch modifies one block, Chronos writes a new physical interval row
 for that logical key in the writer branch segment. Parent and sibling branches
 continue to see the old block row through their branch points. Unchanged blocks
 remain shared by interval visibility. There is no separate filesystem layer
-stack, content-addressed block store, or file-level copy-up mechanism in v1.
+stack, content-addressed block store, or file-level copy-up mechanism in the
+current implementation.
 
 ### POSIX Access
 
@@ -421,17 +424,22 @@ run.postgresql.execute(
     {"score": 0.5, "node_id": "n1"},
 )
 
-# Either direct ChronosFS store operations:
-filesystem.write_file("run_42", "/reports/summary.md", "# Summary\n", parents=True)
+# Either direct branch-bound ChronosFS operations:
+run.fs.write_file("/reports/summary.md", "# Summary\n", parents=True)
 
 # Or POSIX execution inside a mounted ChronosFS branch:
 mount_chronosfs(filesystem, "/mnt/run_42", branch_id="run_42")
 subprocess.run(["python", "scripts/build_report.py"], cwd="/mnt/run_42", check=True)
 
-preview = workspace.merge_preview("run_42", "main", policy="manual_review")
+preview = workspace.merge_atomic_preview("run_42", "main", policy="manual_review")
 
 if policy_allows(preview):
-    workspace.merge_apply("run_42", "main", policy="snapshot_isolation")
+    workspace.merge_atomic(
+        "run_42",
+        "main",
+        policy="snapshot_isolation",
+        operation_id="publish-run-42",
+    )
 else:
     workspace.delete_branch("run_42")
 ```
@@ -495,7 +503,7 @@ For `create_checkpoint`:
 1. Create the checkpoint once in the shared metadata plane.
 2. Every participant resolves the same immutable checkpoint segment.
 
-For `merge_apply`:
+For `merge_atomic`:
 
 1. Resolve a target validation token from the metadata store.
 2. Compute diffs with a three-way comparison over source, target, and fork base.
@@ -671,7 +679,12 @@ publish semantics should use branch lifecycle operations:
 workspace.create_checkpoint("before_agent_run", branch="main")
 workspace.create_branch("agent_run", from_branch="main")
 ...
-workspace.merge_apply("agent_run", "main")
+workspace.merge_atomic(
+    "agent_run",
+    "main",
+    policy="snapshot_isolation",
+    operation_id="publish-agent-run",
+)
 ```
 
 ## Diff
@@ -709,7 +722,10 @@ policy:
 
 ## Merge
 
-Workspace merge is a store-wise merge.
+An atomic workspace merge stages every selected store change and then publishes
+them through the shared branch head. The older `merge_apply` method performs
+independent store merges and is rejected for a workspace configured with
+`shared_metadata_url`.
 
 Relational merge:
 
@@ -826,36 +842,19 @@ deleted in the same transaction. Recovery treats the merge as committed. A
 client that did not receive the response can safely inspect the branch head or
 use an idempotency key in higher-level orchestration.
 
-## Open Questions
+## Current Limits and Future Work
 
-- Should the workspace catalog live inside the relational Chronos metadata
-  database permanently, or should it be pluggable?
-- Should ChronosFS support a highly optimized local interval data plane in
-  addition to SQL-backed interval tables?
-- What block size should be the default for agent code execution workloads?
-- How far should ChronosFS go beyond byte-range text diffs into whole-file or
-  semantic merge helpers without turning the filesystem store into a
-  source-control system?
-- Should workspace `merge_apply()` be allowed when one store has conflicts and
-  another does not, or should all store conflicts block the entire merge?
-- What retention policy should decide when abandoned commit successors are
-  cleaned?
-
-## Proposed Incremental Plan
-
-1. Keep `ChronosWorkspaceContext` as an additive API. Do not change
-   `ChronosBranchContext`.
-2. Use system names for store sessions: `branch.postgresql`, `branch.duckdb`,
-   and `branch.fs`.
-3. Use `ChronosFSStore` as the filesystem store. Store inode, dirent, and block
-   rows in Chronos interval tables.
-4. Use `mount_chronosfs(...)` for POSIX execution inside a branch.
-5. Add workspace diff that groups relational and ChronosFS changes.
-6. Publish multi-store `merge_apply` through the transactional metadata-store
-   branch-head swap.
-7. Extend ChronosFS merge preview with higher-level whole-file or semantic
-   helpers where applications need them.
-8. Add schema-branching support behind the PostgreSQL relational store.
-9. Add GC and compaction for ChronosFS row versions and old relational versions.
-10. Explore a high-performance local ChronosFS data plane that still supports
-    interval visibility predicates and secondary indexes.
+- Atomic workspace merge requires every participant to use the same interval
+  metadata database. Workspaces without `shared_metadata_url` merge their
+  stores independently.
+- Chronos coordinates managed database and filesystem state; it does not make
+  network calls or other irreversible effects transactional.
+- ChronosFS reports byte-range conflicts and useful text or binary payloads,
+  but does not perform semantic source-code merges.
+- FUSE provides POSIX access, not a hostile-code security boundary. Use process,
+  network, resource, and secrets isolation around untrusted programs.
+- Garbage collection and retention remain conservative. Checkpoints and active
+  merge reservations keep their reachable versions alive.
+- Schema branching is an opt-in SQLite/PostgreSQL library feature with the
+  restrictions listed in [Compatibility and limits](compatibility.md). It is
+  not available for DuckDB participants.

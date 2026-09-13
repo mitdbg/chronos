@@ -1,6 +1,6 @@
 # Applications for Multi-Store Branching
 
-**Status:** Draft
+**Status:** Research motivation; not an API specification
 
 This document motivates Chronos multi-store branching: one branch spans a
 relational database and a POSIX filesystem. The key requirement is that code,
@@ -509,4 +509,3 @@ branch linker_ablation:
 
 Diff graph changes and audit artifacts together. Merge accepted nodes, edges,
 and reports as one coherent update.
-

@@ -76,6 +76,8 @@ To add Chronos to an existing application, start with the
 more than one store should also read the
 [multi-store branching guide](docs/multi-store-branching.md), which explains
 how to configure them and when their changes can be merged together atomically.
+Agent clients can use the optional [MCP integration](docs/mcp-integration.md)
+for explicit branch, SQL, diff, merge, and filesystem tools.
 
 The [documentation index](docs/README.md) links to the API guides and further
 reading. If you want to understand how Chronos works, see the

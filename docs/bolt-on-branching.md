@@ -1,6 +1,7 @@
 # Bolt-On Branching for Relational Data
 
-**Status:** Draft
+**Status:** Implemented interval design for Chronos 0.2.0a1. Sections marked
+as alternatives or future work are not part of the current backend.
 
 ## Summary
 
@@ -75,11 +76,11 @@ At a high level:
 
 ## Operational Limits
 
-- The base implementation branches row contents under a shared schema.
-- Branch-local schema changes should be added with the hybrid schema-version
-  design in this document: DDL creates a new interval-backed physical table
-  version for the affected logical table and branch-visible table bindings
-  choose the active schema version.
+- The default implementation branches row contents under a shared schema.
+- The SQLite and PostgreSQL interval adapters have opt-in schema branching for
+  a restricted DDL subset. DDL creates an interval-backed physical table version
+  for the affected logical table, and branch-visible bindings choose the active
+  schema version.
 - Fixed-width interval spaces require sparse allocation, relabeling, or explicit depth limits.
 - Hot keys can accumulate many physical rows.
 - Multi-row writes evaluate the current branch view first, then splice matched keys.
@@ -114,7 +115,7 @@ class ChronosBranchContext:
 
     def register_table(self, table: str, primary_key: list[str]) -> None: ...
 
-    def create_branch(self, branch_id: str, from_branch: str) -> None: ...
+    def create_branch(self, branch_id: str, from_branch: str = "main", ...) -> None: ...
     def create_branch_from_checkpoint(
         self,
         branch_id: str,
@@ -126,19 +127,22 @@ class ChronosBranchContext:
 
     def checkout(self, branch_id: str) -> "BranchSession": ...
     def checkout_checkpoint(self, checkpoint: str) -> "BranchSession": ...
-    def checkout_at(self, branch: str, lsn: int) -> "BranchSession": ...
 
-    def create_checkpoint(self, checkpoint: str, branch: str) -> None: ...
+    def create_checkpoint(self, checkpoint: str, branch: str = "main", ...) -> "CheckpointInfo": ...
+    def get_checkpoint(self, checkpoint: str) -> "CheckpointInfo": ...
+    def list_checkpoints(self, branch: str | None = None, ...) -> list["CheckpointInfo"]: ...
 
     def diff(self, left: str, right: str) -> "BranchDiff": ...
     def diff_rows(self, left: str, right: str, table: str) -> list["RowDiff"]: ...
 
-    def merge_preview(self, source: str, target: str) -> "MergePreview": ...
+    def merge_preview(self, source: str, target: str, *, policy=None) -> "MergePreview": ...
     def merge_apply(
         self,
         source: str,
         target: str,
-        resolution: "MergeResolution",
+        resolution: "MergeResolution | None" = None,
+        *,
+        policy=None,
     ) -> "MergeResult": ...
 
 
@@ -611,7 +615,8 @@ A tombstone hides inherited rows inside its live interval.
 
 ## Branch-Local Schema Changes
 
-Chronos should support branch-local DDL with a hybrid schema-version design.
+The SQLite and PostgreSQL interval adapters support selected branch-local DDL
+with a hybrid schema-version design when schema branching is enabled.
 The key rule is that a table with a divergent schema must remain branchable by
 the interval backend. DDL must not turn the table into a dead-end physical copy
 that future forks cannot share cheaply.
@@ -1249,11 +1254,12 @@ NUMERIC(78):  ~259 bits
 
 The implementation should not rely on 64-bit intervals for correctness.
 
-Adaptive allocation avoids exposing a fixed `interval_child_width` parameter to
-normal users. It also avoids requiring a declared maximum depth. The tradeoff is
-that no finite integer interval can support adversarially unbounded width and
-depth at the same time. Chronos should still reject branch creation when a local
-interval lacks the minimum space for the requested operation.
+Adaptive allocation means normal users do not need to set
+`interval_child_width`, although the constructor retains that option for
+controlled workloads and tests. It also avoids requiring a declared maximum
+depth. No finite integer interval can support adversarially unbounded width and
+depth at the same time, so Chronos rejects branch creation when a local interval
+lacks the minimum space for the requested operation.
 
 For arbitrary adversarial depth, a future implementation can use
 variable-length lexicographic intervals:
@@ -1308,6 +1314,9 @@ administrative rewrite over a broad interval.
 Branch creation does not copy user rows. Storage grows when data changes, not when branches are created.
 
 ## Alternative Representation: Branch Log Tables
+
+This section records an evaluated alternative. The current backend uses interval
+live ranges and does not implement the branch-log representation below.
 
 The same `ChronosBranchContext` API can be implemented with append-only log
 tables instead of write-time interval maintenance. In this representation, a
@@ -2155,35 +2164,15 @@ Segments and row intervals can be collected when they are not reachable from:
 
 Garbage collection must preserve the non-overlap invariant for remaining live branch points.
 
-## Minimal Implementation Plan
+## Implementation Status
 
-For the interval live-range representation:
+The interval backend implements branch and segment metadata, metadata-only
+forks, checkpoints, query rewriting, interval-spliced writes, diff, merge, and
+opt-in PostgreSQL schema versions. The code also enforces allocation limits and
+maintains indexes for visibility and logical-key access.
 
-1. Add `branches` and `segments`.
-2. Implement checkout, branch creation, and checkpoint creation.
-3. Generate physical branched tables with `live_lo`, `live_hi`, and `deleted`.
-4. Implement branch-visible reads with injected branch constants.
-5. Implement keyed update, delete, insert, and interval splice.
-6. Add non-overlap enforcement.
-7. Add sparse interval allocation and depth checks.
-8. Add diff, merge, and garbage collection.
-9. Add branch-local schema versions:
-   - `_chronos_table_schema_versions`
-   - `_chronos_table_bindings`
-   - table resolution from `(logical table, branch point)` to physical table
-   - DDL flow that creates a new interval-backed physical table version
-   - row copy from the previous visible schema version into the new branch
-     segment
-   - binding splices for `CREATE TABLE`, `ALTER TABLE`, and `DROP TABLE`
-
-For the log-table representation:
-
-1. Add `branch_timelines` and `branch_txns`.
-2. Generate per-table append-only log tables.
-3. Implement branch creation as timeline metadata.
-4. Implement branch session checkout with visible timeline ranges.
-5. Rewrite writes into append-only log records.
-6. Rewrite reads to reconstruct current rows from visible logs.
-7. Add indexes for point reads, adjacency reads, and branch-range scans.
-8. Add a maintained current-state projection for fast arbitrary SQL.
-9. Add log-aware diff, time travel by LSN, merge, and garbage collection.
+The current limits are maintained in [Compatibility and limits](compatibility.md).
+In particular, SQL write support is intentionally narrower than the underlying
+database, schema branching accepts only a DDL subset, allocation is finite, and
+garbage collection is conservative. The branch-log representation above remains
+design material rather than an implementation roadmap.
