@@ -12,6 +12,10 @@ SQLite, PostgreSQL, and DuckDB, and also supports files through ChronosFS,
 Qdrant collections, and S3-compatible storage. This repository provides the
 Python library for using Chronos with your existing applications and databases.
 
+If you only need branching within a single PostgreSQL database,
+[Chronos for PostgreSQL](https://github.com/mitdbg/postgres_chronos) implements
+Chronos's interval-based versioning directly inside PostgreSQL.
+
 Chronos is experimental. See the [compatibility guide](docs/compatibility.md)
 for supported operations and current limitations.
 
