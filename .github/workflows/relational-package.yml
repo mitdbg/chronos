@@ -3,6 +3,64 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  gateway:
+    runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gateway build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake libboost-system-dev libfuse3-dev libpq-dev libsqlite3-dev \
+            libssl-dev nlohmann-json3-dev pkg-config python3-dev
+      - name: Build and run the gateway suite
+        run: |
+          cmake -S packages/chronos-gateway -B /tmp/chronos-gateway-build \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/chronos-gateway-build -j2
+          ctest --test-dir /tmp/chronos-gateway-build \
+            --exclude-regex e2b --output-on-failure
+      - name: Run the SQL matrix against PostgreSQL
+        env:
+          PGPASSWORD: postgres
+          CHRONOS_GATEWAY_TEST_POSTGRES_DATA_URL: postgresql://postgres:postgres@127.0.0.1:5432/chronos_gateway_data
+          CHRONOS_GATEWAY_TEST_POSTGRES_METADATA_URL: postgresql://postgres:postgres@127.0.0.1:5432/chronos_gateway_metadata
+        run: |
+          createdb -h 127.0.0.1 -U postgres chronos_gateway_data
+          createdb -h 127.0.0.1 -U postgres chronos_gateway_metadata
+          ctest --test-dir /tmp/chronos-gateway-build \
+            --tests-regex '^chronos_gateway_postgres_tests$' --output-on-failure
+  e2b-adapter:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install build pytest pytest-asyncio
+      - name: Build and install the coordinator adapter
+        run: |
+          python -m build packages/chronos-e2b --outdir /tmp/chronos-e2b-wheel
+          python -m pip install /tmp/chronos-e2b-wheel/*.whl
+      - name: Test the installed adapter
+        run: |
+          CHRONOS_E2B_TEST_INSTALLED=1 python -I packages/chronos-e2b/tests/test_adapter.py
+          PYTHONPATH=examples/verl python -m pytest examples/verl/test_e2b_episode.py -q
   wheel:
     runs-on: ubuntu-22.04
     strategy:
