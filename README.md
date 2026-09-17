@@ -75,8 +75,12 @@ does not use the selected branch.
 The [software development tutorial](docs/tutorials/software-development.md)
 shows how to reproduce a bug, test a fix in a branch, and merge the changes to
 both code and data. The [verl tutorial](docs/tutorials/rl-data-sandbox.md)
-shows how to give each training rollout a separate database branch, calculate
-its reward from the resulting data, and delete the branch afterward.
+shows how to give each training rollout separate database and filesystem state,
+optionally inside an E2B microVM, calculate its reward from the resulting data,
+and delete the branch afterward.
+The [E2B sandbox tutorial](docs/tutorials/e2b-sandbox.md) shows how a runtime
+sandbox can use ordinary PostgreSQL and NFSv4 interfaces without receiving
+backing-store or branch-management credentials.
 
 To add Chronos to an existing application, start with the
 [integration guide](docs/integration.md). Applications that need branches across

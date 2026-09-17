@@ -1,4 +1,5 @@
 """One branch per ToolAgentLoop.run, including GRPO samples of the same prompt."""
+
 from copy import deepcopy
 
 from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
@@ -17,4 +18,5 @@ class ChronosDatabaseAgentLoop(ToolAgentLoop):
             # Evaluate before deletion, once per trajectory, never per tool call.
             output.reward_score = await database.score()
             output.extra_fields["chronos_db_reward"] = output.reward_score
+            output.extra_fields.update(database.trajectory_metadata())
             return output

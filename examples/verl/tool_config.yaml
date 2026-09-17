@@ -2,8 +2,19 @@ tools:
   - class_name: chronos_verl.tool.ChronosTicketTool
     config:
       type: native
-      database_url: ${oc.env:CHRONOS_DATABASE_URL}
+      backend: ${oc.env:CHRONOS_VERL_BACKEND,local}
+      database_url: ${oc.env:CHRONOS_DATABASE_URL,''}
       checkpoint: tickets_baseline
+      e2b:
+        template: ${oc.env:CHRONOS_E2B_TEMPLATE,chronos-agent}
+        workspace: ${oc.env:CHRONOS_E2B_WORKSPACE,training}
+        database: ${oc.env:CHRONOS_E2B_DATABASE,tickets}
+        from_branch: ${oc.env:CHRONOS_E2B_FROM_BRANCH,main}
+        filesystem: ${oc.env:CHRONOS_E2B_FILESYSTEM,read_write}
+        ttl_seconds: ${oc.env:CHRONOS_E2B_TTL_SECONDS,3600}
+        timeout: ${oc.env:CHRONOS_E2B_TIMEOUT,3600}
+        mountpoint: /mnt/chronos
+        command_timeout: ${oc.env:CHRONOS_E2B_COMMAND_TIMEOUT,60}
     tool_schema:
       type: function
       function:
