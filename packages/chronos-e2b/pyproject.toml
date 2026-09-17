@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chronos-e2b"
+version = "0.1.0a1"
+description = "Run E2B sandboxes on isolated Chronos database and filesystem branches"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+  "e2b>=2.46,<3",
+]
+
+[project.urls]
+Repository = "https://github.com/mitdbg/chronos"
+Documentation = "https://github.com/mitdbg/chronos/blob/main/docs/tutorials/e2b-sandbox.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chronos_e2b"]

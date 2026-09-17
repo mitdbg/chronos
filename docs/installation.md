@@ -53,5 +53,30 @@ Direct ChronosFS API access needs no mount. FUSE mounting additionally needs
 /dev/fuse and permissions. A relational build reports an actionable error when
 asked to construct a filesystem store.
 
-See [contributor instructions](../CONTRIBUTING.md). Test installed artifacts in
-isolated environments: PYTHONPATH alone cannot establish which C++ binary runs.
+## Sandbox gateway
+
+The experimental gateway exposes branch-scoped PostgreSQL and NFSv4 interfaces
+to an unmodified runtime sandbox. On Ubuntu, add its server dependencies:
+
+```sh
+sudo apt-get install cmake pybind11-dev nfs-ganesha nfs-ganesha-vfs nfs-common
+cmake -S packages/chronos-gateway -B build/gateway -DCMAKE_BUILD_TYPE=Release
+cmake --build build/gateway -j
+ctest --test-dir build/gateway --output-on-failure
+```
+
+See the [E2B data-sandbox tutorial](tutorials/e2b-sandbox.md) for gateway
+configuration, the privileged NFSv4 integration test, and the rollout
+lifecycle.
+
+Install the coordinator adapter separately. It depends on the E2B SDK but not
+on `chronos-core`, because it reaches Chronos through the gateway:
+
+```sh
+python -m pip install ./packages/chronos-e2b
+```
+
+See the
+[contributor instructions](https://github.com/mitdbg/chronos/blob/main/CONTRIBUTING.md).
+Test installed artifacts in isolated environments: PYTHONPATH alone cannot
+establish which C++ binary runs.
