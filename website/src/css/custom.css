@@ -1,0 +1,108 @@
+:root {
+  --ifm-color-primary: #073b8f;
+  --ifm-color-primary-dark: #063580;
+  --ifm-color-primary-darker: #053178;
+  --ifm-color-primary-darkest: #042963;
+  --ifm-color-primary-light: #08419e;
+  --ifm-color-primary-lighter: #0945a6;
+  --ifm-color-primary-lightest: #0a4ec0;
+  --ifm-background-color: #ffffff;
+  --ifm-font-family-base: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --ifm-heading-font-family: var(--ifm-font-family-base);
+  --ifm-heading-font-weight: 720;
+  --ifm-code-font-size: 92%;
+  --ifm-navbar-height: 4.25rem;
+  --ifm-global-radius: 0.6rem;
+  --ifm-toc-border-color: #e2e9f3;
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #32d7ef;
+  --ifm-color-primary-dark: #16d0ea;
+  --ifm-color-primary-darker: #14c5dd;
+  --ifm-color-primary-darkest: #11a2b6;
+  --ifm-color-primary-light: #4eddf2;
+  --ifm-color-primary-lighter: #5ce0f3;
+  --ifm-color-primary-lightest: #87e8f6;
+  --ifm-background-color: #07162f;
+  --ifm-background-surface-color: #0a2045;
+  --ifm-navbar-background-color: rgba(7, 22, 47, 0.92);
+  --ifm-footer-background-color: #031027;
+  --ifm-toc-border-color: #243a5b;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  color: #172b4d;
+  font-feature-settings: "kern";
+}
+
+.navbar {
+  border-bottom: 1px solid rgba(7, 59, 143, 0.1);
+  box-shadow: none;
+  backdrop-filter: blur(16px);
+}
+
+.navbar__brand {
+  margin-right: 2rem;
+}
+
+.navbar__logo {
+  width: 2.1rem;
+  height: 2.1rem;
+}
+
+.navbar__title {
+  color: #071e46;
+  font-size: 1.05rem;
+  font-weight: 780;
+  letter-spacing: -0.02em;
+}
+
+.navbar__link {
+  font-size: 0.9rem;
+  font-weight: 620;
+}
+
+[data-theme='dark'] body { color: #d6e0ef; }
+[data-theme='dark'] .navbar__title { color: #edf5ff; }
+
+.footer {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.footer__title {
+  color: white;
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.footer__link-item {
+  color: #aebed7;
+}
+
+.theme-doc-markdown h1 {
+  color: #071e46;
+  font-size: 2.6rem;
+  letter-spacing: -0.035em;
+}
+
+[data-theme='dark'] .theme-doc-markdown h1 { color: #f0f6ff; }
+
+.theme-doc-markdown h2 {
+  margin-top: 2.6rem;
+  letter-spacing: -0.02em;
+}
+
+.theme-doc-markdown table {
+  display: table;
+  width: 100%;
+}
+
+code {
+  border-color: rgba(7, 59, 143, 0.12);
+}

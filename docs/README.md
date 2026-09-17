@@ -1,3 +1,7 @@
+---
+slug: /
+---
+
 # Chronos documentation
 
 These pages describe the Python implementation in this repository. Unless a
@@ -14,8 +18,10 @@ page says otherwise, commands and APIs apply to Chronos 0.2.0a1.
 - [Branching introduction](branching-introduction.md) explains the data model
   and interval visibility rules without requiring implementation knowledge.
 
-The runnable examples in [`examples/`](../examples/) are the shortest way to
-exercise the API. Start with the single-store example from the repository root:
+The runnable examples in
+[`examples/`](https://github.com/mitdbg/chronos/tree/main/examples) are the
+shortest way to exercise the API. Start with the single-store example from the
+repository root:
 
 ```sh
 python examples/single_store_branching.py
@@ -29,7 +35,10 @@ their corresponding guides describe that setup.
 - [Software development](tutorials/software-development.md): isolate code and
   data changes, inspect them, and publish an accepted fix.
 - [Data sandboxes for verl rollouts](tutorials/rl-data-sandbox.md): give each
-  rollout a private database branch, compute a reward, and discard the branch.
+  rollout private database and filesystem state, optionally inside an E2B
+  microVM, compute a reward, and discard the branch.
+- [E2B data sandboxes](tutorials/e2b-sandbox.md): attach a branch-scoped
+  PostgreSQL connection and NFSv4 filesystem to an unmodified E2B sandbox.
 
 The verl tutorial demonstrates the environment and tool lifecycle with scripted
 generation. It does not claim to reproduce a published GPU training run.
@@ -53,8 +62,8 @@ generation. It does not claim to reproduce a published GPU training run.
   [multi-store abstract](multi-store-branching-abstract.md) motivate the broader
   model. They are research material, not API specifications.
 - [Related work](related-work.md) is a research reading log.
-- [`diagrams/`](diagrams/) contains the Mermaid sources used by the design
-  documentation.
+- [`diagrams/`](https://github.com/mitdbg/chronos/tree/main/docs/diagrams)
+  contains the Mermaid sources used by the design documentation.
 
 The two PDFs in this directory are retained project artifacts. The Markdown
 pages above are the maintained source for current behavior.
