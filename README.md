@@ -19,6 +19,9 @@ Chronos's interval-based versioning directly inside PostgreSQL.
 Chronos is experimental. See the [compatibility guide](docs/compatibility.md)
 for supported operations and current limitations.
 
+The [Chronos paper](https://arxiv.org/abs/2609.14889) explains the
+interval-based versioning algorithm, cross-store branching, and evaluation.
+
 ## Install
 
 The default build supports SQLite and PostgreSQL. From the repository root on
@@ -97,3 +100,17 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build and test instructions.
 The [experimental release notes](EXPERIMENTAL_RELEASE.md) describe the tests run
 so far and known failures; [RELEASING.md](RELEASING.md) describes the release
 process.
+
+## Cite Chronos
+
+```bibtex
+@misc{zhou2026chronos,
+  title         = {{Chronos}: Efficient Bolt-on Branching Across Data Stores for Stateful Agentic Applications},
+  author        = {Xinjing Zhou and Jason Mohoney and Samuel Madden and Michael Stonebraker and Lei Cao},
+  year          = {2026},
+  eprint        = {2609.14889},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.DB},
+  url           = {https://arxiv.org/abs/2609.14889}
+}
+```
