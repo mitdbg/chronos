@@ -1132,9 +1132,18 @@ class NativeChronosFS {
         cache_inode(inode);
     }
 
+    void chown_path(const std::string &path, uid_t uid, gid_t gid) {
+        chown_inode_public(inode_for_path(path).id, uid, gid);
+    }
+
     void utimens_path(const std::string &path, const struct timespec tv[2]) {
         if (is_control(path)) return;
-        Inode inode = inode_for_path(path);
+        utimens_inode_public(inode_for_path(path).id, tv);
+    }
+
+    void utimens_inode_public(
+        std::int64_t inode_id, const struct timespec tv[2]) {
+        Inode inode = inode_by_id(inode_id);
         std::string now = now_text();
         if (tv == nullptr) {
             inode.atime = now;
@@ -1329,22 +1338,46 @@ class NativeChronosFS {
         cache_inode(inode);
     }
 
-    std::int64_t create_file_at_public(std::int64_t parent_inode_id, const std::string &name, mode_t mode) {
-        Inode parent = inode_by_id(parent_inode_id);
-        if (parent.kind != "directory") throw FsError(ENOTDIR, "not a directory");
-        return create_file_child(parent, name, mode).id;
+    void chown_inode_public(std::int64_t inode_id, uid_t uid, gid_t gid) {
+        Inode inode = inode_by_id(inode_id);
+        if (uid != static_cast<uid_t>(-1)) inode.uid = uid;
+        if (gid != static_cast<gid_t>(-1)) inode.gid = gid;
+        inode.ctime = now_text();
+        upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
+        cache_inode(inode);
     }
 
-    std::int64_t mkdir_at_public(std::int64_t parent_inode_id, const std::string &name, mode_t mode) {
+    std::int64_t create_file_at_public(
+        std::int64_t parent_inode_id,
+        const std::string &name,
+        mode_t mode,
+        uid_t uid = ::getuid(),
+        gid_t gid = ::getgid()) {
         Inode parent = inode_by_id(parent_inode_id);
         if (parent.kind != "directory") throw FsError(ENOTDIR, "not a directory");
-        return mkdir_child(parent, name, mode).id;
+        return create_file_child(parent, name, mode, uid, gid).id;
     }
 
-    std::int64_t symlink_at_public(std::int64_t parent_inode_id, const std::string &name, const std::string &target) {
+    std::int64_t mkdir_at_public(
+        std::int64_t parent_inode_id,
+        const std::string &name,
+        mode_t mode,
+        uid_t uid = ::getuid(),
+        gid_t gid = ::getgid()) {
         Inode parent = inode_by_id(parent_inode_id);
         if (parent.kind != "directory") throw FsError(ENOTDIR, "not a directory");
-        return symlink_child(parent, name, target).id;
+        return mkdir_child(parent, name, mode, uid, gid).id;
+    }
+
+    std::int64_t symlink_at_public(
+        std::int64_t parent_inode_id,
+        const std::string &name,
+        const std::string &target,
+        uid_t uid = ::getuid(),
+        gid_t gid = ::getgid()) {
+        Inode parent = inode_by_id(parent_inode_id);
+        if (parent.kind != "directory") throw FsError(ENOTDIR, "not a directory");
+        return symlink_child(parent, name, target, uid, gid).id;
     }
 
     void unlink_at_public(std::int64_t parent_inode_id, const std::string &name, bool allow_dir) {
@@ -2129,12 +2162,17 @@ class NativeChronosFS {
         return inode_by_id(current);
     }
 
-    Inode create_file_child(const Inode &parent, const std::string &name, mode_t mode) {
+    Inode create_file_child(
+        const Inode &parent,
+        const std::string &name,
+        mode_t mode,
+        uid_t uid = ::getuid(),
+        gid_t gid = ::getgid()) {
         if (parent.kind != "directory") throw FsError(ENOTDIR, "not a directory");
         if (dirent(parent.id, name).first) throw FsError(EEXIST, "path exists");
         std::int64_t id = allocate_inode();
         std::string now = now_text();
-        Inode inode{id, "file", static_cast<mode_t>(mode & 07777), getuid(), getgid(), 0, 1, "", now, now, now, ""};
+        Inode inode{id, "file", static_cast<mode_t>(mode & 07777), uid, gid, 0, 1, "", now, now, now, ""};
         upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
         touch(parent.id);
@@ -2144,12 +2182,17 @@ class NativeChronosFS {
         return inode;
     }
 
-    Inode mkdir_child(const Inode &parent, const std::string &name, mode_t mode) {
+    Inode mkdir_child(
+        const Inode &parent,
+        const std::string &name,
+        mode_t mode,
+        uid_t uid = ::getuid(),
+        gid_t gid = ::getgid()) {
         if (parent.kind != "directory") throw FsError(ENOTDIR, "not a directory");
         if (dirent(parent.id, name).first) throw FsError(EEXIST, "path exists");
         std::int64_t id = allocate_inode();
         std::string now = now_text();
-        Inode inode{id, "directory", static_cast<mode_t>(mode & 07777), getuid(), getgid(), 0, 1, "", now, now, now, ""};
+        Inode inode{id, "directory", static_cast<mode_t>(mode & 07777), uid, gid, 0, 1, "", now, now, now, ""};
         upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
         touch(parent.id);
@@ -2159,12 +2202,17 @@ class NativeChronosFS {
         return inode;
     }
 
-    Inode symlink_child(const Inode &parent, const std::string &name, const std::string &target) {
+    Inode symlink_child(
+        const Inode &parent,
+        const std::string &name,
+        const std::string &target,
+        uid_t uid = ::getuid(),
+        gid_t gid = ::getgid()) {
         if (parent.kind != "directory") throw FsError(ENOTDIR, "not a directory");
         if (dirent(parent.id, name).first) throw FsError(EEXIST, "path exists");
         std::int64_t id = allocate_inode();
         std::string now = now_text();
-        Inode inode{id, "symlink", 0777, getuid(), getgid(), static_cast<std::int64_t>(target.size()), 1, target, now, now, now, ""};
+        Inode inode{id, "symlink", 0777, uid, gid, static_cast<std::int64_t>(target.size()), 1, target, now, now, now, ""};
         upsert("chronosfs_inodes", inode_cols(), {"inode_id"}, inode_values(inode), false);
         upsert("chronosfs_dirents", dirent_cols(), {"parent_inode_id", "name"}, {parent.id, name, id, now}, false);
         touch(parent.id);
@@ -3561,6 +3609,22 @@ py::dict inode_dict(const Inode &inode) {
     return out;
 }
 
+chronos::native::ChronosFSInode native_inode(const Inode &inode) {
+    chronos::native::ChronosFSInode out;
+    out.id = inode.id;
+    out.kind = inode.kind;
+    out.mode = static_cast<std::uint32_t>(inode.mode);
+    out.uid = static_cast<std::uint32_t>(inode.uid);
+    out.gid = static_cast<std::uint32_t>(inode.gid);
+    out.size = inode.size;
+    out.nlink = static_cast<std::uint32_t>(inode.nlink);
+    out.symlink_target = inode.symlink_target;
+    out.atime = inode.atime;
+    out.mtime = inode.mtime;
+    out.ctime = inode.ctime;
+    return out;
+}
+
 IntervalBlob blob_from_py(const py::object &data) {
     if (py::isinstance<py::bytes>(data) || py::isinstance<py::bytearray>(data)) {
         py::bytes bytes = py::reinterpret_borrow<py::bytes>(data);
@@ -3633,6 +3697,10 @@ class NativeChronosFSStoreApi {
 
     void ensure() {
         std::lock_guard<std::recursive_mutex> guard(mutex_);
+        // The Python workspace normally initializes the interval metadata
+        // before constructing ChronosFS. Native consumers such as the gateway
+        // do not have that wrapper, so make this API independently usable.
+        store_->ensure();
         fs_for("main").ensure();
     }
 
@@ -3802,6 +3870,25 @@ class NativeChronosFSStoreApi {
         fs_for(branch).chmod_inode_public(inode_id, mode);
     }
 
+    void chown(
+        const std::string &branch,
+        const std::string &path,
+        std::uint32_t uid,
+        std::uint32_t gid) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).chown_path(path, static_cast<uid_t>(uid), static_cast<gid_t>(gid));
+    }
+
+    void chown_inode(
+        const std::string &branch,
+        std::int64_t inode_id,
+        std::uint32_t uid,
+        std::uint32_t gid) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).chown_inode_public(
+            inode_id, static_cast<uid_t>(uid), static_cast<gid_t>(gid));
+    }
+
     std::int64_t mkdir(const std::string &branch, const std::string &path, mode_t mode, bool parents) {
         std::lock_guard<std::recursive_mutex> guard(mutex_);
         return fs_for(branch).mkdir_path(path, mode, parents);
@@ -3875,6 +3962,151 @@ class NativeChronosFSStoreApi {
     void refresh_branch(const std::string &branch) {
         std::lock_guard<std::recursive_mutex> guard(mutex_);
         filesystems_.erase(branch);
+    }
+
+    chronos::native::ChronosFSInode stat_inode_native(
+        const std::string &branch,
+        std::int64_t inode_id) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        return native_inode(fs_for(branch).stat_inode_id(inode_id));
+    }
+
+    chronos::native::ChronosFSInode lookup_child_native(
+        const std::string &branch,
+        std::int64_t parent_inode_id,
+        const std::string &name) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        return native_inode(fs_for(branch).lookup_child_inode(parent_inode_id, name));
+    }
+
+    std::vector<std::string> list_directory_native(
+        const std::string &branch,
+        std::int64_t inode_id) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        return fs_for(branch).listdir_inode_id(inode_id);
+    }
+
+    IntervalBlob read_native(
+        const std::string &branch,
+        std::int64_t inode_id,
+        std::int64_t offset,
+        std::int64_t size) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        return fs_for(branch).read_inode_range_public(inode_id, offset, size);
+    }
+
+    void write_native(
+        const std::string &branch,
+        std::int64_t inode_id,
+        std::int64_t offset,
+        const IntervalBlob &data) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).write_inode_at_public(inode_id, offset, data);
+    }
+
+    void truncate_native(
+        const std::string &branch,
+        std::int64_t inode_id,
+        std::int64_t size) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).truncate_inode_public(inode_id, size);
+    }
+
+    void chmod_native(
+        const std::string &branch,
+        std::int64_t inode_id,
+        std::uint32_t mode) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).chmod_inode_public(inode_id, static_cast<mode_t>(mode));
+    }
+
+    void chown_native(
+        const std::string &branch,
+        std::int64_t inode_id,
+        std::uint32_t uid,
+        std::uint32_t gid) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).chown_inode_public(
+            inode_id, static_cast<uid_t>(uid), static_cast<gid_t>(gid));
+    }
+
+    void utimens_native(
+        const std::string &branch,
+        std::int64_t inode_id,
+        const struct timespec times[2]) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).utimens_inode_public(inode_id, times);
+    }
+
+    std::int64_t create_file_native(
+        const std::string &branch,
+        std::int64_t parent_inode_id,
+        const std::string &name,
+        std::uint32_t mode,
+        std::uint32_t uid,
+        std::uint32_t gid) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        return fs_for(branch).create_file_at_public(
+            parent_inode_id, name, static_cast<mode_t>(mode), uid, gid);
+    }
+
+    std::int64_t create_directory_native(
+        const std::string &branch,
+        std::int64_t parent_inode_id,
+        const std::string &name,
+        std::uint32_t mode,
+        std::uint32_t uid,
+        std::uint32_t gid) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        return fs_for(branch).mkdir_at_public(
+            parent_inode_id, name, static_cast<mode_t>(mode), uid, gid);
+    }
+
+    std::int64_t create_symlink_native(
+        const std::string &branch,
+        std::int64_t parent_inode_id,
+        const std::string &name,
+        const std::string &target,
+        std::uint32_t uid,
+        std::uint32_t gid) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        return fs_for(branch).symlink_at_public(
+            parent_inode_id, name, target, uid, gid);
+    }
+
+    void unlink_native(
+        const std::string &branch,
+        std::int64_t parent_inode_id,
+        const std::string &name,
+        bool directory) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).unlink_at_public(parent_inode_id, name, directory);
+    }
+
+    void rename_native(
+        const std::string &branch,
+        std::int64_t old_parent_inode_id,
+        const std::string &old_name,
+        std::int64_t new_parent_inode_id,
+        const std::string &new_name) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).rename_at_public(
+            old_parent_inode_id, old_name, new_parent_inode_id, new_name);
+    }
+
+    void begin_write_batch_native(const std::string &branch) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).begin_write_batch_public();
+    }
+
+    void commit_write_batch_native(const std::string &branch) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).commit_write_batch_public();
+    }
+
+    void rollback_write_batch_native(const std::string &branch) {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        fs_for(branch).rollback_write_batch_public();
     }
 
     void checkout_segment(
@@ -4569,6 +4801,22 @@ int op_chmod(const char *path, mode_t mode, struct fuse_file_info *) {
     }
 }
 
+int op_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *) {
+    try {
+        const std::string requested_path = path_of(path);
+        {
+            auto locked = locked_write_fs({requested_path});
+            locked.fs.chown_path(requested_path, uid, gid);
+        }
+        invalidate_paths({requested_path});
+        return 0;
+    } catch (const FsError &e) {
+        return error_code(e);
+    } catch (...) {
+        return -EIO;
+    }
+}
+
 int op_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *) {
     try {
         const std::string requested_path = path_of(path);
@@ -4656,6 +4904,7 @@ int mount_chronosfs_native(
         op.rmdir = op_rmdir;
         op.rename = op_rename;
         op.chmod = op_chmod;
+        op.chown = op_chown;
         op.utimens = op_utimens;
         op.symlink = op_symlink;
         op.readlink = op_readlink;
@@ -4736,6 +4985,229 @@ int mount_chronosfs_native(
 
 namespace chronos::native {
 
+class NativeChronosFilesystem::Impl {
+  public:
+    Impl(std::string database_url, std::string metadata_url, std::int64_t block_size)
+        : api(
+              metadata_url.empty()
+                  ? std::make_unique<NativeChronosFSStoreApi>(
+                        std::move(database_url), block_size)
+                  : std::make_unique<NativeChronosFSStoreApi>(
+                        std::move(database_url), std::move(metadata_url), block_size)) {}
+
+    template <typename Function>
+    decltype(auto) invoke(Function &&function) {
+        try {
+            return function(*api);
+        } catch (const FsError &error) {
+            throw ChronosFSError(error.code, error.what());
+        }
+    }
+
+    std::unique_ptr<NativeChronosFSStoreApi> api;
+};
+
+NativeChronosFilesystem::NativeChronosFilesystem(
+    std::string database_url,
+    std::string metadata_url,
+    std::int64_t block_size)
+    : impl_(std::make_unique<Impl>(
+          std::move(database_url), std::move(metadata_url), block_size)) {}
+
+NativeChronosFilesystem::~NativeChronosFilesystem() = default;
+NativeChronosFilesystem::NativeChronosFilesystem(NativeChronosFilesystem &&) noexcept = default;
+NativeChronosFilesystem &NativeChronosFilesystem::operator=(NativeChronosFilesystem &&) noexcept = default;
+
+void NativeChronosFilesystem::ensure() {
+    impl_->invoke([](auto &api) { api.ensure(); });
+}
+
+void NativeChronosFilesystem::create_branch(
+    const std::string &branch,
+    const std::string &from_branch) {
+    impl_->invoke([&](auto &api) { api.create_branch(branch, from_branch); });
+}
+
+void NativeChronosFilesystem::delete_branch(const std::string &branch) {
+    impl_->invoke([&](auto &api) { api.delete_branch(branch); });
+}
+
+ChronosFSInode NativeChronosFilesystem::stat_inode(
+    const std::string &branch,
+    std::int64_t inode_id) {
+    return impl_->invoke([&](auto &api) { return api.stat_inode_native(branch, inode_id); });
+}
+
+ChronosFSInode NativeChronosFilesystem::lookup_child(
+    const std::string &branch,
+    std::int64_t parent_inode_id,
+    const std::string &name) {
+    return impl_->invoke([&](auto &api) {
+        return api.lookup_child_native(branch, parent_inode_id, name);
+    });
+}
+
+std::vector<std::string> NativeChronosFilesystem::list_directory(
+    const std::string &branch,
+    std::int64_t inode_id) {
+    return impl_->invoke([&](auto &api) {
+        return api.list_directory_native(branch, inode_id);
+    });
+}
+
+IntervalBlob NativeChronosFilesystem::read(
+    const std::string &branch,
+    std::int64_t inode_id,
+    std::int64_t offset,
+    std::int64_t size) {
+    return impl_->invoke([&](auto &api) {
+        return api.read_native(branch, inode_id, offset, size);
+    });
+}
+
+void NativeChronosFilesystem::write(
+    const std::string &branch,
+    std::int64_t inode_id,
+    std::int64_t offset,
+    const IntervalBlob &data) {
+    impl_->invoke([&](auto &api) { api.write_native(branch, inode_id, offset, data); });
+}
+
+void NativeChronosFilesystem::truncate(
+    const std::string &branch,
+    std::int64_t inode_id,
+    std::int64_t size) {
+    impl_->invoke([&](auto &api) { api.truncate_native(branch, inode_id, size); });
+}
+
+void NativeChronosFilesystem::chmod(
+    const std::string &branch,
+    std::int64_t inode_id,
+    std::uint32_t mode) {
+    impl_->invoke([&](auto &api) { api.chmod_native(branch, inode_id, mode); });
+}
+
+void NativeChronosFilesystem::chown(
+    const std::string &branch,
+    std::int64_t inode_id,
+    std::uint32_t uid,
+    std::uint32_t gid) {
+    impl_->invoke([&](auto &api) { api.chown_native(branch, inode_id, uid, gid); });
+}
+
+void NativeChronosFilesystem::utimens(
+    const std::string &branch,
+    std::int64_t inode_id,
+    const struct timespec times[2]) {
+    impl_->invoke([&](auto &api) { api.utimens_native(branch, inode_id, times); });
+}
+
+std::int64_t NativeChronosFilesystem::create_file(
+    const std::string &branch,
+    std::int64_t parent_inode_id,
+    const std::string &name,
+    std::uint32_t mode) {
+    return create_file(branch, parent_inode_id, name, mode, ::getuid(), ::getgid());
+}
+
+std::int64_t NativeChronosFilesystem::create_file(
+    const std::string &branch,
+    std::int64_t parent_inode_id,
+    const std::string &name,
+    std::uint32_t mode,
+    std::uint32_t uid,
+    std::uint32_t gid) {
+    return impl_->invoke([&](auto &api) {
+        return api.create_file_native(branch, parent_inode_id, name, mode, uid, gid);
+    });
+}
+
+std::int64_t NativeChronosFilesystem::create_directory(
+    const std::string &branch,
+    std::int64_t parent_inode_id,
+    const std::string &name,
+    std::uint32_t mode) {
+    return create_directory(
+        branch, parent_inode_id, name, mode, ::getuid(), ::getgid());
+}
+
+std::int64_t NativeChronosFilesystem::create_directory(
+    const std::string &branch,
+    std::int64_t parent_inode_id,
+    const std::string &name,
+    std::uint32_t mode,
+    std::uint32_t uid,
+    std::uint32_t gid) {
+    return impl_->invoke([&](auto &api) {
+        return api.create_directory_native(
+            branch, parent_inode_id, name, mode, uid, gid);
+    });
+}
+
+std::int64_t NativeChronosFilesystem::create_symlink(
+    const std::string &branch,
+    std::int64_t parent_inode_id,
+    const std::string &name,
+    const std::string &target) {
+    return create_symlink(
+        branch, parent_inode_id, name, target, ::getuid(), ::getgid());
+}
+
+std::int64_t NativeChronosFilesystem::create_symlink(
+    const std::string &branch,
+    std::int64_t parent_inode_id,
+    const std::string &name,
+    const std::string &target,
+    std::uint32_t uid,
+    std::uint32_t gid) {
+    return impl_->invoke([&](auto &api) {
+        return api.create_symlink_native(
+            branch, parent_inode_id, name, target, uid, gid);
+    });
+}
+
+void NativeChronosFilesystem::unlink(
+    const std::string &branch,
+    std::int64_t parent_inode_id,
+    const std::string &name,
+    bool directory) {
+    impl_->invoke([&](auto &api) {
+        api.unlink_native(branch, parent_inode_id, name, directory);
+    });
+}
+
+void NativeChronosFilesystem::rename(
+    const std::string &branch,
+    std::int64_t old_parent_inode_id,
+    const std::string &old_name,
+    std::int64_t new_parent_inode_id,
+    const std::string &new_name) {
+    impl_->invoke([&](auto &api) {
+        api.rename_native(
+            branch,
+            old_parent_inode_id,
+            old_name,
+            new_parent_inode_id,
+            new_name);
+    });
+}
+
+void NativeChronosFilesystem::begin_write_batch(const std::string &branch) {
+    impl_->invoke([&](auto &api) { api.begin_write_batch_native(branch); });
+}
+
+void NativeChronosFilesystem::commit_write_batch(const std::string &branch) {
+    impl_->invoke([&](auto &api) { api.commit_write_batch_native(branch); });
+}
+
+void NativeChronosFilesystem::rollback_write_batch(const std::string &branch) {
+    impl_->invoke([&](auto &api) { api.rollback_write_batch_native(branch); });
+}
+
+void NativeChronosFilesystem::refresh(const std::string &branch) {
+    impl_->invoke([&](auto &api) { api.refresh_branch(branch); });
+}
+
 void bind_chronosfs_fuse(py::module_ &m) {
     py::class_<NativeChronosFSStoreApi>(m, "NativeChronosFSStore")
         .def(py::init<std::string, std::int64_t>(), py::arg("database_url"), py::arg("block_size"))
@@ -4775,6 +5247,8 @@ void bind_chronosfs_fuse(py::module_ &m) {
         .def("truncate_inode", &NativeChronosFSStoreApi::truncate_inode, py::arg("branch"), py::arg("inode_id"), py::arg("size"))
         .def("chmod", &NativeChronosFSStoreApi::chmod, py::arg("branch"), py::arg("path"), py::arg("mode"))
         .def("chmod_inode", &NativeChronosFSStoreApi::chmod_inode, py::arg("branch"), py::arg("inode_id"), py::arg("mode"))
+        .def("chown", &NativeChronosFSStoreApi::chown, py::arg("branch"), py::arg("path"), py::arg("uid"), py::arg("gid"))
+        .def("chown_inode", &NativeChronosFSStoreApi::chown_inode, py::arg("branch"), py::arg("inode_id"), py::arg("uid"), py::arg("gid"))
         .def("mkdir", &NativeChronosFSStoreApi::mkdir, py::arg("branch"), py::arg("path"), py::arg("mode") = 0755, py::arg("parents") = false)
         .def("create_file_at", &NativeChronosFSStoreApi::create_file_at, py::arg("branch"), py::arg("parent_inode_id"), py::arg("name"), py::arg("mode") = 0644)
         .def("mkdir_at", &NativeChronosFSStoreApi::mkdir_at, py::arg("branch"), py::arg("parent_inode_id"), py::arg("name"), py::arg("mode") = 0755)

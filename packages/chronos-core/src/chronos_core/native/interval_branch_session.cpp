@@ -909,7 +909,7 @@ class NativeBranchSessionImpl {
     }
 
     bool segment_is_root() {
-        auto rows = store_.driver().query(
+        auto rows = store_.metadata_driver().query(
             "SELECT parent_segment_id FROM _chronos_branch_interval_segments WHERE segment_id = ?",
             {segment_.segment_id}
         );
@@ -976,8 +976,8 @@ class NativeBranchSessionImpl {
     }
 
     void lock_current_branch_for_schema_change() {
-        if (store_.dialect() != "postgres") return;
-        auto rows = store_.driver().query(
+        if (store_.metadata_dialect() != "postgres") return;
+        auto rows = store_.metadata_driver().query(
             "SELECT 1 FROM _chronos_branch_interval_branches WHERE branch_id = ? FOR UPDATE",
             {branch_id_}
         );
@@ -1007,13 +1007,13 @@ class NativeBranchSessionImpl {
         for (const auto &column : columns) {
             (void)column_index(meta.columns, column);
         }
-        auto existing = store_.driver().query(
+        auto existing = store_.metadata_driver().query(
             "SELECT table_name, columns FROM _chronos_branch_indexes "
             "WHERE backend = 'interval' AND index_name = ?",
             {index_name}
         );
         if (existing.empty()) {
-            store_.driver().execute(
+            store_.metadata_driver().execute(
                 "INSERT INTO _chronos_branch_indexes (index_name, table_name, columns, backend) "
                 "VALUES (?, ?, ?, 'interval')",
                 {index_name, table, json_string_array(columns)}
@@ -1030,7 +1030,7 @@ class NativeBranchSessionImpl {
             throw std::runtime_error("unsupported native branch schema statement");
         }
         const std::string index_name = drop_object_name(stmt->objects[0]);
-        auto rows = store_.driver().query(
+        auto rows = store_.metadata_driver().query(
             "SELECT table_name FROM _chronos_branch_indexes WHERE backend = 'interval' AND index_name = ?",
             {index_name}
         );
@@ -1045,7 +1045,7 @@ class NativeBranchSessionImpl {
                 quote_ident(store_.physical_logical_index_name(meta, table, index_name))
             );
         }
-        store_.driver().execute(
+        store_.metadata_driver().execute(
             "DELETE FROM _chronos_branch_indexes WHERE backend = 'interval' AND index_name = ?",
             {index_name}
         );
@@ -1790,9 +1790,15 @@ class NativeBranchSessionImpl {
             key_join += "p." + quote_ident(meta.pk_columns[i]) + " = v." + quote_ident(meta.pk_columns[i]);
         }
 
-        const bool inline_branch_guard = !store_.driver().in_transaction();
-        const bool transaction_private_allowed =
-            !inline_branch_guard && branch_private_dml_allowed_for_transaction();
+        // A colocated PostgreSQL store can check branch privacy inside the
+        // data statement. Split stores cannot reference metadata relations
+        // from the data connection, but execute() already holds the metadata
+        // branch guard for the entire statement, so evaluate it there once.
+        const bool inline_branch_guard =
+            !store_.split_store() && !store_.driver().in_transaction();
+        const bool transaction_private_allowed = store_.split_store()
+            ? branch_private_dml_allowed_locked()
+            : (!inline_branch_guard && branch_private_dml_allowed_for_transaction());
         if (inline_branch_guard) {
             bound.push_back(branch_id_);
             bound.push_back(segment_.segment_id);
@@ -1939,7 +1945,7 @@ class NativeBranchSessionImpl {
                 sqls.push_back(store_.writer_segment_index_sql(meta.physical_name, meta.pk_columns));
             }
         }
-        auto rows = store_.driver().query(
+        auto rows = store_.metadata_driver().query(
             "SELECT index_name, columns FROM _chronos_branch_indexes "
             "WHERE backend = 'interval' AND table_name = ?",
             {table}

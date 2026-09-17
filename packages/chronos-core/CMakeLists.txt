@@ -5,8 +5,9 @@ project(chronos_core_native LANGUAGES CXX)
 option(CHRONOS_WITH_FILESYSTEM "Build ChronosFS and Linux FUSE support" OFF)
 option(CHRONOS_WITH_DUCKDB "Build the DuckDB data adapter" OFF)
 option(CHRONOS_WITH_S3 "Build the S3 gateway" OFF)
+option(CHRONOS_BUILD_PYTHON_MODULE "Build the chronos_core Python extension" ON)
 
-find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(Python COMPONENTS Interpreter Development.Module Development.Embed REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(PostgreSQL REQUIRED)
@@ -92,36 +93,49 @@ set_target_properties(libpg_query_static PROPERTIES
 )
 add_dependencies(libpg_query_static libpg_query_build)
 
-pybind11_add_module(_native_interval
-  src/chronos_core/native/interval_module.cpp
+add_library(chronos_native_backend STATIC
   src/chronos_core/native/native_backends.cpp
 )
-target_compile_features(_native_interval PRIVATE cxx_std_17)
-target_include_directories(_native_interval PRIVATE ${Boost_INCLUDE_DIRS})
-target_link_libraries(_native_interval PRIVATE
+set_target_properties(chronos_native_backend PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(chronos_native_backend PUBLIC cxx_std_17)
+target_include_directories(chronos_native_backend
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/chronos_core/native>
+  PRIVATE
+    ${Boost_INCLUDE_DIRS}
+)
+target_link_libraries(chronos_native_backend PUBLIC
   SQLite::SQLite3
   PostgreSQL::PostgreSQL
   libpg_query_static
   nlohmann_json::nlohmann_json
+  pybind11::headers
+  Python::Module
 )
 if(CHRONOS_WITH_FILESYSTEM)
-  target_sources(_native_interval PRIVATE src/chronos_core/native/chronosfs_fuse.cpp)
-  target_compile_definitions(_native_interval PRIVATE CHRONOS_WITH_FILESYSTEM)
-  target_link_libraries(_native_interval PRIVATE PkgConfig::FUSE3 unordered_dense::unordered_dense)
+  target_sources(chronos_native_backend PRIVATE src/chronos_core/native/chronosfs_fuse.cpp)
+  target_compile_definitions(chronos_native_backend PUBLIC CHRONOS_WITH_FILESYSTEM)
+  target_link_libraries(chronos_native_backend PUBLIC PkgConfig::FUSE3 unordered_dense::unordered_dense)
 endif()
 if(CHRONOS_WITH_S3)
-  target_sources(_native_interval PRIVATE src/chronos_core/native/chronos_s3.cpp)
-  target_compile_definitions(_native_interval PRIVATE CHRONOS_WITH_S3)
-  target_link_libraries(_native_interval PRIVATE Boost::system CURL::libcurl OpenSSL::Crypto pugixml::pugixml)
+  target_sources(chronos_native_backend PRIVATE src/chronos_core/native/chronos_s3.cpp)
+  target_compile_definitions(chronos_native_backend PUBLIC CHRONOS_WITH_S3)
+  target_link_libraries(chronos_native_backend PUBLIC Boost::system CURL::libcurl OpenSSL::Crypto pugixml::pugixml)
 endif()
 if(CHRONOS_WITH_DUCKDB)
-  target_compile_definitions(_native_interval PRIVATE CHRONOS_WITH_DUCKDB)
-  target_include_directories(_native_interval PRIVATE "${DUCKDB_INCLUDE_DIR}")
-  target_link_libraries(_native_interval PRIVATE "${DUCKDB_LIBRARY}")
+  target_compile_definitions(chronos_native_backend PUBLIC CHRONOS_WITH_DUCKDB)
+  target_include_directories(chronos_native_backend PRIVATE "${DUCKDB_INCLUDE_DIR}")
+  target_link_libraries(chronos_native_backend PUBLIC "${DUCKDB_LIBRARY}")
   install(FILES "${DUCKDB_LIBRARY}" DESTINATION chronos_core)
 endif()
-set_target_properties(_native_interval PROPERTIES
-  INSTALL_RPATH "$ORIGIN"
-)
 
-install(TARGETS _native_interval LIBRARY DESTINATION chronos_core)
+if(CHRONOS_BUILD_PYTHON_MODULE)
+  pybind11_add_module(_native_interval src/chronos_core/native/interval_module.cpp)
+  target_compile_features(_native_interval PRIVATE cxx_std_17)
+  target_link_libraries(_native_interval PRIVATE chronos_native_backend)
+  set_target_properties(_native_interval PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+  )
+
+  install(TARGETS _native_interval LIBRARY DESTINATION chronos_core)
+endif()

@@ -506,6 +506,9 @@
             );
             if (enable_schema_branching) {
                 ensure_schema_branching_tables();
+                for (const auto &meta : load_base_table_metas()) {
+                    (void)ensure_base_schema_version(meta, "register");
+                }
             }
             if (started_tx) driver_->execute("COMMIT");
         } catch (...) {
@@ -527,31 +530,46 @@
             "WHERE backend = 'interval' AND table_name = ? AND physical_table = ?",
             {meta.logical_name, meta.physical_name}
         );
-        if (!existing.empty()) return native_as_string(existing[0][0]);
-        const std::string schema_id = schema_version_id(meta.logical_name);
-        const std::string now = current_timestamp_string();
-        driver_->execute(
-            "INSERT INTO _chronos_branch_table_schema_versions "
-            "(backend, table_name, schema_version_id, parent_schema_version_id, physical_table, "
-            " pk_columns, columns, column_defs, ddl_op, created_at, metadata) "
-            "VALUES ('interval', ?, ?, NULL, ?, ?, ?, ?, ?, ?, '{}')",
-            {
-                meta.logical_name,
-                schema_id,
-                meta.physical_name,
-                json_string_array(meta.pk_columns),
-                json_string_array(meta.columns),
-                json_string_array(meta.column_defs),
-                ddl_op,
-                now,
-            }
+        std::string schema_id;
+        if (!existing.empty()) {
+            schema_id = native_as_string(existing[0][0]);
+        } else {
+            schema_id = schema_version_id(meta.logical_name);
+            driver_->execute(
+                "INSERT INTO _chronos_branch_table_schema_versions "
+                "(backend, table_name, schema_version_id, parent_schema_version_id, physical_table, "
+                " pk_columns, columns, column_defs, ddl_op, created_at, metadata) "
+                "VALUES ('interval', ?, ?, NULL, ?, ?, ?, ?, ?, ?, '{}')",
+                {
+                    meta.logical_name,
+                    schema_id,
+                    meta.physical_name,
+                    json_string_array(meta.pk_columns),
+                    json_string_array(meta.columns),
+                    json_string_array(meta.column_defs),
+                    ddl_op,
+                    current_timestamp_string(),
+                }
+            );
+        }
+        auto binding = driver_->query(
+            "SELECT 1 FROM _chronos_branch_table_bindings "
+            "WHERE backend = 'interval' AND table_name = ? LIMIT 1",
+            {meta.logical_name}
         );
-        driver_->execute(
-            "INSERT INTO _chronos_branch_table_bindings "
-            "(backend, table_name, schema_version_id, tombstone, live_lo, live_hi, created_at, metadata) "
-            "VALUES ('interval', ?, ?, 0, 0, ?, ?, '{}')",
-            {meta.logical_name, schema_id, max_interval_value(), now}
-        );
+        if (binding.empty()) {
+            driver_->execute(
+                "INSERT INTO _chronos_branch_table_bindings "
+                "(backend, table_name, schema_version_id, tombstone, live_lo, live_hi, created_at, metadata) "
+                "VALUES ('interval', ?, ?, 0, 0, ?, ?, '{}')",
+                {
+                    meta.logical_name,
+                    schema_id,
+                    max_interval_value(),
+                    current_timestamp_string(),
+                }
+            );
+        }
         return schema_id;
     }
 

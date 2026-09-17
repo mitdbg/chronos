@@ -1,0 +1,32 @@
+{
+  "listeners": {
+    "control": "10.40.0.10:7400",
+    "postgres": "10.40.1.10:5432",
+    "nfs": "10.40.1.10:2049"
+  },
+  "recovery_seconds": 600,
+  "controller_token_env": "CHRONOS_CONTROLLER_TOKEN",
+  "nfs": {
+    "ganesha_library": "/usr/lib/ganesha/libganesha_nfsd.so",
+    "plugins_directory": "/usr/lib/x86_64-linux-gnu/ganesha",
+    "state_directory": "/var/lib/chronos-gateway/nfs",
+    "mountpoint": "/var/lib/chronos-gateway/nfs/mount"
+  },
+  "workspaces": {
+    "training": {
+      "metadata_url_env": "CHRONOS_METADATA_URL",
+      "filesystem": {
+        "data_url_env": "CHRONOS_FILESYSTEM_DATA_URL",
+        "block_size": 1048576
+      },
+      "postgres": {
+        "orders": {
+          "data_url_env": "CHRONOS_ORDERS_DATA_URL"
+        },
+        "events": {
+          "data_url_env": "CHRONOS_EVENTS_DATA_URL"
+        }
+      }
+    }
+  }
+}

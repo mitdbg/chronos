@@ -421,8 +421,20 @@ std::string pg_statement_kind(const std::string &sql) {
 
 bool starts_with_sql_keyword(const std::string &sql, const std::string &keyword) {
     std::size_t i = 0;
-    while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
-        ++i;
+    while (i < sql.size()) {
+        while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) ++i;
+        if (i + 1 < sql.size() && sql[i] == '-' && sql[i + 1] == '-') {
+            const auto newline = sql.find('\n', i + 2);
+            i = newline == std::string::npos ? sql.size() : newline + 1;
+            continue;
+        }
+        if (i + 1 < sql.size() && sql[i] == '/' && sql[i + 1] == '*') {
+            const auto end = sql.find("*/", i + 2);
+            if (end == std::string::npos) return false;
+            i = end + 2;
+            continue;
+        }
+        break;
     }
     if (i + keyword.size() > sql.size()) return false;
     for (std::size_t j = 0; j < keyword.size(); ++j) {
@@ -540,6 +552,32 @@ std::string rewrite_visible_tables(const std::string &sql, const Replacements &r
             upper == "INTERSECT" || upper == "QUALIFY" || upper == "WINDOW" ||
             upper == "ON" || upper == "USING";
     };
+    auto has_explicit_alias = [&](std::size_t offset) {
+        while (offset < sql.size() && std::isspace(static_cast<unsigned char>(sql[offset]))) {
+            ++offset;
+        }
+        if (offset >= sql.size() || sql[offset] == ',' || sql[offset] == ')' ||
+            sql[offset] == ';') {
+            return false;
+        }
+        if (sql[offset] == '"') return true;
+        if (!is_identifier_start(sql[offset])) return false;
+        std::size_t end = offset + 1;
+        while (end < sql.size() && is_identifier_part(sql[end])) ++end;
+        std::string word = sql.substr(offset, end - offset);
+        std::transform(word.begin(), word.end(), word.begin(), [](unsigned char c) {
+            return static_cast<char>(std::toupper(c));
+        });
+        if (word == "AS") return true;
+        return !is_from_clause_boundary(word) && word != "JOIN" && word != "LEFT" &&
+            word != "RIGHT" && word != "FULL" && word != "INNER" && word != "CROSS" &&
+            word != "NATURAL";
+    };
+    auto append_implicit_alias = [&](const std::string &table, std::size_t consumed) {
+        if (has_explicit_alias(consumed)) return;
+        const auto dot = table.rfind('.');
+        out += " AS " + quote_ident(table.substr(dot == std::string::npos ? 0 : dot + 1));
+    };
     for (std::size_t i = 0; i < sql.size();) {
         const char ch = sql[i];
         if (ch == '\'' && !double_quote) {
@@ -573,6 +611,7 @@ std::string rewrite_visible_tables(const std::string &sql, const Replacements &r
                     });
                     if (head == "SELECT" || head.rfind("WITH", 0) == 0) {
                         out += "(" + *replacement + ")";
+                        append_implicit_alias(ident, j + 1);
                     } else {
                         out += quote_ident(*replacement);
                     }
@@ -637,6 +676,7 @@ std::string rewrite_visible_tables(const std::string &sql, const Replacements &r
                 });
                 if (head == "SELECT" || head.rfind("WITH", 0) == 0) {
                     out += "(" + *replacement + ")";
+                    append_implicit_alias(lookup_name, consumed);
                 } else {
                     out += quote_ident(*replacement);
                 }

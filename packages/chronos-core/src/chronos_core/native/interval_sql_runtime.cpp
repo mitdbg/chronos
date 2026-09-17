@@ -4145,6 +4145,28 @@ bool eval_ast_predicate(
     case PG_QUERY__NODE__NODE_A_EXPR: {
         auto *expr = node->a_expr;
         const std::string op = operator_name(expr);
+        if (expr->kind == PG_QUERY__A__EXPR__KIND__AEXPR_IN) {
+            if (!expr->rexpr || expr->rexpr->node_case != PG_QUERY__NODE__NODE_LIST ||
+                !expr->rexpr->list) {
+                throw std::runtime_error("invalid IN predicate in native branch executor");
+            }
+            const auto left = eval_ast_row_values(
+                expr->lexpr, row, params, subquery_evaluator
+            );
+            bool matched = false;
+            for (std::size_t i = 0; i < expr->rexpr->list->n_items; ++i) {
+                const auto right = eval_ast_row_values(
+                    expr->rexpr->list->items[i], row, params, subquery_evaluator
+                );
+                if (left.size() == right.size() && compare_row_values(left, right) == 0) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (op == "=") return matched;
+            if (op == "<>" || op == "!=") return !matched;
+            throw std::runtime_error("unsupported IN predicate operator: " + op);
+        }
         if (upper_copy(op) == "LIKE") {
             const std::string text = native_as_string(eval_ast_value(expr->lexpr, row, params, subquery_evaluator));
             const std::string pattern = native_as_string(eval_ast_value(expr->rexpr, row, params, subquery_evaluator));
