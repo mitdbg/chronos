@@ -1,4 +1,4 @@
-# Chronos
+# <img src="assets/icons/chronos-icon.svg" alt="" width="36" height="36" /> Chronos
 
 Chronos is a branching abstraction for databases, filesystems, and object stores.
 It lets applications create writable branches of their data. Changes made
@@ -74,12 +74,10 @@ does not use the selected branch.
 
 The [software development tutorial](docs/tutorials/software-development.md)
 shows how to reproduce a bug, test a fix in a branch, and merge the changes to
-both code and data. The [verl tutorial](docs/tutorials/rl-data-sandbox.md)
-shows how to give each training rollout separate database and filesystem state,
-optionally inside an E2B microVM, calculate its reward from the resulting data,
-and delete the branch afterward.
-The [E2B sandbox tutorial](docs/tutorials/e2b-sandbox.md) shows how a runtime
-sandbox can use ordinary PostgreSQL and NFSv4 interfaces without receiving
+both code and data. The [verl and E2B tutorial](docs/tutorials/rl-data-sandbox.md)
+shows how to give each rollout separate database and filesystem state in an E2B
+microVM, calculate its reward from the resulting data, and clean up. The
+microVM uses ordinary PostgreSQL and NFSv4 interfaces without receiving
 backing-store or branch-management credentials.
 
 To add Chronos to an existing application, start with the

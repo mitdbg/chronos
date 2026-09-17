@@ -37,7 +37,7 @@ PostgreSQL and NFS paths; it never uses E2B Cloud. See the tutorial for the
 one-time host setup and the required test command.
 
 The complete setup and E2B walkthrough are in the
-[sandbox tutorial](../../docs/tutorials/e2b-sandbox.md). The example runtime
+[verl and E2B tutorial](../../docs/tutorials/rl-data-sandbox.md). The example runtime
 configuration is in
 [`deploy/chronos-gateway`](../../deploy/chronos-gateway/chronos-gateway.example.json).
 The [`chronos-e2b`](../chronos-e2b) coordinator adapter automates branch

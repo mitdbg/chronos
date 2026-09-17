@@ -77,7 +77,7 @@ def read_local_e2b_environment() -> dict[str, str]:
         if not compose.is_file():
             unavailable(
                 f"local E2B Embed is not installed at {embed}; "
-                "see docs/tutorials/e2b-sandbox.md"
+                "see docs/tutorials/rl-data-sandbox.md"
             )
         try:
             result = checked(

@@ -2,7 +2,7 @@ import {themes as prismThemes} from 'prism-react-renderer';
 
 const config = {
   title: 'Chronos',
-  tagline: 'Branch data across databases, filesystems, and object stores',
+  tagline: 'Lightweight Data Sandbox',
   favicon: 'icons/chronos-icon.svg',
 
   url: 'https://mitdbg.github.io',
@@ -38,7 +38,7 @@ const config = {
       {
         name: 'description',
         content:
-          'Chronos creates writable branches across databases, filesystems, and object stores without copying the full dataset.',
+          'Chronos gives agents and applications isolated, writable data sandboxes across relational databases, NoSQL databases, and filesystems without copying entire stores.',
       },
     ],
     colorMode: {
@@ -69,6 +69,11 @@ const config = {
           position: 'left',
         },
         {
+          href: 'https://arxiv.org/abs/2609.14889',
+          label: 'Paper',
+          position: 'right',
+        },
+        {
           href: 'https://github.com/mitdbg/chronos',
           label: 'GitHub',
           position: 'right',
@@ -87,22 +92,22 @@ const config = {
           ],
         },
         {
-          title: 'Use cases',
+          title: 'Tutorials',
           items: [
             {
               label: 'Software development',
               to: '/docs/tutorials/software-development',
             },
             {
-              label: 'RL data sandboxes',
+              label: 'RL rollouts with verl and E2B',
               to: '/docs/tutorials/rl-data-sandbox',
             },
-            {label: 'Multi-store branching', to: '/docs/multi-store-branching'},
           ],
         },
         {
           title: 'Project',
           items: [
+            {label: 'Research paper', href: 'https://arxiv.org/abs/2609.14889'},
             {label: 'GitHub', href: 'https://github.com/mitdbg/chronos'},
             {
               label: 'PostgreSQL implementation',

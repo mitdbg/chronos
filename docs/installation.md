@@ -65,7 +65,7 @@ cmake --build build/gateway -j
 ctest --test-dir build/gateway --output-on-failure
 ```
 
-See the [E2B data-sandbox tutorial](tutorials/e2b-sandbox.md) for gateway
+See the [verl and E2B tutorial](tutorials/rl-data-sandbox.md) for gateway
 configuration, the privileged NFSv4 integration test, and the rollout
 lifecycle.
 

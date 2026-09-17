@@ -34,11 +34,9 @@ their corresponding guides describe that setup.
 
 - [Software development](tutorials/software-development.md): isolate code and
   data changes, inspect them, and publish an accepted fix.
-- [Data sandboxes for verl rollouts](tutorials/rl-data-sandbox.md): give each
-  rollout private database and filesystem state, optionally inside an E2B
-  microVM, compute a reward, and discard the branch.
-- [E2B data sandboxes](tutorials/e2b-sandbox.md): attach a branch-scoped
-  PostgreSQL connection and NFSv4 filesystem to an unmodified E2B sandbox.
+- [RL rollouts with verl and E2B](tutorials/rl-data-sandbox.md): run a support
+  ticket agent in an E2B microVM with a private database and filesystem branch,
+  compute its reward, and clean up the sandbox.
 
 The verl tutorial demonstrates the environment and tool lifecycle with scripted
 generation. It does not claim to reproduce a published GPU training run.

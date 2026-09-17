@@ -79,7 +79,7 @@ states can use separate checkpoints selected by trusted rollout configuration.
 ## Run rollouts in E2B
 
 First configure `chronos-gateway` and build an E2B template as described in the
-[E2B sandbox tutorial](../../docs/tutorials/e2b-sandbox.md). The gateway
+[verl and E2B tutorial](../../docs/tutorials/rl-data-sandbox.md). The gateway
 workspace needs a PostgreSQL store alias named `tickets` and a ChronosFS store.
 The data and metadata URLs below must be the same URLs used by that gateway.
 

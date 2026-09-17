@@ -16,7 +16,7 @@ dependencies = [
 
 [project.urls]
 Repository = "https://github.com/mitdbg/chronos"
-Documentation = "https://github.com/mitdbg/chronos/blob/main/docs/tutorials/e2b-sandbox.md"
+Documentation = "https://github.com/mitdbg/chronos/blob/main/docs/tutorials/rl-data-sandbox.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chronos_e2b"]

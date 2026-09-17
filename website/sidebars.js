@@ -23,7 +23,7 @@ const sidebars = {
         {
           type: 'doc',
           id: 'tutorials/rl-data-sandbox',
-          label: 'RL data sandboxes',
+          label: 'RL rollouts with verl and E2B',
         },
       ],
     },
