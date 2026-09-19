@@ -687,6 +687,8 @@ bool pg_can_prepare_statement(const std::string &sql) {
            keyword == "UPDATE" || keyword == "DELETE";
 }
 
+constexpr std::size_t kPgStatementCacheLimit = 128;
+
 class PgPreparedStatementCache {
   public:
     PgPreparedStatementCache()
@@ -695,8 +697,12 @@ class PgPreparedStatementCache {
     PgResult exec(PGconn *conn, const std::string &sql, const std::vector<Value> &params) {
         auto found = statements_.find(sql);
         if (found == statements_.end()) {
-            if (statements_.size() >= 512) {
-                statements_.clear();
+            if (statements_.size() >= kPgStatementCacheLimit) {
+                // Clearing the client map would leave all named statements
+                // allocated in this PostgreSQL session.  High-cardinality
+                // SQL (such as branch-specific visibility predicates) is
+                // cheaper to execute directly than to prepare and retain.
+                return pg_exec_params(conn, sql, params);
             }
             Prepared prepared;
             prepared.name = "__chronos_native_stmt_" + std::to_string(cache_id_) +
@@ -3584,7 +3590,7 @@ class NativePostgresDriver final : public NativeSqlDriver {
     const std::string &pg_sql_cached(const std::string &qmark_sql) {
         auto found = pg_sql_cache_.find(qmark_sql);
         if (found != pg_sql_cache_.end()) return found->second;
-        if (pg_sql_cache_.size() > 512) pg_sql_cache_.clear();
+        if (pg_sql_cache_.size() >= kPgStatementCacheLimit) pg_sql_cache_.clear();
         auto inserted = pg_sql_cache_.emplace(qmark_sql, pg_placeholder_sql(qmark_sql));
         return inserted.first->second;
     }

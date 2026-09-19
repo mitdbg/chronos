@@ -468,6 +468,36 @@ def _reset_postgres_schema() -> None:
         db.close()
 
 
+def test_postgres_prepared_statement_cache_bounds_server_state() -> None:
+    from chronos_core import _native_interval
+
+    conn = _native_interval.NativeSqlConnection(_postgres_dsn())
+    for number in range(65535):
+        assert conn.query_sql(f"SELECT 1 /* chronos_cache_{number} */") == [[1]]
+        if number + 1 in (128, 512, 8192, 32768, 65535):
+            # This view reports statements in the current server session.
+            assert conn.query_sql("SELECT count(*) FROM pg_prepared_statements")[0][0] <= 128
+
+
+def test_postgres_interval_many_branch_queries_bound_prepared_statements() -> None:
+    ctx = _make_context("postgres", "interval")
+    try:
+        for number in range(1024):
+            name = f"prepared_cache_branch_{number}"
+            ctx.create_branch(name, from_branch="main", terminal=True, fanout=1024)
+            session = ctx.checkout(name)
+            assert session.query("SELECT price FROM products WHERE sku = 'abc'") == [{"price": 10}]
+        session.execute("UPDATE products SET price = 11 WHERE sku = 'abc'")
+        assert session.query("SELECT price FROM products WHERE sku = 'abc'") == [{"price": 11}]
+        assert ctx.checkout("main").query(
+            "SELECT price FROM products WHERE sku = 'abc'"
+        ) == [{"price": 10}]
+        store = ctx._backend._native_branch_store
+        assert store.query_sql("SELECT count(*) FROM pg_prepared_statements")[0][0] <= 128
+    finally:
+        ctx.close()
+
+
 def _make_context(sql_backend: str, branch_backend: str) -> ChronosBranchContext:
     if branch_backend == "litetree" and sql_backend != "sqlite":
         pytest.skip("LiteTree backend only runs on SQLite")
