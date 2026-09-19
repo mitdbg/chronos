@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from typing import Iterable
 
 from chronos_core.branching._common import *
 from chronos_core.branching._orpheus_implementation import orpheus_dataset_tables
@@ -27,7 +28,7 @@ class _OrpheusBackend(_SQLBranchBackend):
         super().__init__(db)
         self.enable_schema_branching = bool(enable_schema_branching)
         self.enable_diff_merge_tracking = bool(enable_diff_merge_tracking)
-        self._base_version_rid_limit_cache: dict[tuple[str, str], int] = {}
+        self._transaction_refs: dict[str, _PreparedBranchRef] = {}
 
     def ensure(self) -> None:
         if self.db.dialect != "postgres":
@@ -70,25 +71,20 @@ class _OrpheusBackend(_SQLBranchBackend):
             )
             """
         )
-        self.db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS _chronos_branch_orpheus_workspace (
-              branch_id TEXT NOT NULL,
-              table_name TEXT NOT NULL,
-              key_text TEXT NOT NULL,
-              rid INTEGER,
-              deleted BOOLEAN NOT NULL,
-              updated_at TEXT NOT NULL,
-              PRIMARY KEY (branch_id, table_name, key_text)
-            )
-            """
-        )
-        self.db.execute(
-            """
-            CREATE INDEX IF NOT EXISTS _chronos_idx_orpheus_workspace_branch
-            ON _chronos_branch_orpheus_workspace (branch_id, table_name)
-            """
-        )
+        # Do not silently hide writes made by an older workspace-based adapter.
+        # A populated workspace must be materialized with that adapter first.
+        legacy = self.db.execute(
+            "SELECT to_regclass('_chronos_branch_orpheus_workspace') AS relation"
+        ).fetchone()
+        if legacy is not None and legacy["relation"] is not None:
+            dirty = self.db.execute(
+                "SELECT 1 FROM _chronos_branch_orpheus_workspace LIMIT 1"
+            ).fetchone()
+            if dirty is not None:
+                raise BranchingError(
+                    "legacy Orpheus workspaces contain unmaterialized branch data; "
+                    "materialize them with the previous adapter before upgrading"
+                )
         if self.enable_diff_merge_tracking:
             self._ensure_diff_merge_tracking_tables()
         if self.enable_schema_branching:
@@ -312,7 +308,13 @@ class _OrpheusBackend(_SQLBranchBackend):
         source = self._branch_row(from_branch)
         if source is None:
             raise BranchNotFoundError(from_branch)
+        self._lock_branch_for_update(from_branch)
         source_vid = self._current_version_id(from_branch)
+        metas = (
+            self._active_metas_for_owner("branch", from_branch).values()
+            if self.enable_schema_branching else self.tables.values()
+        )
+        new_vid = self._fork_version(self._vid(source_vid), metas, "chronos branch")
         if self.enable_schema_branching:
             self._copy_tombstone_bindings("branch", from_branch, "branch", branch_id)
             for meta in self._active_metas_for_owner("branch", from_branch).values():
@@ -325,12 +327,11 @@ class _OrpheusBackend(_SQLBranchBackend):
             """,
             (
                 branch_id,
-                source_vid,
+                new_vid,
                 _utc_now(),
                 _json_dumps(metadata),
             ),
         )
-        self._copy_workspace(from_branch, branch_id)
 
     def update_branch_metadata(
         self, branch_id: str, metadata: dict[str, Any]
@@ -351,6 +352,11 @@ class _OrpheusBackend(_SQLBranchBackend):
         if self._branch_row(branch_id) is not None:
             raise BranchAlreadyExistsError(branch_id)
         cp = self.get_checkpoint(checkpoint)
+        metas = (
+            self._active_metas_for_owner("checkpoint", checkpoint).values()
+            if self.enable_schema_branching else self.tables.values()
+        )
+        new_vid = self._fork_version(self._vid(cp.ref), metas, "chronos branch")
         if self.enable_schema_branching:
             self._copy_tombstone_bindings("checkpoint", checkpoint, "branch", branch_id)
             for meta in self._active_metas_for_owner("checkpoint", checkpoint).values():
@@ -361,7 +367,7 @@ class _OrpheusBackend(_SQLBranchBackend):
             (branch_id, current_vid, created_at, metadata)
             VALUES (?, ?, ?, '{}')
             """,
-            (branch_id, self._vid(cp.ref), _utc_now()),
+            (branch_id, new_vid, _utc_now()),
         )
 
     def delete_branch(self, branch_id: str) -> None:
@@ -369,10 +375,6 @@ class _OrpheusBackend(_SQLBranchBackend):
             raise BranchingError("main cannot be deleted")
         if self._branch_row(branch_id) is None:
             raise BranchNotFoundError(branch_id)
-        self.db.execute(
-            "DELETE FROM _chronos_branch_orpheus_workspace WHERE branch_id = ?",
-            (branch_id,),
-        )
         self.db.execute(
             "DELETE FROM _chronos_branch_orpheus_branches WHERE branch_id = ?",
             (branch_id,),
@@ -425,7 +427,7 @@ class _OrpheusBackend(_SQLBranchBackend):
         branch_row = self._branch_row(branch)
         if branch_row is None:
             raise BranchNotFoundError(branch)
-        checkpoint_vid = self._materialize_workspace(branch, "chronos checkpoint")
+        checkpoint_vid = self._vid(self._current_version_id(branch))
         now = _utc_now()
         if self.enable_schema_branching:
             self._copy_tombstone_bindings("branch", branch, "checkpoint", checkpoint)
@@ -520,20 +522,30 @@ class _OrpheusBackend(_SQLBranchBackend):
         )
 
     def refresh_ref_after_execute(self, ref: _PreparedBranchRef) -> _PreparedBranchRef:
-        if self.enable_schema_branching:
-            return self.prepare_ref(_BranchRef(ref.branch_id, self._current_version_id(ref.branch_id), ref.readonly))
-        return ref
+        current = self._current_version_id(ref.branch_id)
+        if current == ref.ref and not self.enable_schema_branching:
+            return ref
+        refreshed = self.prepare_ref(_BranchRef(ref.branch_id, current, ref.readonly))
+        for key in ("orpheus_transaction", "orpheus_write_vid", "orpheus_parent_vid", "_context_epoch"):
+            if key in ref.metadata:
+                refreshed.metadata[key] = ref.metadata[key]
+        return refreshed
 
     def prepare_transaction(self, ref: _PreparedBranchRef) -> None:
-        ref.metadata["defer_orpheus_materialize"] = True
+        ref.metadata["orpheus_transaction"] = True
+        self._transaction_refs[ref.branch_id] = ref
         return None
 
     def commit_transaction(self, ref: _PreparedBranchRef) -> _PreparedBranchRef:
-        ref.metadata.pop("defer_orpheus_materialize", None)
+        self._transaction_refs.pop(ref.branch_id, None)
+        for key in ("orpheus_transaction", "orpheus_write_vid", "orpheus_parent_vid"):
+            ref.metadata.pop(key, None)
         return ref
 
     def rollback_transaction(self, ref: _PreparedBranchRef) -> None:
-        ref.metadata.pop("defer_orpheus_materialize", None)
+        self._transaction_refs.pop(ref.branch_id, None)
+        for key in ("orpheus_transaction", "orpheus_write_vid", "orpheus_parent_vid"):
+            ref.metadata.pop(key, None)
         return None
 
     def query(self, ref: _PreparedBranchRef, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -568,7 +580,9 @@ class _OrpheusBackend(_SQLBranchBackend):
         if isinstance(plan, _InsertPlan):
             rows = _insert_rows_from_plan(plan, params)
             full_rows = self._full_rows(ref, plan.table, rows)
-            self._apply_workspace_delta(ref.branch_id, plan.table, [], full_rows)
+            if full_rows:
+                _, parent = self._write_version(ref)
+                self._apply_version_delta(ref.branch_id, plan.table, [], full_rows, parent_version=parent)
             return ExecuteResult(len(full_rows))
         if isinstance(plan, _UpdatePlan):
             if not (set(column for column, _expr in plan.assignments) & set(self._require_table_for_ref(ref, plan.table).pk_columns)):
@@ -584,13 +598,17 @@ class _OrpheusBackend(_SQLBranchBackend):
                 new_row = dict(old_row)
                 new_row.update(_update_assignments_from_plan(plan, params, old_row))
                 new_rows.append(new_row)
-            self._apply_workspace_delta(ref.branch_id, plan.table, current_rows, new_rows)
+            if current_rows:
+                _, parent = self._write_version(ref)
+                self._apply_version_delta(ref.branch_id, plan.table, current_rows, new_rows, parent_version=parent)
             return ExecuteResult(len(current_rows))
         if isinstance(plan, _DeletePlan):
             current_rows = self._select_matching_rows(
                 ref, plan.table, plan.where_sql, params, plan.direct_filter
             )
-            self._apply_workspace_delta(ref.branch_id, plan.table, current_rows, [])
+            if current_rows:
+                _, parent = self._write_version(ref)
+                self._apply_version_delta(ref.branch_id, plan.table, current_rows, [], parent_version=parent)
             return ExecuteResult(len(current_rows))
         raise UnsupportedSQLError("only SELECT, INSERT, UPDATE, and DELETE are supported")
 
@@ -614,28 +632,17 @@ class _OrpheusBackend(_SQLBranchBackend):
             for column in meta.columns
         )
         visible = self._branch_visible_subquery(
-            meta,
-            ref.branch_id,
-            self._current_version_id(ref.branch_id),
-            include_rid=False,
+            meta, ref.branch_id, self._current_version_id(ref.branch_id),
+            include_rid=True,
         )
         source = f"SELECT * FROM ({visible}) AS visible_rows"
         stripped = plan.where_sql.strip()
-        if not stripped and not ref.metadata.get("defer_orpheus_materialize"):
-            return self._apply_full_update_plan_materialized(
-                ref,
-                plan.table,
-                meta,
-                source,
-                select_cols,
-                params,
-            )
         if stripped:
             if not stripped.upper().startswith("WHERE "):
                 raise UnsupportedSQLError("unsupported WHERE clause")
             source = f"{source} WHERE {stripped[6:]}"
         cols = ", ".join(_quote(column) for column in meta.columns)
-        pk_returning = ", ".join(_quote(column) for column in meta.pk_columns)
+        new_version, parent_version = self._write_version(ref)
         row = self.db.execute(
             f"""
             WITH source_rows AS (
@@ -646,147 +653,37 @@ class _OrpheusBackend(_SQLBranchBackend):
               ({cols})
               SELECT {select_cols}
               FROM source_rows
-              RETURNING rid, {pk_returning}
+              RETURNING rid
             ),
-            upserted AS (
-              INSERT INTO _chronos_branch_orpheus_workspace
-              (branch_id, table_name, key_text, rid, deleted, updated_at)
-              SELECT :__chronos_branch_id, :__chronos_table_name,
-                     {self._key_json_sql(meta, alias='inserted')},
-                     rid, FALSE, :__chronos_updated_at
-              FROM inserted
-              ON CONFLICT (branch_id, table_name, key_text)
-              DO UPDATE SET
-                rid = EXCLUDED.rid,
-                deleted = FALSE,
-                updated_at = EXCLUDED.updated_at
-              RETURNING 1
+            changed AS (
+              SELECT ARRAY(SELECT rid FROM source_rows) AS old_rids,
+                     ARRAY(SELECT rid FROM inserted) AS new_rids
+            ),
+            updated AS (
+              UPDATE {_quote(self._index_table(meta))} AS i
+                 SET rlist = (
+                   SELECT COALESCE(array_agg(rid ORDER BY rid), ARRAY[]::integer[])
+                   FROM (
+                     SELECT u.rid FROM unnest(i.rlist) AS u(rid), changed AS c
+                     WHERE NOT (u.rid = ANY(c.old_rids))
+                     UNION ALL
+                     SELECT unnest(c.new_rids) FROM changed AS c
+                   ) AS members
+                 )
+               WHERE i.vid = :__chronos_new_version
+              RETURNING cardinality((SELECT new_rids FROM changed)) AS count
             )
-            SELECT COUNT(*) AS count FROM upserted
+            SELECT count FROM updated
             """,
             {
                 **params,
-                "__chronos_branch_id": ref.branch_id,
-                "__chronos_table_name": meta.name,
-                "__chronos_updated_at": _utc_now(),
+                "__chronos_new_version": new_version,
             },
         ).fetchone()
         count = int(row["count"]) if row is not None else 0
-        if count > 1000 and not ref.metadata.get("defer_orpheus_materialize"):
-            # Full-table macrobench backfills can touch every visible row. If
-            # those replacements remain in the workspace, every subsequent
-            # read pays an anti-join against one marker per row. Materializing
-            # keeps Orpheus reads on compact committed rlists.
-            self._materialize_workspace(ref.branch_id, "chronos bulk update")
+        if count:
+            self._finish_version_change(meta, ref.branch_id, parent_version, new_version)
         return count
-
-    def _apply_full_update_plan_materialized(
-        self,
-        ref: _PreparedBranchRef,
-        table: str,
-        meta: _TableMeta,
-        source: str,
-        select_cols: str,
-        params: dict[str, Any],
-    ) -> int:
-        with self._materialization_lock():
-            parent_version = self._vid(self._current_version_id(ref.branch_id))
-            new_version = self._new_version_id()
-            now = _utc_now()
-            # Chronos only follows the parent pointer when resolving Orpheus
-            # versions. Maintaining the reverse children array would update a
-            # shared parent row from every child materialization and serialize
-            # wide branching workloads on that row.
-            self.db.execute(
-                """
-                INSERT INTO _chronos_branch_orpheus_versiontable
-                (vid, author, num_records, parent, children, create_time, commit_time, commit_msg)
-                VALUES (?, 'chronos', 0, ?::integer[], ?::integer[], ?, ?, ?)
-                """,
-                (
-                    new_version,
-                    [parent_version],
-                    [],
-                    now,
-                    now,
-                    "chronos full update",
-                ),
-            )
-            cols = ", ".join(_quote(column) for column in meta.columns)
-            row = self.db.execute(
-                f"""
-                WITH source_rows AS (
-                  {source}
-                ),
-                inserted AS (
-                  INSERT INTO {_quote(meta.physical_name)}
-                  ({cols})
-                  SELECT {select_cols}
-                  FROM source_rows
-                  RETURNING rid
-                )
-                INSERT INTO {_quote(self._index_table(meta))}
-                (vid, rlist)
-                SELECT :__chronos_new_version,
-                       COALESCE(array_agg(rid ORDER BY rid), ARRAY[]::integer[])
-                FROM inserted
-                RETURNING cardinality(rlist) AS count
-                """,
-                {
-                    **params,
-                    "__chronos_new_version": new_version,
-                },
-            ).fetchone()
-            for other_meta in self._active_metas_for_owner("branch", ref.branch_id).values():
-                if other_meta.name == table:
-                    continue
-                if self._workspace_has_table_changes(ref.branch_id, other_meta.name):
-                    self._insert_materialized_rlist(
-                        other_meta,
-                        ref.branch_id,
-                        parent_version,
-                        new_version,
-                    )
-                    self._record_version_deltas_from_workspace(
-                        other_meta,
-                        ref.branch_id,
-                        parent_version,
-                        new_version,
-                    )
-                else:
-                    self._carry_forward_rlist(other_meta, parent_version, new_version)
-            self._record_version_deltas_by_comparing_versions(
-                meta,
-                ref.branch_id,
-                parent_version,
-                new_version,
-            )
-            self.db.execute(
-                """
-                UPDATE _chronos_branch_orpheus_branches
-                   SET current_vid = ?
-                 WHERE branch_id = ?
-                """,
-                (new_version, ref.branch_id),
-            )
-            self._refresh_version_record_count(new_version)
-            self.db.execute(
-                "DELETE FROM _chronos_branch_orpheus_workspace WHERE branch_id = ?",
-                (ref.branch_id,),
-            )
-            return int(row["count"]) if row is not None else 0
-
-    def _workspace_has_table_changes(self, branch_id: str, table: str) -> bool:
-        row = self.db.execute(
-            """
-            SELECT 1
-            FROM _chronos_branch_orpheus_workspace
-            WHERE branch_id = ? AND table_name = ?
-            LIMIT 1
-            """,
-            (branch_id, table),
-        ).fetchone()
-        return row is not None
 
     @contextlib.contextmanager
     def _materialization_lock(self) -> Iterator[None]:
@@ -810,6 +707,90 @@ class _OrpheusBackend(_SQLBranchBackend):
             """,
             (new_version, parent_version),
         )
+
+    def _fork_version(
+        self,
+        parent_version: int,
+        metas: Iterable[_TableMeta],
+        commit_msg: str,
+    ) -> int:
+        """Give a branch its own version while sharing immutable data records."""
+        new_version = self._new_version_id()
+        now = _utc_now()
+        self.db.execute(
+            """
+            INSERT INTO _chronos_branch_orpheus_versiontable
+            (vid, author, num_records, parent, children, create_time, commit_time, commit_msg)
+            SELECT ?, 'chronos', num_records, ?::integer[], ?::integer[], ?, ?, ?
+            FROM _chronos_branch_orpheus_versiontable WHERE vid = ?
+            """,
+            (new_version, [parent_version], [], now, now, commit_msg, parent_version),
+        )
+        seen: set[str] = set()
+        for meta in metas:
+            if meta.physical_name in seen:
+                continue
+            seen.add(meta.physical_name)
+            self._carry_forward_rlist(meta, parent_version, new_version)
+        return new_version
+
+    def _write_version(self, ref: _PreparedBranchRef) -> tuple[int, int]:
+        """Reuse one uncommitted candidate per SQL transaction."""
+        current = self._vid(self._current_version_id(ref.branch_id))
+        pending = ref.metadata.get("orpheus_write_vid")
+        if ref.metadata.get("orpheus_transaction") and pending == current:
+            return current, int(ref.metadata["orpheus_parent_vid"])
+        self._lock_branch_for_update(ref.branch_id)
+        parent = self._vid(self._current_version_id(ref.branch_id))
+        metas = (
+            self._active_metas_for_owner("branch", ref.branch_id).values()
+            if self.enable_schema_branching else self.tables.values()
+        )
+        new_version = self._fork_version(parent, metas, "chronos write")
+        self.db.execute(
+            "UPDATE _chronos_branch_orpheus_branches SET current_vid = ? WHERE branch_id = ?",
+            (new_version, ref.branch_id),
+        )
+        if ref.metadata.get("orpheus_transaction"):
+            ref.metadata["orpheus_write_vid"] = new_version
+            ref.metadata["orpheus_parent_vid"] = parent
+        return new_version, parent
+
+    def _replace_membership(
+        self, meta: _TableMeta, version: int,
+        removed: list[int], added: list[int],
+    ) -> None:
+        self.db.execute(
+            f"""
+            UPDATE {_quote(self._index_table(meta))} AS i
+               SET rlist = (
+                 SELECT COALESCE(array_agg(rid ORDER BY rid), ARRAY[]::integer[])
+                 FROM (
+                   SELECT u.rid FROM unnest(i.rlist) AS u(rid)
+                   WHERE NOT (u.rid = ANY(?::integer[]))
+                   UNION ALL
+                   SELECT unnest(?::integer[])
+                 ) AS members
+               )
+             WHERE i.vid = ?
+            """,
+            (removed, added, version),
+        )
+
+    def _finish_version_change(
+        self, meta: _TableMeta, branch_id: str,
+        parent_version: int, new_version: int,
+    ) -> None:
+        self._refresh_version_record_count(new_version)
+        if self.enable_diff_merge_tracking:
+            self.db.execute(
+                "DELETE FROM _chronos_branch_orpheus_version_delta "
+                "WHERE vid = ? AND table_name = ?",
+                (new_version, meta.name),
+            )
+            self._record_version_deltas_by_comparing_versions(
+                meta, branch_id, parent_version, new_version,
+            )
 
     def visible_rows(self, branch_id: str, table: str) -> list[dict[str, Any]]:
         ref = self.prepare_ref(_BranchRef(branch_id, self._current_version_id(branch_id)))
@@ -862,8 +843,8 @@ class _OrpheusBackend(_SQLBranchBackend):
         with self._materialization_lock():
             self._lock_branch_for_update(source)
             self._lock_branch_for_update(target)
-            source_vid = self._materialize_workspace(source, "chronos merge source")
-            target_vid = self._materialize_workspace(target, "chronos merge target")
+            source_vid = self._vid(self._current_version_id(source))
+            target_vid = self._vid(self._current_version_id(target))
             changes, conflicts = self._merge_preview_from_tracking(source, target)
             if conflicts:
                 raise BranchingError("merge has unresolved conflicts")
@@ -1212,20 +1193,7 @@ class _OrpheusBackend(_SQLBranchBackend):
                 [table, *version_ids],
             ).fetchall()
             keys.update(str(row["key_text"]) for row in rows)
-        keys.update(self._workspace_key_texts(left_branch, table))
-        keys.update(self._workspace_key_texts(right_branch, table))
         return sorted(keys)
-
-    def _workspace_key_texts(self, branch_id: str, table: str) -> list[str]:
-        rows = self.db.execute(
-            """
-            SELECT key_text
-            FROM _chronos_branch_orpheus_workspace
-            WHERE branch_id = ? AND table_name = ?
-            """,
-            (branch_id, table),
-        ).fetchall()
-        return [str(row["key_text"]) for row in rows]
 
     def _rows_by_key_text_for_version(
         self,
@@ -1266,45 +1234,9 @@ class _OrpheusBackend(_SQLBranchBackend):
     ) -> dict[str, dict[str, Any]]:
         if not key_texts:
             return {}
-        values = ", ".join("(?)" for _ in key_texts)
-        rid_col = "d.rid, " if include_rid else ""
-        cols = ", ".join(f"d.{_quote(column)}" for column in meta.columns)
-        rows = self.db.execute(
-            f"""
-            WITH keys(key_text) AS (VALUES {values}),
-            committed_rows AS (
-              SELECT keys.key_text, {rid_col}{cols}
-              FROM keys
-              JOIN {_quote(meta.physical_name)} AS d
-                ON {self._key_json_sql(meta, alias='d')} = keys.key_text
-              JOIN {_quote(self._index_table(meta))} AS i
-                ON i.vid = ?
-               AND d.rid = ANY(i.rlist)
-              WHERE NOT EXISTS (
-                SELECT 1
-                FROM _chronos_branch_orpheus_workspace AS w
-                WHERE w.branch_id = ?
-                  AND w.table_name = ?
-                  AND w.key_text = keys.key_text
-              )
-            ),
-            workspace_rows AS (
-              SELECT keys.key_text, {rid_col}{cols}
-              FROM keys
-              JOIN _chronos_branch_orpheus_workspace AS w
-                ON w.branch_id = ?
-               AND w.table_name = ?
-               AND w.key_text = keys.key_text
-               AND w.deleted = FALSE
-              JOIN {_quote(meta.physical_name)} AS d ON d.rid = w.rid
-            )
-            SELECT * FROM committed_rows
-            UNION ALL
-            SELECT * FROM workspace_rows
-            """,
-            [*key_texts, version_id, branch_id, meta.name, branch_id, meta.name],
-        ).fetchall()
-        return {str(row["key_text"]): self._row_from_result(row, meta, include_rid) for row in rows}
+        return self._rows_by_key_text_for_version(
+            meta, version_id, key_texts, include_rid=include_rid,
+        )
 
     def _row_from_result(
         self, row: Any, meta: _TableMeta, include_rid: bool
@@ -1389,7 +1321,7 @@ class _OrpheusBackend(_SQLBranchBackend):
             )
             if visible is not None:
                 remove_rows.append(visible)
-        self._apply_workspace_delta(
+        self._apply_version_delta(
             branch_id,
             table,
             remove_rows,
@@ -1415,236 +1347,50 @@ class _OrpheusBackend(_SQLBranchBackend):
             )
             if visible is not None:
                 remove_rows.append(visible)
-        self._apply_workspace_delta(branch_id, table, remove_rows, [])
+        self._apply_version_delta(branch_id, table, remove_rows, [])
 
-    def _apply_workspace_delta(
+    def _apply_version_delta(
         self,
         branch_id: str,
         table: str,
         remove_rows: list[dict[str, Any]],
         add_rows: list[dict[str, Any]],
+        *,
+        parent_version: int | None = None,
     ) -> None:
         meta = self._meta_for_owner("branch", branch_id, table) if self.enable_schema_branching else self._require_table(table)
         if meta is None:
             raise TableNotRegisteredError(table)
-        version_id = self._current_version_id(branch_id)
-        removed_keys: set[tuple[Any, ...]] = set()
-        for row in remove_rows:
-            key = self._key_tuple(meta, row)
-            removed_keys.add(key)
-        add_keys = {self._key_tuple(meta, row) for row in add_rows}
-        for row in remove_rows:
-            key = self._key_tuple(meta, row)
-            if key not in add_keys:
-                self._upsert_workspace_marker(branch_id, meta, row, None, deleted=True)
-        for row in add_rows:
-            key_dict = self._row_key(meta, row)
-            key = self._key_tuple(meta, row)
-            visible = self._visible_row_by_key_for_branch(
-                branch_id,
-                version_id,
-                table,
-                key_dict,
-            )
-            if visible is not None and key not in removed_keys:
-                raise DuplicateKeyError(f"duplicate key on branch {branch_id}: {key_dict}")
-            rid = self._insert_workspace_row(meta, row)
-            self._upsert_workspace_marker(branch_id, meta, row, rid, deleted=False)
-
-    def _materialize_workspace(self, branch_id: str, commit_msg: str) -> int:
-        with self._materialization_lock():
-            parent_version = self._vid(self._current_version_id(branch_id))
-            if not self._workspace_is_dirty(branch_id):
-                return parent_version
-            new_version = self._new_version_id()
-            now = _utc_now()
-            # Keep the parent pointer but avoid updating the parent's reverse
-            # children array; concurrent materializations from sibling branches
-            # would otherwise contend on the same versiontable tuple.
-            self.db.execute(
-                """
-                INSERT INTO _chronos_branch_orpheus_versiontable
-                (vid, author, num_records, parent, children, create_time, commit_time, commit_msg)
-                VALUES (?, 'chronos', 0, ?::integer[], ?::integer[], ?, ?, ?)
-                """,
-                (
-                    new_version,
-                    [parent_version],
-                    [],
-                    now,
-                    now,
-                    commit_msg,
-                ),
-            )
-            table_metas = (
-                self._active_metas_for_owner("branch", branch_id).values()
-                if self.enable_schema_branching
-                else self.tables.values()
-            )
-            for table_meta in table_metas:
-                self._insert_materialized_rlist(
-                    table_meta,
-                    branch_id,
-                    parent_version,
-                    new_version,
-                )
-                self._record_version_deltas_from_workspace(
-                    table_meta,
-                    branch_id,
-                    parent_version,
-                    new_version,
-                )
-            self.db.execute(
-                """
-                UPDATE _chronos_branch_orpheus_branches
-                   SET current_vid = ?
-                 WHERE branch_id = ?
-                """,
-                (new_version, branch_id),
-            )
-            self._refresh_version_record_count(new_version)
-            self.db.execute(
-                "DELETE FROM _chronos_branch_orpheus_workspace WHERE branch_id = ?",
-                (branch_id,),
-            )
-            return new_version
-
-    def _workspace_is_dirty(self, branch_id: str) -> bool:
-        row = self.db.execute(
-            """
-            SELECT 1
-            FROM _chronos_branch_orpheus_workspace
-            WHERE branch_id = ?
-            LIMIT 1
-            """,
-            (branch_id,),
-        ).fetchone()
-        return row is not None
-
-    def _copy_workspace(self, source_branch: str, dest_branch: str) -> None:
-        self.db.execute(
-            """
-            INSERT INTO _chronos_branch_orpheus_workspace
-            (branch_id, table_name, key_text, rid, deleted, updated_at)
-            SELECT ?, table_name, key_text, rid, deleted, ?
-            FROM _chronos_branch_orpheus_workspace
-            WHERE branch_id = ?
-            """,
-            (dest_branch, _utc_now(), source_branch),
-        )
-
-    def _insert_materialized_rlist(
-        self,
-        meta: _TableMeta,
-        branch_id: str,
-        parent_version: int,
-        new_version: int,
-    ) -> None:
-        self.db.execute(
-            f"""
-            INSERT INTO {_quote(self._index_table(meta))}
-            (vid, rlist)
-            WITH parent_rows AS (
-              SELECT unnest(
-                COALESCE(
-                  (
-                    SELECT rlist
-                      FROM {_quote(self._index_table(meta))}
-                     WHERE vid = ?
-                  ),
-                  ARRAY[]::integer[]
-                )
-              ) AS rid
-            ),
-            live_parent_rows AS (
-              SELECT p.rid
-                FROM parent_rows AS p
-                JOIN {_quote(meta.physical_name)} AS d ON d.rid = p.rid
-               WHERE NOT EXISTS (
-                 SELECT 1
-                   FROM _chronos_branch_orpheus_workspace AS w
-                  WHERE w.branch_id = ?
-                    AND w.table_name = ?
-                    AND w.key_text = {self._key_json_sql(meta, alias='d')}
-               )
-            ),
-            live_workspace_rows AS (
-              SELECT w.rid
-                FROM _chronos_branch_orpheus_workspace AS w
-               WHERE w.branch_id = ?
-                 AND w.table_name = ?
-                 AND w.deleted = FALSE
-            ),
-            materialized AS (
-              SELECT rid FROM live_parent_rows
-              UNION ALL
-              SELECT rid FROM live_workspace_rows
-            )
-            SELECT ?, COALESCE(array_agg(rid ORDER BY rid), ARRAY[]::integer[])
-              FROM materialized
-            """,
-            (
-                parent_version,
-                branch_id,
-                meta.name,
-                branch_id,
-                meta.name,
-                new_version,
-            ),
-        )
-
-    def _record_version_deltas_from_workspace(
-        self,
-        meta: _TableMeta,
-        branch_id: str,
-        parent_version: int,
-        new_version: int,
-    ) -> None:
-        if not self.enable_diff_merge_tracking:
+        if not remove_rows and not add_rows:
             return
-        self._ensure_diff_merge_tracking_tables()
-        self.db.execute(
-            f"""
-            INSERT INTO _chronos_branch_orpheus_version_delta
-            (vid, writer_branch_id, table_name, key_text, op, before_rid, after_rid, created_at)
-            WITH parent_rows AS (
-              SELECT d.rid, {self._key_json_sql(meta, alias='d')} AS key_text
-              FROM {_quote(meta.physical_name)} AS d
-              JOIN {_quote(self._index_table(meta))} AS i
-                ON i.vid = ?
-               AND d.rid = ANY(i.rlist)
-            )
-            SELECT ?, ?, ?, w.key_text,
-                   CASE
-                     WHEN w.deleted THEN 'deleted'
-                     WHEN p.rid IS NULL THEN 'added'
-                     ELSE 'modified'
-                   END,
-                   p.rid,
-                   CASE WHEN w.deleted THEN NULL ELSE w.rid END,
-                   ?
-            FROM _chronos_branch_orpheus_workspace AS w
-            LEFT JOIN parent_rows AS p ON p.key_text = w.key_text
-            WHERE w.branch_id = ?
-              AND w.table_name = ?
-              AND NOT (w.deleted AND p.rid IS NULL)
-            ON CONFLICT (vid, table_name, key_text)
-            DO UPDATE SET
-              writer_branch_id = EXCLUDED.writer_branch_id,
-              op = EXCLUDED.op,
-              before_rid = EXCLUDED.before_rid,
-              after_rid = EXCLUDED.after_rid,
-              created_at = EXCLUDED.created_at
-            """,
-            (
-                parent_version,
-                new_version,
-                branch_id,
-                meta.name,
-                _utc_now(),
-                branch_id,
-                meta.name,
-            ),
+        removed_keys = {self._key_tuple(meta, row) for row in remove_rows}
+        added_keys: set[tuple[Any, ...]] = set()
+        version_id = self._current_version_id(branch_id)
+        for row in add_rows:
+            key = self._key_tuple(meta, row)
+            key_dict = self._row_key(meta, row)
+            if key in added_keys or (
+                key not in removed_keys
+                and self._visible_row_by_key_for_branch(branch_id, version_id, table, key_dict)
+                is not None
+            ):
+                raise DuplicateKeyError(f"duplicate key on branch {branch_id}: {key_dict}")
+            added_keys.add(key)
+        # SQL statements have already created their transaction's candidate.
+        # Direct upsert/delete calls create a candidate after validating keys.
+        if parent_version is None:
+            direct_ref = self._transaction_refs.get(branch_id)
+            if direct_ref is None:
+                direct_ref = self.prepare_ref(_BranchRef(branch_id, version_id))
+            _, parent_version = self._write_version(direct_ref)
+        added_rids = [self._insert_physical_row(meta, row) for row in add_rows]
+        self._replace_membership(
+            meta, self._vid(self._current_version_id(branch_id)),
+            [int(row["rid"]) for row in remove_rows], added_rids,
+        )
+        self._finish_version_change(
+            meta, branch_id, parent_version,
+            self._vid(self._current_version_id(branch_id)),
         )
 
     def _record_version_deltas_by_comparing_versions(
@@ -2017,7 +1763,6 @@ class _OrpheusBackend(_SQLBranchBackend):
             column_defs=tuple([*old_meta.column_defs, new_def]),
             backend=self.name,
         )
-        self._materialize_workspace(ref.branch_id, "chronos schema change")
         if self._schema_physical_is_private_to_branch(ref.branch_id, old_meta.physical_name):
             self.db.execute(
                 f"ALTER TABLE {_quote(old_meta.physical_name)} ADD COLUMN {new_def}"
@@ -2060,7 +1805,6 @@ class _OrpheusBackend(_SQLBranchBackend):
             column_defs=tuple(old_def for _old_column, old_def in kept),
             backend=self.name,
         )
-        self._materialize_workspace(ref.branch_id, "chronos schema change")
         if self._schema_physical_is_private_to_branch(ref.branch_id, old_meta.physical_name):
             self.db.execute(
                 f"ALTER TABLE {_quote(old_meta.physical_name)} DROP COLUMN {_quote(column)}"
@@ -2103,7 +1847,6 @@ class _OrpheusBackend(_SQLBranchBackend):
             if isinstance(using, exp.Expression)
             else f"CAST({_quote(column)} AS {type_sql})"
         )
-        self._materialize_workspace(ref.branch_id, "chronos schema change")
         if self._schema_physical_is_private_to_branch(ref.branch_id, old_meta.physical_name):
             self.db.execute(
                 f"ALTER TABLE {_quote(old_meta.physical_name)} "
@@ -2385,7 +2128,7 @@ class _OrpheusBackend(_SQLBranchBackend):
         current = self._current_version_id(ref.branch_id)
         if current == ref.ref:
             return ref
-        return self.prepare_ref(_BranchRef(ref.branch_id, current, False))
+        return self.refresh_ref_after_execute(ref)
 
     def _replacements(self, ref: _BranchRef, include_rid: bool) -> dict[str, str]:
         version_id = ref.ref if ref.readonly else self._current_version_id(ref.branch_id)
@@ -2416,17 +2159,6 @@ class _OrpheusBackend(_SQLBranchBackend):
         cols = [f"d.{_quote(column)}" for column in meta.columns]
         if include_rid:
             cols.insert(0, "d.rid")
-        if self._vid(version_id) == 1:
-            rid_limit = self._base_version_rid_limit(meta, version_id)
-            # Version 1 is loaded before any branch-local rows are appended to
-            # the shared datatable, so its rid set is a stable prefix. Scanning
-            # that prefix lets PostgreSQL push filters into the physical table
-            # instead of expanding the whole rlist array for every read.
-            return (
-                f"SELECT {', '.join(cols)} "
-                f"FROM {_quote(meta.physical_name)} AS d "
-                f"WHERE d.rid <= {rid_limit}"
-            )
         return (
             f"SELECT {', '.join(cols)} "
             f"FROM {_quote(meta.physical_name)} AS d "
@@ -2442,61 +2174,7 @@ class _OrpheusBackend(_SQLBranchBackend):
         version_id: str,
         include_rid: bool,
     ) -> str:
-        cols = [f"d.{_quote(column)}" for column in meta.columns]
-        if include_rid:
-            cols.insert(0, "d.rid")
-        select_cols = ", ".join(cols)
-        branch_literal = self._sql_literal(branch_id)
-        table_literal = self._sql_literal(meta.name)
-        if self._vid(version_id) == 1:
-            rid_limit = self._base_version_rid_limit(meta, version_id)
-            base_from = (
-                f"FROM {_quote(meta.physical_name)} AS d "
-                f"WHERE d.rid <= {rid_limit} "
-            )
-        else:
-            base_from = (
-                f"FROM {_quote(meta.physical_name)} AS d "
-                f"JOIN {_quote(self._index_table(meta))} AS i "
-                f"  ON i.vid = {self._vid(version_id)} "
-                f" AND d.rid = ANY(i.rlist) "
-                f"WHERE TRUE "
-            )
-        return (
-            f"SELECT {select_cols} "
-            f"{base_from}"
-            f"AND NOT EXISTS ("
-            f"  SELECT 1 FROM _chronos_branch_orpheus_workspace AS w "
-            f"  WHERE w.branch_id = {branch_literal} "
-            f"    AND w.table_name = {table_literal} "
-            f"    AND w.key_text = {self._key_json_sql(meta, alias='d')}"
-            f") "
-            f"UNION ALL "
-            f"SELECT {select_cols} "
-            f"FROM _chronos_branch_orpheus_workspace AS w "
-            f"JOIN {_quote(meta.physical_name)} AS d ON d.rid = w.rid "
-            f"WHERE w.branch_id = {branch_literal} "
-            f"  AND w.table_name = {table_literal} "
-            f"  AND w.deleted = FALSE"
-        )
-
-    def _base_version_rid_limit(self, meta: _TableMeta, version_id: str) -> int:
-        key = (meta.physical_name, str(self._vid(version_id)))
-        cached = self._base_version_rid_limit_cache.get(key)
-        if cached is not None:
-            return cached
-        row = self.db.execute(
-            f"""
-            SELECT COALESCE(MAX(r.rid), 0) AS rid_limit
-            FROM {_quote(self._index_table(meta))} AS i
-            CROSS JOIN LATERAL unnest(i.rlist) AS r(rid)
-            WHERE i.vid = ?
-            """,
-            (self._vid(version_id),),
-        ).fetchone()
-        rid_limit = int(row["rid_limit"]) if row is not None else 0
-        self._base_version_rid_limit_cache[key] = rid_limit
-        return rid_limit
+        return self._committed_visible_subquery(meta, version_id, include_rid)
 
     def _select_matching_rows(
         self,
@@ -2582,34 +2260,7 @@ class _OrpheusBackend(_SQLBranchBackend):
         meta = self._meta_for_owner("branch", branch_id, table) if self.enable_schema_branching else self._require_table(table)
         if meta is None:
             raise TableNotRegisteredError(table)
-        marker = self.db.execute(
-            """
-            SELECT rid, deleted
-            FROM _chronos_branch_orpheus_workspace
-            WHERE branch_id = ?
-              AND table_name = ?
-              AND key_text = ?
-            """,
-            (branch_id, table, self._workspace_key_text(meta, key)),
-        ).fetchone()
-        if marker is not None:
-            if marker["deleted"]:
-                return None
-            return self._row_by_rid(meta, int(marker["rid"]))
         return self._visible_row_by_key_in_meta(meta, version_id, key)
-
-    def _row_by_rid(self, meta: _TableMeta, rid: int) -> dict[str, Any] | None:
-        cols = ", ".join(f"d.{_quote(column)}" for column in meta.columns)
-        row = self.db.execute(
-            f"""
-            SELECT d.rid, {cols}
-            FROM {_quote(meta.physical_name)} AS d
-            WHERE d.rid = ?
-            LIMIT 1
-            """,
-            (rid,),
-        ).fetchone()
-        return dict(row) if row is not None else None
 
     def _visible_row_by_key_in_meta(
         self,
@@ -2632,46 +2283,9 @@ class _OrpheusBackend(_SQLBranchBackend):
         ).fetchone()
         return dict(row) if row is not None else None
 
-    def _upsert_workspace_marker(
-        self,
-        branch_id: str,
-        meta: _TableMeta,
-        row: dict[str, Any],
-        rid: int | None,
-        *,
-        deleted: bool,
-    ) -> None:
-        self.db.execute(
-            """
-            INSERT INTO _chronos_branch_orpheus_workspace
-            (branch_id, table_name, key_text, rid, deleted, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT (branch_id, table_name, key_text)
-            DO UPDATE SET
-              rid = EXCLUDED.rid,
-              deleted = EXCLUDED.deleted,
-              updated_at = EXCLUDED.updated_at
-            """,
-            (
-                branch_id,
-                meta.name,
-                self._workspace_key_text(meta, row),
-                rid,
-                deleted,
-                _utc_now(),
-            ),
-        )
-
-    def _workspace_key_text(self, meta: _TableMeta, row: dict[str, Any]) -> str:
-        return json.dumps([row[column] for column in meta.pk_columns], default=str)
-
     def _key_json_sql(self, meta: _TableMeta, alias: str) -> str:
         columns = ", ".join(f"{_quote(alias)}.{_quote(column)}" for column in meta.pk_columns)
         return f"jsonb_build_array({columns})::text"
-
-    @staticmethod
-    def _sql_literal(value: str) -> str:
-        return "'" + value.replace("'", "''") + "'"
 
     def _insert_version_rlist(
         self,
@@ -2715,9 +2329,6 @@ class _OrpheusBackend(_SQLBranchBackend):
             """,
             (self._vid(version_id),),
         )
-
-    def _insert_workspace_row(self, meta: _TableMeta, row: dict[str, Any]) -> int:
-        return self._insert_physical_row(meta, row)
 
     def _insert_physical_row(
         self,
