@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo=/home/ubuntu/TAR-OS/chronos
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 app="$repo/apps/enterprise-knowledge-mcp"
 artifact_root="$repo/.enterprise-knowledge/enterprise-rag-curated-v2"
-corpus="${ENTERPRISE_CORPUS:-/home/ubuntu/TAR-OS/EnterpriseRAG-Bench/generated_data_infra_v1}"
+corpus="${ENTERPRISE_CORPUS:-$repo/.enterprise-knowledge/datasets/enterprise-rag-infra-v1}"
 document_snapshot="${ENTERPRISE_DOCUMENT_SNAPSHOT:-$repo/.enterprise-knowledge/enterprise-rag-curated-v2/document-snapshot}"
 code_snapshot="$artifact_root/code-snapshot"
 native_root=/tmp/chronos-enterprise-full-bench/native-curated-v2

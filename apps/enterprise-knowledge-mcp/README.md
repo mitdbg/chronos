@@ -197,6 +197,13 @@ export OPENROUTER_API_KEY=...
 
 ## Prepare and ingest EnterpriseRAG
 
+The paper uses an augmented EnterpriseRAG-Bench corpus containing the original
+company records, pinned vLLM/LiteLLM/Langfuse source trees, cutoff-filtered
+public GitHub history, and synthetic internal maintenance records. The complete
+provenance and one-command rebuild recipe are checked in under
+[`datasets/enterprise_rag_infra_v1`](datasets/enterprise_rag_infra_v1/README.md).
+The examples below also work with the unaugmented upstream corpus.
+
 ```bash
 .venv/bin/chronos-enterprise-knowledge \
   prepare-snapshot \
@@ -375,11 +382,12 @@ The persistent end-to-end driver is:
 apps/enterprise-knowledge-mcp/scripts/run_curated_v2_pipeline.sh
 ```
 
-The driver accepts `ENTERPRISE_CORPUS` and defaults to
-`/home/ubuntu/TAR-OS/EnterpriseRAG-Bench/generated_data_infra_v1`. Set that
-variable explicitly to use the original corpus. `ENTERPRISE_DOCUMENT_SNAPSHOT`
-can select a separate prepared snapshot; otherwise the derivative corpus is
-prepared under the curated artifact directory.
+The driver reads the input from `ENTERPRISE_CORPUS`; without it, the portable
+default is `.enterprise-knowledge/datasets/enterprise-rag-infra-v1` under the
+repository root. Set the variable to the output of the checked-in dataset
+recipe. `ENTERPRISE_DOCUMENT_SNAPSHOT` can select a separate prepared snapshot;
+otherwise the derivative corpus is prepared under the curated artifact
+directory.
 
 It layers the complete EnterpriseRAG snapshot and pinned-code snapshot,
 creates the 3-by-2 hierarchy, captures all thirteen real Codex workflows, and

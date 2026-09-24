@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "curated_at": "2026-07-27",
+  "purpose": "Shared source state for realistic Redwood Inference coding-agent workflows.",
+  "repositories": [
+    {
+      "name": "vllm",
+      "upstream": "https://github.com/vllm-project/vllm",
+      "commit": "272abd5f486967f1fb9db7ca7504f8c34235ef50",
+      "role": "LLM inference and serving runtime",
+      "license": "Apache-2.0",
+      "teams": [
+        "team/runtime-scheduling",
+        "team/performance-evals",
+        "team/model-optimization"
+      ]
+    },
+    {
+      "name": "litellm",
+      "upstream": "https://github.com/BerriAI/litellm",
+      "commit": "8f86c87f8e065343af6e74e0823ab8a8276b9528",
+      "role": "OpenAI-compatible inference gateway, routing, and administration",
+      "license": "MIT with separately licensed enterprise components",
+      "teams": [
+        "team/platform-console",
+        "team/site-reliability"
+      ]
+    },
+    {
+      "name": "langfuse",
+      "upstream": "https://github.com/langfuse/langfuse",
+      "commit": "c4eaf1f4c0cd1851f0c9dbea2802c243cf787a09",
+      "role": "Inference observability, evaluation, and operations console",
+      "license": "MIT outside separately licensed ee directories",
+      "teams": [
+        "team/platform-console",
+        "team/site-reliability",
+        "team/performance-evals"
+      ]
+    }
+  ],
+  "indexing_policy": {
+    "maximum_file_bytes": 1048576,
+    "excluded_directories": [
+      ".git",
+      ".next",
+      ".venv",
+      "build",
+      "coverage",
+      "dist",
+      "generated",
+      "node_modules",
+      "target"
+    ],
+    "excluded_license_scopes": [
+      "langfuse/ee",
+      "langfuse/web/src/ee",
+      "langfuse/worker/src/ee"
+    ],
+    "excluded_generated_dependency_files": [
+      "Cargo.lock",
+      "package-lock.json",
+      "pnpm-lock.yaml",
+      "uv.lock",
+      "yarn.lock"
+    ]
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "artifact": "EnterpriseRAG-Bench/generated_data_infra_v1",
+  "base": {
+    "repository": "https://github.com/onyx-dot-app/EnterpriseRAG-Bench",
+    "commit": "d36685e273713975ee20299bbf1ab64165575b3c"
+  },
+  "cutoff": "2026-07-27T23:59:59Z",
+  "generation_mode": "template-fallback",
+  "source_corpus": {
+    "bytes": 4239214357,
+    "documents": 628081,
+    "chunks": 10704651,
+    "selection_digest": "5811ac692e06f8b1aab138567336120440b6912fb28804eb6d3da7a970215827"
+  },
+  "ingested_main_branch": {
+    "documents": 628082,
+    "chunks": 10704652,
+    "note": "The hierarchy initializer adds one company-knowledge root record."
+  },
+  "structured_document_counts": {
+    "confluence": 5209,
+    "fireflies": 10183,
+    "github": 8072,
+    "github_public": 97336,
+    "gmail": 121415,
+    "google_drive": 25123,
+    "hubspot": 15017,
+    "jira": 6130,
+    "linear": 35338,
+    "slack": 285675,
+    "total": 609498
+  },
+  "internal_documents_added": 200,
+  "public_github_crawl": {
+    "requests": 12237,
+    "objects": 733187,
+    "response_bytes": 4232090120,
+    "api_cost": 5741
+  },
+  "base_lineage": {
+    "file_count": 531929,
+    "digest": "d9a9a1f9ec31e8f9c4021a68512aecc2e8bced2c8beaeeb8c172874d2b4bba9a"
+  }
+}

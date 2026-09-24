@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-repo=/home/ubuntu/TAR-OS/chronos
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 app="$repo/apps/enterprise-knowledge-mcp"
 suite="$app/workflows/curated-v2"
-corpus="${ENTERPRISE_CORPUS:-/home/ubuntu/TAR-OS/EnterpriseRAG-Bench/generated_data_infra_v1}"
+corpus="${ENTERPRISE_CORPUS:-$repo/.enterprise-knowledge/datasets/enterprise-rag-infra-v1}"
 capture_tag="${ENTERPRISE_CAPTURE_TAG:-llm-v1}"
 run_id="${ENTERPRISE_CAPTURE_RUN_ID:-20260804-llm-latency-v1}"
 trace_id="${ENTERPRISE_CAPTURE_TRACE_ID:-llm-latency-v1}"
