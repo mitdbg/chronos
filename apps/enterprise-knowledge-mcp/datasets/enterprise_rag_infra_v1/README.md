@@ -134,6 +134,15 @@ Git pack layouts can differ. Compare a rebuild with `paper_artifact.json`; for
 archival byte identity, the original compressed crawl responses must also be
 published as a separate data artifact.
 
+To compare the indexed records and selected source paths—not incidental Git
+pack files, absolute paths, or generation timestamps—with the paper artifact:
+
+```bash
+.venv/bin/python \
+  apps/enterprise-knowledge-mcp/datasets/enterprise_rag_infra_v1/verify.py \
+  "$ENTERPRISE_CORPUS"
+```
+
 ## Test the builder
 
 The unit tests use only temporary fixtures and do not download the corpus:

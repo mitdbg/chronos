@@ -9,6 +9,8 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Sequence
 
@@ -41,6 +43,35 @@ def git_output(checkout: Path, *arguments: str) -> str:
     return subprocess.check_output(
         ["git", "-C", str(checkout), *arguments], text=True
     ).strip()
+
+
+def validate_github_credential() -> None:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
+        raise RuntimeError("Set GITHUB_TOKEN or GH_TOKEN before the crawl phase.")
+    request = urllib.request.Request(
+        "https://api.github.com/rate_limit",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "chronos-enterprise-rag-preflight",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    f"GitHub credential preflight returned HTTP {response.status}."
+                )
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(
+            f"GitHub rejected the configured credential with HTTP {error.code}."
+        ) from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            f"GitHub credential preflight failed: {error.reason}"
+        ) from error
 
 
 def checkout_at_commit(url: str, commit: str, destination: Path) -> None:
@@ -80,13 +111,18 @@ def checkout_at_commit(url: str, commit: str, destination: Path) -> None:
 def install_seed_files(base: Path) -> None:
     seed_root = HERE / "seed"
     for source in sorted(path for path in seed_root.rglob("*") if path.is_file()):
-        destination = base / source.relative_to(seed_root)
+        relative = source.relative_to(seed_root)
+        destination = base / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists() and destination.read_bytes() != source.read_bytes():
-            raise RuntimeError(
-                f"Refusing to replace a different source-preparation file: {destination}"
-            )
+        source_payload = source.read_bytes()
+        payload = source_payload
+        if relative.parent == Path("codebases/upstream-issues"):
+            payload = source_payload.rstrip(b"\n") + b"\n\n"
+        # These five files are owned by this recipe. Refreshing them makes an
+        # interrupted preparation resumable after documentation corrections.
         shutil.copy2(source, destination)
+        if payload != source_payload:
+            destination.write_bytes(payload)
 
 
 def prepare_codebases(base: Path) -> None:
@@ -167,6 +203,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.phase in {"crawl", "all"}:
+        validate_github_credential()
     checkout = resolve_enterprise_rag_checkout(args)
     base = checkout / "generated_data"
     if not base.is_dir():
@@ -177,11 +215,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.phase == "source":
         print(f"Prepared pinned source corpus at {base}")
         return 0
-
-    if args.phase in {"crawl", "all"} and not (
-        os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    ):
-        raise RuntimeError("Set GITHUB_TOKEN or GH_TOKEN before the crawl phase.")
 
     output = (
         args.output.expanduser().resolve()

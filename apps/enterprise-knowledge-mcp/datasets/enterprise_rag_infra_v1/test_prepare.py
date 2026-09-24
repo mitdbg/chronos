@@ -3,13 +3,26 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 import build_infra_dataset
 import prepare
 
 
 class PrepareDatasetTests(unittest.TestCase):
+    def test_crawl_preflight_rejects_invalid_credential(self) -> None:
+        error = urllib.error.HTTPError(
+            "https://api.github.com/rate_limit", 401, "Unauthorized", {}, None
+        )
+        with (
+            mock.patch.dict("os.environ", {"GITHUB_TOKEN": "invalid"}, clear=True),
+            mock.patch("prepare.urllib.request.urlopen", side_effect=error),
+            self.assertRaisesRegex(RuntimeError, "HTTP 401"),
+        ):
+            prepare.validate_github_credential()
+
     def test_manifest_pins_match_builder(self) -> None:
         manifest = json.loads(
             (prepare.HERE / "seed" / "codebases" / "manifest.json").read_text(
@@ -24,16 +37,17 @@ class PrepareDatasetTests(unittest.TestCase):
         }
         self.assertEqual(pins, build_infra_dataset.PINNED_COMMITS)
 
-    def test_seed_files_install_without_overwriting_different_content(self) -> None:
+    def test_seed_files_install_exact_recipe_content(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             prepare.install_seed_files(base)
             installed = base / "codebases" / "manifest.json"
             self.assertTrue(installed.is_file())
-            prepare.install_seed_files(base)
+            issue = base / "codebases" / "upstream-issues" / "litellm-24720.md"
+            self.assertTrue(issue.read_bytes().endswith(b"\n\n"))
             installed.write_text("different\n", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "Refusing to replace"):
-                prepare.install_seed_files(base)
+            prepare.install_seed_files(base)
+            self.assertNotEqual(installed.read_text(encoding="utf-8"), "different\n")
 
     def test_paper_reproduction_is_the_default(self) -> None:
         arguments = prepare.parser().parse_args([])

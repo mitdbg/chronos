@@ -10,7 +10,7 @@
     "bytes": 4239214357,
     "documents": 628081,
     "chunks": 10704651,
-    "selection_digest": "5811ac692e06f8b1aab138567336120440b6912fb28804eb6d3da7a970215827"
+    "path_selection_digest": "867d8b384de997c5f75e792ba36cf9ac75598d2161ea10210b9b31f4997f98e9"
   },
   "ingested_main_branch": {
     "documents": 628082,
@@ -37,8 +37,9 @@
     "response_bytes": 4232090120,
     "api_cost": 5741
   },
-  "base_lineage": {
-    "file_count": 531929,
-    "digest": "d9a9a1f9ec31e8f9c4021a68512aecc2e8bced2c8beaeeb8c172874d2b4bba9a"
+  "indexed_content_digests": {
+    "algorithm": "sha256 over sorted relative path length, path, byte length, and bytes",
+    "github_public": "e1d4b93069a46a26f19faf5d7ce61146377f47efe4c2ffaa08ed9b271953ed77",
+    "internal_infra_v1": "2253da7f385bc314c6317b42ab5a619d8ccd3abf8ebec58c35ea00438b235035"
   }
 }
