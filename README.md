@@ -12,6 +12,16 @@ SQLite, PostgreSQL, and DuckDB, and also supports files through ChronosFS,
 Qdrant collections, and S3-compatible storage. This repository provides the
 Python library for using Chronos with your existing applications and databases.
 
+If you only need branching within a single PostgreSQL database,
+[Chronos for PostgreSQL](https://github.com/mitdbg/postgres_chronos) implements
+Chronos's interval-based versioning directly inside PostgreSQL.
+
+Chronos is experimental. See the [compatibility guide](docs/compatibility.md)
+for supported operations and current limitations.
+
+The [Chronos paper](https://arxiv.org/abs/2609.14889) explains the
+interval-based versioning algorithm, cross-store branching, and evaluation.
+
 ## Install
 
 The default build supports SQLite and PostgreSQL. From the repository root on
@@ -93,3 +103,17 @@ The [experimental release notes](EXPERIMENTAL_RELEASE.md) describe the tests run
 so far and known failures; [RELEASING.md](RELEASING.md) describes the release
 process.
 
+
+## Cite Chronos
+
+```bibtex
+@misc{zhou2026chronos,
+  title         = {{Chronos}: Efficient Bolt-on Branching Across Data Stores for Stateful Agentic Applications},
+  author        = {Xinjing Zhou and Jason Mohoney and Samuel Madden and Michael Stonebraker and Lei Cao},
+  year          = {2026},
+  eprint        = {2609.14889},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.DB},
+  url           = {https://arxiv.org/abs/2609.14889}
+}
+```
