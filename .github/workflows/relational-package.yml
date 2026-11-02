@@ -104,8 +104,9 @@ jobs:
           CHRONOS_CLI_TEST_POSTGRES_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
           CHRONOS_CLI_REQUIRE_DUCKDB: ${{ matrix.duckdb }}
         run: |
-          python -I -m pytest tests/test_cli.py tests/test_cli_support.py \
-            tests/test_cli_integration.py -q --timeout=60
+          python -I -m pytest tests/test_cli.py::TestRelationalCommands \
+            tests/test_cli.py::TestTerminalBehavior \
+            tests/test_cli_integration.py::TestRelationalWorkflows -q --timeout=60
       - name: Test Qdrant CLI in local and server modes
         if: matrix.python == '3.12' && matrix.duckdb == 'OFF'
         env:
@@ -116,5 +117,5 @@ jobs:
           docker run --detach --rm --name chronos-cli-qdrant-test \
             -p 127.0.0.1:6333:6333 qdrant/qdrant:v1.20.0
           trap 'docker stop chronos-cli-qdrant-test > /dev/null' EXIT
-          python -I -m pytest tests/test_cli_qdrant.py \
-            tests/test_cli_qdrant_integration.py -q --timeout=60
+          python -I -m pytest tests/test_cli.py::TestQdrantCommands \
+            tests/test_cli_integration.py::TestQdrantWorkflows -q --timeout=60

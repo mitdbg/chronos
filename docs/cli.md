@@ -295,7 +295,7 @@ repository root:
 ```sh
 CHRONOS_CLI_TEST_POSTGRES_ADMIN_URL=postgresql://postgres:chronos_test@127.0.0.1:55434/postgres \
   uv run --no-sync --package chronos-core python -m pytest \
-  tests/test_cli.py tests/test_cli_support.py tests/test_cli_integration.py -v
+  tests/test_cli.py tests/test_cli_integration.py -v
 ```
 
 The PostgreSQL account must have permission to create and drop databases. The
@@ -314,9 +314,10 @@ and stdin, checkpoints, diffs, successful merges, conflicts, and rollback after 
 failed write. CI is configured to test the installed wheel on Python 3.10 and 3.12, with
 an additional DuckDB-enabled Python 3.12 build.
 
-`test_cli.py` checks command parsing, API arguments, errors, and entry points with
-fake connections. `test_cli_support.py` checks JSON conversion and cleanup.
-`test_cli_integration.py` runs real CLI processes against SQLite and PostgreSQL.
+`test_cli.py` groups relational, Qdrant, and shared terminal checks, using fake
+connections where appropriate. `test_cli_integration.py` groups real relational
+and Qdrant workflows. Optional stores and services are skipped when unavailable;
+SQL tests do not require the Qdrant dependency.
 
 Stop the disposable server when finished:
 
