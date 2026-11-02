@@ -20,6 +20,7 @@ dist/
 .eggs/
 
 # Local runtime state
+/.chronos/
 .chronos-code/
 .chronos-runtime/
 .chronos-overlay-test/

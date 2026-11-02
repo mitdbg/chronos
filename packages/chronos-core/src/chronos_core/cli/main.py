@@ -1,9 +1,8 @@
-"""One-off terminal commands wrapping the public relational API."""
+"""One-off terminal commands wrapping public Chronos APIs."""
 from __future__ import annotations
 
 import json
 import sys
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +10,8 @@ import typer
 import sqlglot
 from sqlglot import exp
 
-from chronos_core.cli._support import DatabaseConfig, connect, database_config, print_result
+from chronos_core.cli._support import DatabaseConfig, MergePolicy, connect, database_config, print_result
+from chronos_core.cli.qdrant import app as qdrant_app
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 branch_app = typer.Typer(no_args_is_help=True)
@@ -22,11 +22,7 @@ app.add_typer(branch_app, name="branch", help="Manage branches.")
 app.add_typer(table_app, name="table", help="Create ordinary tables and register them with Chronos.")
 app.add_typer(checkpoint_app, name="checkpoint", help="Create and list checkpoints.")
 app.add_typer(merge_app, name="merge", help="Preview and apply merges.")
-
-
-class MergePolicy(str, Enum):
-    abort_on_conflict = "abort_on_conflict"
-    snapshot_isolation = "snapshot_isolation"
+app.add_typer(qdrant_app, name="qdrant", help="Branch-aware vector storage and search.")
 
 
 @app.callback()

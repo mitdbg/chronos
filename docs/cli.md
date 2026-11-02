@@ -1,7 +1,7 @@
 # Chronos CLI
 
-The `chronos` command is a one-off wrapper around the public relational Python
-API. Each invocation opens the selected database, calls the API, prints its
+The `chronos` command is a one-off wrapper around the public relational and Qdrant
+Python APIs. Each invocation opens the selected store, calls the API, prints its
 return value, and closes the connection. It does not remember a current branch
 or keep a background connection open.
 
@@ -170,6 +170,39 @@ The CLI uses the default interval backend with one relational data store per
 invocation. DuckDB uses a separate metadata store as described below. Workspace
 coordination, a persistent interactive shell, advanced connection tuning, and
 custom Python merge callbacks are not exposed.
+
+## Qdrant
+
+The `qdrant` command group wraps `ChronosQdrantStore` and its branch sessions.
+Install the optional Qdrant dependency; for an existing checkout environment:
+
+```sh
+uv pip install 'qdrant-client>=1.18,<2'
+mkdir -p .chronos/qdrant-demo
+export CHRONOS_QDRANT_PATH="$PWD/.chronos/qdrant-demo/vectors"
+export CHRONOS_METADATA_URL="sqlite:///$PWD/.chronos/qdrant-demo/metadata.sqlite"
+
+uv run --no-sync --package chronos-core chronos qdrant collection register documents --dimensions 3
+uv run --no-sync --package chronos-core chronos qdrant point upsert documents example \
+  '{"vector":[1,0,0],"payload":{"title":"Example"}}'
+uv run --no-sync --package chronos-core chronos qdrant search documents '[1,0,0]'
+```
+
+Choose persistent local storage with `--path` / `CHRONOS_QDRANT_PATH`, or a server
+with `--url` / `CHRONOS_QDRANT_URL`, not both. Server authentication uses
+`--api-key` / `CHRONOS_QDRANT_API_KEY`. Metadata requires SQLite or PostgreSQL via
+`--metadata-url` / `CHRONOS_METADATA_URL`. Explicit Qdrant options go after
+`qdrant` and before the subcommand; flags override their environment variables.
+
+Point upsert and search also accept JSON from `--file`, `--stdin`, or a pipe.
+Use `--branch` to select a branch; `main` is the default. The group also exposes
+branch, checkpoint, diff, and merge operations through the public store APIs.
+Run `chronos qdrant --help` or subcommand help for available options. Results use
+the JSON conventions above; search consumes vectors rather than generating them.
+
+The example stores everything under `.chronos/qdrant-demo/`. After closing clients,
+remove that folder to delete both its vectors and metadata. Unset the demo
+environment variables before switching stores. No storage is created by help.
 
 ## DuckDB data with separate metadata
 

@@ -13,8 +13,8 @@ page says otherwise, commands and APIs apply to Chronos 0.2.0a1.
   optional DuckDB, filesystem, and S3 features.
 - [Integration](integration.md) explains how to adopt existing tables and route
   application access through Chronos.
-- [CLI](cli.md) wraps the relational API with branch, query, checkpoint, diff,
-  and merge commands, including JSON output for pipes and files.
+- [CLI](cli.md) wraps the relational and Qdrant APIs with JSON output for
+  pipes and files.
 - [Compatibility and limits](compatibility.md) states what is supported and
   where direct database access can bypass branch isolation.
 - [Branching introduction](branching-introduction.md) explains the data model

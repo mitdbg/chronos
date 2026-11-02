@@ -5,11 +5,13 @@ import base64
 import json
 import re
 import sqlite3
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Iterator
+from enum import Enum
+from typing import TYPE_CHECKING, Any, NoReturn
 from urllib.parse import urlsplit
 
 import psycopg
@@ -23,6 +25,11 @@ if TYPE_CHECKING:
 class DatabaseConfig:
     database_url: str
     metadata_url: str | None = None
+
+
+class MergePolicy(str, Enum):
+    abort_on_conflict = "abort_on_conflict"
+    snapshot_isolation = "snapshot_isolation"
 
 
 def database_config(ctx: typer.Context) -> DatabaseConfig:
@@ -57,8 +64,25 @@ def print_result(result: Any) -> None:
         typer.echo(json.dumps(result, default=_json_default, ensure_ascii=False, indent=2))
 
 
+def report_error(
+    error: Exception, *, secrets: tuple[str | None, ...] = (), urls: tuple[str | None, ...] = (),
+) -> NoReturn:
+    """Report an operational failure without exposing configured credentials."""
+    message = str(error)
+    for url in urls:
+        if url:
+            message = message.replace(url, "<database>")
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "<redacted>")
+    message = re.sub(r"([a-zA-Z][\w+.-]*://)[^\s/@]+@", r"\1<credentials>@", message)
+    message = re.sub(r"(?i)(password\s*=\s*)(?:'[^']*'|\"[^\"]*\"|[^\s]+)", r"\1<redacted>", message)
+    typer.echo(f"Error: {message}", err=True)
+    raise typer.Exit(1) from error
+
+
 @contextmanager
-def connect(database: DatabaseConfig) -> Iterator[ChronosBranchContext]:
+def connect(database: DatabaseConfig) -> Generator[ChronosBranchContext, None, None]:
     from chronos_core.branching import BranchingError, ChronosBranchContext
 
     try:
@@ -71,11 +95,4 @@ def connect(database: DatabaseConfig) -> Iterator[ChronosBranchContext]:
         finally:
             context.close()
     except (BranchingError, RuntimeError, sqlite3.Error, psycopg.Error, OSError, ValueError, TypeError) as error:
-        message = str(error)
-        for url in (database.database_url, database.metadata_url):
-            if url:
-                message = message.replace(url, "<database>")
-        message = re.sub(r"([a-zA-Z][\w+.-]*://)[^\s/@]+@", r"\1<credentials>@", message)
-        message = re.sub(r"(?i)(password\s*=\s*)(?:'[^']*'|\"[^\"]*\"|[^\s]+)", r"\1<redacted>", message)
-        typer.echo(f"Error: {message}", err=True)
-        raise typer.Exit(1) from error
+        report_error(error, urls=(database.database_url, database.metadata_url))
