@@ -106,7 +106,13 @@ jobs:
         run: |
           python -I -m pytest tests/test_cli.py::TestRelationalCommands \
             tests/test_cli.py::TestTerminalBehavior \
-            tests/test_cli_integration.py::TestRelationalWorkflows -q --timeout=60
+            tests/test_cli.py::TestWorkspaceConfiguration \
+            tests/test_cli.py::TestWorkspaceCommands \
+            tests/test_cli_integration.py::TestRelationalWorkflows \
+            tests/test_cli_integration.py::TestWorkspaceSQLWorkflows \
+            tests/test_cli_integration.py::TestWorkspaceResources::test_sqlite_workspace_persists_after_close \
+            tests/test_cli_integration.py::TestWorkspaceResources::test_sqlite_workspace_without_qdrant_dependency \
+            -q --timeout=60
       - name: Test Qdrant CLI in local and server modes
         if: matrix.python == '3.12' && matrix.duckdb == 'OFF'
         env:
@@ -118,4 +124,8 @@ jobs:
             -p 127.0.0.1:6333:6333 qdrant/qdrant:v1.20.0
           trap 'docker stop chronos-cli-qdrant-test > /dev/null' EXIT
           python -I -m pytest tests/test_cli.py::TestQdrantCommands \
-            tests/test_cli_integration.py::TestQdrantWorkflows -q --timeout=60
+            tests/test_cli.py::TestWorkspaceQdrantCommands \
+            tests/test_cli_integration.py::TestQdrantWorkflows \
+            tests/test_cli_integration.py::TestWorkspaceResources \
+            tests/test_cli_integration.py::TestWorkspaceQdrantWorkflows \
+            tests/test_cli_integration.py::TestWorkspaceFailureWorkflows -q --timeout=60

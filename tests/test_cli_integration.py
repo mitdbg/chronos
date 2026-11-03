@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 import time
 from dataclasses import asdict
 from functools import partial
@@ -16,11 +17,13 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from typer.testing import CliRunner
 from psycopg import sql as postgres_sql
 
 from chronos_core import _native_interval
 from chronos_core.cli._qdrant import QdrantConfig
 from chronos_core.cli._relational import DatabaseConfig
+from chronos_core.cli._workspace_config import load_workspace_config, open_workspace
 
 
 def _run_cli(arguments: list[str], *, environment: dict[str, str],
@@ -324,3 +327,308 @@ class TestQdrantWorkflows:
         data.write_text("[0,1,0]", encoding="utf-8")
         assert _invoke_qdrant(target, "search", "docs", "--file", str(data))[0]["id"] == "two"
         assert _invoke_qdrant(target, "search", "docs", input_text="[1,0,0]")[0]["id"] == "one"
+
+
+class TestWorkspaceResources:
+    def test_sqlite_workspace_without_qdrant_dependency(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "chronos.toml"
+        config_file.write_text('[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\n')
+        code = '''
+            import importlib.abc
+            import json
+            import sys
+            from pathlib import Path
+
+            class BlockQdrant(importlib.abc.MetaPathFinder):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "qdrant_client" or fullname.startswith("qdrant_client."):
+                        raise ModuleNotFoundError("simulated missing qdrant-client")
+
+            sys.meta_path.insert(0, BlockQdrant())
+            from chronos_core.cli._workspace_config import load_workspace_config, open_workspace
+            with open_workspace(load_workspace_config(Path(sys.argv[1]))) as workspace:
+                print(json.dumps(workspace.list_branches()))
+        '''
+        result = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", textwrap.dedent(code), str(config_file)],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == ["main"]
+
+    def test_sqlite_workspace_persists_after_close(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "chronos.toml"
+        config_file.write_text('[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\n')
+        config = load_workspace_config(config_file)
+        with open_workspace(config) as workspace:
+            database = workspace.stores["app"]
+            database.db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")
+            database.db.commit()
+            database.register_table("items", ["id"])
+            session = workspace.checkout().stores["app"]
+            session.execute("INSERT INTO items (id, value) VALUES (1, 'persisted')")
+        assert (tmp_path / "app.sqlite").is_file()
+        with open_workspace(config) as workspace:
+            assert workspace.checkout().stores["app"].query("SELECT * FROM items") == [
+                {"id": 1, "value": "persisted"},
+            ]
+
+    def test_add_qdrant_to_existing_sqlite_workspace(self, tmp_path: Path) -> None:
+        pytest.importorskip("qdrant_client")
+        config_file = tmp_path / "chronos.toml"
+        sqlite_config = '[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\n'
+        config_file.write_text(sqlite_config)
+        with open_workspace(load_workspace_config(config_file)) as workspace:
+            database = workspace.stores["app"]
+            database.db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")
+            database.db.commit()
+            database.register_table("items", ["id"])
+            workspace.checkout().stores["app"].execute("INSERT INTO items (id, value) VALUES (1, 'base')")
+            workspace.create_branch("experiment")
+            workspace.checkout("experiment").stores["app"].execute("UPDATE items SET value = 'candidate' WHERE id = 1")
+        config_file.write_text(sqlite_config + '''
+[workspace]
+shared_metadata_url="sqlite:///app.sqlite"
+[stores.vectors]
+kind="qdrant"
+metadata_url="sqlite:///app.sqlite"
+path="vectors"
+''')
+        config = load_workspace_config(config_file)
+        with open_workspace(config) as workspace:
+            assert set(workspace.list_branches()) == {"main", "experiment"}
+            workspace.stores["vectors"].register_collection("documents", 2)
+            main = workspace.checkout("main")
+            experiment = workspace.checkout("experiment")
+            assert main.stores["app"].query("SELECT * FROM items") == [{"id": 1, "value": "base"}]
+            assert experiment.stores["app"].query("SELECT * FROM items") == [{"id": 1, "value": "candidate"}]
+            experiment.stores["vectors"].upsert("documents", "one", [1.0, 0.0], {"value": "candidate"})
+            assert main.stores["vectors"].get("documents", "one") is None
+            result = workspace.merge_atomic(
+                "experiment", "main", operation_id="added-qdrant", policy="abort_on_conflict",
+            )
+            assert result.status == "committed"
+            assert result.stores == {"app": 1, "vectors": 1}
+        with open_workspace(config) as workspace:
+            main = workspace.checkout("main")
+            assert main.stores["app"].query("SELECT * FROM items") == [{"id": 1, "value": "candidate"}]
+            assert main.stores["vectors"].get("documents", "one").payload == {"value": "candidate"}
+
+    @pytest.mark.parametrize("atomic", [False, True])
+    def test_sqlite_qdrant_workspace_reopens(self, tmp_path: Path, atomic: bool) -> None:
+        pytest.importorskip("qdrant_client")
+        config_file = tmp_path / "chronos.toml"
+        header = '[workspace]\nshared_metadata_url="sqlite:///app.sqlite"\n' if atomic else ""
+        metadata = "app.sqlite" if atomic else "vectors.sqlite"
+        config_file.write_text(header + f'''
+[stores.app]
+kind="sqlite"
+database_url="sqlite:///app.sqlite"
+[stores.vectors]
+kind="qdrant"
+metadata_url="sqlite:///{metadata}"
+path="vectors"
+''')
+        config = load_workspace_config(config_file)
+        with open_workspace(config) as workspace:
+            database = workspace.stores["app"]
+            database.db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")
+            database.db.commit()
+            database.register_table("items", ["id"])
+            workspace.stores["vectors"].register_collection("documents", 2)
+            workspace.create_branch("experiment")
+            session = workspace.checkout("experiment")
+            session.stores["app"].execute("INSERT INTO items (id, value) VALUES (1, 'candidate')")
+            session.stores["vectors"].upsert("documents", "one", [1.0, 0.0], {"value": "candidate"})
+            workspace.create_checkpoint("saved", branch="experiment")
+        assert (tmp_path / "app.sqlite").is_file()
+        assert (tmp_path / "vectors").is_dir()
+        with open_workspace(config) as workspace:
+            main = workspace.checkout("main")
+            assert main.stores["app"].query("SELECT * FROM items") == []
+            assert main.stores["vectors"].get("documents", "one") is None
+            assert {name: len(diff.changes) for name, diff in workspace.diff("main", "experiment").items()} == {
+                "app": 1, "vectors": 1,
+            }
+            if atomic:
+                preview = workspace.merge_atomic_preview("experiment", "main", policy="abort_on_conflict")
+                result = workspace.merge_atomic(
+                    "experiment", "main", policy="abort_on_conflict",
+                    operation_id="workspace-persistence", preview_token=preview.preview_token,
+                )
+                assert result.status == "committed"
+                assert result.stores == {"app": 1, "vectors": 1}
+            else:
+                assert set(workspace.merge_apply("experiment", "main", policy="abort_on_conflict")) == {"app", "vectors"}
+        with open_workspace(config) as workspace:
+            main = workspace.checkout("main")
+            assert main.stores["app"].query("SELECT * FROM items") == [{"id": 1, "value": "candidate"}]
+            assert main.stores["vectors"].get("documents", "one").payload == {"value": "candidate"}
+            workspace.delete_branch("experiment")
+
+
+def _workspace_config_file(root: Path, database: DatabaseConfig, vectors: QdrantConfig | None = None, *, atomic: bool = False) -> Path:
+    lines = []
+    if atomic:
+        lines.extend(["[workspace]", f"shared_metadata_url={json.dumps(database.metadata_url or database.database_url)}"])
+    lines.extend(["[stores.app]", f"kind={json.dumps(urlsplit(database.database_url).scheme)}",
+                  f"database_url={json.dumps(database.database_url)}"])
+    if database.metadata_url:
+        lines.append(f"metadata_url={json.dumps(database.metadata_url)}")
+    if vectors is not None:
+        lines.extend(["[stores.vectors]", 'kind="qdrant"', f"metadata_url={json.dumps(vectors.metadata_url)}",
+                      f"collection_prefix={json.dumps(vectors.collection_prefix)}"])
+        if vectors.path is not None:
+            lines.append(f"path={json.dumps(str(vectors.path))}")
+        else:
+            lines.append(f"url={json.dumps(vectors.url)}")
+            if vectors.api_key:
+                lines.append(f"api_key={json.dumps(vectors.api_key)}")
+    config = root / "chronos.toml"
+    config.write_text("\n".join(lines) + "\n")
+    return config
+
+
+def _invoke_workspace(config: Path, *args: str, ok: bool = True, input_text: str | None = None) -> Any:
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("CHRONOS_")}
+    environment["CHRONOS_WORKSPACE_CONFIG"] = str(config)
+    return _run_cli(["workspace", *args], environment=environment, ok=ok, input_text=input_text)
+
+
+class TestWorkspaceSQLWorkflows:
+    def test_relational_workspace(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
+        config = _workspace_config_file(tmp_path, cli_database)
+        _invoke_workspace(config, "table", "create", "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)", "--store", "app")
+        _invoke_workspace(config, "table", "register", "items", "--primary-key", "id", "--store", "app")
+        _invoke_workspace(config, "execute", "INSERT INTO items (id, value) VALUES (:id, :value)", "--store", "app", "--params", '{"id":1,"value":"base"}')
+        # A second independently backed SQL store needs no special adapter in the CLI.
+        audit_url = f"sqlite:///{tmp_path / 'audit.sqlite'}"
+        with config.open("a") as stream:
+            stream.write(f'\n[stores.audit]\nkind="sqlite"\ndatabase_url={json.dumps(audit_url)}\n')
+        _invoke_workspace(config, "table", "create", "CREATE TABLE audit (id INTEGER PRIMARY KEY, value TEXT)", "--store", "audit")
+        _invoke_workspace(config, "table", "register", "audit", "--primary-key", "id", "--store", "audit")
+        _invoke_workspace(config, "branch", "create", "experiment")
+        _invoke_workspace(config, "execute", "UPDATE items SET value = 'candidate' WHERE id = 1", "--store", "app", "--branch", "experiment")
+        _invoke_workspace(config, "execute", "INSERT INTO audit (id, value) VALUES (1, 'candidate')", "--store", "audit", "--branch", "experiment")
+        assert _invoke_workspace(config, "query", "SELECT value FROM items", "--store", "app") == [{"value": "base"}]
+        assert _invoke_workspace(config, "query", "SELECT * FROM audit", "--store", "audit") == []
+        checkpoint = _invoke_workspace(config, "checkpoint", "create", "saved", "--branch", "experiment")
+        assert set(checkpoint) == {"app", "audit"}
+        _invoke_workspace(config, "branch", "create-from-checkpoint", "restored", "saved")
+        assert _invoke_workspace(config, "query", "SELECT value FROM items", "--store", "app", "--branch", "restored") == [{"value": "candidate"}]
+        difference = _invoke_workspace(config, "diff", "main", "experiment")
+        assert {name: len(result["changes"]) for name, result in difference.items()} == {"app": 1, "audit": 1}
+        assert set(_invoke_workspace(config, "merge", "preview", "experiment", "main")) == {"app", "audit"}
+        _invoke_workspace(config, "merge", "atomic-preview", "experiment", "main", ok=False)
+        assert set(_invoke_workspace(config, "merge", "apply", "experiment", "main")) == {"app", "audit"}
+        assert _invoke_workspace(config, "query", "SELECT value FROM items", "--store", "app") == [{"value": "candidate"}]
+        assert _invoke_workspace(config, "query", "SELECT value FROM audit", "--store", "audit") == [{"value": "candidate"}]
+        _invoke_workspace(config, "branch", "delete", "restored")
+        _invoke_workspace(config, "branch", "delete", "experiment")
+        assert _invoke_workspace(config, "branch", "list") == ["main"]
+
+
+class TestWorkspaceQdrantWorkflows:
+    @pytest.mark.parametrize("atomic", [False, True])
+    def test_two_store_workflow(self, qdrant_target: QdrantConfig, tmp_path: Path, atomic: bool) -> None:
+        target = qdrant_target
+        database = DatabaseConfig(target.metadata_url if atomic else f"sqlite:///{tmp_path / 'app.sqlite'}")
+        # Begin with SQLite/PostgreSQL alone, then add Qdrant to existing data.
+        config = _workspace_config_file(tmp_path, database)
+        _invoke_workspace(config, "table", "create", "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)", "--store", "app")
+        _invoke_workspace(config, "table", "register", "items", "--primary-key", "id", "--store", "app")
+        _invoke_workspace(config, "execute", "INSERT INTO items (id, value) VALUES (1, 'base')", "--store", "app")
+        config = _workspace_config_file(tmp_path, database, target, atomic=atomic)
+        _invoke_workspace(config, "qdrant", "--store", "vectors", "collection", "register", "documents", "--dimensions", "3")
+        assert _invoke_workspace(config, "qdrant", "--store", "vectors", "collection", "info", "documents")["dimensions"] == 3
+        _invoke_workspace(config, "branch", "create", "experiment")
+        _invoke_workspace(config, "execute", "UPDATE items SET value = 'candidate' WHERE id = 1", "--store", "app", "--branch", "experiment")
+        _invoke_workspace(config, "qdrant", "--store", "vectors", "point", "upsert", "documents", "one", "--stdin", "--branch", "experiment", input_text='{"vector":[1,0,0],"payload":{"value":"candidate"}}')
+        assert _invoke_workspace(config, "query", "--store", "app", "--stdin", input_text="SELECT value FROM items") == [{"value": "base"}]
+        assert _invoke_workspace(config, "qdrant", "--store", "vectors", "point", "get", "documents", "one") is None
+        assert _invoke_workspace(config, "qdrant", "--store", "vectors", "search", "documents", "[1,0,0]", "--branch", "experiment")[0]["id"] == "one"
+        _invoke_workspace(config, "checkpoint", "create", "saved", "--branch", "experiment")
+        _invoke_workspace(config, "branch", "create-from-checkpoint", "restored", "saved")
+        assert _invoke_workspace(config, "qdrant", "--store", "vectors", "point", "get", "documents", "one", "--branch", "restored")["payload"] == {"value": "candidate"}
+        assert {name: len(result["changes"]) for name, result in _invoke_workspace(config, "diff", "main", "experiment").items()} == {"app": 1, "vectors": 1}
+        if atomic:
+            preview = _invoke_workspace(config, "merge", "atomic-preview", "experiment", "main")
+            _invoke_workspace(config, "merge", "apply", "experiment", "main", ok=False)
+            result = _invoke_workspace(config, "merge", "atomic-apply", "experiment", "main", "--operation-id", "workspace-demo", "--preview-token", preview["preview_token"])
+            assert result["status"] == "committed"
+            assert result["stores"] == {"app": 1, "vectors": 1}
+        else:
+            assert set(_invoke_workspace(config, "merge", "preview", "experiment", "main")) == {"app", "vectors"}
+            _invoke_workspace(config, "merge", "apply", "experiment", "main")
+        assert _invoke_workspace(config, "query", "SELECT value FROM items", "--store", "app") == [{"value": "candidate"}]
+        assert _invoke_workspace(config, "qdrant", "--store", "vectors", "point", "get", "documents", "one")["payload"] == {"value": "candidate"}
+        _invoke_workspace(config, "qdrant", "--store", "vectors", "point", "delete", "documents", "one")
+        assert _invoke_workspace(config, "qdrant", "--store", "vectors", "point", "list", "documents") == []
+        _invoke_workspace(config, "branch", "delete", "restored")
+        _invoke_workspace(config, "branch", "delete", "experiment")
+        assert _invoke_workspace(config, "branch", "list") == ["main"]
+
+
+def _prepare_workspace_merge(root: Path, *, atomic: bool) -> Path:
+    pytest.importorskip("qdrant_client")
+    database = DatabaseConfig(f"sqlite:///{root / 'app.sqlite'}")
+    target = QdrantConfig(
+        metadata_url=database.database_url if atomic else f"sqlite:///{root / 'vectors.sqlite'}",
+        path=root / "vectors",
+    )
+    config = _workspace_config_file(root, database, target, atomic=atomic)
+    _invoke_workspace(config, "table", "create", "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)", "--store", "app")
+    _invoke_workspace(config, "table", "register", "items", "--primary-key", "id", "--store", "app")
+    _invoke_workspace(config, "execute", "INSERT INTO items (id, value) VALUES (1, 'base')", "--store", "app")
+    _invoke_workspace(config, "qdrant", "--store", "vectors", "collection", "register", "documents", "--dimensions", "3")
+    _invoke_workspace(config, "branch", "create", "experiment")
+    _invoke_workspace(config, "execute", "UPDATE items SET value = 'candidate' WHERE id = 1", "--store", "app", "--branch", "experiment")
+    _invoke_workspace(config, "qdrant", "--store", "vectors", "point", "upsert", "documents", "one", '{"vector":[1,0,0]}', "--branch", "experiment")
+    return config
+
+
+class TestWorkspaceFailureWorkflows:
+    def test_atomic_stale_preview_is_rejected(self, tmp_path: Path) -> None:
+        config = _prepare_workspace_merge(tmp_path, atomic=True)
+        preview = _invoke_workspace(config, "merge", "atomic-preview", "experiment", "main")
+        _invoke_workspace(config, "execute", "UPDATE items SET value = 'changed after preview' WHERE id = 1", "--store", "app", "--branch", "experiment")
+        _invoke_workspace(config, "merge", "atomic-apply", "experiment", "main", "--operation-id", "stale", "--preview-token", preview["preview_token"], ok=False)
+        assert _invoke_workspace(config, "query", "SELECT value FROM items", "--store", "app") == [{"value": "base"}]
+        assert _invoke_workspace(config, "qdrant", "--store", "vectors", "point", "get", "documents", "one") is None
+
+    @pytest.mark.parametrize("atomic", [False, True])
+    def test_merge_failure_retains_api_guarantees(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, atomic: bool) -> None:
+        config = _prepare_workspace_merge(tmp_path, atomic=atomic)
+        from chronos_core.cli.main import app
+        from chronos_core.workspace.qdrant import ChronosQdrantStore
+
+        def fail_vector_store(*args, **kwargs):
+            raise RuntimeError("injected vector failure")
+
+        # Fail the second participant after SQL has applied/staged its changes.
+        method = "stage_branch_transaction_changes" if atomic else "merge_apply"
+        monkeypatch.setattr(ChronosQdrantStore, method, fail_vector_store)
+        command = "atomic-apply" if atomic else "apply"
+        arguments = ["workspace", "--config", str(config), "merge", command, "experiment", "main"]
+        if atomic:
+            arguments.extend(["--operation-id", "failed-merge"])
+        result = CliRunner().invoke(app, arguments)
+        assert result.exit_code == 1, result.output
+        assert result.stdout == ""
+        assert "injected vector failure" in result.stderr
+        assert "Traceback" not in result.stderr
+        # Atomic mode never publishes the staged SQL change; coordinated mode
+        # preserves the API's partial apply instead of pretending to roll it back.
+        expected = "base" if atomic else "candidate"
+        assert _invoke_workspace(config, "query", "SELECT value FROM items", "--store", "app") == [{"value": expected}]
+        assert _invoke_workspace(config, "qdrant", "--store", "vectors", "point", "get", "documents", "one") is None
+        assert _invoke_workspace(config, "query", "SELECT value FROM items", "--store", "app", "--branch", "experiment") == [{"value": "candidate"}]
+
+    def test_conflict_blocks_atomic_merge(self, tmp_path: Path) -> None:
+        config = _prepare_workspace_merge(tmp_path, atomic=True)
+        _invoke_workspace(config, "execute", "UPDATE items SET value = 'main change' WHERE id = 1", "--store", "app")
+        preview = _invoke_workspace(config, "merge", "atomic-preview", "experiment", "main")
+        assert len(preview["stores"]["app"]["conflicts"]) == 1
+        _invoke_workspace(config, "merge", "atomic-apply", "experiment", "main", "--operation-id", "conflicting", ok=False)
+        assert _invoke_workspace(config, "query", "SELECT value FROM items", "--store", "app") == [{"value": "main change"}]
+        assert _invoke_workspace(config, "qdrant", "--store", "vectors", "point", "get", "documents", "one") is None

@@ -190,6 +190,7 @@ source = { editable = "packages/chronos-core" }
 dependencies = [
     { name = "psycopg", extra = ["binary"] },
     { name = "sqlglot" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "typer" },
 ]
 
@@ -227,6 +228,7 @@ requires-dist = [
     { name = "qdrant-client", marker = "extra == 'qdrant'", specifier = ">=1.18,<2" },
     { name = "qdrant-client", marker = "extra == 'test'", specifier = ">=1.18,<2" },
     { name = "sqlglot", specifier = ">=25" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
     { name = "tomli", marker = "python_full_version < '3.11' and extra == 'mcp'", specifier = ">=2.0" },
     { name = "tomli", marker = "python_full_version < '3.11' and extra == 'test'", specifier = ">=2.0" },
     { name = "typer", specifier = ">=0.25.1" },

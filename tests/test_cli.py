@@ -11,18 +11,54 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock
+from contextlib import contextmanager
 
 import pytest
 import typer
 from typer.testing import CliRunner
 
 from chronos_core.branching import BranchingError, ChronosBranchContext
-from chronos_core.cli import _qdrant
+from chronos_core.cli import _qdrant, _workspace
 from chronos_core.cli._relational import DatabaseConfig, connect
 from chronos_core.cli._terminal import print_result
+from chronos_core.cli._workspace_config import (
+    WorkspaceConfigError, load_workspace_config, open_workspace,
+)
 from chronos_core.cli.main import app
 
 runner = CliRunner()
+
+
+@pytest.fixture
+def workspace_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHRONOS_WORKSPACE_CONFIG", raising=False)
+    (tmp_path / "chronos.toml").write_text(
+        '[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\n'
+        '[stores.other]\nkind="sqlite"\ndatabase_url="sqlite:///other.sqlite"\n'
+    )
+    workspace = MagicMock()
+    for method in ("create_branch", "create_branch_from_checkpoint", "delete_branch", "create_checkpoint",
+                   "diff", "merge_preview", "merge_apply", "merge_atomic_preview", "merge_atomic"):
+        getattr(workspace, method).return_value = None
+    workspace.list_branches.return_value = ["main"]
+    workspace.stores = {"app": MagicMock(), "other": MagicMock()}
+    workspace.stores["app"].register_table.return_value = None
+    workspace.stores["app"].db.commit.return_value = None
+    session = MagicMock()
+    session.query.return_value = [{"id": 1}]
+    session.execute.return_value = None
+    workspace.checkout.return_value.stores = {"app": session, "other": MagicMock()}
+
+    @contextmanager
+    def opened(config):
+        try:
+            yield workspace
+        finally:
+            workspace.close()
+
+    monkeypatch.setattr(_workspace, "open_workspace", MagicMock(side_effect=opened))
+    return workspace
 
 
 @pytest.fixture
@@ -447,3 +483,386 @@ class TestTerminalBehavior:
         assert capsys.readouterr().out == ""
         with pytest.raises(TypeError, match="Unsupported JSON value"):
             print_result(object())
+
+
+class TestWorkspaceConfiguration:
+    def test_path_precedence_and_relative_storage(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("CHRONOS_WORKSPACE_CONFIG", raising=False)
+        default = tmp_path / "chronos.toml"
+        default.write_text('[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///.chronos/app.sqlite"\n')
+        assert load_workspace_config().stores["app"].metadata_url == f"sqlite:///{tmp_path / '.chronos/app.sqlite'}"
+        other = tmp_path / "project"
+        other.mkdir()
+        configured = other / "workspace.toml"
+        configured.write_text('[stores.analytics]\nkind="duckdb"\ndatabase_url="duckdb:///data.duckdb"\nmetadata_url="sqlite:///meta.sqlite"\n')
+        monkeypatch.setenv("CHRONOS_WORKSPACE_CONFIG", str(configured))
+        selected = load_workspace_config()
+        assert selected.config_path == configured
+        assert selected.stores["analytics"].connection == DatabaseConfig(
+            f"duckdb:///{other / 'data.duckdb'}", f"sqlite:///{other / 'meta.sqlite'}",
+        )
+        assert load_workspace_config(default).config_path == default
+        assert not (tmp_path / ".chronos").exists()
+        assert sorted(item.name for item in other.iterdir()) == ["workspace.toml"]
+
+    def test_environment_values_and_atomic_metadata(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("WORKSPACE_DATABASE", "postgres://user:secret@localhost/test")
+        monkeypatch.setenv("VECTOR_KEY", "vector-secret")
+        config = tmp_path / "chronos.toml"
+        config.write_text('''
+[workspace]
+shared_metadata_url = "${WORKSPACE_DATABASE}"
+[stores.app]
+kind = "postgresql"
+database_url = "${WORKSPACE_DATABASE}"
+[stores.vectors]
+kind = "qdrant"
+metadata_url = "${WORKSPACE_DATABASE}"
+url = "http://localhost:6333"
+api_key = "${VECTOR_KEY}"
+timeout = 2.5
+''')
+        loaded = load_workspace_config(config)
+        assert loaded.shared_metadata_url == "postgresql://user:secret@localhost/test"
+        assert loaded.stores["vectors"].connection == _qdrant.QdrantConfig(
+            loaded.shared_metadata_url, url="http://localhost:6333", api_key="vector-secret", timeout=2.5,
+        )
+        monkeypatch.delenv("VECTOR_KEY")
+        with pytest.raises(WorkspaceConfigError, match="unset environment variable 'VECTOR_KEY'") as failure:
+            load_workspace_config(config)
+        assert "secret" not in str(failure.value)
+
+    @pytest.mark.parametrize("source", [
+        '', '[stores.app]\nkind="other"',
+        '[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///:memory:"',
+        '[stores.app]\nkind="sqlite"\ndatabase_url="postgresql://user:secret@host/test"',
+        '[stores.app]\nkind="duckdb"\ndatabase_url="duckdb:///app.duckdb"',
+        '[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\ntypo="secret"',
+        '[stores.fs]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"',
+        '[stores.vectors]\nkind="qdrant"\nmetadata_url="sqlite:///meta.sqlite"',
+        '[stores.vectors]\nkind="qdrant"\nmetadata_url="sqlite:///meta.sqlite"\npath=":memory:"',
+        '[stores.vectors]\nkind="qdrant"\nmetadata_url="sqlite:///meta.sqlite"\npath="data"\nurl="http://localhost:6333"',
+        '[stores.vectors]\nkind="qdrant"\nmetadata_url="sqlite:///meta.sqlite"\npath="data"\napi_key="secret"',
+        '[stores.vectors]\nkind="qdrant"\nmetadata_url="sqlite:///meta.sqlite"\nurl="http://localhost:6333"\ntimeout=nan',
+        '[stores.vectors]\nkind="qdrant"\nmetadata_url="sqlite:///meta.sqlite"\nurl="http://localhost:6333"\ntimeout=true',
+        '[workspace]\nshared_metadata_url="sqlite:///shared.sqlite"\n[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///other.sqlite"',
+        '[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///same.sqlite"\n[stores.vectors]\nkind="qdrant"\nmetadata_url="sqlite:///same.sqlite"\npath="data"',
+        '[stores.app]\nkind="sqlite"\ndatabase_url="secret',
+    ])
+    def test_invalid_configuration_does_not_create_storage(self, source: str, tmp_path: Path) -> None:
+        config = tmp_path / "chronos.toml"
+        config.write_text(source)
+        with pytest.raises(WorkspaceConfigError) as failure:
+            load_workspace_config(config)
+        assert "secret" not in str(failure.value)
+        assert list(tmp_path.iterdir()) == [config]
+
+    def test_store_selection(self, tmp_path: Path) -> None:
+        config = tmp_path / "chronos.toml"
+        config.write_text('[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"')
+        loaded = load_workspace_config(config)
+        assert loaded.store("app").kind == "sqlite"
+        with pytest.raises(WorkspaceConfigError, match="Unknown store"):
+            loaded.store("missing")
+        with pytest.raises(WorkspaceConfigError, match="not a Qdrant store"):
+            loaded.store("app", qdrant=True)
+
+    @pytest.mark.parametrize("failure_stage", ["none", "open", "workspace", "operation", "close"])
+    def test_resource_ownership(self, failure_stage: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import chronos_core.workspace as workspace_api
+
+        config_path = tmp_path / "chronos.toml"
+        # Declaration order must not affect shared-context construction or cleanup.
+        config_path.write_text('''
+[workspace]
+shared_metadata_url="sqlite:///app.sqlite"
+[stores.vectors]
+kind="qdrant"
+metadata_url="sqlite:///app.sqlite"
+path="vectors"
+[stores.app]
+kind="sqlite"
+database_url="sqlite:///app.sqlite"
+''')
+        loaded = load_workspace_config(config_path)
+        database = MagicMock()
+        vectors = MagicMock()
+        factory = MagicMock()
+        factory.local.return_value = vectors
+        workspace_factory = MagicMock()
+        monkeypatch.setattr(ChronosBranchContext, "connect", MagicMock(return_value=database))
+        monkeypatch.setattr(_qdrant, "_store_class", lambda: factory)
+        monkeypatch.setattr(workspace_api, "ChronosWorkspaceContext", workspace_factory)
+        events = []
+        database.close.side_effect = lambda: events.append("database")
+
+        def close_vectors() -> None:
+            events.append("vectors")
+            if failure_stage in {"operation", "close"}:
+                raise RuntimeError("close failed")
+
+        vectors.close.side_effect = close_vectors
+        if failure_stage == "open":
+            factory.local.side_effect = RuntimeError("open failed")
+        if failure_stage == "workspace":
+            workspace_factory.side_effect = RuntimeError("workspace failed")
+        if failure_stage == "none":
+            with open_workspace(loaded) as workspace:
+                assert workspace is workspace_factory.return_value
+        else:
+            expected = "operation failed" if failure_stage == "operation" else f"{failure_stage} failed"
+            with pytest.raises(RuntimeError, match=expected):
+                with open_workspace(loaded):
+                    if failure_stage == "operation":
+                        raise RuntimeError("operation failed")
+        assert events == (["database"] if failure_stage == "open" else ["vectors", "database"])
+        if failure_stage != "open":
+            factory.local.assert_called_once_with(
+                loaded.shared_metadata_url, path=tmp_path / "vectors", collection_prefix="chronos_", context=database,
+            )
+            workspace_factory.assert_called_once_with(
+                stores={"vectors": vectors, "app": database}, shared_metadata_url=loaded.shared_metadata_url,
+            )
+            workspace_factory.return_value.close.assert_not_called()
+
+    def test_split_sql_and_remote_qdrant(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import chronos_core.workspace as workspace_api
+
+        config_file = tmp_path / "chronos.toml"
+        config_file.write_text('''
+[workspace]
+shared_metadata_url="postgresql://localhost/metadata"
+[stores.analytics]
+kind="duckdb"
+database_url="duckdb:///analytics.duckdb"
+metadata_url="postgresql://localhost/metadata"
+[stores.vectors]
+kind="qdrant"
+metadata_url="postgresql://localhost/metadata"
+url="http://localhost:6333"
+api_key="test-key"
+collection_prefix="project_"
+timeout=3
+''')
+        config = load_workspace_config(config_file)
+        split = MagicMock()
+        monkeypatch.setattr(ChronosBranchContext, "connect_split", split)
+        factory = MagicMock()
+        monkeypatch.setattr(_qdrant, "_store_class", lambda: factory)
+        workspace_factory = MagicMock()
+        monkeypatch.setattr(workspace_api, "ChronosWorkspaceContext", workspace_factory)
+        with open_workspace(config):
+            pass
+        split.assert_called_once_with(f"duckdb:///{tmp_path / 'analytics.duckdb'}", "postgresql://localhost/metadata")
+        factory.remote.assert_called_once_with(
+            "postgresql://localhost/metadata", url="http://localhost:6333", api_key="test-key",
+            collection_prefix="project_", timeout=3, context=None,
+        )
+        split.return_value.close.assert_called_once_with()
+        factory.remote.return_value.close.assert_called_once_with()
+
+    def test_missing_file(self, tmp_path: Path) -> None:
+        with pytest.raises(WorkspaceConfigError, match="Cannot read workspace configuration"):
+            load_workspace_config(tmp_path / "missing.toml")
+
+
+class TestWorkspaceCommands:
+    @pytest.mark.parametrize(("args", "method", "expected_args", "expected_kwargs"), [
+        (["branch", "list"], "list_branches", (), {}),
+        (["branch", "create", "trial", "--from", "parent"], "create_branch", ("trial",), {"from_branch": "parent"}),
+        (["branch", "create-from-checkpoint", "trial", "saved"], "create_branch_from_checkpoint", ("trial", "saved"), {}),
+        (["branch", "delete", "trial"], "delete_branch", ("trial",), {}),
+        (["checkpoint", "create", "saved", "--branch", "trial"], "create_checkpoint", ("saved",), {"branch": "trial"}),
+        (["diff", "main", "trial"], "diff", ("main", "trial"), {}),
+        (["merge", "preview", "trial", "main"], "merge_preview", ("trial", "main"), {"policy": "abort_on_conflict"}),
+        (["merge", "apply", "trial", "main", "--policy", "snapshot_isolation"], "merge_apply", ("trial", "main"), {"policy": "snapshot_isolation"}),
+        (["merge", "atomic-preview", "trial", "main"], "merge_atomic_preview", ("trial", "main"), {"policy": "abort_on_conflict"}),
+        (["merge", "atomic-apply", "trial", "main", "--operation-id", "merge-1", "--preview-token", "reviewed"],
+         "merge_atomic", ("trial", "main"), {"policy": "abort_on_conflict", "operation_id": "merge-1", "preview_token": "reviewed"}),
+    ])
+    def test_workspace_forwarding(self, workspace_connection: MagicMock, args, method, expected_args, expected_kwargs) -> None:
+        result = runner.invoke(app, ["workspace", *args])
+        assert result.exit_code == 0, result.output
+        getattr(workspace_connection, method).assert_called_once_with(*expected_args, **expected_kwargs)
+        workspace_connection.close.assert_called_once_with()
+        if method == "list_branches":
+            assert json.loads(result.stdout) == ["main"]
+        else:
+            assert result.stdout == ""
+
+    def test_named_relational_commands(self, workspace_connection: MagicMock) -> None:
+        workspace = workspace_connection
+        result = runner.invoke(app, ["workspace", "table", "create", "--store", "app", "CREATE TABLE items (id INTEGER)"])
+        assert result.exit_code == 0, result.output
+        workspace.stores["app"].db.execute.assert_called_once_with("CREATE TABLE items (id INTEGER)")
+        workspace.stores["app"].db.commit.assert_called_once_with()
+        result = runner.invoke(app, ["workspace", "table", "register", "items", "--store", "app", "--primary-key", "id", "--primary-key", "tenant"])
+        assert result.exit_code == 0, result.output
+        workspace.stores["app"].register_table.assert_called_once_with("items", ["id", "tenant"])
+        result = runner.invoke(app, ["workspace", "query", "SELECT :id", "--store", "app", "--branch", "trial", "--params", '{"id":1}'])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == [{"id": 1}]
+        session = workspace.checkout.return_value.stores["app"]
+        session.query.assert_called_once_with("SELECT :id", {"id": 1})
+        workspace.checkout.assert_called_once_with("trial")
+        for checked_out in workspace.checkout.return_value.stores.values():
+            checked_out.close.assert_called_once_with()
+        result = runner.invoke(app, ["workspace", "execute", "UPDATE items SET id = :id", "--store", "app", "--params", '{"id":2}'])
+        assert result.exit_code == 0, result.output
+        session.execute.assert_called_once_with("UPDATE items SET id = :id", {"id": 2})
+
+    def test_sql_input_modes(self, workspace_connection: MagicMock, tmp_path: Path) -> None:
+        sql_file = tmp_path / "query.sql"
+        sql_file.write_text("SELECT :id")
+        session = workspace_connection.checkout.return_value.stores["app"]
+        for args, input_text in [(["--file", str(sql_file)], None), (["--stdin"], "SELECT :id"), ([], "SELECT :id")]:
+            result = runner.invoke(app, ["workspace", "query", "--store", "app", "--params", '{"id":3}', *args], input=input_text)
+            assert result.exit_code == 0, result.output
+            assert session.query.call_args.args == ("SELECT :id", {"id": 3})
+
+    @pytest.mark.parametrize("args", [
+        ["query", "SELECT 1", "--store", "missing"],
+        ["query", "SELECT 1", "--store", "app", "--params", "[]"],
+        ["query", "SELECT 1", "--store", "app", "--stdin"],
+        ["query", "--store", "app", "--stdin"],
+        ["table", "create", "--store", "app", "DELETE FROM items"],
+        ["qdrant", "--store", "app", "collection", "list"],
+        ["qdrant", "collection", "list"],
+        ["merge", "atomic-apply", "trial", "main"],
+    ])
+    def test_invalid_arguments_do_not_open_stores(self, workspace_connection: MagicMock, args) -> None:
+        result = runner.invoke(app, ["workspace", *args], input="")
+        assert result.exit_code == 2, result.output
+        _workspace.open_workspace.assert_not_called()
+
+    def test_help_and_configuration_precedence(self, workspace_connection: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        for args in ([], ["branch"], ["query"], ["qdrant"], ["qdrant", "point"], ["qdrant", "point", "upsert"], ["merge", "atomic-apply"]):
+            result = runner.invoke(app, ["workspace", "--config", "missing.toml", *args, "--help"])
+            assert result.exit_code == 0, result.output
+        _workspace.open_workspace.assert_not_called()
+        monkeypatch.setenv("CHRONOS_WORKSPACE_CONFIG", str(tmp_path / "missing.toml"))
+        result = runner.invoke(app, ["workspace", "branch", "list"])
+        assert result.exit_code == 2
+        _workspace.open_workspace.assert_not_called()
+        result = runner.invoke(app, ["workspace", "--config", str(tmp_path / "chronos.toml"), "branch", "list"])
+        assert result.exit_code == 0, result.output
+        assert _workspace.open_workspace.call_args.args[0].config_path == tmp_path / "chronos.toml"
+
+    def test_api_error_and_session_cleanup(self, workspace_connection: MagicMock) -> None:
+        workspace = workspace_connection
+        session = workspace.checkout.return_value.stores["app"]
+        session.query.side_effect = BranchingError("query failed")
+        session.close.side_effect = RuntimeError("close failed")
+        result = runner.invoke(app, ["workspace", "query", "SELECT 1", "--store", "app"])
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "query failed" in result.stderr
+        assert "close failed" not in result.stderr
+        session.close.assert_called_once_with()
+        workspace.checkout.return_value.stores["other"].close.assert_called_once_with()
+        workspace.close.assert_called_once_with()
+
+    def test_api_result_field_names_are_preserved(self, workspace_connection: MagicMock) -> None:
+        from chronos_core.workspace import AtomicMergeResult, WorkspaceBranchToken
+        token = WorkspaceBranchToken("main", 1)
+        result = AtomicMergeResult("merge-1", "trial", "main", "committed", token, token, token, 2, 0, {"app": 1, "other": 1})
+        workspace_connection.merge_atomic.return_value = result
+        invoked = runner.invoke(app, ["workspace", "merge", "atomic-apply", "trial", "main", "--operation-id", "merge-1"])
+        assert invoked.exit_code == 0, invoked.output
+        assert json.loads(invoked.stdout) == {
+            "operation_id": "merge-1", "source": "trial", "target": "main", "status": "committed",
+            "source_token": {"branch_id": "main", "current_segment_id": 1},
+            "old_target_token": {"branch_id": "main", "current_segment_id": 1},
+            "new_target_token": {"branch_id": "main", "current_segment_id": 1},
+            "selected": 2, "skipped": 0, "stores": {"app": 1, "other": 1},
+        }
+
+
+class TestWorkspaceQdrantCommands:
+    @pytest.fixture
+    def workspace(self, workspace_connection: MagicMock, tmp_path: Path) -> MagicMock:
+        pytest.importorskip("qdrant_client")
+        (tmp_path / "chronos.toml").write_text('''
+[stores.app]
+kind="sqlite"
+database_url="sqlite:///app.sqlite"
+[stores.vectors]
+kind="qdrant"
+metadata_url="sqlite:///vectors.sqlite"
+path="vectors"
+''')
+        vector_store = MagicMock()
+        for method in ("register_collection", "list_collections", "collection_info"):
+            getattr(vector_store, method).return_value = None
+        vector_session = MagicMock()
+        for method in ("upsert", "get", "list_points", "delete", "search"):
+            getattr(vector_session, method).return_value = None
+        workspace_connection.stores["vectors"] = vector_store
+        workspace_connection.checkout.return_value.stores["vectors"] = vector_session
+        return workspace_connection
+
+    @pytest.mark.parametrize(("args", "method", "positional", "keywords", "session"), [
+        (["collection", "register", "docs", "--dimensions", "3", "--distance", "dot"], "register_collection", ("docs", 3), {"distance": "dot"}, False),
+        (["collection", "list"], "list_collections", (), {}, False),
+        (["collection", "info", "docs"], "collection_info", ("docs",), {}, False),
+        (["point", "upsert", "docs", "one", '{"vector":[1,0,0],"payload":{"value":"one"}}', "--revision", "v1"],
+         "upsert", ("docs", "one", [1, 0, 0], {"value": "one"}), {"revision": "v1"}, True),
+        (["point", "get", "docs", "one"], "get", ("docs", "one"), {}, True),
+        (["point", "list", "docs"], "list_points", ("docs",), {}, True),
+        (["point", "delete", "docs", "one"], "delete", ("docs", "one"), {}, True),
+        (["search", "docs", "[1,0,0]", "--limit", "3", "--score-threshold", "0.5"], "search", ("docs", [1, 0, 0]), {"limit": 3, "score_threshold": 0.5}, True),
+    ])
+    def test_forwarding(self, workspace: MagicMock, args, method, positional, keywords, session: bool) -> None:
+        result = runner.invoke(app, ["workspace", "qdrant", "--store", "vectors", *args, *(["--branch", "trial"] if session else [])])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == ""
+        target = workspace.checkout.return_value.stores["vectors"] if session else workspace.stores["vectors"]
+        getattr(target, method).assert_called_once_with(*positional, **keywords)
+        if session:
+            workspace.checkout.assert_called_once_with("trial")
+        workspace.close.assert_called_once_with()
+
+    @pytest.mark.parametrize("data", ['{"vector":[true]}', '{"vector":[NaN]}', '{"vector":[1],"payload":[]}'])
+    def test_invalid_point_does_not_connect(self, workspace: MagicMock, data: str) -> None:
+        result = runner.invoke(app, ["workspace", "qdrant", "--store", "vectors", "point", "upsert", "docs", "one", data])
+        assert result.exit_code == 2, result.output
+        _workspace.open_workspace.assert_not_called()
+
+    def test_transport_error_redacts_credentials(self, workspace: MagicMock, tmp_path: Path) -> None:
+        import httpx
+        (tmp_path / "chronos.toml").write_text('''
+[stores.app]
+kind="postgresql"
+database_url="postgresql://user:sql-secret@localhost/app"
+[stores.vectors]
+kind="qdrant"
+metadata_url="sqlite:///vectors.sqlite"
+url="http://localhost:6333"
+api_key="vector-secret"
+''')
+        workspace.checkout.return_value.stores["vectors"].search.side_effect = httpx.ConnectError(
+            "Failed using vector-secret and postgresql://user:sql-secret@localhost/app"
+        )
+        result = runner.invoke(app, ["workspace", "qdrant", "--store", "vectors", "search", "docs", "[1,0,0]"])
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "secret" not in result.stderr
+        assert "<redacted>" in result.stderr
+        workspace.close.assert_called_once_with()
+
+    def test_json_file_and_stdin(self, workspace: MagicMock, tmp_path: Path) -> None:
+        data = tmp_path / "point.json"
+        data.write_text('{"vector":[1,0,0],"payload":{"source":"file"}}')
+        result = runner.invoke(app, ["workspace", "qdrant", "--store", "vectors", "point", "upsert", "docs", "one", "--file", str(data)])
+        assert result.exit_code == 0, result.output
+        session = workspace.checkout.return_value.stores["vectors"]
+        session.upsert.assert_called_once_with("docs", "one", [1, 0, 0], {"source": "file"}, revision=None)
+        for args in (["--stdin"], []):
+            result = runner.invoke(app, ["workspace", "qdrant", "--store", "vectors", "search", "docs", *args], input="[0,1,0]")
+            assert result.exit_code == 0, result.output
+            assert session.search.call_args.args == ("docs", [0, 1, 0])
+        data.write_text("[1,0,0]")
+        result = runner.invoke(app, ["workspace", "qdrant", "--store", "vectors", "search", "docs", "--file", str(data)])
+        assert result.exit_code == 0, result.output
+        assert session.search.call_args.args == ("docs", [1, 0, 0])

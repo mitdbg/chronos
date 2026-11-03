@@ -1,9 +1,10 @@
 # Chronos CLI
 
-The `chronos` command is a one-off wrapper around the public relational and Qdrant
-Python APIs. Each invocation opens the selected store, calls the API, prints its
-return value, and closes the connection. It does not remember a current branch
-or keep a background connection open.
+The `chronos` command wraps the public workspace, relational, and Qdrant Python
+APIs. Use a workspace for one or several named stores; direct-store commands
+remain available for quick scripts. Each invocation opens its stores, calls the
+API, prints its return value, and closes connections. Stored data persists. The
+CLI does not remember a current branch or keep background connections open.
 
 ## Install and choose a database
 
@@ -34,6 +35,73 @@ Mixing Python's Homebrew SQLite connection with a native extension linked to
 macOS's SQLite can crash the process. After a custom build, use
 `uv run --no-sync --package chronos-core chronos ...` to run the installed build
 without syncing it again.
+
+## Workspaces
+
+Configure named stores in `chronos.toml`. For example, one SQLite store:
+
+```toml
+[stores.app]
+kind = "sqlite"
+database_url = "sqlite:///.chronos/app.sqlite"
+```
+
+Create `.chronos/` first. Local database URLs and Qdrant paths resolve relative
+to the TOML file. Configuration precedence is `--config PATH`, then
+`CHRONOS_WORKSPACE_CONFIG`, then `chronos.toml` in the current directory. A
+workspace name is not required. Connection strings may reference `${ENV_VAR}`;
+unset references are errors. Single-store connection environment variables are
+not used for workspace commands, and `.env` files are not loaded automatically.
+
+```sh
+chronos workspace table create --store app \
+  'CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)'
+chronos workspace table register --store app items --primary-key id
+chronos workspace branch create experiment
+chronos workspace query --store app --branch experiment 'SELECT * FROM items'
+```
+
+SQL participants support `sqlite`, `postgresql`, and `duckdb` kinds, with
+`database_url` and optional `metadata_url` (required for DuckDB). Qdrant uses
+`kind = "qdrant"`, `metadata_url`, and exactly one of `path` or `url`; remote
+connections also accept `api_key` and `timeout`. Select vector operations with
+`chronos workspace qdrant --store NAME ...`, using the same collection, point,
+and search arguments as the direct Qdrant commands below.
+
+Branches, checkpoints, diffs, and merges operate across the workspace. With
+independent metadata, `merge preview/apply` calls the coordinated API, which
+can retain partial changes if a later participant fails. Atomic mode requires
+`[workspace].shared_metadata_url` and matching metadata URLs for every store.
+Use `merge atomic-preview` and `merge atomic-apply --operation-id ID`; optionally
+pass the returned `--preview-token` to reject a changed preview. Atomic mode
+does not silently fall back to coordinated merging. Filesystems are not exposed
+by the workspace CLI yet.
+
+### Checked terminal demo
+
+After installation, run `bash examples/cli_workspace_demo.sh --help` from the
+repository. The default demo uses PostgreSQL plus embedded Qdrant; set
+`CHRONOS_DEMO_POSTGRES_URL` to a fresh demo database, then run:
+
+```sh
+bash examples/cli_workspace_demo.sh
+```
+
+For SQLite plus embedded Qdrant without servers:
+
+```sh
+bash examples/cli_workspace_demo.sh --sqlite
+```
+
+The script performs every Chronos operation through the CLI and uses Python
+only to check its JSON output. It prints each check, verifies single-store
+startup, adding Qdrant, branch isolation, checkpoint restoration, search, and
+atomic merging, then removes its branches. It leaves the checkpoint and data
+in place and prints the config path for further exploration. Local files go
+into a fresh `.chronos/workspace-demo.*` directory; PostgreSQL data remains in
+the supplied database. No servers are started or stopped by the script.
+
+## Direct-store commands
 
 Set the database URL in your terminal. This example uses a persistent local file:
 

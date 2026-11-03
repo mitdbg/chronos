@@ -5,10 +5,12 @@ import typer
 
 from chronos_core.cli._qdrant import app as qdrant_app
 from chronos_core.cli._relational import DatabaseConfig, register_commands
+from chronos_core.cli._workspace import app as workspace_app
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 register_commands(app)
 app.add_typer(qdrant_app, name="qdrant", help="Branch-aware vector storage and search.")
+app.add_typer(workspace_app, name="workspace", help="Coordinate configured stores, or use just one.")
 
 
 @app.callback()

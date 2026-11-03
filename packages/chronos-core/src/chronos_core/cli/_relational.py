@@ -91,6 +91,21 @@ def _parameters(params: str | None) -> dict[str, Any] | None:
     return value
 
 
+def _create_table_input(sql: str | None, file: Path | None, stdin: bool) -> str:
+    statement = _sql_input(sql, file, stdin)
+    try:
+        statements = sqlglot.parse(statement)
+    except sqlglot.errors.ParseError as error:
+        raise typer.BadParameter("Expected one CREATE TABLE statement.") from error
+    if (
+        len(statements) != 1
+        or not isinstance(statements[0], exp.Create)
+        or statements[0].kind != "TABLE"
+    ):
+        raise typer.BadParameter("Expected one CREATE TABLE statement.")
+    return statement
+
+
 branch_app = typer.Typer(no_args_is_help=True)
 table_app = typer.Typer(no_args_is_help=True)
 checkpoint_app = typer.Typer(no_args_is_help=True)
@@ -135,17 +150,7 @@ def create_table(
     stdin: bool = typer.Option(False, "--stdin"),
 ) -> None:
     """Create an ordinary table for subsequent table register; not a branch-local write."""
-    statement = _sql_input(sql, file, stdin)
-    try:
-        statements = sqlglot.parse(statement)
-    except sqlglot.errors.ParseError as error:
-        raise typer.BadParameter("Expected one CREATE TABLE statement.") from error
-    if (
-        len(statements) != 1
-        or not isinstance(statements[0], exp.Create)
-        or statements[0].kind != "TABLE"
-    ):
-        raise typer.BadParameter("Expected one CREATE TABLE statement.")
+    statement = _create_table_input(sql, file, stdin)
     with connect(database_config(ctx)) as database:
         database.db.execute(statement)
         print_result(database.db.commit())
