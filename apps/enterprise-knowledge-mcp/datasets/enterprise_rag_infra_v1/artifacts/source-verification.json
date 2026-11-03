@@ -1,0 +1,18 @@
+{
+  "matches_paper_indexed_corpus": true,
+  "mismatches": [],
+  "observed": {
+    "documents": 628081,
+    "github_public": {
+      "bytes": 1128750002,
+      "digest": "e1d4b93069a46a26f19faf5d7ce61146377f47efe4c2ffaa08ed9b271953ed77",
+      "documents": 97336
+    },
+    "internal_infra_v1": {
+      "bytes": 1025321,
+      "digest": "2253da7f385bc314c6317b42ab5a619d8ccd3abf8ebec58c35ea00438b235035",
+      "documents": 200
+    },
+    "path_selection_digest": "867d8b384de997c5f75e792ba36cf9ac75598d2161ea10210b9b31f4997f98e9"
+  }
+}

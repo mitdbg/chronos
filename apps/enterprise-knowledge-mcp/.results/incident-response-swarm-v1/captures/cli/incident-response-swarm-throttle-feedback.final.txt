@@ -1,0 +1,8 @@
+Completed and published.
+
+- Evidence: `SUP-999999` source (`dsid_5dd...`) records queue depth 824, throttling, KV-cache eviction, fragmentation, OOM-guard/SIGABRT, 502s, and a staging reproduction. Related `SUP-201992` (`dsid_205...`) supports retry amplification and backoff mitigation.
+- Diagnosis: mixed streaming and synchronous traffic triggered gateway throttling; retries amplified connection and runtime memory pressure, leading to runtime aborts and gateway 502/503s.
+- Report: `/artifacts/incidents/swarm-throttle-feedback.md`, indexed as `incident-report/swarm-throttle-feedback`.
+- Memory: persisted as `episodic/swarm-throttle-feedback` with cited evidence.
+- Publication: reviewed diff, selected only the report and memory bundles, and committed merge `merge:task/swarm-throttle-feedback:team/site-reliability:ed8827b9c7ea4b2b9038b74f912c182f`. Fetch and search verification succeeded. Temporary branch deleted.
+- Uncertainty: final runtime-eviction/backpressure root cause remains unresolved; combined mitigations do not isolate individual contributors.

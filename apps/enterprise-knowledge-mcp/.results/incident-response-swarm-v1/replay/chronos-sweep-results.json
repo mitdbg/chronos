@@ -1,0 +1,98 @@
+[
+  {
+    "system": "chronos",
+    "workers": 2,
+    "output": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/incident-response-swarm-v1/results/worker-sweep-20260827-clean-connection-optimized/chronos/workers-002",
+    "runner_returncode": 0,
+    "status": "ok",
+    "successful_workers": 2,
+    "elapsed_seconds": 196.4519971970003,
+    "throughput_bundles_per_second": 0.010180604058682171,
+    "verifier_violations": 0,
+    "incomplete_bundles": 0
+  },
+  {
+    "system": "chronos",
+    "workers": 4,
+    "output": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/incident-response-swarm-v1/results/worker-sweep-20260827-clean-connection-optimized/chronos/workers-004",
+    "runner_returncode": 0,
+    "status": "ok",
+    "successful_workers": 4,
+    "elapsed_seconds": 208.95493681399967,
+    "throughput_bundles_per_second": 0.01914288344170869,
+    "verifier_violations": 0,
+    "incomplete_bundles": 0
+  },
+  {
+    "system": "chronos",
+    "workers": 8,
+    "output": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/incident-response-swarm-v1/results/worker-sweep-20260827-clean-connection-optimized/chronos/workers-008",
+    "runner_returncode": 0,
+    "status": "ok",
+    "successful_workers": 8,
+    "elapsed_seconds": 325.144804931002,
+    "throughput_bundles_per_second": 0.02460442202574221,
+    "verifier_violations": 0,
+    "incomplete_bundles": 0
+  },
+  {
+    "system": "chronos",
+    "workers": 16,
+    "output": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/incident-response-swarm-v1/results/worker-sweep-20260827-clean-connection-optimized/chronos/workers-016",
+    "runner_returncode": 0,
+    "status": "ok",
+    "successful_workers": 16,
+    "elapsed_seconds": 341.473476207997,
+    "throughput_bundles_per_second": 0.04685576220348705,
+    "verifier_violations": 0,
+    "incomplete_bundles": 0
+  },
+  {
+    "system": "chronos",
+    "workers": 32,
+    "output": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/incident-response-swarm-v1/results/worker-sweep-20260827-clean-connection-optimized/chronos/workers-032",
+    "runner_returncode": 0,
+    "status": "ok",
+    "successful_workers": 32,
+    "elapsed_seconds": 378.0671626830008,
+    "throughput_bundles_per_second": 0.0846410457150206,
+    "verifier_violations": 0,
+    "incomplete_bundles": 0
+  },
+  {
+    "system": "chronos",
+    "workers": 128,
+    "output": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/incident-response-swarm-v1/results/worker-sweep-20260827-clean-connection-optimized/chronos/workers-128",
+    "runner_returncode": 0,
+    "status": "ok",
+    "successful_workers": 128,
+    "elapsed_seconds": 721.1856799289999,
+    "throughput_bundles_per_second": 0.17748549862027418,
+    "verifier_violations": 0,
+    "incomplete_bundles": 0
+  },
+  {
+    "system": "chronos",
+    "workers": 1,
+    "output": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/incident-response-swarm-v1/results/worker-sweep-20260827-clean-connection-optimized/chronos/workers-001",
+    "runner_returncode": 0,
+    "status": "ok",
+    "successful_workers": 1,
+    "elapsed_seconds": 193.9313968690003,
+    "throughput_bundles_per_second": 0.005156462626190926,
+    "verifier_violations": 0,
+    "incomplete_bundles": 0
+  },
+  {
+    "system": "chronos",
+    "workers": 64,
+    "output": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/incident-response-swarm-v1/results/worker-sweep-20260827-clean-connection-optimized/chronos/workers-064",
+    "runner_returncode": 0,
+    "status": "ok",
+    "successful_workers": 64,
+    "elapsed_seconds": 465.9655379970027,
+    "throughput_bundles_per_second": 0.1373492131523505,
+    "verifier_violations": 0,
+    "incomplete_bundles": 0
+  }
+]

@@ -1,0 +1,10 @@
+Published successfully to `team/site-reliability`.
+
+- Report: `incident-report/swarm-autoscale-warmup`
+- Memory: `episodic/swarm-autoscale-warmup`
+- Evidence: `SUP-175001`, document `enterprise_fccf46a7c5a6b5a11d3ba9f4`, source path `/knowledge/company/sources/jira/ops-requests/SUP-175001-evening-5xx-surge-apigw-autoscaler-warmup-crashloop.json`
+- Diagnosis: quota-throttled warm-up and prefetch contention caused gateway queue growth; 8× hedged retries amplified load into cold runtimes, triggering GPU/NVML watchdog evictions and upstream 5xxs.
+- Mitigation: scoped 60 RPS tenant limit, client backoff, temporary prewarm capacity, and affected-worker restarts. Combined actions reduced 5xx from ~35% to <2% in ~25 minutes.
+- Uncertainty: the permanent causal weight of cloud quota delay, NVMe I/O, and the NVML/driver condition remains unresolved; no canary or recurrence result was available.
+
+The merge committed 14 reviewed changes; scratch artifacts were excluded. The report was fetched and found by search after promotion. Temporary branch `task/swarm-autoscale-warmup` was deleted.

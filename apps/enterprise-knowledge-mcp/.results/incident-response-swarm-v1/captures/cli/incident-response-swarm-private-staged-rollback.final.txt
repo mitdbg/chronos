@@ -1,0 +1,20 @@
+Completed on `team/site-reliability`.
+
+Evidence used:
+
+- PR 176543 (`dsid_b3bee87d2284436fa3dd7f8149dba38d`): records dependency-sensitive rollback failures, reverse-topological execution, seed preservation, resume controls, and validation tests.
+- PR 76321 (`dsid_009d514ee6c349268c542af07d9cd5b1`): documents the earlier reverse-patch rollback model.
+
+Diagnosis: the earlier rollback representation lacked dependency ordering and tenant seed-state preservation, allowing partial rollback to lose state or leave the cluster inconsistent. This is not evidence of an artifact-signature failure.
+
+Mitigation: generate `installer rollback-plan --dry-run`, review preconditions/order, enable `seed-preserve`, execute staged reverse-topological rollback with checkpoints, and use `installer rollback --resume` or manual abort. Existing installs require opt-in; large binary restores are out of scope.
+
+Published and verified:
+
+- Report: `incident-report/swarm-private-staged-rollback`, at `/artifacts/incidents/swarm-private-staged-rollback.md`
+- Memory: `episodic/swarm-private-staged-rollback`
+- Merge committed to `team/site-reliability`; direct fetch and search both succeeded.
+- Scratch artifacts were unselected.
+- Temporary branch `task/swarm-private-staged-rollback` was deleted.
+
+Uncertainty: no customer, release version, failed stage, rollback plan, logs, or feature-flag state were provided. The recorded tests validate the mitigation path, not this live incident’s exact execution.

@@ -1,0 +1,14 @@
+Published to `team/site-reliability`.
+
+- Evidence: SUP-912345 (`dsid_84a6d354dca5476b85a34c38d4edfa14`) reports large HTTP/2 shard streams stalling after partial DATA, missing ICMP Type 3/Code 4 at the provider handoff, and successful MTU-1400 mitigation.
+- Diagnosis: egress-provider ICMP filtering/rate limiting prevented PMTU discovery, black-holing packets above the path MTU.
+- Validation: the source record documents reproduction in the customer VPC, three-point captures, MTU 1400 restoration, and a tested 1200-byte TLS-record cap.
+- Uncertainty: provider-side capture, exact rate-limit threshold, actual path MTU, and permanent provider remediation remain unconfirmed.
+
+Publication:
+
+- Report: [swarm-stream-pmtu-hang.md](/artifacts/incidents/swarm-stream-pmtu-hang.md), document ID `incident-report/swarm-stream-pmtu-hang`.
+- Memory: `episodic/swarm-stream-pmtu-hang`, citing the SUP-912345 document and source path.
+- Merge committed; scratch artifacts were excluded.
+- Target fetch and search verification succeeded.
+- Temporary task branch deleted.

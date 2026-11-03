@@ -105,6 +105,17 @@ From the `chronos` repository:
 .venv/bin/uv sync --all-packages --all-extras
 ```
 
+## Paper artifacts
+
+- [Dataset](datasets/enterprise_rag_infra_v1/README.md): company documents,
+  pinned vLLM/LiteLLM/Langfuse sources, public issues/PRs, and the prepared snapshot.
+- [Incident-response swarm](.results/incident-response-swarm-v1/README.md):
+  eight captured worker sessions, normalized traces, and Figure 7 replay outputs.
+- [Sequential workflows](workflows/curated-v2/README.md): the sixteen-workflow suite.
+
+See the [dataset preparation guide](datasets/enterprise_rag_infra_v1/REPRODUCING.md)
+and [replay guide](.results/incident-response-swarm-v1/REPRODUCING.md) for commands.
+
 ### Native-component comparison backend
 
 The native-component baseline follows
