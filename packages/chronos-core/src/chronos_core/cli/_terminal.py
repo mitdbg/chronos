@@ -9,6 +9,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
 from typing import Any, NoReturn
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 import typer
 
@@ -32,7 +33,7 @@ def _json_default(value: Any) -> Any:
 
 def print_result(result: Any) -> None:
     if result is not None:
-        typer.echo(json.dumps(result, default=_json_default, ensure_ascii=False, indent=2))
+        typer.echo(json.dumps(result, default=_json_default, ensure_ascii=False, indent=2, allow_nan=False))
 
 
 def report_error(
@@ -40,12 +41,23 @@ def report_error(
 ) -> NoReturn:
     """Report an operational failure without exposing configured credentials."""
     message = str(error)
+    sensitive = [secret for secret in secrets if secret]
     for url in urls:
         if url:
             message = message.replace(url, "<database>")
-    for secret in secrets:
-        if secret:
-            message = message.replace(secret, "<redacted>")
+            try:
+                parsed = urlsplit(url)
+            except ValueError:
+                continue
+            if parsed.password:
+                sensitive.extend((parsed.password, unquote(parsed.password)))
+            sensitive.extend(value for key, value in parse_qsl(parsed.query) if key == "password" and value)
+            for item in parsed.query.split("&"):
+                key, separator, value = item.partition("=")
+                if separator and unquote(key) == "password" and value:
+                    sensitive.append(value)
+    for secret in sorted(set(sensitive), key=len, reverse=True):
+        message = message.replace(secret, "<redacted>")
     message = re.sub(r"([a-zA-Z][\w+.-]*://)[^\s/@]+@", r"\1<credentials>@", message)
     message = re.sub(r"(?i)(password\s*=\s*)(?:'[^']*'|\"[^\"]*\"|[^\s]+)", r"\1<redacted>", message)
     typer.echo(f"Error: {message}", err=True)

@@ -10,18 +10,31 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
-from chronos_core.cli._qdrant import QdrantConfig
-from chronos_core.cli._relational import DatabaseConfig
-
 if TYPE_CHECKING:
     from chronos_core.workspace import ChronosWorkspaceContext
+
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    database_url: str
+    metadata_url: str | None = None
+
+
+@dataclass(frozen=True)
+class QdrantConfig:
+    metadata_url: str
+    path: Path | None = None
+    url: str | None = None
+    api_key: str | None = None
+    collection_prefix: str = "chronos_"
+    timeout: float | None = None
 
 
 class WorkspaceConfigError(ValueError):
@@ -81,6 +94,22 @@ def _text(value: Any, field: str) -> str:
     return result
 
 
+def _local_path(value: str | Path, root: Path, field: str) -> Path:
+    try:
+        location = Path(value).expanduser()
+        return (location if location.is_absolute() else root / location).resolve()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise WorkspaceConfigError(f"{field} must be a valid local path.") from error
+
+
+def _metadata_identity(url: str, root: Path) -> str:
+    if url.startswith("sqlite:///"):
+        # Match the adapter's decoding for comparisons without rewriting the
+        # URL passed to the API (literal percent signs may themselves be encoded).
+        return f"sqlite:///{_local_path(unquote(url[len('sqlite:///'):]), root, 'metadata_url')}"
+    return url
+
+
 def _database_url(value: Any, root: Path, field: str, *, kind: str | None = None) -> str:
     url = _text(value, field)
     try:
@@ -98,10 +127,7 @@ def _database_url(value: Any, root: Path, field: str, *, kind: str | None = None
     local = url[len(f"{scheme}:///"):]
     if not local or local == ":memory:":
         raise WorkspaceConfigError(f"{field} requires persistent storage, not an in-memory database.")
-    location = Path(local).expanduser()
-    if not location.is_absolute():
-        location = root / location
-    return f"{scheme}:///{location.resolve()}"
+    return f"{scheme}:///{_local_path(local, root, field)}"
 
 
 def _store_config(value: Any, root: Path, field: str) -> StoreConfig:
@@ -130,10 +156,7 @@ def _store_config(value: Any, root: Path, field: str) -> StoreConfig:
         local = _text(data["path"], f"{field}.path")
         if local == ":memory:":
             raise WorkspaceConfigError(f"{field}.path requires persistent storage.")
-        local_path = Path(local).expanduser()
-        if not local_path.is_absolute():
-            local_path = root / local_path
-        local_path = local_path.resolve()
+        local_path = _local_path(local, root, f"{field}.path")
         if "api_key" in data or "timeout" in data:
             raise WorkspaceConfigError(f"{field}: api_key and timeout require url.")
     else:
@@ -147,10 +170,14 @@ def _store_config(value: Any, root: Path, field: str) -> StoreConfig:
     api_key = _text(data["api_key"], f"{field}.api_key") if "api_key" in data else None
     prefix = _text(data.get("collection_prefix", "chronos_"), f"{field}.collection_prefix")
     timeout = data.get("timeout")
-    if timeout is not None and (
-        isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-        or not math.isfinite(timeout) or timeout < 0.001
-    ):
+    try:
+        valid_timeout = timeout is None or (
+            not isinstance(timeout, bool) and isinstance(timeout, (int, float))
+            and math.isfinite(timeout) and timeout >= 0.001
+        )
+    except OverflowError:
+        valid_timeout = False
+    if not valid_timeout:
         raise WorkspaceConfigError(f"{field}.timeout must be a finite number of at least 0.001 seconds.")
     return StoreConfig("qdrant", QdrantConfig(metadata, local_path, url, api_key, prefix, timeout))
 
@@ -158,7 +185,7 @@ def _store_config(value: Any, root: Path, field: str) -> StoreConfig:
 def load_workspace_config(path: Path | None = None) -> WorkspaceConfig:
     """Read explicit path, environment path, or ./chronos.toml without opening stores."""
     selected = path if path is not None else Path(os.environ.get("CHRONOS_WORKSPACE_CONFIG", "chronos.toml"))
-    config_path = selected.expanduser().resolve()
+    config_path = _local_path(selected, Path.cwd(), "--config")
     try:
         raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError) as error:
@@ -187,7 +214,13 @@ def load_workspace_config(path: Path | None = None) -> WorkspaceConfig:
     metadata_urls = [store.metadata_url for store in stores.values()]
     if shared is not None and any(url != shared for url in metadata_urls):
         raise WorkspaceConfigError("Every store must use workspace.shared_metadata_url for atomic operations.")
-    if shared is None and len(set(metadata_urls)) != len(metadata_urls):
+    if shared is not None and sum(store.kind != "qdrant" for store in stores.values()) > 1:
+        raise WorkspaceConfigError(
+            "This CLI does not yet support multiple SQL participants sharing metadata. "
+            "Use independent metadata, or one SQL participant with Qdrant."
+        )
+    identities = [_metadata_identity(url, config_path.parent) for url in metadata_urls]
+    if shared is None and len(set(identities)) != len(identities):
         raise WorkspaceConfigError("Stores sharing metadata require workspace.shared_metadata_url.")
     return WorkspaceConfig(config_path, stores, shared)
 
@@ -227,9 +260,9 @@ def open_workspace(config: WorkspaceConfig) -> Generator[ChronosWorkspaceContext
                 target = entry.connection
                 if not isinstance(target, QdrantConfig):
                     continue
-                from chronos_core.cli._qdrant import _store_class
+                from chronos_core.workspace.qdrant import ChronosQdrantStore
 
-                factory = _store_class()
+                factory = ChronosQdrantStore
                 options = {"collection_prefix": target.collection_prefix, "context": contexts.get(target.metadata_url)}
                 if target.path is not None:
                     store = factory.local(target.metadata_url, path=target.path, **options)

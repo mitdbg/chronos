@@ -27,7 +27,7 @@ Optional builds use `-Ccmake.define.CHRONOS_WITH_FILESYSTEM=ON`,
 Python extras do not change compiled capabilities.
 
 See the repository's docs/installation.md, docs/integration.md, and docs/tutorials.
-The installed `chronos` command wraps the relational and Qdrant APIs; run
+The installed `chronos` command wraps a workspace of named relational and Qdrant stores; run
 `chronos --help` and see [the CLI guide](../../docs/cli.md) for setup and usage.
 This is a Python library, not a PostgreSQL-wire proxy. Managed access must pass
 through branch sessions. Version 0.2.0a1 is an experimental release candidate.

@@ -26,7 +26,7 @@ cd "$repo_root"
 mkdir -p .chronos
 demo_dir="$(mktemp -d "$repo_root/.chronos/workspace-demo.XXXXXX")"
 export CHRONOS_WORKSPACE_CONFIG="$demo_dir/chronos.toml"
-cli=(uv run --no-sync --package chronos-core chronos workspace)
+cli=(uv run --no-sync --package chronos-core chronos)
 python=(uv run --no-sync --package chronos-core python)
 
 # Python only compares JSON output; every Chronos operation uses the CLI.

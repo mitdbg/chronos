@@ -1,30 +1,30 @@
-"""Assemble the public Chronos CLI and its root connection options."""
+"""Assemble the workspace CLI and its root configuration option."""
 from __future__ import annotations
+
+from pathlib import Path
 
 import typer
 
 from chronos_core.cli._qdrant import app as qdrant_app
-from chronos_core.cli._relational import DatabaseConfig, register_commands
-from chronos_core.cli._workspace import app as workspace_app
+from chronos_core.cli._relational import register_commands as register_relational_commands
+from chronos_core.cli._workspace import WorkspaceOptions, register_commands as register_workspace_commands
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
-register_commands(app)
-app.add_typer(qdrant_app, name="qdrant", help="Branch-aware vector storage and search.")
-app.add_typer(workspace_app, name="workspace", help="Coordinate configured stores, or use just one.")
+register_workspace_commands(app)
+register_relational_commands(app)
+app.add_typer(qdrant_app, name="qdrant", help="Use a named Qdrant participant.")
 
 
 @app.callback()
 def main(
     ctx: typer.Context,
-    database_url: str | None = typer.Option(
-        None, "--database-url", envvar="CHRONOS_DATABASE_URL", help="Database connection URL."
-    ),
-    metadata_url: str | None = typer.Option(
-        None, "--metadata-url", envvar="CHRONOS_METADATA_URL",
-        help="Separate SQLite or PostgreSQL metadata URL; required for DuckDB.",
+    config: Path | None = typer.Option(
+        None, "--config", envvar="CHRONOS_WORKSPACE_CONFIG",
+        help="Workspace TOML path; defaults to ./chronos.toml.",
     ),
 ) -> None:
-    ctx.obj = DatabaseConfig(database_url, metadata_url) if database_url else None
+    """Use configured Chronos stores together, including workspaces with just one store."""
+    ctx.obj = WorkspaceOptions(config)
 
 
 if __name__ == "__main__":

@@ -1,63 +1,20 @@
-"""Relational commands, SQL input, and connection ownership."""
+"""SQL input and commands for named relational workspace participants."""
 from __future__ import annotations
 
 import json
-import sqlite3
 import sys
-from collections.abc import Generator
-from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
+from typing import Any
 
-import psycopg
 import sqlglot
 import typer
 from sqlglot import exp
 
-from chronos_core.cli._terminal import MergePolicy, print_result, report_error
-
-if TYPE_CHECKING:
-    from chronos_core.branching import ChronosBranchContext
+from chronos_core.cli._terminal import print_result
+from chronos_core.cli._workspace import connect_workspace, store_session
 
 
-@dataclass(frozen=True)
-class DatabaseConfig:
-    database_url: str
-    metadata_url: str | None = None
-
-
-def database_config(ctx: typer.Context) -> DatabaseConfig:
-    database = ctx.find_object(DatabaseConfig)
-    if database is None or not database.database_url:
-        raise typer.BadParameter(
-            "Provide --database-url or set CHRONOS_DATABASE_URL.",
-            param_hint="--database-url",
-        )
-    if urlsplit(database.database_url).scheme == "duckdb" and not database.metadata_url:
-        raise typer.BadParameter(
-            "DuckDB requires --metadata-url or CHRONOS_METADATA_URL for SQLite or PostgreSQL metadata.",
-            param_hint="--metadata-url",
-        )
-    return database
-
-
-@contextmanager
-def connect(database: DatabaseConfig) -> Generator[ChronosBranchContext, None, None]:
-    from chronos_core.branching import BranchingError, ChronosBranchContext
-
-    try:
-        if database.metadata_url is None:
-            context = ChronosBranchContext.connect(database.database_url)
-        else:
-            context = ChronosBranchContext.connect_split(database.database_url, database.metadata_url)
-        try:
-            yield context
-        finally:
-            context.close()
-    except (BranchingError, RuntimeError, sqlite3.Error, psycopg.Error, OSError, ValueError, TypeError) as error:
-        report_error(error, urls=(database.database_url, database.metadata_url))
+table_app = typer.Typer(no_args_is_help=True)
 
 
 def _sql_input(sql: str | None, file: Path | None, stdin: bool) -> str:
@@ -106,135 +63,51 @@ def _create_table_input(sql: str | None, file: Path | None, stdin: bool) -> str:
     return statement
 
 
-branch_app = typer.Typer(no_args_is_help=True)
-table_app = typer.Typer(no_args_is_help=True)
-checkpoint_app = typer.Typer(no_args_is_help=True)
-merge_app = typer.Typer(no_args_is_help=True)
-
-
-@branch_app.command("list")
-def list_branches(ctx: typer.Context) -> None:
-    with connect(database_config(ctx)) as database:
-        print_result(database.list_branches())
-
-
-@branch_app.command("create")
-def create_branch(
-    ctx: typer.Context, name: str,
-    from_branch: str = typer.Option("main", "--from"),
-) -> None:
-    with connect(database_config(ctx)) as database:
-        print_result(database.create_branch(name, from_branch=from_branch))
-
-
-@branch_app.command("delete")
-def delete_branch(ctx: typer.Context, name: str) -> None:
-    with connect(database_config(ctx)) as database:
-        print_result(database.delete_branch(name))
-
-
-@table_app.command("register")
-def register_table(
-    ctx: typer.Context, table: str,
-    primary_key: list[str] = typer.Option(..., "--primary-key"),
-) -> None:
-    with connect(database_config(ctx)) as database:
-        print_result(database.register_table(table, primary_key))
-
-
 @table_app.command("create")
 def create_table(
-    ctx: typer.Context,
-    sql: str | None = typer.Argument(None),
-    file: Path | None = typer.Option(None, "--file"),
-    stdin: bool = typer.Option(False, "--stdin"),
+    ctx: typer.Context, sql: str | None = typer.Argument(None),
+    store: str = typer.Option(..., "--store"),
+    file: Path | None = typer.Option(None, "--file"), stdin: bool = typer.Option(False, "--stdin"),
 ) -> None:
-    """Create an ordinary table for subsequent table register; not a branch-local write."""
     statement = _create_table_input(sql, file, stdin)
-    with connect(database_config(ctx)) as database:
+    with connect_workspace(ctx, store) as workspace:
+        database = workspace.stores[store]
         database.db.execute(statement)
         print_result(database.db.commit())
 
 
+@table_app.command("register")
+def register_table(ctx: typer.Context, table: str, store: str = typer.Option(..., "--store"),
+                   primary_key: list[str] = typer.Option(..., "--primary-key")) -> None:
+    with connect_workspace(ctx, store) as workspace:
+        print_result(workspace.stores[store].register_table(table, primary_key))
+
+
 def query(
-    ctx: typer.Context,
-    sql: str | None = typer.Argument(None),
-    branch: str = typer.Option("main", "--branch"),
+    ctx: typer.Context, sql: str | None = typer.Argument(None),
+    store: str = typer.Option(..., "--store"), branch: str = typer.Option("main", "--branch"),
     params: str | None = typer.Option(None, "--params"),
-    file: Path | None = typer.Option(None, "--file"),
-    stdin: bool = typer.Option(False, "--stdin"),
+    file: Path | None = typer.Option(None, "--file"), stdin: bool = typer.Option(False, "--stdin"),
 ) -> None:
-    """Call the branch session's query API with SQL and optional named parameters."""
     statement, parameters = _sql_input(sql, file, stdin), _parameters(params)
-    with connect(database_config(ctx)) as database:
-        with database.checkout(branch) as session:
+    with connect_workspace(ctx, store) as workspace:
+        with store_session(workspace, branch, store) as session:
             print_result(session.query(statement, parameters))
 
 
 def execute(
-    ctx: typer.Context,
-    sql: str | None = typer.Argument(None),
-    branch: str = typer.Option("main", "--branch"),
+    ctx: typer.Context, sql: str | None = typer.Argument(None),
+    store: str = typer.Option(..., "--store"), branch: str = typer.Option("main", "--branch"),
     params: str | None = typer.Option(None, "--params"),
-    file: Path | None = typer.Option(None, "--file"),
-    stdin: bool = typer.Option(False, "--stdin"),
+    file: Path | None = typer.Option(None, "--file"), stdin: bool = typer.Option(False, "--stdin"),
 ) -> None:
-    """Call the branch session's execute API; SQL is not split into a script."""
     statement, parameters = _sql_input(sql, file, stdin), _parameters(params)
-    with connect(database_config(ctx)) as database:
-        with database.checkout(branch) as session:
+    with connect_workspace(ctx, store) as workspace:
+        with store_session(workspace, branch, store) as session:
             print_result(session.execute(statement, parameters))
 
 
-@checkpoint_app.command("create")
-def create_checkpoint(
-    ctx: typer.Context, name: str,
-    branch: str = typer.Option("main", "--branch"),
-) -> None:
-    with connect(database_config(ctx)) as database:
-        print_result(database.create_checkpoint(name, branch=branch))
-
-
-@checkpoint_app.command("list")
-def list_checkpoints(
-    ctx: typer.Context, branch: str | None = typer.Option(None, "--branch"),
-) -> None:
-    with connect(database_config(ctx)) as database:
-        print_result(database.list_checkpoints(branch=branch))
-
-
-def diff(
-    ctx: typer.Context, left: str, right: str,
-    table: str | None = typer.Option(None, "--table"),
-) -> None:
-    with connect(database_config(ctx)) as database:
-        print_result(database.diff(left, right) if table is None else database.diff_rows(left, right, table))
-
-
-@merge_app.command("preview")
-def merge_preview(
-    ctx: typer.Context, source: str, target: str,
-    policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy"),
-) -> None:
-    with connect(database_config(ctx)) as database:
-        print_result(database.merge_preview(source, target, policy=policy.value))
-
-
-@merge_app.command("apply")
-def merge_apply(
-    ctx: typer.Context, source: str, target: str,
-    policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy"),
-) -> None:
-    with connect(database_config(ctx)) as database:
-        print_result(database.merge_apply(source, target, policy=policy.value))
-
-
 def register_commands(app: typer.Typer) -> None:
-    """Attach relational commands to the root without introducing a SQL subcommand."""
     app.command()(query)
     app.command()(execute)
-    app.command()(diff)
-    app.add_typer(branch_app, name="branch", help="Manage branches.")
-    app.add_typer(table_app, name="table", help="Create ordinary tables and register them with Chronos.")
-    app.add_typer(checkpoint_app, name="checkpoint", help="Create and list checkpoints.")
-    app.add_typer(merge_app, name="merge", help="Preview and apply merges.")
+    app.add_typer(table_app, name="table", help="Prepare tables in a named relational store.")
