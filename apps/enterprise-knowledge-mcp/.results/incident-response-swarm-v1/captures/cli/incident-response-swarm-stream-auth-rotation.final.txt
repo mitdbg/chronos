@@ -1,0 +1,10 @@
+Investigation and publication completed.
+
+- Evidence: SUP-99816, document `dsid_980c1997922d47718ca8e8eaaa349d02` at `/knowledge/company/sources/jira/ops-requests/SUP-99816-auth-rotation-baggage-header-accumulation-causes-streaming-stalls.json`.
+- Diagnosis: Auth rotation plus append-mode `x-trace-baggage` grew headers from ~6 KB to ~78 KB, exceeding API Gateway/nginx buffers. Proxy buffering delayed flushes; the 30-second ALB idle timeout reset streams. No CPU/GPU saturation was observed.
+- Validation: Internal SDK-loop reproduction produced the same header growth and ALB/nginx errors. Overwrite-mode baggage and targeted edge mitigations reduced failures from ~12% to <1% over 48 hours.
+- Mitigation: Use baggage overwrite mode, reduce rotation frequency, retain feature-gated buffer/proxy changes, and temporarily use a 60-second ALB timeout.
+- Published report: `/artifacts/incidents/swarm-stream-auth-rotation.md`, indexed as `incident-report/swarm-stream-auth-rotation`.
+- Published memory: `episodic/swarm-stream-auth-rotation`, citing the source evidence.
+- Promotion: Reviewed and committed to `team/site-reliability`; report fetch and search verification succeeded. Temporary task branch deleted.
+- Uncertainty: SUP-99816 remains In Progress/partial resolution. SDK release, alerting, defensive limits, fleet-wide standards, and rollback procedures are not evidenced as complete.

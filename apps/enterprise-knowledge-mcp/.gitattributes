@@ -1,0 +1,8 @@
+# Archive shards stay below GitHub's per-object LFS limit.
+datasets/enterprise_rag_infra_v1/artifacts/*.part-* filter=lfs diff=lfs merge=lfs -text
+# Retained artifact hashes require byte-preserving checkouts, including CSV CRLF.
+.results/** -text
+.results/**/*.csv whitespace=cr-at-eol
+# Keep JSON metadata browsable; bulk event streams and logs use LFS.
+.results/**/*.jsonl filter=lfs diff=lfs merge=lfs -text
+.results/**/*.log filter=lfs diff=lfs merge=lfs -text

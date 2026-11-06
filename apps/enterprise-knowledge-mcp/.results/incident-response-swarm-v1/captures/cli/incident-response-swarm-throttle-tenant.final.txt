@@ -1,0 +1,7 @@
+Completed.
+
+- Evidence: `SUP-99214` (`dsid_b608f0b436a643759e2cbe24c62beef4`) records 30–50% throughput loss, elevated latency/504s, GPU context-switch and kernel-wait spikes, autoscaler lag, reproduction with synthetic GPU load, and recovery after traffic reroute. The published TER runbook (`dsid_69cd1297f520407bbb0cd9a2f0ffb5ce`) documents tenant throttling only as a conditional mitigation.
+- Diagnosis: GPU scheduling contention, likely involving co-located GPU activity, was compounded by autoscaling that lacked GPU-wait signals. The evidence does not support a tenant rate-limit setting as the cause.
+- Validation/mitigation: The ticket’s reproduction increased load with GPU microbenchmarks; 30% fallback routing restored p95 to baseline. Recorded mitigations were node isolation, increasing minimum capacity from 2 to 3, and context-switch alerting.
+- Uncertainty: `SUP-99214` remained In Progress. The exact noisy process, driver contribution, and autoscaler contribution remain unresolved.
+- Publication: Report indexed as `incident-report/swarm-throttle-tenant` at `/artifacts/incidents/swarm-throttle-tenant.md`; episodic memory persisted as `episodic/swarm-throttle-tenant`. The reviewed merge committed to `team/site-reliability`; scratch artifacts were unselected. Fetch and search verification succeeded, and the temporary task branch was deleted.

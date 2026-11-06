@@ -1,0 +1,44 @@
+{
+  "experiment": "incident-response-swarm-worker-sweep-v1",
+  "systems": [
+    "chronos",
+    "native-branching",
+    "native-branching-lock"
+  ],
+  "selected_systems": [
+    "native-branching-lock"
+  ],
+  "workers": [
+    128
+  ],
+  "startup_batch_size": 1,
+  "allow_shell": true,
+  "replay_llm_latency": true,
+  "merge_retries": "unlimited",
+  "chronos_session_epochs": false,
+  "worker_thread_limits": {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "ORT_NUM_THREADS": "1",
+    "TOKENIZERS_PARALLELISM": "false",
+    "CHRONOS_BM25_THREADS": "1",
+    "CHRONOS_QDRANT_POOL_SIZE": "1",
+    "CHRONOS_INTERVAL_GC_SYNCHRONOUS": "1"
+  },
+  "qdrant_client_pool_size": 1,
+  "chronos_interval_gc": "synchronous",
+  "target_branch": "team/site-reliability",
+  "traces_dir": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/incident-response-swarm-v1/traces/luna-max-20260821",
+  "inputs": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/concurrency-v1/incident-response-swarm/incident-inputs.jsonl",
+  "service_configuration": {
+    "chronos_qdrant_url": "http://127.0.0.1:6333",
+    "native_qdrant_url": "http://127.0.0.1:6342",
+    "qdrant_image": "qdrant/qdrant:v1.18.2",
+    "qdrant_memory": "8g",
+    "qdrant_max_workers": 8
+  },
+  "started_at_utc": "2026-08-28T18:38:11Z",
+  "finished_at_utc": "2026-08-29T02:49:57Z"
+}

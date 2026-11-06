@@ -1,0 +1,17 @@
+Published to `team/site-reliability`.
+
+- Report: `incident-report/swarm-private-index-rollback`
+- Memory: `episodic/swarm-private-index-rollback`
+- Merge committed atomically; only those two documents were selected. Scratch artifacts were excluded.
+- Fetch and search verification succeeded; temporary task branch was deleted.
+
+Diagnosis: PR 76321’s rollback metadata is artifact/provenance-centric and does not document dependency ordering or tenant seed/state preservation. PR 176543 records failures in multi-stage private upgrades requiring coordinated schema, config, Helm, and seed-data rollback, then adds dependency-aware staged rollback and seed preservation.
+
+Evidence:
+
+- GitHub PR 76321 — `dsid_009d514ee6c349268c542af07d9cd5b1`
+- GitHub PR 176543 — `dsid_b3bee87d2284436fa3dd7f8149dba38d`
+- Private rollback gating guidance — `dsid_67dc493c8cd449dfb82109aebf3d8cbb`
+- Private rollback runbook — `dsid_0a6c6e67d89c4cb4b053a7c04d780d97`
+
+Remaining uncertainty: no customer-specific failing index, release version, rollback logs, or exact missing field was present, so deployment-specific causality is unconfirmed.

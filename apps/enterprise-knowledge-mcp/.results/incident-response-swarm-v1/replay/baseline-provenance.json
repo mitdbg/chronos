@@ -1,0 +1,31 @@
+{
+  "source_sweep": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/incident-response-swarm-v1/results/worker-sweep-20260822-atomic-optimized-complete",
+  "copied_systems": [
+    "native-branching",
+    "native-branching-lock"
+  ],
+  "native_branching_worker_counts": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128
+  ],
+  "native_branching_lock_worker_counts": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "traces_dir": "/home/ubuntu/TAR-OS/chronos/.enterprise-knowledge/enterprise-rag-curated-v2/incident-response-swarm-v1/traces/luna-max-20260821",
+  "inputs": "/home/ubuntu/TAR-OS/chronos/apps/enterprise-knowledge-mcp/workflows/curated-v2/concurrency-v1/incident-response-swarm/incident-inputs.jsonl",
+  "replay_llm_latency": true,
+  "source_merge_retries": 11,
+  "note": "These are copied historical baseline artifacts, not rerun under the 2026-08-27 connection-limited Chronos sweep configuration. No app-managed incident-swarm result was available to copy."
+}

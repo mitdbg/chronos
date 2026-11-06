@@ -1,0 +1,9 @@
+Published successfully to `team/site-reliability`.
+
+- Evidence: `SUP-888888` (`dsid_2340bdfbd47e400ead5733cacaa5e5ad`) and corroborating `SUP-321409` (`dsid_97196a6292ef4c518cb61dbd4b38b985`).
+- Diagnosis: v2.3.1 increased short-lived runner/session churn, fragmenting token-bucket accounting and causing apparent exhaustion with intermittent 429s despite usage below quota.
+- Mitigation: reuse long-lived workers/connections; stage a scoped TTL rollback to v2.2.x, monitoring 429 frequency.
+- Uncertainty: exact reservation/reconciliation behavior, causal contribution of HTTP/2 handling, and durability of the reported ~85% canary reduction remain unconfirmed.
+- Report: `/artifacts/incidents/swarm-autoscale-fragmentation.md`
+- Memory: `episodic/swarm-autoscale-fragmentation`, with evidence citations.
+- Verification: report fetched and found by search on `team/site-reliability`; scratch artifacts were excluded. Temporary task branch deleted.
