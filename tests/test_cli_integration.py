@@ -338,6 +338,48 @@ path="vectors"
 
 
 class TestWorkspaceSQLWorkflows:
+    def test_atomic_merge_across_separate_sql_databases(self, tmp_path: Path) -> None:
+        config = tmp_path / "chronos.toml"
+        config.write_text(textwrap.dedent("""
+            [workspace]
+            shared_metadata_url = "sqlite:///metadata.sqlite"
+
+            [stores.app]
+            kind = "sqlite"
+            database_url = "sqlite:///app.sqlite"
+            metadata_url = "sqlite:///metadata.sqlite"
+            merge_tables = ["items"]
+
+            [stores.audit]
+            kind = "sqlite"
+            database_url = "sqlite:///audit.sqlite"
+            metadata_url = "sqlite:///metadata.sqlite"
+            merge_tables = ["events"]
+        """))
+        invoke = partial(_invoke_workspace, config)
+        tables = {"app": "items", "audit": "events"}
+        for store, table in tables.items():
+            invoke("table", "create", f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)", "--store", store)
+            invoke("table", "register", table, "--store", store, "--primary-key", "id")
+        invoke("branch", "create", "draft")
+        for store, table in tables.items():
+            invoke("execute", f"INSERT INTO {table} (id) VALUES (1)", "--store", store, "--branch", "draft")
+            assert invoke("query", f"SELECT id FROM {table}", "--store", store) == []
+
+        preview = invoke("merge", "atomic-preview", "draft", "main")
+        assert {
+            store: [change["table"] for change in result["changes"]]
+            for store, result in preview["stores"].items()
+        } == {"app": ["items"], "audit": ["events"]}
+        result = invoke(
+            "merge", "atomic-apply", "draft", "main", "--operation-id", "separate-sql",
+            "--preview-token", preview["preview_token"],
+        )
+        assert result["status"] == "committed"
+        assert result["stores"] == {"app": 1, "audit": 1}
+        for store, table in tables.items():
+            assert invoke("query", f"SELECT id FROM {table}", "--store", store) == [{"id": 1}]
+
     def test_nonfinite_api_result_is_not_printed_as_invalid_json(self, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, DatabaseConfig(f"sqlite:///{tmp_path / 'app.sqlite'}"))
         with open_workspace(load_workspace_config(config)) as workspace:
@@ -661,3 +703,108 @@ class TestWorkspaceFilesystemWorkflows:
             assert failed.returncode == 1
             assert 'Traceback' not in failed.stderr
             assert str(tmp_path / 'state' / 'mounts') not in Path('/proc/self/mountinfo').read_text()
+
+
+class TestNativeChronosFSWorkflows:
+    @pytest.fixture(autouse=True)
+    def require_native_filesystem(self) -> None:
+        if not hasattr(_native_interval, "NativeChronosFSStore"):
+            if os.environ.get("CHRONOS_CLI_REQUIRE_CHRONOSFS") == "ON":
+                pytest.fail("This test run requires a native ChronosFS build")
+            pytest.skip("Native ChronosFS is disabled in this build")
+
+    @staticmethod
+    def file_command(config: Path, *args: str, payload: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [sys.executable, "-m", "chronos_core.cli", "--config", str(config), "fs", *args],
+            input=payload, capture_output=True, timeout=30,
+        )
+
+    def test_native_only_persists_binary_file(self, tmp_path: Path) -> None:
+        config = tmp_path / "chronos.toml"
+        config.write_text('[filesystem]\nkind="chronosfs"\ndatabase_url="sqlite:///files.sqlite"\n')
+        payload = b"\x00\xff\n"
+        written = self.file_command(config, "write", "/dir/file", "--stdin", "--parents", payload=payload)
+        assert written.returncode == 0, written.stderr
+        assert _invoke_workspace(config, "fs", "ls", "/dir") == ["file"]
+        read = self.file_command(config, "read", "/dir/file")
+        assert read.returncode == 0, read.stderr
+        assert read.stdout == payload
+
+    @pytest.mark.parametrize("split", [False, True], ids=["unified", "split-scoped"])
+    def test_sql_and_native_filesystem_atomic_merge(self, tmp_path: Path, split: bool) -> None:
+        config = tmp_path / "chronos.toml"
+        sql_config = '[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\n'
+        fs_config = '[filesystem]\nkind="chronosfs"\n'
+        if split:
+            sql_config += 'merge_tables=["items"]\n'
+            fs_config += 'database_url="sqlite:///files.sqlite"\nmetadata_url="sqlite:///app.sqlite"\n'
+        else:
+            fs_config += 'database_url="sqlite:///app.sqlite"\n'
+        config.write_text(
+            '[workspace]\nshared_metadata_url="sqlite:///app.sqlite"\n' + sql_config + fs_config
+        )
+        invoke = partial(_invoke_workspace, config)
+        invoke("table", "create", "CREATE TABLE items (id INTEGER PRIMARY KEY)", "--store", "app")
+        invoke("table", "register", "items", "--primary-key", "id", "--store", "app")
+        invoke("branch", "create", "draft")
+        invoke("execute", "INSERT INTO items (id) VALUES (1)", "--store", "app", "--branch", "draft")
+        written = self.file_command(config, "write", "/report", "--branch", "draft", "--stdin", payload=b"draft\n")
+        assert written.returncode == 0, written.stderr
+        assert invoke("query", "SELECT * FROM items", "--store", "app") == []
+        assert "report" not in invoke("fs", "ls")
+        preview = invoke("merge", "atomic-preview", "draft", "main")
+        assert all(preview["stores"][name]["changes"] for name in ("app", "filesystem"))
+        if split:
+            assert [change["table"] for change in preview["stores"]["app"]["changes"]] == ["items"]
+        result = invoke("merge", "atomic-apply", "draft", "main",
+                        "--operation-id", "native-filesystem", "--preview-token", preview["preview_token"])
+        assert result["status"] == "committed"
+        assert invoke("query", "SELECT * FROM items", "--store", "app") == [{"id": 1}]
+        read = self.file_command(config, "read", "/report")
+        assert read.returncode == 0, read.stderr
+        assert read.stdout == b"draft\n"
+
+    def test_mount_writes_to_selected_branch(self, tmp_path: Path) -> None:
+        import shutil
+
+        unmount = shutil.which("fusermount3")
+        if unmount is None or not Path("/dev/fuse").exists():
+            if os.environ.get("CHRONOS_CLI_REQUIRE_CHRONOSFS") == "ON":
+                pytest.fail("This test requires /dev/fuse and fusermount3")
+            pytest.skip("Native mount requires /dev/fuse and fusermount3")
+
+        config = tmp_path / "chronos.toml"
+        config.write_text('[filesystem]\nkind="chronosfs"\ndatabase_url="sqlite:///files.sqlite"\n')
+        mountpoint = tmp_path / "mount"
+        mountpoint.mkdir()
+        _invoke_workspace(config, "branch", "create", "draft")
+        command = [
+            sys.executable, "-m", "chronos_core.cli", "--config", str(config),
+            "fs", "mount", str(mountpoint), "--branch", "draft",
+        ]
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            try:
+                deadline = time.monotonic() + 15
+                while not mountpoint.is_mount():
+                    if process.poll() is not None:
+                        _, stderr = process.communicate()
+                        pytest.fail(f"Mount command exited early: {stderr.decode(errors='replace')}")
+                    if time.monotonic() >= deadline:
+                        pytest.fail("Timed out waiting for the native mount")
+                    time.sleep(0.05)
+                (mountpoint / "report").write_bytes(b"mounted draft\n")
+                subprocess.run([unmount, "-u", str(mountpoint)], check=True, timeout=10)
+                _, stderr = process.communicate(timeout=15)
+                assert process.returncode == 0, stderr
+            finally:
+                if mountpoint.is_mount():
+                    subprocess.run([unmount, "-uz", str(mountpoint)], timeout=10)
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+
+        assert "report" not in _invoke_workspace(config, "fs", "ls")
+        read = self.file_command(config, "read", "/report", "--branch", "draft")
+        assert read.returncode == 0, read.stderr
+        assert read.stdout == b"mounted draft\n"

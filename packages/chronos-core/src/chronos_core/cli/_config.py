@@ -45,6 +45,7 @@ class WorkspaceConfigError(ValueError):
 class StoreConfig:
     kind: Literal["sqlite", "postgresql", "duckdb", "qdrant"]
     connection: DatabaseConfig | QdrantConfig
+    merge_tables: tuple[str, ...] | None = None
 
     @property
     def metadata_url(self) -> str:
@@ -65,7 +66,7 @@ class WorkspaceConfig:
     config_path: Path
     stores: dict[str, StoreConfig]
     shared_metadata_url: str | None = None
-    filesystem: FilesystemConfig | None = None
+    filesystem: FilesystemConfig | DatabaseConfig | None = None
 
     def store(self, name: str, *, qdrant: bool = False) -> StoreConfig:
         store = self.stores.get(name)
@@ -142,7 +143,7 @@ def _store_config(value: Any, root: Path, field: str) -> StoreConfig:
         raise WorkspaceConfigError(f"{field} must be a TOML table.")
     kind = value.get("kind")
     if kind in ("sqlite", "postgresql", "duckdb"):
-        data = _table(value, field, {"kind", "database_url", "metadata_url"})
+        data = _table(value, field, {"kind", "database_url", "metadata_url", "merge_tables"})
         url = _database_url(data.get("database_url"), root, f"{field}.database_url", kind=kind)
         metadata = (
             _database_url(data["metadata_url"], root, f"{field}.metadata_url")
@@ -150,7 +151,15 @@ def _store_config(value: Any, root: Path, field: str) -> StoreConfig:
         )
         if kind == "duckdb" and metadata is None:
             raise WorkspaceConfigError(f"{field}.metadata_url is required for DuckDB.")
-        return StoreConfig(kind, DatabaseConfig(url, metadata))
+        merge_tables = None
+        if "merge_tables" in data:
+            tables = data["merge_tables"]
+            if not isinstance(tables, list) or any(
+                not isinstance(table, str) or not table.strip() for table in tables
+            ):
+                raise WorkspaceConfigError(f"{field}.merge_tables must be an array of non-empty table names.")
+            merge_tables = tuple(tables) or None
+        return StoreConfig(kind, DatabaseConfig(url, metadata), merge_tables)
     if kind != "qdrant":
         raise WorkspaceConfigError(f"{field}.kind must be sqlite, postgresql, duckdb, or qdrant.")
     data = _table(value, field, {"kind", "metadata_url", "path", "url", "api_key", "collection_prefix", "timeout"})
@@ -208,13 +217,26 @@ def load_workspace_config(path: Path | None = None) -> WorkspaceConfig:
     )
     filesystem = None
     if "filesystem" in data:
-        fields = _table(data["filesystem"], "filesystem", {"root", "state_dir"})
-        filesystem = FilesystemConfig(*(
-            _local_path(_text(fields.get(key), f"filesystem.{key}"), config_path.parent, f"filesystem.{key}")
-            for key in ("root", "state_dir")
-        ))
-        if shared is not None:
-            raise WorkspaceConfigError("The OverlayFS backend does not support shared-metadata atomic workspaces.")
+        fields = _table(data["filesystem"], "filesystem", {"kind", "root", "state_dir", "database_url", "metadata_url"})
+        kind = fields.get("kind", "overlayfs")
+        if kind == "overlayfs":
+            _table(fields, "filesystem", {"kind", "root", "state_dir"})
+            filesystem = FilesystemConfig(*(
+                _local_path(_text(fields.get(key), f"filesystem.{key}"), config_path.parent, f"filesystem.{key}")
+                for key in ("root", "state_dir")
+            ))
+            if shared is not None:
+                raise WorkspaceConfigError("The OverlayFS backend does not support shared-metadata atomic workspaces.")
+        elif kind == "chronosfs":
+            _table(fields, "filesystem", {"kind", "database_url", "metadata_url"})
+            url = _database_url(fields.get("database_url"), config_path.parent, "filesystem.database_url")
+            metadata = (
+                _database_url(fields["metadata_url"], config_path.parent, "filesystem.metadata_url")
+                if "metadata_url" in fields else None
+            )
+            filesystem = DatabaseConfig(url, metadata)
+        else:
+            raise WorkspaceConfigError("filesystem.kind must be overlayfs or chronosfs.")
     entries = data.get("stores", {})
     if not isinstance(entries, dict) or (not entries and filesystem is None):
         raise WorkspaceConfigError("Configure at least one named store in [stores.NAME] or [filesystem].")
@@ -228,13 +250,27 @@ def load_workspace_config(path: Path | None = None) -> WorkspaceConfig:
             raise WorkspaceConfigError(f"Invalid or reserved workspace store name {name!r}.")
         stores[name] = _store_config(value, config_path.parent, f"stores.{name}")
     metadata_urls = [store.metadata_url for store in stores.values()]
+    if isinstance(filesystem, DatabaseConfig):
+        metadata_urls.append(filesystem.metadata_url or filesystem.database_url)
+        if shared is not None and any(
+            isinstance(store.connection, DatabaseConfig)
+            and store.connection.database_url != filesystem.database_url
+            and store.merge_tables is None
+            for store in stores.values()
+        ):
+            raise WorkspaceConfigError(
+                "SQL stores with separate data from native ChronosFS require nonempty merge_tables for atomic workspaces."
+            )
     if shared is not None and any(url != shared for url in metadata_urls):
         raise WorkspaceConfigError("Every store must use workspace.shared_metadata_url for atomic operations.")
-    if shared is not None and sum(store.kind != "qdrant" for store in stores.values()) > 1:
-        raise WorkspaceConfigError(
-            "This CLI does not yet support multiple SQL participants sharing metadata. "
-            "Use independent metadata, or one SQL participant with Qdrant."
-        )
+    sql_stores = {name: store for name, store in stores.items() if store.kind != "qdrant"}
+    if shared is not None and len(sql_stores) > 1:
+        unscoped = [name for name, store in sql_stores.items() if store.merge_tables is None]
+        if unscoped:
+            raise WorkspaceConfigError(
+                "Multiple SQL stores sharing metadata require nonempty merge_tables for each store. "
+                f"Missing for: {', '.join(unscoped)}."
+            )
     identities = [_metadata_identity(url, config_path.parent) for url in metadata_urls]
     if shared is None and len(set(identities)) != len(identities):
         raise WorkspaceConfigError("Stores sharing metadata require workspace.shared_metadata_url.")
@@ -271,6 +307,8 @@ def open_workspace(config: WorkspaceConfig) -> Generator[ChronosWorkspaceContext
                 else:
                     context = ChronosBranchContext.connect_split(database.database_url, database.metadata_url)
                 resources.callback(close, context)
+                if entry.merge_tables is not None:
+                    context.set_merge_table_scope(list(entry.merge_tables))
                 stores[name] = context
             for name, entry in config.stores.items():
                 target = entry.connection
@@ -290,11 +328,28 @@ def open_workspace(config: WorkspaceConfig) -> Generator[ChronosWorkspaceContext
                 resources.callback(close, store)
                 stores[name] = store
             filesystem_options: dict[str, Any] = {}
-            if config.filesystem is not None:
+            if isinstance(config.filesystem, FilesystemConfig):
                 from chronos_core.workspace import ChronosFilesystemStore
 
                 filesystem = ChronosFilesystemStore(config.filesystem.root, state_dir=config.filesystem.state_dir)
                 resources.callback(close, filesystem)
+                filesystem_options["filesystem"] = filesystem
+            elif isinstance(config.filesystem, DatabaseConfig):
+                from chronos_core.workspace import ChronosFSStore
+
+                target = config.filesystem
+                context = (
+                    ChronosBranchContext.connect_split(target.database_url, target.metadata_url)
+                    if target.metadata_url and target.metadata_url != target.database_url
+                    else ChronosBranchContext.connect(target.database_url)
+                )
+                try:
+                    filesystem = ChronosFSStore(context)
+                except BaseException:
+                    close(context)
+                    raise
+                resources.callback(close, filesystem)
+                filesystem.ensure()
                 filesystem_options["filesystem"] = filesystem
             workspace = ChronosWorkspaceContext(
                 stores={name: stores[name] for name in config.stores},

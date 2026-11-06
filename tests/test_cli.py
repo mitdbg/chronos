@@ -701,3 +701,99 @@ class TestWorkspaceFilesystemCommands:
         assert result.exit_code == 1
         assert 'failed to mount branch' in result.stderr
         workspace_connection.close.assert_called_once_with()
+
+
+def test_native_filesystem_commands(workspace_connection: MagicMock, tmp_path: Path) -> None:
+    from chronos_core.workspace import ChronosFSStore
+
+    workspace_connection.filesystem = MagicMock(spec=ChronosFSStore)
+    session = workspace_connection.checkout.return_value.fs
+    payload = b"\x00\xff\n"
+    source = tmp_path / "payload"
+    source.write_bytes(payload)
+    session.write_file.return_value = 12
+    result = runner.invoke(app, ["fs", "write", "/dir/file", "--branch", "draft", "--file", str(source), "--parents"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == 12
+    workspace_connection.checkout.assert_called_with("draft")
+    session.write_file.assert_called_once_with("/dir/file", payload, parents=True)
+
+    session.read_file.return_value = payload
+    result = runner.invoke(app, ["fs", "read", "/dir/file"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout_bytes == payload
+    session.read_file.assert_called_once_with("/dir/file")
+
+    session.listdir.return_value = ["file"]
+    result = runner.invoke(app, ["fs", "ls", "/dir"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == ["file"]
+    session.listdir.assert_called_once_with("/dir")
+
+    result = runner.invoke(app, ["fs", "run", "--", "true"])
+    assert result.exit_code == 2
+    assert "requires the OverlayFS backend" in result.stderr
+
+
+@pytest.mark.parametrize("args", [[], ["--file", __file__, "--stdin"]])
+def test_native_write_requires_one_input(workspace_connection: MagicMock, args: list[str]) -> None:
+    result = runner.invoke(app, ["fs", "write", "/file", *args])
+    assert result.exit_code == 2
+    workspace_connection.checkout.assert_not_called()
+
+
+def test_native_filesystem_requires_matching_atomic_metadata(tmp_path: Path) -> None:
+    config = tmp_path / "chronos.toml"
+    config.write_text(
+        '[workspace]\nshared_metadata_url="sqlite:///shared.sqlite"\n'
+        '[filesystem]\nkind="chronosfs"\ndatabase_url="sqlite:///files.sqlite"\n'
+    )
+    with pytest.raises(WorkspaceConfigError, match="Every store must use"):
+        load_workspace_config(config)
+
+
+@pytest.mark.parametrize("scope", ["", "merge_tables=[]\n"])
+def test_native_atomic_split_sql_requires_explicit_scope(tmp_path: Path, scope: str) -> None:
+    config = tmp_path / "chronos.toml"
+    config.write_text(
+        '[workspace]\nshared_metadata_url="sqlite:///app.sqlite"\n'
+        '[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\n'
+        + scope + '[filesystem]\nkind="chronosfs"\ndatabase_url="sqlite:///files.sqlite"\n'
+        'metadata_url="sqlite:///app.sqlite"\n'
+    )
+    with pytest.raises(WorkspaceConfigError, match="require nonempty merge_tables"):
+        load_workspace_config(config)
+
+
+@pytest.mark.parametrize("scope", ["", "merge_tables=[]\n"])
+def test_default_merge_scope_includes_all_tables(tmp_path: Path, scope: str) -> None:
+    config = tmp_path / "chronos.toml"
+    config.write_text('[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\n' + scope)
+    assert load_workspace_config(config).stores["app"].merge_tables is None
+
+
+@pytest.mark.parametrize("mount_error", [False, True])
+def test_native_mount_delegates_and_closes(
+    workspace_connection: MagicMock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mount_error: bool,
+) -> None:
+    from chronos_core import workspace as api
+
+    filesystem = MagicMock(spec=api.ChronosFSStore)
+    workspace_connection.filesystem = filesystem
+    mountpoint = tmp_path / "mount"
+    mountpoint.mkdir()
+    failure = api.ChronosFSMountError("mount failed") if mount_error else None
+    mount = MagicMock(side_effect=failure)
+    monkeypatch.setattr(api, "mount_chronosfs", mount)
+
+    result = runner.invoke(app, [
+        "fs", "mount", str(mountpoint), "--branch", "draft", "-o", "ro", "--option", "default_permissions",
+    ])
+    assert result.exit_code == (1 if mount_error else 0), result.output
+    if mount_error:
+        assert "mount failed" in result.stderr
+    mount.assert_called_once_with(
+        filesystem, mountpoint.resolve(), branch_id="draft", options={"ro", "default_permissions"},
+    )
+    workspace_connection.checkout.assert_not_called()
+    workspace_connection.close.assert_called_once_with()

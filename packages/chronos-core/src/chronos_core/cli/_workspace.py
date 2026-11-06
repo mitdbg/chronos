@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import psycopg
 import typer
 
-from chronos_core.cli._config import QdrantConfig, WorkspaceConfigError, load_workspace_config, open_workspace
+from chronos_core.cli._config import DatabaseConfig, QdrantConfig, WorkspaceConfigError, load_workspace_config, open_workspace
 from chronos_core.cli._terminal import MergePolicy, print_result, report_error
 
 if TYPE_CHECKING:
@@ -46,11 +46,16 @@ def connect_workspace(
             raise typer.BadParameter(str(error), param_hint="--store") from error
 
     from chronos_core.branching import BranchingError
-    from chronos_core.workspace.filesystem import FilesystemStoreError
+    from chronos_core.workspace import ChronosFSError, ChronosFSMountError, FilesystemStoreError
 
-    errors = (FilesystemStoreError, BranchingError, RuntimeError, ValueError, TypeError, OSError, sqlite3.Error, psycopg.Error)
+    errors = (
+        ChronosFSError, ChronosFSMountError, FilesystemStoreError, BranchingError,
+        RuntimeError, ValueError, TypeError, OSError, sqlite3.Error, psycopg.Error,
+    )
     secrets: list[str | None] = []
     urls: list[str | None] = []
+    if isinstance(config.filesystem, DatabaseConfig):
+        urls.extend((config.filesystem.database_url, config.filesystem.metadata_url))
     for entry in config.stores.values():
         target = entry.connection
         urls.append(target.metadata_url)

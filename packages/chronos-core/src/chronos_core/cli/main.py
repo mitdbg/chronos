@@ -11,7 +11,7 @@ from chronos_core.cli._relational import register_commands as register_relationa
 from chronos_core.cli._workspace import WorkspaceOptions, register_commands as register_workspace_commands
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
-app.add_typer(filesystem_app, name="fs", help="Run commands in the workspace filesystem.")
+app.add_typer(filesystem_app, name="fs", help="Use the configured workspace filesystem.")
 register_workspace_commands(app)
 register_relational_commands(app)
 app.add_typer(qdrant_app, name="qdrant", help="Use a named Qdrant participant.")

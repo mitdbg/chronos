@@ -80,20 +80,23 @@ jobs:
         include:
           - python: '3.10'
             duckdb: 'OFF'
+            filesystem: 'OFF'
           - python: '3.12'
             duckdb: 'OFF'
+            filesystem: 'ON'
           - python: '3.12'
             duckdb: 'ON'
+            filesystem: 'OFF'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libpq-dev libboost-dev
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libpq-dev libboost-dev libfuse3-dev
       - run: python -m pip install build pytest pytest-asyncio pytest-timeout
       - name: Build from source distribution and install the wheel
         run: |
-          python -m build packages/chronos-core --outdir /tmp/chronos-wheel -Cbuild-dir=/tmp/chronos-build -Cbuild.tool-args=-j2 -Ccmake.define.CHRONOS_WITH_DUCKDB=${{ matrix.duckdb }}
+          python -m build packages/chronos-core --outdir /tmp/chronos-wheel -Cbuild-dir=/tmp/chronos-build -Cbuild.tool-args=-j2 -Ccmake.define.CHRONOS_WITH_DUCKDB=${{ matrix.duckdb }} -Ccmake.define.CHRONOS_WITH_FILESYSTEM=${{ matrix.filesystem }}
           python -m pip install /tmp/chronos-wheel/*.whl
       - name: Test the installed relational artifact
         run: |
@@ -120,6 +123,13 @@ jobs:
           sudo apt-get install -y fuse-overlayfs fuse3
           sudo modprobe fuse
           python -I -m pytest tests/test_cli_integration.py::TestWorkspaceFilesystemWorkflows -q --timeout=120
+      - name: Test native ChronosFS CLI
+        if: matrix.filesystem == 'ON'
+        env:
+          CHRONOS_CLI_REQUIRE_CHRONOSFS: 'ON'
+        run: |
+          python -I -m pytest tests/test_cli.py -k native -q --timeout=60
+          python -I -m pytest tests/test_cli_integration.py::TestNativeChronosFSWorkflows -q --timeout=120
       - name: Test workspace DuckDB and Qdrant together
         if: matrix.duckdb == 'ON'
         env:

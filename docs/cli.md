@@ -46,18 +46,22 @@ kind = "sqlite"
 database_url = "sqlite:///.chronos/app.sqlite"
 ```
 
-Create `.chronos/` first. Local database URLs and Qdrant paths resolve relative
+Save the example as `chronos.toml` and create `.chronos/` first. Local database URLs and Qdrant paths resolve relative
 to the TOML file. Configuration precedence is `--config PATH`, then
 `CHRONOS_WORKSPACE_CONFIG`, then `chronos.toml` in the current directory. A
 workspace name is not required. Connection strings may reference `${ENV_VAR}`;
 unset references are errors. `.env` files are not loaded automatically.
 
+From the repository root, run the commands below. If `chronos` is already on
+your PATH, you can use it directly in place of the `uv run` invocation.
+
 ```sh
-chronos table create --store app \
+mkdir -p .chronos
+uv run --package chronos-core chronos table create --store app \
   'CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)'
-chronos table register --store app items --primary-key id
-chronos branch create experiment
-chronos query --store app --branch experiment 'SELECT * FROM items'
+uv run --package chronos-core chronos table register --store app items --primary-key id
+uv run --package chronos-core chronos branch create experiment
+uv run --package chronos-core chronos query --store app --branch experiment 'SELECT * FROM items'
 ```
 
 SQL participants support `sqlite`, `postgresql`, and `duckdb` kinds, with
@@ -70,14 +74,13 @@ Branches, checkpoints, diffs, and merges operate across the workspace. With
 independent metadata, `merge preview/apply` calls the coordinated API, which
 can retain partial changes if a later participant fails. Atomic mode requires
 `[workspace].shared_metadata_url` and matching metadata URLs for every store.
-This CLI version supports one SQL participant in atomic mode; multiple SQL
-participants can use independent metadata. Shared-metadata SQL participants
-need per-table merge scopes, and the current API's diff does not honor those
-scopes, so the CLI rejects that topology rather than implementing custom behavior.
-Use `merge atomic-preview` and `merge atomic-apply --operation-id ID`; optionally
-pass the returned `--preview-token` to reject a changed preview. Atomic mode
-does not silently fall back to coordinated merging. Filesystems are not exposed
-by the workspace CLI yet.
+Multiple SQL participants sharing metadata require a nonempty `merge_tables`
+scope for each store. See the atomic SQL example below. Use
+`merge atomic-preview` to inspect the candidate changes and
+`merge atomic-apply --operation-id ID` to publish them. Pass the returned
+`--preview-token` to reject a changed preview. Ordinary `diff` can fail in
+split-data workspaces because the Python API's diff does not use merge scopes.
+See the filesystem sections below for OverlayFS and native ChronosFS setup.
 
 ## Checked terminal demo
 
@@ -146,9 +149,9 @@ redirected to a file.
 Non-finite floats returned by the API fail clearly because JSON cannot represent
 them; query execution and the API's returned values are not modified.
 
-## Filesystem workspace
+## OverlayFS workspace
 
-The filesystem participant wraps `ChronosFilesystemStore` and requires Linux,
+The OverlayFS participant wraps `ChronosFilesystemStore` and requires Linux,
 `fuse-overlayfs`, `fusermount3` (or `fusermount`), and permission to use `/dev/fuse`.
 It can be the only participant or accompany named SQL/Qdrant stores. Configure
 an existing base directory and an explicit persistent state directory, preferably
@@ -191,8 +194,7 @@ the current filesystem merge implementation, which applies file-level changes
 without three-way conflict detection. The existing `abort_on_conflict` default
 and explicit policies remain unchanged; the API rejects them for this filesystem.
 The CLI's OverlayFS backend does not support shared-metadata atomic workspaces.
-These configurations are rejected before opening stores. The separate native
-ChronosFS backend is not exposed by this CLI. Coordinated merges do not promise all-store rollback.
+These configurations are rejected before opening stores. Coordinated merges do not promise all-store rollback.
 
 Each invocation releases its mounts while preserving state and versioned files.
 Use short-lived commands; this interface does not keep a mount alive for later
@@ -213,3 +215,115 @@ security profile (for example `--device /dev/fuse --cap-add SYS_ADMIN
 --security-opt apparmor=unconfined`). Keep test data on the container's Linux
 filesystem. The required-test flag prevents missing dependencies from counting
 as a successful skipped run.
+
+## Native ChronosFS workspace
+
+Native ChronosFS stores versioned files in Chronos. Use a Linux package built
+with `CHRONOS_WITH_FILESYSTEM=ON`. File commands use the Python API directly
+and do not need a FUSE mount. Select one filesystem backend per workspace.
+Omitting `kind` keeps the existing OverlayFS configuration behavior.
+
+```toml
+[filesystem]
+kind = "chronosfs"
+database_url = "sqlite:///files.sqlite"
+```
+
+```sh
+chronos branch create experiment
+printf 'hello\n' | chronos fs write /notes/report.txt --branch experiment --parents --stdin
+chronos fs ls /notes --branch experiment
+chronos fs read /notes/report.txt --branch experiment
+```
+
+`fs read` writes raw bytes to stdout. `fs write` accepts either `--file PATH`
+or `--stdin` and prints the API's result as JSON. `fs run` is available with
+the OverlayFS backend.
+
+For an atomic workspace with SQLite, configure the SQL store and native
+ChronosFS to use the same database:
+
+```toml
+[workspace]
+shared_metadata_url = "sqlite:///app.sqlite"
+
+[stores.app]
+kind = "sqlite"
+database_url = "sqlite:///app.sqlite"
+
+[filesystem]
+kind = "chronosfs"
+database_url = "sqlite:///app.sqlite"
+```
+
+Use the existing `merge atomic-preview` and `merge atomic-apply` commands to
+publish SQL and filesystem changes together. The API preview can show the
+filesystem changes both as interval rows under the SQL participant and as
+file changes under the filesystem participant.
+
+To keep SQL rows and native file data in separate databases, put the SQL
+participant's table scope in the workspace TOML:
+
+```toml
+[workspace]
+shared_metadata_url = "sqlite:///app.sqlite"
+
+[stores.app]
+kind = "sqlite"
+database_url = "sqlite:///app.sqlite"
+merge_tables = ["items"]
+
+[filesystem]
+kind = "chronosfs"
+database_url = "sqlite:///files.sqlite"
+metadata_url = "sqlite:///app.sqlite"
+```
+
+Omitting `merge_tables` or setting it to `[]` keeps the API's all-tables
+default. Split atomic configurations that require explicit table ownership
+need a nonempty list. The CLI passes that list to `set_merge_table_scope()`
+when it opens the SQL store. Register tables separately with `chronos table register`.
+Update the scope when you want another registered table included in merges.
+This setting controls merge scope and does not change workspace `diff`.
+
+On Linux with FUSE access, you can also mount a native branch into an existing
+directory:
+
+```sh
+mkdir -p ./chronos-mount
+chronos fs mount ./chronos-mount --branch experiment
+```
+
+The command stays in the foreground. Use the directory from another terminal
+and unmount it there with `fusermount3 -u ./chronos-mount` when finished.
+Repeat `--option` (or `-o`) to pass individual FUSE options to the Python API.
+
+## Atomic merge across SQL stores
+
+Declare each SQL store in the workspace TOML and point each one at the shared
+metadata database. Give each store an explicit `merge_tables` list containing
+the tables it should handle during an atomic merge:
+
+```toml
+[workspace]
+shared_metadata_url = "sqlite:///metadata.sqlite"
+
+[stores.app]
+kind = "sqlite"
+database_url = "sqlite:///app.sqlite"
+metadata_url = "sqlite:///metadata.sqlite"
+merge_tables = ["items"]
+
+[stores.audit]
+kind = "sqlite"
+database_url = "sqlite:///audit.sqlite"
+metadata_url = "sqlite:///metadata.sqlite"
+merge_tables = ["events"]
+```
+
+Register each table in its owning store. Use `merge atomic-preview` to inspect
+the changes per store and `merge atomic-apply` to publish them together.
+`merge_tables` is forwarded to the Python API's merge scope. To compare a
+candidate for publication in this split setup, use atomic preview. The
+ordinary workspace `diff` API does not use merge scopes and can fail when it
+looks for a table owned by a different data database.
