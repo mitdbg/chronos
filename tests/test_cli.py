@@ -15,6 +15,7 @@ from contextlib import contextmanager
 
 import pytest
 import typer
+from rich.text import Text
 from typer.testing import CliRunner
 
 from chronos_core.branching import BranchingError, ChronosBranchContext
@@ -324,8 +325,9 @@ class TestWorkspaceCommands:
             environment = {key: value for key, value in os.environ.items() if not key.startswith("CHRONOS_")}
             result = subprocess.run(args, capture_output=True, text=True, env=environment, timeout=30)
             assert result.returncode == 0, result.stderr
-            assert "--config" in result.stdout
-            assert "--database-url" not in result.stdout
+            help_text = Text.from_ansi(result.stdout).plain
+            assert "--config" in help_text
+            assert "--database-url" not in help_text
 
     def test_help_and_sql_without_qdrant_dependency(self, tmp_path: Path) -> None:
         code = '''
@@ -691,7 +693,7 @@ class TestWorkspaceFilesystemCommands:
         monkeypatch.delenv('CHRONOS_WORKSPACE_CONFIG', raising=False)
         result = runner.invoke(app, ['fs', 'run', '--help'])
         assert result.exit_code == 0
-        assert '--json' in result.stdout
+        assert "--json" in Text.from_ansi(result.stdout).plain
 
     def test_filesystem_error_is_reported(self, workspace_connection: MagicMock) -> None:
         from chronos_core.workspace.filesystem import FilesystemStoreError
