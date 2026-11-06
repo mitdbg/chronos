@@ -17,6 +17,7 @@ from chronos_core.cli._terminal import MergePolicy, print_result, report_error
 
 if TYPE_CHECKING:
     from chronos_core.workspace import ChronosWorkspaceContext
+    from chronos_core.workspace.runtime import WorkspaceBranchSession
 
 
 @dataclass(frozen=True)
@@ -45,8 +46,9 @@ def connect_workspace(
             raise typer.BadParameter(str(error), param_hint="--store") from error
 
     from chronos_core.branching import BranchingError
+    from chronos_core.workspace.filesystem import FilesystemStoreError
 
-    errors = (BranchingError, RuntimeError, ValueError, TypeError, OSError, sqlite3.Error, psycopg.Error)
+    errors = (FilesystemStoreError, BranchingError, RuntimeError, ValueError, TypeError, OSError, sqlite3.Error, psycopg.Error)
     secrets: list[str | None] = []
     urls: list[str | None] = []
     for entry in config.stores.values():
@@ -73,11 +75,11 @@ def connect_workspace(
 
 
 @contextmanager
-def store_session(workspace: ChronosWorkspaceContext, branch: str, store: str) -> Generator[Any, None, None]:
+def workspace_session(workspace: ChronosWorkspaceContext, branch: str) -> Generator[WorkspaceBranchSession, None, None]:
     checked_out = workspace.checkout(branch)
     errors: list[Exception] = []
     try:
-        yield checked_out.stores[store]
+        yield checked_out
     finally:
         # SQL sessions expose close(). Qdrant control sessions without a public
         # close method are released by their owning context when it closes.
@@ -90,6 +92,12 @@ def store_session(workspace: ChronosWorkspaceContext, branch: str, store: str) -
                     errors.append(error)
         if errors and sys.exc_info()[0] is None:
             raise errors[0]
+
+
+@contextmanager
+def store_session(workspace: ChronosWorkspaceContext, branch: str, store: str) -> Generator[Any, None, None]:
+    with workspace_session(workspace, branch) as checked_out:
+        yield checked_out.stores[store]
 
 
 @branch_app.command("list")
@@ -131,21 +139,21 @@ def diff(ctx: typer.Context, left: str, right: str) -> None:
 def merge_preview(ctx: typer.Context, source: str, target: str,
                   policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy")) -> None:
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.merge_preview(source, target, policy=policy.value))
+        print_result(workspace.merge_preview(source, target, policy=policy.api_value))
 
 
 @merge_app.command("apply")
 def merge_apply(ctx: typer.Context, source: str, target: str,
                 policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy")) -> None:
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.merge_apply(source, target, policy=policy.value))
+        print_result(workspace.merge_apply(source, target, policy=policy.api_value))
 
 
 @merge_app.command("atomic-preview")
 def merge_atomic_preview(ctx: typer.Context, source: str, target: str,
                          policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy")) -> None:
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.merge_atomic_preview(source, target, policy=policy.value))
+        print_result(workspace.merge_atomic_preview(source, target, policy=policy.api_value))
 
 
 @merge_app.command("atomic-apply")
@@ -157,7 +165,7 @@ def merge_atomic(
 ) -> None:
     with connect_workspace(ctx) as workspace:
         print_result(workspace.merge_atomic(
-            source, target, operation_id=operation_id, preview_token=preview_token, policy=policy.value,
+            source, target, operation_id=operation_id, preview_token=preview_token, policy=policy.api_value,
         ))
 
 

@@ -584,3 +584,120 @@ api_key="vector-secret"
         result = runner.invoke(app, ["qdrant", "--store", "vectors", "search", "docs", "--file", str(data)])
         assert result.exit_code == 0, result.output
         assert session.search.call_args.args == ("docs", [1, 0, 0])
+
+
+class TestWorkspaceFilesystemCommands:
+    def test_config_and_resource_ownership(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from chronos_core import workspace as api
+
+        config_file = tmp_path / 'chronos.toml'
+        config_file.write_text('[filesystem]\nroot="base"\nstate_dir="state"\n')
+        config = load_workspace_config(config_file)
+        assert config.stores == {}
+        assert config.filesystem.root == tmp_path / 'base'
+        assert config.filesystem.state_dir == tmp_path / 'state'
+        factory = MagicMock()
+        monkeypatch.setattr(api, 'ChronosFilesystemStore', factory)
+        with open_workspace(config) as workspace:
+            assert workspace.filesystem is factory.return_value
+        factory.assert_called_once_with(tmp_path / 'base', state_dir=tmp_path / 'state')
+        factory.return_value.close.assert_called_once_with()
+        factory.return_value.cleanup.assert_not_called()
+
+    @pytest.mark.parametrize('extra', [
+        '[workspace]\nshared_metadata_url="sqlite:///meta.sqlite"\n',
+        '[stores.filesystem]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\n',
+    ])
+    def test_unsupported_config(self, tmp_path: Path, extra: str) -> None:
+        config_file = tmp_path / 'chronos.toml'
+        config_file.write_text('[filesystem]\nroot="base"\nstate_dir="state"\n' + extra)
+        with pytest.raises(WorkspaceConfigError):
+            load_workspace_config(config_file)
+
+    def test_state_directory_is_required(self, tmp_path: Path) -> None:
+        config_file = tmp_path / 'chronos.toml'
+        config_file.write_text('[filesystem]\nroot="base"\n')
+        with pytest.raises(WorkspaceConfigError, match='state_dir'):
+            load_workspace_config(config_file)
+
+    @pytest.mark.parametrize('as_json', [False, True])
+    def test_run_forwards_arguments_and_output(self, workspace_connection: MagicMock, as_json: bool) -> None:
+        workspace = workspace_connection
+        command = ['example', '--child-option', 'two words']
+        filesystem = workspace.checkout.return_value.fs
+        filesystem.run.return_value = subprocess.CompletedProcess(command, 7, '\x1b[32moutput\x1b[0m\n', '\x1b[31merror\x1b[0m\n')
+        args = ['fs', 'run', '--branch', 'feature', '--cwd', 'nested', '--env', '{"MODE":"test"}', '--timeout', '2']
+        if as_json:
+            args.append('--json')
+        result = runner.invoke(app, [*args, '--', *command])
+        assert result.exit_code == 7, result.output
+        filesystem.run.assert_called_once_with(command, cwd='nested', env={'MODE': 'test'}, timeout=2.0)
+        workspace.checkout.assert_called_once_with('feature')
+        if as_json:
+            assert json.loads(result.stdout) == dict(args=command, returncode=7, stdout='\x1b[32moutput\x1b[0m\n', stderr='\x1b[31merror\x1b[0m\n')
+            assert result.stderr == ''
+        else:
+            assert result.stdout == '\x1b[32moutput\x1b[0m\n'
+            assert result.stderr == '\x1b[31merror\x1b[0m\n'
+        for session in workspace.checkout.return_value.stores.values():
+            session.close.assert_called_once_with()
+        workspace.close.assert_called_once_with()
+
+    @pytest.mark.parametrize('args', [[], ['--env', '[]', '--', 'echo'], ['--env', '{"X":1}', '--', 'echo'],
+                                      ['--timeout', 'nan', '--', 'echo']])
+    def test_invalid_input_before_connection(self, workspace_connection: MagicMock, args: list[str]) -> None:
+        result = runner.invoke(app, ['fs', 'run', *args])
+        assert result.exit_code == 2
+        _workspace.open_workspace.assert_not_called()
+
+    @pytest.mark.parametrize('error', [FileNotFoundError('missing command'), subprocess.TimeoutExpired(['secret'], 1)])
+    def test_run_failure_closes_resources(self, workspace_connection: MagicMock, error: Exception) -> None:
+        workspace_connection.checkout.return_value.fs.run.side_effect = error
+        result = runner.invoke(app, ['fs', 'run', '--', 'secret'])
+        assert result.exit_code == 1
+        assert 'secret' not in result.stderr
+        workspace_connection.close.assert_called_once_with()
+        for session in workspace_connection.checkout.return_value.stores.values():
+            session.close.assert_called_once_with()
+
+    def test_no_filesystem(self, workspace_connection: MagicMock) -> None:
+        workspace_connection.filesystem = None
+        result = runner.invoke(app, ['fs', 'run', '--', 'echo'])
+        assert result.exit_code == 2
+        workspace_connection.checkout.assert_not_called()
+        workspace_connection.close.assert_called_once_with()
+
+    @pytest.mark.parametrize('operation', ['preview', 'apply', 'atomic-preview', 'atomic-apply'])
+    def test_api_default_merge_policy(self, workspace_connection: MagicMock, operation: str) -> None:
+        args = ['merge', operation, 'feature', 'main', '--policy', 'api-default']
+        if operation == 'atomic-apply':
+            args.extend(['--operation-id', 'operation'])
+        result = runner.invoke(app, args)
+        assert result.exit_code == 0, result.output
+        name = {'preview': 'merge_preview', 'apply': 'merge_apply',
+                'atomic-preview': 'merge_atomic_preview', 'atomic-apply': 'merge_atomic'}[operation]
+        assert getattr(workspace_connection, name).call_args.kwargs['policy'] is None
+
+    def test_signal_exit_and_api_defaults(self, workspace_connection: MagicMock) -> None:
+        filesystem = workspace_connection.checkout.return_value.fs
+        filesystem.run.return_value = subprocess.CompletedProcess(['command'], -15, '', '')
+        result = runner.invoke(app, ['fs', 'run', '--', 'command'])
+        assert result.exit_code == 143
+        filesystem.run.assert_called_once_with(['command'], cwd='.', env=None, timeout=None)
+        workspace_connection.checkout.assert_called_once_with('main')
+
+    def test_help_needs_no_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('CHRONOS_WORKSPACE_CONFIG', raising=False)
+        result = runner.invoke(app, ['fs', 'run', '--help'])
+        assert result.exit_code == 0
+        assert '--json' in result.stdout
+
+    def test_filesystem_error_is_reported(self, workspace_connection: MagicMock) -> None:
+        from chronos_core.workspace.filesystem import FilesystemStoreError
+
+        workspace_connection.checkout.side_effect = FilesystemStoreError('failed to mount branch')
+        result = runner.invoke(app, ['fs', 'run', '--', 'command'])
+        assert result.exit_code == 1
+        assert 'failed to mount branch' in result.stderr
+        workspace_connection.close.assert_called_once_with()

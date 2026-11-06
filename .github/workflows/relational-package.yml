@@ -107,10 +107,19 @@ jobs:
           python -I -m pytest tests/test_cli.py::TestTerminalBehavior \
             tests/test_cli.py::TestWorkspaceConfiguration \
             tests/test_cli.py::TestWorkspaceCommands \
+            tests/test_cli.py::TestWorkspaceFilesystemCommands \
             tests/test_cli_integration.py::TestWorkspaceSQLWorkflows \
             tests/test_cli_integration.py::TestWorkspaceResources::test_sqlite_workspace_persists_after_close \
             tests/test_cli_integration.py::TestWorkspaceResources::test_sqlite_workspace_without_qdrant_dependency \
             -q --timeout=60
+      - name: Test workspace filesystem on Linux
+        if: matrix.python == '3.12' && matrix.duckdb == 'OFF'
+        env:
+          CHRONOS_CLI_REQUIRE_FILESYSTEM: 'ON'
+        run: |
+          sudo apt-get install -y fuse-overlayfs fuse3
+          sudo modprobe fuse
+          python -I -m pytest tests/test_cli_integration.py::TestWorkspaceFilesystemWorkflows -q --timeout=120
       - name: Test workspace DuckDB and Qdrant together
         if: matrix.duckdb == 'ON'
         env:

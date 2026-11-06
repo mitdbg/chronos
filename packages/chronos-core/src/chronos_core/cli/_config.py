@@ -55,10 +55,17 @@ class StoreConfig:
 
 
 @dataclass(frozen=True)
+class FilesystemConfig:
+    root: Path
+    state_dir: Path
+
+
+@dataclass(frozen=True)
 class WorkspaceConfig:
     config_path: Path
     stores: dict[str, StoreConfig]
     shared_metadata_url: str | None = None
+    filesystem: FilesystemConfig | None = None
 
     def store(self, name: str, *, qdrant: bool = False) -> StoreConfig:
         store = self.stores.get(name)
@@ -193,22 +200,31 @@ def load_workspace_config(path: Path | None = None) -> WorkspaceConfig:
     except tomllib.TOMLDecodeError as error:
         # Decoder messages can contain configuration values, including secrets.
         raise WorkspaceConfigError("Invalid TOML in workspace configuration.") from error
-    data = _table(raw, "configuration", {"workspace", "stores"})
+    data = _table(raw, "configuration", {"workspace", "stores", "filesystem"})
     workspace = _table(data.get("workspace", {}), "workspace", {"shared_metadata_url"})
     shared = (
         _database_url(workspace["shared_metadata_url"], config_path.parent, "workspace.shared_metadata_url")
         if "shared_metadata_url" in workspace else None
     )
-    entries = data.get("stores")
-    if not isinstance(entries, dict) or not entries:
-        raise WorkspaceConfigError("Configure at least one named store in [stores.NAME].")
+    filesystem = None
+    if "filesystem" in data:
+        fields = _table(data["filesystem"], "filesystem", {"root", "state_dir"})
+        filesystem = FilesystemConfig(*(
+            _local_path(_text(fields.get(key), f"filesystem.{key}"), config_path.parent, f"filesystem.{key}")
+            for key in ("root", "state_dir")
+        ))
+        if shared is not None:
+            raise WorkspaceConfigError("The OverlayFS backend does not support shared-metadata atomic workspaces.")
+    entries = data.get("stores", {})
+    if not isinstance(entries, dict) or (not entries and filesystem is None):
+        raise WorkspaceConfigError("Configure at least one named store in [stores.NAME] or [filesystem].")
     # These names cannot be used by WorkspaceBranchSession, even via its stores mapping.
     from chronos_core.workspace.runtime import WorkspaceBranchSession
 
     reserved = {"branch_id", "fs", "stores", "transaction", *dir(WorkspaceBranchSession)}
     stores = {}
     for name, value in entries.items():
-        if not name.strip() or name in reserved:
+        if not name.strip() or name in reserved or (filesystem is not None and name == "filesystem"):
             raise WorkspaceConfigError(f"Invalid or reserved workspace store name {name!r}.")
         stores[name] = _store_config(value, config_path.parent, f"stores.{name}")
     metadata_urls = [store.metadata_url for store in stores.values()]
@@ -222,7 +238,7 @@ def load_workspace_config(path: Path | None = None) -> WorkspaceConfig:
     identities = [_metadata_identity(url, config_path.parent) for url in metadata_urls]
     if shared is None and len(set(identities)) != len(identities):
         raise WorkspaceConfigError("Stores sharing metadata require workspace.shared_metadata_url.")
-    return WorkspaceConfig(config_path, stores, shared)
+    return WorkspaceConfig(config_path, stores, shared, filesystem)
 
 
 @contextmanager
@@ -273,9 +289,17 @@ def open_workspace(config: WorkspaceConfig) -> Generator[ChronosWorkspaceContext
                     )
                 resources.callback(close, store)
                 stores[name] = store
+            filesystem_options: dict[str, Any] = {}
+            if config.filesystem is not None:
+                from chronos_core.workspace import ChronosFilesystemStore
+
+                filesystem = ChronosFilesystemStore(config.filesystem.root, state_dir=config.filesystem.state_dir)
+                resources.callback(close, filesystem)
+                filesystem_options["filesystem"] = filesystem
             workspace = ChronosWorkspaceContext(
                 stores={name: stores[name] for name in config.stores},
                 shared_metadata_url=config.shared_metadata_url,
+                **filesystem_options,
             )
             # ExitStack owns the participants directly because workspace.close()
             # stops at the first close failure instead of attempting all stores.

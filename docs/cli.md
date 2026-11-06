@@ -136,7 +136,8 @@ chronos qdrant --store vectors point upsert documents one \
 chronos qdrant --store vectors search documents '[1, 0, 0]' --branch experiment
 ```
 
-Results are the API's JSON values, including workspace store names and result
+Except for `fs run`'s default command-output mode described below, results are
+the API's JSON values, including workspace store names and result
 field names. `None` prints nothing. Dataclasses become objects, dates use ISO
 strings, decimals become strings, and bytes become tagged base64 objects.
 Expected operational errors go to stderr with exit code 1; invalid CLI arguments
@@ -144,3 +145,71 @@ use exit code 2. Help opens no connections. JSON output can be piped to `jq` or
 redirected to a file.
 Non-finite floats returned by the API fail clearly because JSON cannot represent
 them; query execution and the API's returned values are not modified.
+
+## Filesystem workspace
+
+The filesystem participant wraps `ChronosFilesystemStore` and requires Linux,
+`fuse-overlayfs`, `fusermount3` (or `fusermount`), and permission to use `/dev/fuse`.
+It can be the only participant or accompany named SQL/Qdrant stores. Configure
+an existing base directory and an explicit persistent state directory, preferably
+outside the base directory. Relative paths resolve against the TOML file:
+
+```toml
+[filesystem]
+root = "base"
+state_dir = ".chronos/filesystem"
+```
+
+Branch, checkpoint, and diff commands include this participant automatically.
+Run ordinary programs against a branch using the existing session `run()` API:
+
+```sh
+chronos branch create experiment
+chronos fs run --branch experiment -- sh -c 'printf "hello\n" > report.txt'
+chronos fs run --branch experiment -- cat report.txt
+chronos checkpoint create saved --branch experiment
+chronos diff main experiment
+chronos merge preview experiment main --policy api-default
+chronos merge apply experiment main --policy api-default
+```
+
+`fs run` defaults to branch `main` and working directory `.`. Options must precede
+`-- COMMAND...`. `--cwd` selects a directory within the branch; `--timeout` passes
+a timeout in seconds; `--env '{"NAME":"value"}'` replaces the child environment
+(the API inherits the current environment when this option is omitted). Commands
+are passed as argument lists; shell syntax requires explicitly running a shell.
+The mounted working directory is not a security sandbox for the child process.
+
+Output is captured by the API and printed to stdout/stderr after completion.
+The CLI exits with the child's exit code (signals use the shell convention
+`128 + signal`). `--json` instead prints the API result fields `args`, `returncode`,
+`stdout`, and `stderr`, while retaining that exit status. These child-generated
+outputs are passed through as-is. Startup failures and timeouts exit with code 1.
+
+`--policy api-default` passes `None` to the workspace API. This is required for
+the current filesystem merge implementation, which applies file-level changes
+without three-way conflict detection. The existing `abort_on_conflict` default
+and explicit policies remain unchanged; the API rejects them for this filesystem.
+The CLI's OverlayFS backend does not support shared-metadata atomic workspaces.
+These configurations are rejected before opening stores. The separate native
+ChronosFS backend is not exposed by this CLI. Coordinated merges do not promise all-store rollback.
+
+Each invocation releases its mounts while preserving state and versioned files.
+Use short-lived commands; this interface does not keep a mount alive for later
+external use or background processes. For a disposable demo, keep the base,
+configuration, and state inside one dedicated directory, and remove that directory
+only after commands finish and its mounts are released.
+
+Filesystem integration tests live in `TestWorkspaceFilesystemWorkflows` in
+`tests/test_cli_integration.py`. Run them in Linux with the dependencies above:
+
+```sh
+CHRONOS_CLI_REQUIRE_FILESYSTEM=ON python -m pytest \
+  tests/test_cli_integration.py::TestWorkspaceFilesystemWorkflows -q
+```
+
+For Docker, the test container needs `/dev/fuse`, `SYS_ADMIN`, and a mount-permitting
+security profile (for example `--device /dev/fuse --cap-add SYS_ADMIN
+--security-opt apparmor=unconfined`). Keep test data on the container's Linux
+filesystem. The required-test flag prevents missing dependencies from counting
+as a successful skipped run.

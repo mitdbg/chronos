@@ -15,8 +15,13 @@ import typer
 
 
 class MergePolicy(str, Enum):
+    api_default = "api-default"
     abort_on_conflict = "abort_on_conflict"
     snapshot_isolation = "snapshot_isolation"
+
+    @property
+    def api_value(self) -> str | None:
+        return None if self is MergePolicy.api_default else self.value
 
 
 def _json_default(value: Any) -> Any:

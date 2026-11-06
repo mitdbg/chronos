@@ -590,3 +590,74 @@ class TestWorkspaceFailureWorkflows:
         _invoke_workspace(config, "merge", "atomic-apply", "experiment", "main", "--operation-id", "conflicting", ok=False)
         assert _invoke_workspace(config, "query", "SELECT value FROM items", "--store", "app") == [{"value": "main change"}]
         assert _invoke_workspace(config, "qdrant", "--store", "vectors", "point", "get", "documents", "one") is None
+
+
+class TestWorkspaceFilesystemWorkflows:
+    @pytest.mark.parametrize('with_sql', [False, True])
+    def test_persistent_workspace(self, tmp_path: Path, with_sql: bool) -> None:
+        import shutil
+
+        available = (sys.platform == 'linux' and shutil.which('fuse-overlayfs')
+                     and (shutil.which('fusermount3') or shutil.which('fusermount'))
+                     and Path('/dev/fuse').exists())
+        if not available:
+            if os.environ.get('CHRONOS_CLI_REQUIRE_FILESYSTEM') == 'ON':
+                pytest.fail('Filesystem integration requires Linux, /dev/fuse, and fuse-overlayfs')
+            pytest.skip('Filesystem integration requires Linux FUSE')
+        base = tmp_path / 'base'
+        base.mkdir()
+        (base / 'report.txt').write_text('original')
+        config = tmp_path / 'chronos.toml'
+        config.write_text('[filesystem]\nroot="base"\nstate_dir="state"\n' + (
+            '[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\n' if with_sql else ''
+        ))
+
+        def run(branch: str, code: str) -> dict[str, Any]:
+            return _invoke_workspace(config, 'fs', 'run', '--branch', branch, '--json', '--', sys.executable, '-c', code)
+
+        assert _invoke_workspace(config, 'branch', 'list') == ['main']
+        if with_sql:
+            _invoke_workspace(config, 'table', 'create', '--store', 'app', 'CREATE TABLE docs (id INTEGER PRIMARY KEY)')
+            _invoke_workspace(config, 'table', 'register', '--store', 'app', 'docs', '--primary-key', 'id')
+        _invoke_workspace(config, 'branch', 'create', 'feature')
+        run('feature', 'from pathlib import Path; Path("report.txt").write_text("changed")')
+        assert run('main', 'print(open("report.txt").read())')['stdout'] == 'original\n'
+        assert run('feature', 'print(open("report.txt").read())')['stdout'] == 'changed\n'
+        if with_sql:
+            _invoke_workspace(config, 'execute', '--store', 'app', '--branch', 'feature', 'INSERT INTO docs (id) VALUES (1)')
+        checkpoint = _invoke_workspace(config, 'checkpoint', 'create', 'saved', '--branch', 'feature')
+        assert 'filesystem' in checkpoint
+        _invoke_workspace(config, 'branch', 'create-from-checkpoint', 'restored', 'saved')
+        assert run('restored', 'print(open("report.txt").read())')['stdout'] == 'changed\n'
+        diff = _invoke_workspace(config, 'diff', 'main', 'feature')
+        with open_workspace(load_workspace_config(config)) as workspace:
+            assert diff == json.loads(json.dumps({key: asdict(value) for key, value in workspace.diff('main', 'feature').items()}))
+        assert diff['filesystem']['changes'][0]['path'] == 'report.txt'
+        # Preserve the API's refusal of policy-aware filesystem merging.
+        _invoke_workspace(config, 'merge', 'preview', 'feature', 'main', ok=False)
+        _invoke_workspace(config, 'merge', 'apply', 'feature', 'main', ok=False)
+        preview = _invoke_workspace(config, 'merge', 'preview', 'feature', 'main', '--policy', 'api-default')
+        assert preview['filesystem'] == diff['filesystem']
+        merged = _invoke_workspace(config, 'merge', 'apply', 'feature', 'main', '--policy', 'api-default')
+        assert merged['filesystem']['applied'] == 1
+        assert run('main', 'print(open("report.txt").read())')['stdout'] == 'changed\n'
+        if with_sql:
+            assert _invoke_workspace(config, 'query', '--store', 'app', 'SELECT * FROM docs') == [{'id': 1}]
+        _invoke_workspace(config, 'branch', 'delete', 'restored')
+        _invoke_workspace(config, 'branch', 'delete', 'feature')
+        assert _invoke_workspace(config, 'branch', 'list') == ['main']
+        assert (base / 'report.txt').read_text() == 'original'
+        assert (tmp_path / 'state' / 'metadata.json').exists()
+        assert str(tmp_path / 'state' / 'mounts') not in Path('/proc/self/mountinfo').read_text()
+
+        environment = {key: value for key, value in os.environ.items() if not key.startswith('CHRONOS_')}
+        command = [sys.executable, '-m', 'chronos_core.cli', '--config', str(config), 'fs', 'run']
+        failed = subprocess.run([*command, '--', sys.executable, '-c',
+                                 'import sys; print("out"); print("err", file=sys.stderr); sys.exit(7)'],
+                                capture_output=True, text=True, env=environment, timeout=30)
+        assert (failed.returncode, failed.stdout, failed.stderr) == (7, 'out\n', 'err\n')
+        for args in [ ['--cwd', '..', '--', 'true'], ['--timeout', '0.01', '--', sys.executable, '-c', 'import time; time.sleep(1)'] ]:
+            failed = subprocess.run([*command, *args], capture_output=True, text=True, env=environment, timeout=30)
+            assert failed.returncode == 1
+            assert 'Traceback' not in failed.stderr
+            assert str(tmp_path / 'state' / 'mounts') not in Path('/proc/self/mountinfo').read_text()
