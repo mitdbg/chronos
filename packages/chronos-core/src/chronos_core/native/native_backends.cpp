@@ -46,6 +46,7 @@
 #include <sqlite3.h>
 
 #include "copy_branch_store.hpp"
+#include "database_url_path.hpp"
 #include "interval_data_plane.hpp"
 
 namespace py = pybind11;

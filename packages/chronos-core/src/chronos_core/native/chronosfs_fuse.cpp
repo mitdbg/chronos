@@ -2,6 +2,7 @@
 
 #include "chronosfs_fuse.hpp"
 
+#include "database_url_path.hpp"
 #include "interval_data_plane.hpp"
 
 #include <algorithm>
@@ -436,7 +437,8 @@ std::string blob_sql_type(const chronos::native::NativeBranchStore &store) {
 std::string chronosfs_object_dir(const std::string &database_url) {
     constexpr const char *prefix = "sqlite:///";
     if (database_url.rfind(prefix, 0) != 0) return {};
-    std::string database_path = database_url.substr(std::strlen(prefix));
+    std::string database_path = chronos::native::decode_database_url_path(
+        database_url.substr(std::strlen(prefix)));
     if (database_path.empty() || database_path == ":memory:") return {};
     return database_path + ".chronosfs-objects";
 }

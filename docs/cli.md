@@ -70,6 +70,12 @@ SQL participants support `sqlite`, `postgresql`, and `duckdb` kinds, with
 connections also accept `api_key` and `timeout`. Select vector operations with
 `chronos qdrant --store NAME ...`.
 
+Local database URLs use percent-encoded filenames, resolved relative to the
+configuration file. For example, `sqlite:///data%23trial.sqlite` names
+`data#trial.sqlite`; `%2520` names a literal `%20`. Characters in the config
+directory are encoded automatically. DuckDB paths containing `?` are rejected
+because the bundled DuckDB version cannot construct their WAL paths correctly.
+
 Branches, checkpoints, diffs, and merges operate across the workspace. With
 independent metadata, `merge preview/apply` calls the coordinated API, which
 can retain partial changes if a later participant fails. Atomic mode requires

@@ -12,7 +12,7 @@ from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Iterator
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import uuid4
 
 import psycopg
@@ -200,6 +200,50 @@ def _qdrant_workspace_file(root: Path, target: QdrantConfig) -> Path:
 
 
 class TestWorkspaceResources:
+    @pytest.mark.parametrize("kind", ["sqlite", "sqlite-split", "duckdb-sqlite"])
+    def test_database_paths_preserve_reserved_characters(self, tmp_path: Path, kind: str) -> None:
+        if kind == "duckdb-sqlite" and not _native_interval.has_duckdb:
+            if os.environ.get("CHRONOS_CLI_REQUIRE_DUCKDB") == "ON":
+                pytest.fail("This test run requires a DuckDB-enabled native build")
+            pytest.skip("DuckDB disabled in this native build")
+        root = tmp_path / ("workspace #%20+目录" if kind == "duckdb-sqlite" else "workspace #?%20+目录")
+        root.mkdir()
+        scheme = "duckdb" if kind == "duckdb-sqlite" else "sqlite"
+        data = root / ("data%20#.duckdb" if scheme == "duckdb" else "data%20#?.sqlite")
+        metadata = root / "metadata%20#?.sqlite"
+        config = root / "chronos.toml"
+        config.write_text(
+            f'[stores.app]\nkind="{scheme}"\ndatabase_url="{scheme}:///{quote(data.name, safe="")}"\n'
+            + (f'metadata_url="sqlite:///{quote(metadata.name, safe="")}"\n' if kind != "sqlite" else '')
+        )
+        loaded = load_workspace_config(config)
+        with open_workspace(loaded) as workspace:
+            app = workspace.stores["app"]
+            app.db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")
+            app.db.commit()
+            app.register_table("items", ["id"])
+            with app.checkout("main") as session:
+                session.execute("INSERT INTO items (id, value) VALUES (1, 'persisted')")
+        assert data.is_file()
+        if kind != "sqlite":
+            assert metadata.is_file()
+        with open_workspace(loaded) as workspace:
+            with workspace.stores["app"].checkout("main") as session:
+                assert session.query("SELECT value FROM items") == [{"value": "persisted"}]
+        assert sorted(path.name for path in tmp_path.iterdir()) == [root.name]
+
+    def test_hash_directories_keep_workspace_state_separate(self, tmp_path: Path) -> None:
+        configs = []
+        for name in ("workspace#one", "workspace#two"):
+            root = tmp_path / name
+            root.mkdir()
+            config = root / "chronos.toml"
+            config.write_text('[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\n')
+            configs.append(config)
+        _invoke_workspace(configs[0], "branch", "create", "private-to-one")
+        assert _invoke_workspace(configs[1], "branch", "list") == ["main"]
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["workspace#one", "workspace#two"]
+
     def test_sqlite_workspace_without_qdrant_dependency(self, tmp_path: Path) -> None:
         config_file = tmp_path / "chronos.toml"
         config_file.write_text('[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///app.sqlite"\n')
@@ -765,7 +809,8 @@ class TestNativeChronosFSWorkflows:
         assert read.returncode == 0, read.stderr
         assert read.stdout == b"draft\n"
 
-    def test_mount_writes_to_selected_branch(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("directory", ["plain", "workspace #?%20+目录"])
+    def test_mount_writes_to_selected_branch(self, tmp_path: Path, directory: str) -> None:
         import shutil
 
         unmount = shutil.which("fusermount3")
@@ -774,6 +819,8 @@ class TestNativeChronosFSWorkflows:
                 pytest.fail("This test requires /dev/fuse and fusermount3")
             pytest.skip("Native mount requires /dev/fuse and fusermount3")
 
+        tmp_path = tmp_path / directory
+        tmp_path.mkdir()
         config = tmp_path / "chronos.toml"
         config.write_text('[filesystem]\nkind="chronosfs"\ndatabase_url="sqlite:///files.sqlite"\n')
         mountpoint = tmp_path / "mount"
@@ -793,7 +840,8 @@ class TestNativeChronosFSWorkflows:
                     if time.monotonic() >= deadline:
                         pytest.fail("Timed out waiting for the native mount")
                     time.sleep(0.05)
-                (mountpoint / "report").write_bytes(b"mounted draft\n")
+                payload = b"mounted draft\n" * 8192
+                (mountpoint / "report").write_bytes(payload)
                 subprocess.run([unmount, "-u", str(mountpoint)], check=True, timeout=10)
                 _, stderr = process.communicate(timeout=15)
                 assert process.returncode == 0, stderr
@@ -807,4 +855,5 @@ class TestNativeChronosFSWorkflows:
         assert "report" not in _invoke_workspace(config, "fs", "ls")
         read = self.file_command(config, "read", "/report", "--branch", "draft")
         assert read.returncode == 0, read.stderr
-        assert read.stdout == b"mounted draft\n"
+        assert read.stdout == payload
+        assert (tmp_path / "files.sqlite.chronosfs-objects").is_dir()

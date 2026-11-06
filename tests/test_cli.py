@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import quote
 from unittest.mock import MagicMock
 from contextlib import contextmanager
 
@@ -79,6 +80,7 @@ class TestTerminalBehavior:
 class TestWorkspaceConfiguration:
     @pytest.mark.parametrize("source", [
         '[stores.vectors]\nkind="qdrant"\nmetadata_url="sqlite:///meta.sqlite"\nurl="http://localhost:6333"\ntimeout=' + '9' * 400,
+        '[stores.app]\nkind="duckdb"\ndatabase_url="duckdb:///query%3Fdir/data.duckdb"\nmetadata_url="sqlite:///metadata.sqlite"',
         '[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///~chronos_no_such_user_987654/app.sqlite"',
         '[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///shared.sqlite"\n[stores.vectors]\nkind="qdrant"\nmetadata_url="sqlite:///shared%2Esqlite"\npath="vectors"',
         '[workspace]\nshared_metadata_url="sqlite:///shared.sqlite"\n[stores.first]\nkind="sqlite"\ndatabase_url="sqlite:///shared.sqlite"\n[stores.second]\nkind="sqlite"\ndatabase_url="sqlite:///shared.sqlite"',
@@ -100,6 +102,33 @@ class TestWorkspaceConfiguration:
         config.write_text('[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///literal%252Ename.sqlite"')
         loaded = load_workspace_config(config)
         assert loaded.stores["app"].connection.database_url == f"sqlite:///{tmp_path / 'literal%252Ename.sqlite'}"
+
+    def test_encoded_tilde_is_a_literal_filename(self, tmp_path: Path) -> None:
+        config = tmp_path / "chronos.toml"
+        config.write_text('[stores.app]\nkind="sqlite"\ndatabase_url="sqlite:///%7Echronos_no_such_user_987654/app.sqlite"')
+        loaded = load_workspace_config(config)
+        assert loaded.stores["app"].connection.database_url == f"sqlite:///{tmp_path / '~chronos_no_such_user_987654/app.sqlite'}"
+
+    @pytest.mark.parametrize("kind", ["sqlite", "duckdb"])
+    @pytest.mark.parametrize("directory", ["space dir", "hash#dir", "query?dir", "literal%20dir", "plus+dir", "目录"])
+    def test_local_database_urls_encode_config_directory(self, tmp_path: Path, kind: str, directory: str) -> None:
+        root = tmp_path / directory
+        root.mkdir()
+        config = root / "chronos.toml"
+        filename = "literal%20#.db" if kind == "duckdb" else "literal%20#?.db"
+        config.write_text(
+            f'[stores.app]\nkind="{kind}"\ndatabase_url="{kind}:///{quote(filename, safe="")}"\n'
+            + ('metadata_url="sqlite:///metadata.sqlite"\n' if kind == "duckdb" else '')
+        )
+        if kind == "duckdb" and "?" in directory:
+            with pytest.raises(WorkspaceConfigError, match="DuckDB database paths"):
+                load_workspace_config(config)
+            return
+        loaded = load_workspace_config(config)
+        connection = loaded.stores["app"].connection
+        assert connection.database_url == f"{kind}:///{quote(str(root / filename), safe='/')}"
+        if kind == "duckdb":
+            assert connection.metadata_url == f"sqlite:///{quote(str(root / 'metadata.sqlite'), safe='/')}"
 
     def test_invalid_config_path_is_a_usage_error(self) -> None:
         result = runner.invoke(app, ["--config", "~chronos_no_such_user_987654/chronos.toml", "branch", "list"])

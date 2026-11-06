@@ -1210,8 +1210,12 @@ py::dict stats_to_py_dict(const BulkUpsertStats &native_stats, std::size_t input
 
 std::string sqlite_path_from_url(const std::string &database_url) {
     const std::string prefix = "sqlite:///";
-    if (database_url.rfind(prefix, 0) == 0) return "/" + database_url.substr(prefix.size());
-    if (database_url.rfind("sqlite://", 0) == 0) return database_url.substr(std::string("sqlite://").size());
+    if (database_url.rfind(prefix, 0) == 0) {
+        return "/" + decode_database_url_path(database_url.substr(prefix.size()));
+    }
+    if (database_url.rfind("sqlite://", 0) == 0) {
+        return decode_database_url_path(database_url.substr(std::string("sqlite://").size()));
+    }
     return database_url;
 }
 
@@ -1324,16 +1328,16 @@ std::string duckdb_path_from_url(const std::string &database_url) {
     const std::string url_prefix = "duckdb://";
     const std::string scheme_prefix = "duckdb:";
     if (database_url.rfind(absolute_prefix, 0) == 0) {
-        std::string path = database_url.substr(absolute_prefix.size());
+        std::string path = decode_database_url_path(database_url.substr(absolute_prefix.size()));
         if (path == ":memory:") return path;
         while (!path.empty() && path.front() == '/') path.erase(path.begin());
         return "/" + path;
     }
     if (database_url.rfind(url_prefix, 0) == 0) {
-        return database_url.substr(url_prefix.size());
+        return decode_database_url_path(database_url.substr(url_prefix.size()));
     }
     if (database_url.rfind(scheme_prefix, 0) == 0) {
-        return database_url.substr(scheme_prefix.size());
+        return decode_database_url_path(database_url.substr(scheme_prefix.size()));
     }
     return database_url;
 }
@@ -2923,6 +2927,11 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
   public:
     explicit NativeDuckDBDriver(const std::string &database_url) : dialect_("duckdb") {
         path_ = duckdb_path_from_url(database_url);
+        // DuckDB 1.5.4 treats '?' as a query delimiter when constructing its
+        // WAL filename, even for local paths. Fail before creating any files.
+        if (path_.find('?') != std::string::npos) {
+            throw std::invalid_argument("DuckDB database paths cannot contain '?'");
+        }
         if (path_ != ":memory:" && !path_.empty()) {
             std::filesystem::path db_path(path_);
             if (db_path.has_parent_path()) {

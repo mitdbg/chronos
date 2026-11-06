@@ -17,6 +17,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from chronos_core import _native_interval
 
@@ -133,7 +134,7 @@ def _sqlite_database_path(database_url: str) -> str | None:
     prefix = "sqlite:///"
     if not database_url.startswith(prefix):
         return None
-    return "/" + database_url[len(prefix) :]
+    return "/" + unquote(database_url[len(prefix) :])
 
 
 def _checkpoint_sqlite(database_url: str, state: _DaemonState) -> None:

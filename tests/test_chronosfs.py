@@ -1292,6 +1292,50 @@ def test_shared_daemon_identity_is_store_scoped() -> None:
     ]
 
 
+def test_shared_daemon_checkpoint_preserves_database_path(tmp_path: Path) -> None:
+    import sqlite3
+    from urllib.parse import quote
+
+    from chronos_core.workspace.chronosfs.daemon import _DaemonState, _checkpoint_sqlite
+
+    database = tmp_path / "state #?%20+目录.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY)")
+        connection.execute("INSERT INTO marker VALUES (7)")
+    state = _DaemonState()
+    state.request_shutdown()
+    _checkpoint_sqlite(f"sqlite:///{quote(str(database), safe='/')}", state)
+    assert sorted(path.name for path in tmp_path.iterdir()) == [database.name]
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT id FROM marker").fetchall() == [(7,)]
+
+
+def test_existing_sqlite_adapter_preserves_database_path(tmp_path: Path) -> None:
+    import sqlite3
+    from urllib.parse import quote
+
+    from chronos_core import _native_interval
+    from chronos_core.branching.sql_adapters import SQLiteDatabaseAdapter
+    from chronos_core.workspace.chronosfs.fuse import _database_urls_for_mount
+
+    database = tmp_path / "state #?%20+目录.sqlite"
+    raw_connection = sqlite3.connect(database)
+    raw_connection.row_factory = sqlite3.Row
+    adapter = SQLiteDatabaseAdapter(raw_connection, str(database))
+    context = ChronosBranchContext.from_database_adapter(adapter)
+    store = ChronosFSStore(context)
+    try:
+        store.ensure()
+        store.write_file("main", "/note", b"preserved")
+        url = f"sqlite:///{quote(str(database), safe='/')}"
+        assert store._database_url == url
+        assert _database_urls_for_mount(store) == (url, url)
+        connection = _native_interval.NativeSqlConnection(url)
+        assert connection.query_sql("SELECT count(*) FROM _chronosfs_metadata")[0][0] > 0
+    finally:
+        store.close()
+
+
 def test_shared_daemon_shutdown_waits_for_mounts() -> None:
     from chronos_core.workspace.chronosfs.daemon import _DaemonState
 

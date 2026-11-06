@@ -10,7 +10,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 try:
     import tomllib
@@ -135,7 +135,15 @@ def _database_url(value: Any, root: Path, field: str, *, kind: str | None = None
     local = url[len(f"{scheme}:///"):]
     if not local or local == ":memory:":
         raise WorkspaceConfigError(f"{field} requires persistent storage, not an in-memory database.")
-    return f"{scheme}:///{_local_path(local, root, field)}"
+    # Decode the URL's filename before resolving it, then encode the complete
+    # path so characters in the config directory cannot become URL syntax.
+    decoded = unquote(local)
+    # An encoded leading tilde is a literal filename, not a home-directory
+    # request. Join it to the root before _local_path expands unescaped '~'.
+    location = _local_path(decoded if local.startswith("~") else root / decoded, root, field)
+    if scheme == "duckdb" and "?" in str(location):
+        raise WorkspaceConfigError(f"{field}: DuckDB database paths cannot contain '?'.")
+    return f"{scheme}:///{quote(str(location), safe='/')}"
 
 
 def _store_config(value: Any, root: Path, field: str) -> StoreConfig:

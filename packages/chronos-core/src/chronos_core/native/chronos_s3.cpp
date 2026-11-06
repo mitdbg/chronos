@@ -1,5 +1,6 @@
 #include "chronos_s3.hpp"
 
+#include "database_url_path.hpp"
 #include "interval_data_plane.hpp"
 
 #include <algorithm>
@@ -66,16 +67,14 @@ const std::vector<std::string> kObjectColumns = {
 };
 const std::vector<std::string> kObjectPrimaryKey = {"bucket", "object_key"};
 
+std::string url_encode(std::string_view input, bool preserve_slash);
+std::string sqlite_file_path(const std::string &path);
+
 std::string sqlite_url(const std::string &path) {
     std::string url = path;
-    std::string file_path = path;
-    const std::string prefix = "sqlite:///";
-    if (path.rfind(prefix, 0) == 0) {
-        file_path = "/" + path.substr(prefix.size());
-    } else if (path.rfind("sqlite://", 0) == 0) {
-        file_path = path.substr(std::strlen("sqlite://"));
-    } else {
-        url = "sqlite:///" + path;
+    const std::string file_path = sqlite_file_path(path);
+    if (path.rfind("sqlite://", 0) != 0) {
+        url = "sqlite:///" + url_encode(path, true);
     }
     sqlite3 *database = nullptr;
     if (sqlite3_open_v2(
@@ -94,8 +93,12 @@ std::string sqlite_url(const std::string &path) {
 
 std::string sqlite_file_path(const std::string &path) {
     const std::string prefix = "sqlite:///";
-    if (path.rfind(prefix, 0) == 0) return "/" + path.substr(prefix.size());
-    if (path.rfind("sqlite://", 0) == 0) return path.substr(std::strlen("sqlite://"));
+    if (path.rfind(prefix, 0) == 0) {
+        return "/" + decode_database_url_path(path.substr(prefix.size()));
+    }
+    if (path.rfind("sqlite://", 0) == 0) {
+        return decode_database_url_path(path.substr(std::strlen("sqlite://")));
+    }
     return path;
 }
 

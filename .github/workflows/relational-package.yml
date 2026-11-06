@@ -112,6 +112,8 @@ jobs:
             tests/test_cli.py::TestWorkspaceCommands \
             tests/test_cli.py::TestWorkspaceFilesystemCommands \
             tests/test_cli_integration.py::TestWorkspaceSQLWorkflows \
+            tests/test_cli_integration.py::TestWorkspaceResources::test_database_paths_preserve_reserved_characters \
+            tests/test_cli_integration.py::TestWorkspaceResources::test_hash_directories_keep_workspace_state_separate \
             tests/test_cli_integration.py::TestWorkspaceResources::test_sqlite_workspace_persists_after_close \
             tests/test_cli_integration.py::TestWorkspaceResources::test_sqlite_workspace_without_qdrant_dependency \
             -q --timeout=60
@@ -130,6 +132,8 @@ jobs:
         run: |
           python -I -m pytest tests/test_cli.py -k native -q --timeout=60
           python -I -m pytest tests/test_cli_integration.py::TestNativeChronosFSWorkflows -q --timeout=120
+          python -I -m pytest tests/test_chronosfs.py::test_shared_daemon_checkpoint_preserves_database_path \
+            tests/test_chronosfs.py::test_existing_sqlite_adapter_preserves_database_path -q --timeout=60
       - name: Test workspace DuckDB and Qdrant together
         if: matrix.duckdb == 'ON'
         env:
