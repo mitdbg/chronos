@@ -1,4 +1,5 @@
 import sqlite3
+from urllib.parse import quote
 import pytest
 
 import chronos_core._native_interval as native_interval
@@ -57,6 +58,59 @@ def test_native_connectors_smoke(tmp_path):
     assert native_interval.recommended_sql_parser()["name"] == "libpg_query"
     assert native_interval.supports_connection_dialect("sqlite") is True
     assert native_interval.supports_connection_dialect("postgres") is True
+
+
+@pytest.mark.parametrize("encoded", [False, True], ids=["raw-path", "url"])
+def test_native_sqlite_connection_preserves_path_characters(tmp_path, encoded):
+    path = tmp_path / "data #?%20+目录.sqlite"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+        db.execute("INSERT INTO items VALUES (7)")
+    location = f"sqlite:///{quote(str(path), safe='/')}" if encoded else str(path)
+    conn = native_interval.NativeSqlConnection(location)
+    assert conn.query_sql("SELECT id FROM items") == [[7]]
+
+
+def test_native_sqlite_connection_rejects_encoded_nul(tmp_path):
+    path = tmp_path / "data.sqlite"
+    sqlite3.connect(path).close()
+    with pytest.raises(ValueError, match="NUL"):
+        native_interval.NativeSqlConnection(f"sqlite:///{path}%00ignored")
+
+
+@pytest.mark.skipif(not native_interval.has_duckdb, reason="DuckDB driver disabled in this build")
+def test_native_duckdb_connection_preserves_path_characters(tmp_path):
+    path = tmp_path / "data #%20+目录.duckdb"
+    conn = native_interval.NativeSqlConnection(f"duckdb:///{quote(str(path), safe='/')}")
+    conn.execute_sql("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+    conn.execute_sql("INSERT INTO items VALUES (7)")
+    conn.commit()
+    assert conn.query_sql("SELECT id FROM items") == [[7]]
+    assert path.is_file()
+
+
+@pytest.mark.skipif(not native_interval.has_duckdb, reason="DuckDB driver disabled in this build")
+@pytest.mark.parametrize("relative", ["data?.duckdb", "query?dir/data.duckdb"])
+def test_native_duckdb_rejects_question_mark_before_creating_files(tmp_path, relative):
+    path = tmp_path / relative
+    with pytest.raises(ValueError, match="DuckDB database paths"):
+        native_interval.NativeSqlConnection(f"duckdb:///{quote(str(path), safe='/')}")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(not hasattr(native_interval, "NativeChronosLakeServer"), reason="S3 support disabled in this build")
+@pytest.mark.parametrize("encoded", [False, True], ids=["raw-path", "url"])
+def test_native_lake_metadata_preserves_path_characters(tmp_path, encoded):
+    path = tmp_path / "metadata #?%20+目录.sqlite"
+    location = f"sqlite:///{quote(str(path), safe='/')}" if encoded else str(path)
+    server = native_interval.NativeChronosLakeServer(location, "http://127.0.0.1:9", worker_threads=1)
+    try:
+        assert server.branches() == ["main"]
+        server.create_branch("trial", "main")
+        assert sorted(server.branches()) == ["main", "trial"]
+        assert path.is_file()
+    finally:
+        server.stop()
 
 
 def test_native_sqlite_connection_uses_chronos_wal_checkpoint_default(tmp_path, monkeypatch):

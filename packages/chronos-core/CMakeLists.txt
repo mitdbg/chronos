@@ -133,9 +133,11 @@ if(CHRONOS_BUILD_PYTHON_MODULE)
   pybind11_add_module(_native_interval src/chronos_core/native/interval_module.cpp)
   target_compile_features(_native_interval PRIVATE cxx_std_17)
   target_link_libraries(_native_interval PRIVATE chronos_native_backend)
-  set_target_properties(_native_interval PROPERTIES
-    INSTALL_RPATH "$ORIGIN"
-  )
+  if(APPLE)
+    set_target_properties(_native_interval PROPERTIES INSTALL_RPATH "@loader_path")
+  else()
+    set_target_properties(_native_interval PROPERTIES INSTALL_RPATH "$ORIGIN")
+  endif()
 
   install(TARGETS _native_interval LIBRARY DESTINATION chronos_core)
 endif()

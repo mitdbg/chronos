@@ -20,6 +20,7 @@ dist/
 .eggs/
 
 # Local runtime state
+/.chronos/
 .chronos-code/
 .chronos-runtime/
 .chronos-overlay-test/
@@ -28,9 +29,11 @@ dist/
 # Generated benchmark output
 .benchmarks/
 
-# Generated SQLite databases and journal files
+# Generated local databases and journal files
 *.sqlite
 *.sqlite-*
+*.duckdb
+*.duckdb.wal
 
 # Literal local workspace state directory
 /$state/

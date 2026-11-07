@@ -13,6 +13,8 @@ requires-python = ">=3.10"
 dependencies = [
   "psycopg[binary]>=3.1",
   "sqlglot>=25",
+  "typer>=0.25.1",
+  "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +46,7 @@ Documentation = "https://github.com/mitdbg/chronos/blob/main/docs/README.md"
 chronos-mcp = "chronos_core.mcp.cli:main"
 chronos-mcp-deploy-codex = "chronos_core.mcp.deploy_codex:main"
 chronos-lake = "chronos_core.lake.cli:main"
+chronos = "chronos_core.cli.main:app"
 
 [tool.scikit-build]
 wheel.packages = ["src/chronos_core"]

@@ -12,6 +12,7 @@ import sys
 import time
 from contextlib import suppress
 from pathlib import Path
+from urllib.parse import quote
 
 from chronos_core import _native_interval
 from chronos_core.workspace.chronosfs.store import ChronosFSStore
@@ -207,7 +208,7 @@ def _database_url_for_mount(store: ChronosFSStore) -> str:
     if not database_url:
         database_path = getattr(store.context.db, "database_path", None)
         if database_path:
-            database_url = f"sqlite:///{database_path}"
+            database_url = f"sqlite:///{quote(str(database_path), safe='/')}"
     if not database_url:
         raise ChronosFSMountError(
             "native ChronosFS FUSE requires a file-backed database URL"
@@ -221,7 +222,7 @@ def _database_urls_for_mount(store: ChronosFSStore) -> tuple[str, str]:
     if not metadata_url:
         metadata_path = getattr(store.context.metadata_db, "database_path", None)
         if metadata_path:
-            metadata_url = f"sqlite:///{metadata_path}"
+            metadata_url = f"sqlite:///{quote(str(metadata_path), safe='/')}"
     return database_url, str(metadata_url or database_url)
 
 

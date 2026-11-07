@@ -63,21 +63,95 @@ jobs:
           PYTHONPATH=examples/verl python -m pytest examples/verl/test_e2b_episode.py -q
   wheel:
     runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     strategy:
       matrix:
-        python: ['3.10', '3.12']
+        include:
+          - python: '3.10'
+            duckdb: 'OFF'
+            filesystem: 'OFF'
+          - python: '3.12'
+            duckdb: 'OFF'
+            filesystem: 'ON'
+          - python: '3.12'
+            duckdb: 'ON'
+            filesystem: 'OFF'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libpq-dev libboost-dev
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libpq-dev libboost-dev libfuse3-dev
       - run: python -m pip install build pytest pytest-asyncio pytest-timeout
       - name: Build from source distribution and install the wheel
         run: |
-          python -m build packages/chronos-core --outdir /tmp/chronos-wheel -Cbuild-dir=/tmp/chronos-build -Cbuild.tool-args=-j2
+          python -m build packages/chronos-core --outdir /tmp/chronos-wheel -Cbuild-dir=/tmp/chronos-build -Cbuild.tool-args=-j2 -Ccmake.define.CHRONOS_WITH_DUCKDB=${{ matrix.duckdb }} -Ccmake.define.CHRONOS_WITH_FILESYSTEM=${{ matrix.filesystem }}
           python -m pip install /tmp/chronos-wheel/*.whl
       - name: Test the installed relational artifact
         run: |
           python -I -m pytest tests/test_build_features.py tests/test_native_interval.py tests/test_interval_allocator.py tests/test_checkpoint_forks.py tests/test_reused_session_transactions.py -k 'not postgres' -q --timeout=60
           python -I examples/single_store_branching.py
+      - name: Test the installed CLI against the enabled relational stores
+        env:
+          CHRONOS_CLI_TEST_POSTGRES_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+          CHRONOS_CLI_REQUIRE_DUCKDB: ${{ matrix.duckdb }}
+        run: |
+          python -I -m pytest tests/test_cli.py::TestTerminalBehavior \
+            tests/test_cli.py::TestWorkspaceConfiguration \
+            tests/test_cli.py::TestWorkspaceCommands \
+            tests/test_cli.py::TestWorkspaceFilesystemCommands \
+            tests/test_cli_integration.py::TestWorkspaceSQLWorkflows \
+            tests/test_cli_integration.py::TestWorkspaceResources::test_database_paths_preserve_reserved_characters \
+            tests/test_cli_integration.py::TestWorkspaceResources::test_hash_directories_keep_workspace_state_separate \
+            tests/test_cli_integration.py::TestWorkspaceResources::test_sqlite_workspace_persists_after_close \
+            tests/test_cli_integration.py::TestWorkspaceResources::test_sqlite_workspace_without_qdrant_dependency \
+            -q --timeout=60
+      - name: Test workspace filesystem on Linux
+        if: matrix.python == '3.12' && matrix.duckdb == 'OFF'
+        env:
+          CHRONOS_CLI_REQUIRE_FILESYSTEM: 'ON'
+        run: |
+          sudo apt-get install -y fuse-overlayfs fuse3
+          sudo modprobe fuse
+          python -I -m pytest tests/test_cli_integration.py::TestWorkspaceFilesystemWorkflows -q --timeout=120
+      - name: Test native ChronosFS CLI
+        if: matrix.filesystem == 'ON'
+        env:
+          CHRONOS_CLI_REQUIRE_CHRONOSFS: 'ON'
+        run: |
+          python -I -m pytest tests/test_cli.py -k native -q --timeout=60
+          python -I -m pytest tests/test_cli_integration.py::TestNativeChronosFSWorkflows -q --timeout=120
+          python -I -m pytest tests/test_chronosfs.py::test_shared_daemon_checkpoint_preserves_database_path \
+            tests/test_chronosfs.py::test_existing_sqlite_adapter_preserves_database_path -q --timeout=60
+      - name: Test workspace DuckDB and Qdrant together
+        if: matrix.duckdb == 'ON'
+        env:
+          CHRONOS_CLI_REQUIRE_DUCKDB: 'ON'
+        run: |
+          python -m pip install 'qdrant-client==1.20.0'
+          python -I -m pytest tests/test_cli_integration.py::TestWorkspaceQdrantWorkflows::test_duckdb_and_qdrant -q --timeout=60
+      - name: Test Qdrant CLI in local and server modes
+        if: matrix.python == '3.12' && matrix.duckdb == 'OFF'
+        env:
+          CHRONOS_CLI_TEST_POSTGRES_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+          CHRONOS_CLI_TEST_QDRANT_URL: http://127.0.0.1:6333
+        run: |
+          python -m pip install 'qdrant-client==1.20.0'
+          docker run --detach --rm --name chronos-cli-qdrant-test \
+            -p 127.0.0.1:6333:6333 qdrant/qdrant:v1.20.0
+          trap 'docker stop chronos-cli-qdrant-test > /dev/null' EXIT
+          python -I -m pytest tests/test_cli.py::TestWorkspaceQdrantCommands \
+            tests/test_cli_integration.py::TestWorkspaceResources \
+            tests/test_cli_integration.py::TestWorkspaceQdrantWorkflows \
+            tests/test_cli_integration.py::TestWorkspaceFailureWorkflows -q --timeout=60

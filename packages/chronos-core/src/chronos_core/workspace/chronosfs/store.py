@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Literal
+from urllib.parse import quote
 
 from chronos_core import _native_interval
 from chronos_core.branching import (
@@ -1460,7 +1461,7 @@ def _database_url_for_adapter(adapter: Any) -> str:
         return str(database_url)
     database_path = getattr(adapter, "database_path", None)
     if database_path and str(database_path) != ":memory:":
-        return f"sqlite:///{database_path}"
+        return f"sqlite:///{quote(str(database_path), safe='/')}"
     raise ChronosFSError(
         "native ChronosFS requires a file-backed SQLite or PostgreSQL database"
     )
