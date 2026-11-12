@@ -501,6 +501,58 @@ class TestWorkspaceSQLWorkflows:
             {"id": 1, "value": "updated"},
         ]
 
+    def test_upsert_transaction_and_metadata(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
+        config = _workspace_config_file(tmp_path, cli_database)
+        invoke = partial(_invoke_workspace, config)
+        invoke("table", "create", "--store", "app", "CREATE TABLE objects (key TEXT PRIMARY KEY, body TEXT)")
+        invoke("table", "register", "--store", "app", "objects", "--primary-key", "key")
+        invoke("table", "create", "--store", "app", "CREATE TABLE catalog (key TEXT PRIMARY KEY, kind TEXT)")
+        invoke("table", "register", "--store", "app", "catalog", "--primary-key", "key")
+        invoke("branch", "create", "agent", "--metadata", '{"owner": "harness"}')
+        branches = {info["branch_id"]: info for info in invoke("branch", "list", "--store", "app")}
+        assert branches["agent"]["metadata"] == {"owner": "harness"}
+        assert set(invoke("branch", "list")) == {"agent", "main"}
+        updated = invoke("branch", "update-metadata", "agent", '{"owner": "harness", "status": "open"}', "--store", "app")
+        assert updated["branch_id"] == "agent"
+        assert updated["metadata"] == {"owner": "harness", "status": "open"}
+
+        # Upsert inserts, then updates by registered primary key.
+        assert invoke("upsert", "objects", '[{"key": "a", "body": "first"}]', "--store", "app", "--branch", "agent") == {"rowcount": 1}
+        assert invoke("upsert", "objects", "--store", "app", "--branch", "agent", "--stdin",
+                      input_text='[{"key": "a", "body": "second"}, {"key": "b", "body": "new"}]') == {"rowcount": 2}
+        assert invoke("query", "SELECT * FROM objects ORDER BY key", "--store", "app", "--branch", "agent") == [
+            {"key": "a", "body": "second"}, {"key": "b", "body": "new"},
+        ]
+        assert invoke("query", "SELECT * FROM objects", "--store", "app") == []
+
+        # One transaction writes an object and its catalog row together.
+        operations = json.dumps([
+            {"upsert": "objects", "rows": [{"key": "c", "body": "together"}]},
+            {"execute": "INSERT INTO catalog (key, kind) VALUES (:key, :kind)", "params": {"key": "c", "kind": "doc"}},
+        ])
+        assert invoke("transaction", operations, "--store", "app", "--branch", "agent") == [{"rowcount": 1}, {"rowcount": 1}]
+        assert invoke("query", "SELECT kind FROM catalog WHERE key = 'c'", "--store", "app", "--branch", "agent") == [{"kind": "doc"}]
+        # A failing statement rolls back the earlier upsert in the same transaction.
+        failing = json.dumps([
+            {"upsert": "objects", "rows": [{"key": "d", "body": "orphan"}]},
+            {"execute": "INSERT INTO catalog (key, kind) VALUES ('c', 'duplicate')"},
+        ])
+        operations_file = tmp_path / "operations.json"
+        operations_file.write_text(failing, encoding="utf-8")
+        invoke("transaction", "--store", "app", "--branch", "agent", "--file", str(operations_file), ok=False)
+        assert invoke("query", "SELECT key FROM objects WHERE key = 'd'", "--store", "app", "--branch", "agent") == []
+        assert invoke("query", "SELECT kind FROM catalog WHERE key = 'c'", "--store", "app", "--branch", "agent") == [{"kind": "doc"}]
+
+        invoke("checkpoint", "create", "first", "--branch", "agent", "--metadata", '{"step": 1}')
+        invoke("checkpoint", "create", "base", "--metadata", '{"step": 0}')
+        listed = invoke("checkpoint", "list", "--store", "app", "--branch", "agent")
+        assert [(item["checkpoint_id"], item["branch_id"], item["metadata"]) for item in listed] == [
+            ("first", "agent", {"step": 1}),
+        ]
+        assert {item["checkpoint_id"] for item in invoke("checkpoint", "list", "--store", "app")} == {"first", "base"}
+        filtered = invoke("checkpoint", "list", "--store", "app", "--metadata-filter", '{"step": 0}')
+        assert [item["checkpoint_id"] for item in filtered] == ["base"]
+
     def test_relational_aggregation(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, cli_database)
         invoke = partial(_invoke_workspace, config)

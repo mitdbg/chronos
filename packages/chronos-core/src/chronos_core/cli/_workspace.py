@@ -13,7 +13,7 @@ import psycopg
 import typer
 
 from chronos_core.cli._config import DatabaseConfig, QdrantConfig, WorkspaceConfigError, load_workspace_config, open_workspace
-from chronos_core.cli._terminal import MergePolicy, print_result, report_error
+from chronos_core.cli._terminal import MergePolicy, json_object_option, print_result, report_error
 
 if TYPE_CHECKING:
     from chronos_core.workspace import ChronosWorkspaceContext
@@ -106,15 +106,27 @@ def store_session(workspace: ChronosWorkspaceContext, branch: str, store: str) -
 
 
 @branch_app.command("list")
-def list_branches(ctx: typer.Context) -> None:
-    with connect_workspace(ctx) as workspace:
-        print_result(workspace.list_branches())
+def list_branches(ctx: typer.Context, store: str | None = typer.Option(
+    None, "--store", help="List one relational store's branch records, including metadata.",
+)) -> None:
+    with connect_workspace(ctx, store) as workspace:
+        print_result(workspace.list_branches() if store is None else workspace.stores[store].list_branches())
 
 
 @branch_app.command("create")
-def create_branch(ctx: typer.Context, name: str, from_branch: str = typer.Option("main", "--from")) -> None:
+def create_branch(ctx: typer.Context, name: str, from_branch: str = typer.Option("main", "--from"),
+                  metadata: str | None = typer.Option(None, "--metadata")) -> None:
+    values = json_object_option(metadata, "--metadata")
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.create_branch(name, from_branch=from_branch))
+        print_result(workspace.create_branch(name, from_branch=from_branch, metadata=values))
+
+
+@branch_app.command("update-metadata")
+def update_branch_metadata(ctx: typer.Context, name: str, metadata: str,
+                           store: str = typer.Option(..., "--store")) -> None:
+    values = json_object_option(metadata, "METADATA")
+    with connect_workspace(ctx, store) as workspace:
+        print_result(workspace.stores[store].update_branch_metadata(name, values))
 
 
 @branch_app.command("create-from-checkpoint")
@@ -130,9 +142,20 @@ def delete_branch(ctx: typer.Context, name: str) -> None:
 
 
 @checkpoint_app.command("create")
-def create_checkpoint(ctx: typer.Context, name: str, branch: str = typer.Option("main", "--branch")) -> None:
+def create_checkpoint(ctx: typer.Context, name: str, branch: str = typer.Option("main", "--branch"),
+                      metadata: str | None = typer.Option(None, "--metadata")) -> None:
+    values = json_object_option(metadata, "--metadata")
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.create_checkpoint(name, branch=branch))
+        print_result(workspace.create_checkpoint(name, branch=branch, metadata=values))
+
+
+@checkpoint_app.command("list")
+def list_checkpoints(ctx: typer.Context, store: str = typer.Option(..., "--store"),
+                     branch: str | None = typer.Option(None, "--branch"),
+                     metadata_filter: str | None = typer.Option(None, "--metadata-filter")) -> None:
+    values = json_object_option(metadata_filter, "--metadata-filter")
+    with connect_workspace(ctx, store) as workspace:
+        print_result(workspace.stores[store].list_checkpoints(branch, values))
 
 
 def diff(ctx: typer.Context, left: str, right: str) -> None:
@@ -177,5 +200,5 @@ def merge_atomic(
 def register_commands(app: typer.Typer) -> None:
     app.command()(diff)
     app.add_typer(branch_app, name="branch", help="Manage branches across the workspace.")
-    app.add_typer(checkpoint_app, name="checkpoint", help="Checkpoint all participants.")
+    app.add_typer(checkpoint_app, name="checkpoint", help="Checkpoint all participants and list checkpoints.")
     app.add_typer(merge_app, name="merge", help="Preview and apply coordinated or atomic merges.")

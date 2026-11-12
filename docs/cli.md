@@ -134,6 +134,34 @@ chronos query --store app --file query.sql
 printf 'SELECT * FROM items' | chronos query --store app
 ```
 
+`upsert --store NAME TABLE ROWS` calls the branch session's `upsert_rows()`: rows
+are a JSON array of objects, inserted or replaced by the table's registered
+primary key. Use it where SQL `INSERT ... ON CONFLICT DO UPDATE` is not accepted.
+`transaction --store NAME OPERATIONS` runs several writes on one branch inside the
+session's `transaction()`, so they commit or roll back together. Operations are
+a JSON array; each one is keyed by the command it stands for:
+`{"execute": SQL, "params": {...}}` or `{"upsert": TABLE, "rows": [...]}`. The
+result is the list of the API's per-operation results. Both commands accept
+JSON text, `--file`, or `--stdin`, like the Qdrant point commands.
+
+```sh
+chronos upsert items '[{"id": 1, "value": "updated"}]' --store app --branch experiment
+chronos transaction --store app --branch experiment '[
+  {"upsert": "objects", "rows": [{"key": "a", "body": "..."}]},
+  {"execute": "INSERT INTO catalog (key) VALUES (:key)", "params": {"key": "a"}}
+]'
+```
+
+`branch create` and `checkpoint create` accept `--metadata` with a JSON object,
+passed to the workspace API. Branch and checkpoint records with metadata are
+read from one named SQL store, because the workspace API lists only branch
+names: `branch list --store NAME` prints that store's branch records,
+`branch update-metadata BRANCH METADATA --store NAME` replaces a branch's
+metadata, and `checkpoint list --store NAME` prints checkpoint records,
+optionally narrowed by `--branch` and `--metadata-filter` (a JSON object of
+values to match). Without shared metadata, `update-metadata` changes only the
+named store's record.
+
 Qdrant requires `chronos-core[qdrant]`. Register collections, then use point and
 search commands on a selected store. Dense vectors and payloads are JSON; point
 upserts and searches also accept `--file` and `--stdin`.

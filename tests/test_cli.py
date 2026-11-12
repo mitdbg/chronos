@@ -411,10 +411,14 @@ class TestWorkspaceCommands:
 
     @pytest.mark.parametrize(("args", "method", "expected_args", "expected_kwargs"), [
         (["branch", "list"], "list_branches", (), {}),
-        (["branch", "create", "trial", "--from", "parent"], "create_branch", ("trial",), {"from_branch": "parent"}),
+        (["branch", "create", "trial", "--from", "parent"], "create_branch", ("trial",), {"from_branch": "parent", "metadata": None}),
+        (["branch", "create", "trial", "--metadata", '{"owner":"agent"}'], "create_branch", ("trial",),
+         {"from_branch": "main", "metadata": {"owner": "agent"}}),
         (["branch", "create-from-checkpoint", "trial", "saved"], "create_branch_from_checkpoint", ("trial", "saved"), {}),
         (["branch", "delete", "trial"], "delete_branch", ("trial",), {}),
-        (["checkpoint", "create", "saved", "--branch", "trial"], "create_checkpoint", ("saved",), {"branch": "trial"}),
+        (["checkpoint", "create", "saved", "--branch", "trial"], "create_checkpoint", ("saved",), {"branch": "trial", "metadata": None}),
+        (["checkpoint", "create", "saved", "--metadata", '{"step":2}'], "create_checkpoint", ("saved",),
+         {"branch": "main", "metadata": {"step": 2}}),
         (["diff", "main", "trial"], "diff", ("main", "trial"), {}),
         (["merge", "preview", "trial", "main"], "merge_preview", ("trial", "main"), {"policy": "abort_on_conflict"}),
         (["merge", "apply", "trial", "main", "--policy", "snapshot_isolation"], "merge_apply", ("trial", "main"), {"policy": "snapshot_isolation"}),
@@ -453,6 +457,83 @@ class TestWorkspaceCommands:
         assert result.exit_code == 0, result.output
         session.execute.assert_called_once_with("UPDATE items SET id = :id", {"id": 2})
 
+    def test_store_branch_and_checkpoint_records(self, workspace_connection: MagicMock) -> None:
+        from chronos_core.branching import BranchInfo, CheckpointInfo
+        store = workspace_connection.stores["app"]
+        branch = BranchInfo("trial", "7", "interval", "2026-01-02", {"owner": "agent"})
+        store.list_branches.return_value = [branch]
+        store.update_branch_metadata.return_value = branch
+        store.list_checkpoints.return_value = [CheckpointInfo("saved", "trial", "7", "2026-01-02", {"step": 2})]
+        result = runner.invoke(app, ["branch", "list", "--store", "app"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == [{
+            "branch_id": "trial", "current_ref": "7", "backend": "interval",
+            "created_at": "2026-01-02", "metadata": {"owner": "agent"},
+        }]
+        workspace_connection.list_branches.assert_not_called()
+        result = runner.invoke(app, ["branch", "update-metadata", "trial", '{"owner":"agent"}', "--store", "app"])
+        assert result.exit_code == 0, result.output
+        store.update_branch_metadata.assert_called_once_with("trial", {"owner": "agent"})
+        assert json.loads(result.stdout)["metadata"] == {"owner": "agent"}
+        result = runner.invoke(app, ["checkpoint", "list", "--store", "app", "--branch", "trial",
+                                     "--metadata-filter", '{"step":2}'])
+        assert result.exit_code == 0, result.output
+        store.list_checkpoints.assert_called_once_with("trial", {"step": 2})
+        assert json.loads(result.stdout) == [{
+            "checkpoint_id": "saved", "branch_id": "trial", "ref": "7",
+            "created_at": "2026-01-02", "metadata": {"step": 2},
+        }]
+        result = runner.invoke(app, ["checkpoint", "list", "--store", "app"])
+        assert result.exit_code == 0, result.output
+        assert store.list_checkpoints.call_args.args == (None, None)
+
+    def test_upsert_and_transaction_forwarding(self, workspace_connection: MagicMock, tmp_path: Path) -> None:
+        from chronos_core.branching import ExecuteResult
+        workspace = workspace_connection
+        session = workspace.checkout.return_value.stores["app"]
+        session.upsert_rows.return_value = ExecuteResult(2)
+        session.execute.return_value = ExecuteResult(1)
+        rows = '[{"id":1,"value":"a"},{"id":2,"value":"b"}]'
+        result = runner.invoke(app, ["upsert", "items", rows, "--store", "app", "--branch", "trial"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == {"rowcount": 2}
+        session.upsert_rows.assert_called_once_with("items", [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}])
+        workspace.checkout.assert_called_once_with("trial")
+        rows_file = tmp_path / "rows.json"
+        rows_file.write_text('[{"id":3}]')
+        for args, input_text in [(["--file", str(rows_file)], None), (["--stdin"], '[{"id":3}]'), ([], '[{"id":3}]')]:
+            result = runner.invoke(app, ["upsert", "items", "--store", "app", *args], input=input_text)
+            assert result.exit_code == 0, result.output
+            assert session.upsert_rows.call_args.args == ("items", [{"id": 3}])
+        session.upsert_rows.reset_mock()
+        operations = json.dumps([
+            {"upsert": "objects", "rows": [{"key": "a", "body": "x"}]},
+            {"execute": "INSERT INTO catalog (key) VALUES (:key)", "params": {"key": "a"}},
+            {"execute": "DELETE FROM stale"},
+        ])
+        result = runner.invoke(app, ["transaction", operations, "--store", "app", "--branch", "trial"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == [{"rowcount": 2}, {"rowcount": 1}, {"rowcount": 1}]
+        session.transaction.assert_called_once_with()
+        session.transaction.return_value.__enter__.assert_called_once()
+        session.transaction.return_value.__exit__.assert_called_once()
+        session.upsert_rows.assert_called_once_with("objects", [{"key": "a", "body": "x"}])
+        assert session.execute.call_args_list[-2:] == [
+            (("INSERT INTO catalog (key) VALUES (:key)", {"key": "a"}),), (("DELETE FROM stale", None),),
+        ]
+
+    def test_transaction_failure_prints_nothing(self, workspace_connection: MagicMock) -> None:
+        session = workspace_connection.checkout.return_value.stores["app"]
+        session.execute.side_effect = BranchingError("statement failed")
+        result = runner.invoke(app, ["transaction", '[{"execute":"UPDATE items SET id = 1"}]', "--store", "app"])
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "statement failed" in result.stderr
+        exit_args = session.transaction.return_value.__exit__.call_args.args
+        assert exit_args[0] is BranchingError
+        session.close.assert_called_once_with()
+        workspace_connection.close.assert_called_once_with()
+
     def test_sql_input_modes(self, workspace_connection: MagicMock, tmp_path: Path) -> None:
         sql_file = tmp_path / "query.sql"
         sql_file.write_text("SELECT :id")
@@ -479,6 +560,22 @@ class TestWorkspaceCommands:
         ["qdrant", "collection", "list"],
         ["merge", "atomic-apply", "trial", "main"],
         ["merge", "apply", "trial", "main", "--policy", "unknown"],
+        ["branch", "create", "trial", "--metadata", "[]"],
+        ["branch", "list", "--store", "missing"],
+        ["branch", "update-metadata", "trial", '{"a":1}'],
+        ["branch", "update-metadata", "trial", "broken", "--store", "app"],
+        ["checkpoint", "create", "saved", "--metadata", "NaN"],
+        ["checkpoint", "list"],
+        ["checkpoint", "list", "--store", "app", "--metadata-filter", "[1]"],
+        ["upsert", "items", '{"id":1}', "--store", "app"],
+        ["upsert", "items", "[1]", "--store", "app"],
+        ["upsert", "items", "--store", "app"],
+        ["upsert", "items", "[]"],
+        ["transaction", "[]", "--store", "app"],
+        ["transaction", '[{"query":"SELECT 1"}]', "--store", "app"],
+        ["transaction", '[{"execute":"SELECT 1","params":[]}]', "--store", "app"],
+        ["transaction", '[{"upsert":"items"}]', "--store", "app"],
+        ["transaction", '[{"upsert":"items","rows":{}}]', "--store", "app"],
     ])
     def test_invalid_arguments_do_not_open_stores(self, workspace_connection: MagicMock, args) -> None:
         result = runner.invoke(app, [*args], input="")
@@ -486,7 +583,8 @@ class TestWorkspaceCommands:
         _workspace.open_workspace.assert_not_called()
 
     def test_help_and_configuration_precedence(self, workspace_connection: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        for args in ([], ["branch"], ["query"], ["qdrant"], ["qdrant", "point"], ["qdrant", "point", "upsert"], ["merge", "atomic-apply"]):
+        for args in ([], ["branch"], ["query"], ["upsert"], ["transaction"], ["checkpoint", "list"],
+                     ["branch", "update-metadata"], ["qdrant"], ["qdrant", "point"], ["qdrant", "point", "upsert"], ["merge", "atomic-apply"]):
             result = runner.invoke(app, ["--config", "missing.toml", *args, "--help"])
             assert result.exit_code == 0, result.output
         _workspace.open_workspace.assert_not_called()
