@@ -7,12 +7,14 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import psycopg
 import typer
 
-from chronos_core.cli._config import DatabaseConfig, QdrantConfig, WorkspaceConfigError, load_workspace_config, open_workspace
+from chronos_core.cli._config import (
+    DatabaseConfig, QdrantConfig, WorkspaceConfig, WorkspaceConfigError, load_workspace_config, open_workspace,
+)
 from chronos_core.cli._terminal import MergePolicy, json_object_option, print_result, report_error
 
 if TYPE_CHECKING:
@@ -30,25 +32,54 @@ checkpoint_app = typer.Typer(no_args_is_help=True)
 merge_app = typer.Typer(no_args_is_help=True)
 
 
-@contextmanager
-def connect_workspace(
-    ctx: typer.Context, store: str | None = None, *, qdrant: bool = False,
-) -> Generator[ChronosWorkspaceContext, None, None]:
-    options = ctx.find_object(WorkspaceOptions)
-    try:
-        config = load_workspace_config(options.config_path if options else None)
-    except WorkspaceConfigError as error:
-        raise typer.BadParameter(str(error), param_hint="--config") from error
+@dataclass(frozen=True)
+class _ErrorPolicy:
+    """Expected operational errors and the configured values to redact from them."""
+    errors: tuple[type[BaseException], ...]
+    secrets: tuple[str | None, ...]
+    urls: tuple[str | None, ...]
+
+    def report(self, error: Exception) -> NoReturn:
+        report_error(error, secrets=self.secrets, urls=self.urls)
+
+
+@dataclass(frozen=True)
+class _HeldWorkspace:
+    config: WorkspaceConfig
+    policy: _ErrorPolicy
+    workspace: ChronosWorkspaceContext
+
+
+# Set only while persistent mode keeps one workspace open for many commands.
+_held: _HeldWorkspace | None = None
+
+
+def held_workspace() -> _HeldWorkspace | None:
+    return _held
+
+
+def _load_config(ctx: typer.Context, store: str | None, qdrant: bool) -> WorkspaceConfig:
+    if _held is not None:
+        config = _held.config
+    else:
+        options = ctx.find_object(WorkspaceOptions)
+        try:
+            config = load_workspace_config(options.config_path if options else None)
+        except WorkspaceConfigError as error:
+            raise typer.BadParameter(str(error), param_hint="--config") from error
     if store is not None:
         try:
             config.store(store, qdrant=qdrant)
         except WorkspaceConfigError as error:
             raise typer.BadParameter(str(error), param_hint="--store") from error
+    return config
 
+
+def _error_policy(config: WorkspaceConfig) -> _ErrorPolicy:
     from chronos_core.branching import BranchingError
     from chronos_core.workspace import ChronosFSError, ChronosFSMountError, FilesystemStoreError
 
-    errors = (
+    errors: tuple[type[BaseException], ...] = (
         ChronosFSError, ChronosFSMountError, FilesystemStoreError, BranchingError,
         RuntimeError, ValueError, TypeError, OSError, sqlite3.Error, psycopg.Error,
     )
@@ -72,11 +103,44 @@ def connect_workspace(
         except ImportError:
             report_error(RuntimeError("Qdrant support requires installing chronos-core[qdrant]."))
         errors += (grpc.RpcError, httpx.HTTPError, ResponseHandlingException, UnexpectedResponse)
+    return _ErrorPolicy(errors, tuple(secrets), tuple(urls))
+
+
+@contextmanager
+def connect_workspace(
+    ctx: typer.Context, store: str | None = None, *, qdrant: bool = False,
+) -> Generator[ChronosWorkspaceContext, None, None]:
+    config = _load_config(ctx, store, qdrant)
+    if _held is not None:
+        # Persistent mode: reuse the open workspace and leave closing to its owner.
+        try:
+            yield _held.workspace
+        except _held.policy.errors as error:
+            _held.policy.report(error)
+        return
+    policy = _error_policy(config)
     try:
         with open_workspace(config) as workspace:
             yield workspace
-    except errors as error:
-        report_error(error, secrets=tuple(secrets), urls=tuple(urls))
+    except policy.errors as error:
+        policy.report(error)
+
+
+@contextmanager
+def hold_workspace(ctx: typer.Context) -> Generator[_HeldWorkspace, None, None]:
+    """Open the configured workspace once for persistent mode."""
+    global _held
+    config = _load_config(ctx, None, False)
+    policy = _error_policy(config)
+    try:
+        with open_workspace(config) as workspace:
+            _held = _HeldWorkspace(config, policy, workspace)
+            try:
+                yield _held
+            finally:
+                _held = None
+    except policy.errors as error:
+        policy.report(error)
 
 
 @contextmanager

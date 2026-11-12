@@ -183,6 +183,40 @@ redirected to a file.
 Non-finite floats returned by the API fail clearly because JSON cannot represent
 them; query execution and the API's returned values are not modified.
 
+## Persistent mode
+
+Each ordinary invocation opens and closes the workspace. For many small calls,
+`chronos --persistent` opens the workspace once and then reads one command per
+stdin line, written exactly as its arguments would follow `chronos` (split with
+shell quoting rules). It writes one JSON line per command and exits when stdin
+closes, closing the workspace:
+
+```sh
+printf '%s\n' \
+  'branch create agent' \
+  'query --store app --branch agent "SELECT * FROM items"' |
+  chronos --config chronos.toml --persistent
+```
+
+```json
+{"ok": true, "exit_code": 0, "result": null, "output": null, "error": null}
+{"ok": true, "exit_code": 0, "result": [{"id": 1, "value": "base"}], "output": null, "error": null}
+```
+
+`result` is the JSON the one-shot command prints (or `null` when it prints
+nothing), and `exit_code` is its exit status. Errors that would go to stderr are
+in `error`; the process keeps serving after a failed command. Commands whose
+output is not JSON, such as `--help`, `fs read`, or `fs run` without `--json`,
+return it in `output` as text (or tagged base64 for non-UTF-8 bytes).
+
+The workspace is chosen at startup with `--config` or `CHRONOS_WORKSPACE_CONFIG`;
+command lines cannot change it. Stdin carries the command stream, so commands
+inside persistent mode take SQL and JSON as text or `--file`, not `--stdin`.
+`fs mount` is rejected because it runs in the foreground. Each command still
+checks out its branch and closes its sessions, so results match one-shot
+commands; transactions do not stay open between lines (use `transaction`).
+Startup failures print to stderr and exit 1 before any command is read.
+
 ## OverlayFS workspace
 
 The OverlayFS participant wraps `ChronosFilesystemStore` and requires Linux,

@@ -926,3 +926,84 @@ def test_native_mount_delegates_and_closes(
     )
     workspace_connection.checkout.assert_not_called()
     workspace_connection.close.assert_called_once_with()
+
+
+class TestPersistentMode:
+    @staticmethod
+    def _responses(result) -> list[dict]:
+        return [json.loads(line) for line in result.stdout.splitlines()]
+
+    def test_one_workspace_serves_many_commands(self, workspace_connection: MagicMock) -> None:
+        session = workspace_connection.checkout.return_value.stores["app"]
+        script = "\n".join([
+            "branch list",
+            "",
+            "query 'SELECT :id' --store app --branch trial --params '{\"id\": 1}'",
+            "branch create trial --metadata '{\"owner\": \"agent\"}'",
+        ]) + "\n"
+        result = runner.invoke(app, ["--persistent"], input=script)
+        assert result.exit_code == 0, result.output
+        assert self._responses(result) == [
+            {"ok": True, "exit_code": 0, "result": ["main"], "output": None, "error": None},
+            {"ok": True, "exit_code": 0, "result": [{"id": 1}], "output": None, "error": None},
+            {"ok": True, "exit_code": 0, "result": None, "output": None, "error": None},
+        ]
+        _workspace.open_workspace.assert_called_once()
+        workspace_connection.close.assert_called_once_with()
+        session.query.assert_called_once_with("SELECT :id", {"id": 1})
+        session.close.assert_called_once_with()
+        workspace_connection.create_branch.assert_called_once_with("trial", from_branch="main", metadata={"owner": "agent"})
+        assert _workspace.held_workspace() is None
+
+    def test_failures_are_reported_and_serving_continues(self, workspace_connection: MagicMock, tmp_path: Path) -> None:
+        url = f"sqlite:///{tmp_path / 'app.sqlite'}"
+        workspace_connection.diff.side_effect = BranchingError(f"cannot open {url}")
+        workspace_connection.delete_branch.side_effect = KeyError("unexpected")
+        script = "\n".join([
+            "diff main trial",
+            "query 'SELECT 1' --store missing",
+            "query --store app",
+            "bogus",
+            "branch delete trial",
+            "unterminated 'quote",
+            "fs mount ./somewhere",
+            "--config other.toml branch list",
+            "--persistent",
+            "branch list",
+        ]) + "\n"
+        result = runner.invoke(app, ["--persistent"], input=script)
+        assert result.exit_code == 0, result.output
+        responses = self._responses(result)
+        assert [response["exit_code"] for response in responses] == [1, 2, 2, 2, 1, 2, 2, 2, 2, 0]
+        assert "<database>" in responses[0]["error"] and url not in responses[0]["error"]
+        assert "Unknown store 'missing'" in responses[1]["error"]
+        assert "Provide SQL text" in responses[2]["error"]
+        assert responses[4]["error"] == "Error: 'unexpected'"
+        assert responses[-1]["result"] == ["main"]
+        _workspace.open_workspace.assert_called_once()
+        workspace_connection.close.assert_called_once_with()
+
+    def test_non_json_output_is_returned_as_output(self, workspace_connection: MagicMock) -> None:
+        result = runner.invoke(app, ["--persistent"], input="checkpoint --help\n")
+        assert result.exit_code == 0, result.output
+        [response] = self._responses(result)
+        assert response["ok"] and response["result"] is None
+        assert "list" in response["output"]
+
+    def test_persistent_rejects_a_command_argument(self, workspace_connection: MagicMock) -> None:
+        result = runner.invoke(app, ["--persistent", "branch", "list"], input="")
+        assert result.exit_code == 2
+        _workspace.open_workspace.assert_not_called()
+
+    def test_open_failure_exits_before_reading(self, workspace_connection: MagicMock) -> None:
+        _workspace.open_workspace.side_effect = BranchingError("open failed")
+        result = runner.invoke(app, ["--persistent"], input="branch list\n")
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "open failed" in result.stderr
+
+    def test_missing_command_is_still_a_usage_error(self, workspace_connection: MagicMock) -> None:
+        result = runner.invoke(app, ["--config", "chronos.toml"])
+        assert result.exit_code == 2
+        assert "Missing command" in result.output
+        _workspace.open_workspace.assert_not_called()
