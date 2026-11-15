@@ -63,6 +63,7 @@ class _OpenTransaction:
     """A branch session whose transaction() stays entered between persistent-mode lines."""
     store: str
     branch: str
+    workspace: ChronosWorkspaceContext
     checked_out: WorkspaceBranchSession
     scope: ExitStack
     failed: bool = False
@@ -97,7 +98,7 @@ def _check_open_transaction(ctx: typer.Context) -> None:
         )
 
 
-def _close_sessions(checked_out: WorkspaceBranchSession) -> list[Exception]:
+def _release_sessions(workspace: ChronosWorkspaceContext, checked_out: WorkspaceBranchSession) -> list[Exception]:
     # SQL sessions expose close(). Qdrant control sessions without a public
     # close method are released by their owning context when it closes.
     errors: list[Exception] = []
@@ -108,6 +109,15 @@ def _close_sessions(checked_out: WorkspaceBranchSession) -> list[Exception]:
                 close()
             except Exception as error:
                 errors.append(error)
+    # The OverlayFS store keeps a checked-out branch mounted until unmount() or
+    # close(). Release it per command so persistent mode keeps the one-shot
+    # guarantee that each invocation releases its mounts.
+    unmount = getattr(workspace.filesystem, "unmount", None)
+    if checked_out.fs is not None and callable(unmount):
+        try:
+            unmount(checked_out.branch_id)
+        except Exception as error:
+            errors.append(error)
     return errors
 
 
@@ -121,9 +131,9 @@ def begin_transaction(workspace: ChronosWorkspaceContext, store: str, branch: st
     try:
         scope.enter_context(checked_out.stores[store].transaction())
     except BaseException:
-        _close_sessions(checked_out)
+        _release_sessions(workspace, checked_out)
         raise
-    _transaction = _OpenTransaction(store, branch, checked_out, scope)
+    _transaction = _OpenTransaction(store, branch, workspace, checked_out, scope)
 
 
 def end_transaction(*, commit: bool) -> None:
@@ -139,7 +149,7 @@ def end_transaction(*, commit: bool) -> None:
         else:
             transaction.scope.__exit__(_Rollback, _Rollback(), None)
     finally:
-        errors = _close_sessions(transaction.checked_out)
+        errors = _release_sessions(transaction.workspace, transaction.checked_out)
     if errors:
         raise errors[0]
 
@@ -249,7 +259,7 @@ def workspace_session(workspace: ChronosWorkspaceContext, branch: str) -> Genera
     try:
         yield checked_out
     finally:
-        errors = _close_sessions(checked_out)
+        errors = _release_sessions(workspace, checked_out)
         if errors and sys.exc_info()[0] is None:
             raise errors[0]
 

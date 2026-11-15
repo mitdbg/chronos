@@ -1011,6 +1011,16 @@ class TestPersistentMode:
         _workspace.open_workspace.assert_called_once()
         workspace_connection.close.assert_called_once_with()
 
+    def test_each_command_releases_its_filesystem_mount(self, workspace_connection: MagicMock) -> None:
+        workspace_connection.checkout.return_value.branch_id = "trial"
+        result = runner.invoke(app, ["--persistent"], input="query 'SELECT 1' --store app --branch trial\n")
+        assert result.exit_code == 0, result.output
+        # Released after the command, not only when the workspace closes at exit.
+        workspace_connection.filesystem.unmount.assert_called_once_with("trial")
+        workspace_connection.filesystem = None
+        result = runner.invoke(app, ["--persistent"], input="query 'SELECT 1' --store app\n")
+        assert result.exit_code == 0, result.output
+
     def test_non_json_output_is_returned_as_output(self, workspace_connection: MagicMock) -> None:
         result = runner.invoke(app, ["--persistent"], input="checkpoint --help\n")
         assert result.exit_code == 0, result.output
