@@ -705,3 +705,39 @@ def test_native_duckdb_sql_connection_executes_data_plane_sql(tmp_path):
     assert conn.dialect() == "duckdb"
     assert conn.query_sql_dict("SELECT sum(qty) AS total FROM items") == [{"total": 10}]
     assert conn.query_sql("SELECT id, qty FROM items") == [[1, 10]]
+
+
+def test_branch_and_segment_records_have_timestamps(tmp_path):
+    from datetime import datetime
+
+    path = tmp_path / "timestamps.sqlite"
+    ctx = ChronosBranchContext.connect(f"sqlite:///{path}")
+    try:
+        ctx.db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")
+        ctx.db.commit()
+        ctx.register_table("items", ["id"])
+        ctx.create_branch("child")
+        ctx.checkout("child").execute("INSERT INTO items (id, value) VALUES (1, 'child')")
+        ctx.create_checkpoint("saved", branch="child")
+        # Reserving a branch transaction writes the merge and continuation segments.
+        transaction = ctx.reserve_branch_transaction("child", "main", ["app"])
+
+        def timestamp(value):
+            # The native store writes UTC ISO-8601 timestamps, never a placeholder.
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        for info in ctx.list_branches():
+            timestamp(info.created_at)
+        conn = _connect(path)
+        try:
+            segments = conn.execute(
+                "SELECT segment_kind, created_at FROM _chronos_branch_interval_segments"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert {row["segment_kind"] for row in segments} >= {"fork_base", "checkpoint", "merge"}
+        for row in segments:
+            timestamp(row["created_at"])
+        ctx.abort_branch_transaction(transaction)
+    finally:
+        ctx.close()

@@ -1750,7 +1750,7 @@
             fork_base_id = ids[2];
         }
         const cpp_int child_branch_point = fork_base_hi + (child_hi - fork_base_hi) / 2;
-        std::string now = "native";
+        const std::string now = current_timestamp_string();
         if (metadata_dialect() == "postgres") {
             auto rows = driver_->query(
                 "WITH inserted_segments AS ("
@@ -3889,6 +3889,7 @@
         std::int64_t parent_segment_id,
         const std::string &target
     ) {
+        const std::string now = current_timestamp_string();
         driver_->execute(
             "INSERT INTO _chronos_branch_interval_segments "
             "(segment_id, parent_segment_id, owner_branch_id, segment_kind, live_lo, live_hi, "
@@ -3903,14 +3904,14 @@
                 segments.merge_segment.live_lo,
                 segments.merge_segment.live_hi,
                 segments.merge_segment.branch_point,
-                std::string("native"),
+                now,
                 segments.continuation_segment.segment_id,
                 segments.merge_segment.segment_id,
                 target,
                 segments.continuation_segment.live_lo,
                 segments.continuation_segment.live_hi,
                 segments.continuation_segment.branch_point,
-                std::string("native"),
+                now,
             }
         );
     }
