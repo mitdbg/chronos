@@ -11,7 +11,9 @@ import typer
 from sqlglot import exp
 
 from chronos_core.cli._terminal import print_result, read_json_input
-from chronos_core.cli._workspace import connect_workspace, store_session
+from chronos_core.cli._workspace import (
+    begin_transaction, connect_workspace, end_transaction, held_workspace, store_session,
+)
 
 
 table_app = typer.Typer(no_args_is_help=True)
@@ -170,9 +172,39 @@ def transaction(
             print_result(results)
 
 
+def _require_persistent(command: str) -> None:
+    if held_workspace() is None:
+        raise typer.BadParameter(
+            f"{command} needs persistent mode (chronos --persistent); use `transaction` to group statements."
+        )
+
+
+def begin(
+    ctx: typer.Context, store: str = typer.Option(..., "--store"), branch: str = typer.Option("main", "--branch"),
+) -> None:
+    _require_persistent("begin")
+    with connect_workspace(ctx, store) as workspace:
+        begin_transaction(workspace, store, branch)
+
+
+def commit(ctx: typer.Context) -> None:
+    _require_persistent("commit")
+    with connect_workspace(ctx):
+        end_transaction(commit=True)
+
+
+def rollback(ctx: typer.Context) -> None:
+    _require_persistent("rollback")
+    with connect_workspace(ctx):
+        end_transaction(commit=False)
+
+
 def register_commands(app: typer.Typer) -> None:
     app.command()(query)
     app.command()(execute)
     app.command()(upsert)
     app.command()(transaction)
+    app.command()(begin)
+    app.command()(commit)
+    app.command()(rollback)
     app.add_typer(table_app, name="table", help="Prepare tables in a named relational store.")

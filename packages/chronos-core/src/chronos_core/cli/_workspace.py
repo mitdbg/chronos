@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -56,6 +56,92 @@ _held: _HeldWorkspace | None = None
 
 def held_workspace() -> _HeldWorkspace | None:
     return _held
+
+
+@dataclass
+class _OpenTransaction:
+    """A branch session whose transaction() stays entered between persistent-mode lines."""
+    store: str
+    branch: str
+    checked_out: WorkspaceBranchSession
+    scope: ExitStack
+    failed: bool = False
+
+
+class _Rollback(Exception):
+    """Passed into the held transaction context so the API rolls it back."""
+
+
+# Commands allowed while a transaction is open; only rollback once it has failed.
+_IN_TRANSACTION = {("query",), ("execute",), ("upsert",), ("commit",), ("rollback",)}
+_transaction: _OpenTransaction | None = None
+
+
+def _refuse(message: str) -> NoReturn:
+    typer.echo(f"Error: {message}", err=True)
+    raise typer.Exit(1)
+
+
+def _check_open_transaction(ctx: typer.Context) -> None:
+    if _transaction is None:
+        return
+    command = tuple(ctx.command_path.split()[1:])
+    if _transaction.failed and command != ("rollback",):
+        _refuse("a command failed in the open transaction; only rollback is allowed.")
+    if command == ("begin",):
+        _refuse("a transaction is already open; commit or roll back first.")
+    if command not in _IN_TRANSACTION:
+        _refuse(
+            f"a transaction is open on store {_transaction.store!r}, branch {_transaction.branch!r}; "
+            "commit or roll back first."
+        )
+
+
+def _close_sessions(checked_out: WorkspaceBranchSession) -> list[Exception]:
+    # SQL sessions expose close(). Qdrant control sessions without a public
+    # close method are released by their owning context when it closes.
+    errors: list[Exception] = []
+    for session in checked_out.stores.values():
+        close = getattr(session, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as error:
+                errors.append(error)
+    return errors
+
+
+def begin_transaction(workspace: ChronosWorkspaceContext, store: str, branch: str) -> None:
+    """Enter the store session's transaction() and keep it open for later lines."""
+    global _transaction
+    if _transaction is not None:
+        _refuse("a transaction is already open; commit or roll back first.")
+    checked_out = workspace.checkout(branch)
+    scope = ExitStack()
+    try:
+        scope.enter_context(checked_out.stores[store].transaction())
+    except BaseException:
+        _close_sessions(checked_out)
+        raise
+    _transaction = _OpenTransaction(store, branch, checked_out, scope)
+
+
+def end_transaction(*, commit: bool) -> None:
+    """Leave the held transaction() normally (commit) or with an exception (rollback)."""
+    global _transaction
+    transaction = _transaction
+    if transaction is None:
+        _refuse("no transaction is open.")
+    _transaction = None
+    try:
+        if commit:
+            transaction.scope.close()
+        else:
+            transaction.scope.__exit__(_Rollback, _Rollback(), None)
+    finally:
+        errors = _close_sessions(transaction.checked_out)
+    if errors:
+        raise errors[0]
 
 
 def _load_config(ctx: typer.Context, store: str | None, qdrant: bool) -> WorkspaceConfig:
@@ -113,8 +199,11 @@ def connect_workspace(
     config = _load_config(ctx, store, qdrant)
     if _held is not None:
         # Persistent mode: reuse the open workspace and leave closing to its owner.
+        _check_open_transaction(ctx)
         try:
             yield _held.workspace
+        except typer.Exit:
+            raise  # an exit the command chose; Exit subclasses RuntimeError
         except _held.policy.errors as error:
             _held.policy.report(error)
         return
@@ -122,6 +211,8 @@ def connect_workspace(
     try:
         with open_workspace(config) as workspace:
             yield workspace
+    except typer.Exit:
+        raise  # an exit the command chose; Exit subclasses RuntimeError
     except policy.errors as error:
         policy.report(error)
 
@@ -138,6 +229,15 @@ def hold_workspace(ctx: typer.Context) -> Generator[_HeldWorkspace, None, None]:
             try:
                 yield _held
             finally:
+                if _transaction is not None:
+                    # Input ended with a transaction open: roll it back, never commit.
+                    try:
+                        end_transaction(commit=False)
+                    except Exception as error:
+                        try:
+                            policy.report(error)
+                        except typer.Exit:
+                            pass
                 _held = None
     except policy.errors as error:
         policy.report(error)
@@ -146,27 +246,31 @@ def hold_workspace(ctx: typer.Context) -> Generator[_HeldWorkspace, None, None]:
 @contextmanager
 def workspace_session(workspace: ChronosWorkspaceContext, branch: str) -> Generator[WorkspaceBranchSession, None, None]:
     checked_out = workspace.checkout(branch)
-    errors: list[Exception] = []
     try:
         yield checked_out
     finally:
-        # SQL sessions expose close(). Qdrant control sessions without a public
-        # close method are released by their owning context when it closes.
-        for session in checked_out.stores.values():
-            close = getattr(session, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception as error:
-                    errors.append(error)
+        errors = _close_sessions(checked_out)
         if errors and sys.exc_info()[0] is None:
             raise errors[0]
 
 
 @contextmanager
 def store_session(workspace: ChronosWorkspaceContext, branch: str, store: str) -> Generator[Any, None, None]:
-    with workspace_session(workspace, branch) as checked_out:
-        yield checked_out.stores[store]
+    transaction = _transaction
+    if transaction is None:
+        with workspace_session(workspace, branch) as checked_out:
+            yield checked_out.stores[store]
+        return
+    if (store, branch) != (transaction.store, transaction.branch):
+        _refuse(
+            f"the open transaction is on store {transaction.store!r}, branch {transaction.branch!r}; "
+            "commit or roll back first."
+        )
+    try:
+        yield transaction.checked_out.stores[store]
+    except BaseException:
+        transaction.failed = True
+        raise
 
 
 @branch_app.command("list")

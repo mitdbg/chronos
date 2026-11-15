@@ -233,8 +233,47 @@ command lines cannot change it. Stdin carries the command stream, so commands
 inside persistent mode take SQL and JSON as text or `--file`, not `--stdin`.
 `fs mount` is rejected because it runs in the foreground. Each command still
 checks out its branch and closes its sessions, so results match one-shot
-commands; transactions do not stay open between lines (use `transaction`).
-Startup failures print to stderr and exit 1 before any command is read.
+commands. Startup failures print to stderr and exit 1 before any command is read.
+
+### Open transactions
+
+Commands autocommit by default. In persistent mode, `begin --store NAME
+[--branch BRANCH]` enters that branch session's `transaction()` and keeps it
+open across lines; `commit` leaves it normally and `rollback` leaves it with an
+error, so the API commits or rolls back. Until then, `query`, `execute`, and
+`upsert` on the same store and branch run inside the transaction and see its
+earlier writes:
+
+```sh
+printf '%s\n' \
+  'table info skill --store app' \
+  'begin --store app --branch agent' \
+  'query --store app --branch agent "SELECT count(*) AS n FROM skill WHERE key = '\''a'\''"' \
+  'upsert skill '\''[{"key": "a", "body": "..."}]'\'' --store app --branch agent' \
+  'commit' |
+  chronos --persistent
+```
+
+Check and prepare tables (`table info`, `table create`, `table register`)
+before `begin`: table commands are refused inside a transaction, and table
+creation commits on the store's connection.
+
+- While a transaction is open, every other command is refused with exit code 1,
+  including `query`/`execute`/`upsert` on another store or branch, `begin`,
+  `transaction`, and branch, checkpoint, merge, and table commands. A refused
+  command does not affect the transaction.
+- If a command inside the transaction fails, only `rollback` is accepted;
+  everything else, including `commit`, is refused until then.
+- `commit` or `rollback` with no open transaction exits 1.
+- When stdin closes with a transaction open, it is rolled back.
+- `begin`, `commit`, and `rollback` exist only in persistent mode; one-shot
+  invocations exit 2. Use `transaction` to group statements in one call.
+
+With SQLite, a transaction holds the database's write lock from its first write
+until commit or rollback. Other processes using that database, including
+one-shot `chronos` commands, fail with `database is locked` during that time.
+Keep transactions short. PostgreSQL does not lock other readers out; they see
+the data as of the last commit.
 
 ## OverlayFS workspace
 

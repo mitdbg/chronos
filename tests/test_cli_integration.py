@@ -633,6 +633,63 @@ class TestWorkspaceSQLWorkflows:
                 one_shot(["table", "register", "--store", "app", "audit", "--primary-key", "id"])
                 assert store.describe_table("audit").primary_key == ("id",)
 
+    def test_persistent_open_transactions(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
+        config = _workspace_config_file(tmp_path, cli_database)
+        invoke = partial(_invoke_workspace, config)
+        invoke("table", "create", "--store", "app", "CREATE TABLE skill (key TEXT PRIMARY KEY, body TEXT)")
+        invoke("table", "register", "--store", "app", "skill", "--primary-key", "key")
+        invoke("branch", "create", "agent")
+        on_agent = ("--store", "app", "--branch", "agent")
+        keys = "SELECT key FROM skill ORDER BY key"
+
+        # Reads inside the transaction see its writes; rollback discards them.
+        invoke("begin", *on_agent)
+        invoke("table", "info", "skill", "--store", "app", ok=False)
+        invoke("query", "SELECT 1 AS one", "--store", "app", ok=False)  # branch main, not the open one
+        invoke("execute", "INSERT INTO skill (key, body) VALUES ('a', 'x')", *on_agent)
+        invoke("upsert", "skill", '[{"key": "b", "body": "y"}]', *on_agent)
+        assert invoke("query", keys, *on_agent) == [{"key": "a"}, {"key": "b"}]
+        invoke("rollback")
+        assert invoke("query", keys, *on_agent) == []
+
+        # Commit publishes everything; a check-then-create flow runs within it.
+        invoke("begin", *on_agent)
+        assert invoke("query", "SELECT count(*) AS n FROM skill WHERE key = 'c'", *on_agent) == [{"n": 0}]
+        invoke("upsert", "skill", '[{"key": "c", "body": "z"}]', *on_agent)
+        invoke("commit")
+        invoke("commit", ok=False)
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("CHRONOS_")}
+        environment["CHRONOS_WORKSPACE_CONFIG"] = str(config)
+        assert _run_cli(["query", keys, *on_agent], environment=environment) == [{"key": "c"}]
+
+        # A failed command leaves only rollback, which discards the earlier write.
+        invoke("begin", *on_agent)
+        invoke("execute", "INSERT INTO skill (key, body) VALUES ('d', 'w')", *on_agent)
+        invoke("execute", "INSERT INTO skill (key, body) VALUES ('c', 'dup')", *on_agent, ok=False)
+        invoke("query", keys, *on_agent, ok=False)
+        invoke("commit", ok=False)
+        invoke("rollback")
+        assert invoke("query", keys, *on_agent) == [{"key": "c"}]
+
+        # Another process during an open transaction after its first write.
+        invoke("begin", *on_agent)
+        invoke("execute", "INSERT INTO skill (key, body) VALUES ('e', 'open')", *on_agent)
+        scheme = urlsplit(cli_database.database_url).scheme
+        if scheme != "duckdb":  # DuckDB admits one process at a time regardless
+            outside = subprocess.run(
+                [sys.executable, "-m", "chronos_core.cli", "query", keys, *on_agent],
+                env=environment, capture_output=True, text=True, timeout=60,
+            )
+            if scheme == "sqlite":
+                assert outside.returncode == 1
+                assert "database is locked" in outside.stderr
+            else:
+                assert outside.returncode == 0, outside.stderr
+                assert json.loads(outside.stdout) == [{"key": "c"}]
+        # Closing stdin with the transaction open rolls it back.
+        _close_sessions()
+        assert invoke("query", keys, *on_agent) == [{"key": "c"}]
+
     def test_upsert_transaction_and_metadata(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, cli_database)
         invoke = partial(_invoke_workspace, config)

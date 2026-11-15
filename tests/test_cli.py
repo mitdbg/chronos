@@ -1035,3 +1035,100 @@ class TestPersistentMode:
         assert result.exit_code == 2
         assert "Missing command" in result.output
         _workspace.open_workspace.assert_not_called()
+
+
+class TestPersistentTransactions:
+    @staticmethod
+    def _run(script: list[str]):
+        result = runner.invoke(app, ["--persistent"], input="\n".join(script) + "\n")
+        assert result.exit_code == 0, result.output
+        return [json.loads(line) for line in result.stdout.splitlines()]
+
+    @staticmethod
+    def _session(workspace: MagicMock) -> MagicMock:
+        return workspace.checkout.return_value.stores["app"]
+
+    @staticmethod
+    def _exits(session: MagicMock) -> list[tuple]:
+        # ExitStack calls __exit__ through the type, so the mock also records the
+        # context object; the last three arguments are the exception triple.
+        return [call.args[-3:] for call in session.transaction.return_value.__exit__.call_args_list]
+
+    def test_commit_keeps_one_session_between_lines(self, workspace_connection: MagicMock) -> None:
+        from chronos_core.branching import ExecuteResult
+        session = self._session(workspace_connection)
+        session.execute.return_value = ExecuteResult(1)
+        session.upsert_rows.return_value = ExecuteResult(1)
+        responses = self._run([
+            "begin --store app --branch trial",
+            "execute 'INSERT INTO items (id) VALUES (1)' --store app --branch trial",
+            "upsert items '[{\"id\": 2}]' --store app --branch trial",
+            "query 'SELECT id FROM items' --store app --branch trial",
+            "commit",
+        ])
+        assert [(r["exit_code"], r["result"]) for r in responses] == [
+            (0, None), (0, {"rowcount": 1}), (0, {"rowcount": 1}), (0, [{"id": 1}]), (0, None),
+        ]
+        workspace_connection.checkout.assert_called_once_with("trial")
+        session.transaction.assert_called_once_with()
+        assert self._exits(session) == [(None, None, None)]
+        session.close.assert_called_once_with()
+        workspace_connection.close.assert_called_once_with()
+
+    def test_rollback_and_end_of_input_roll_back(self, workspace_connection: MagicMock) -> None:
+        session = self._session(workspace_connection)
+        responses = self._run(["begin --store app", "rollback", "begin --store app"])
+        assert [r["exit_code"] for r in responses] == [0, 0, 0]
+        exits = self._exits(session)
+        # Rolled back explicitly, then again when stdin closed with the second one open.
+        assert len(exits) == 2
+        assert all(exc_type is not None for exc_type, _, _ in exits)
+        assert session.close.call_count == 2
+        workspace_connection.close.assert_called_once_with()
+
+    def test_failed_command_allows_only_rollback(self, workspace_connection: MagicMock) -> None:
+        session = self._session(workspace_connection)
+        session.execute.side_effect = BranchingError("duplicate key")
+        responses = self._run([
+            "begin --store app",
+            "execute 'INSERT INTO items (id) VALUES (1)' --store app",
+            "query 'SELECT 1' --store app",
+            "commit",
+            "rollback",
+            "branch list",
+        ])
+        assert [r["exit_code"] for r in responses] == [0, 1, 1, 1, 0, 0]
+        assert "duplicate key" in responses[1]["error"]
+        assert "only rollback is allowed" in responses[2]["error"]
+        assert "only rollback is allowed" in responses[3]["error"]
+        session.query.assert_not_called()
+        [(exc_type, _, _)] = self._exits(session)
+        assert exc_type is not None
+
+    def test_refusals_while_open_do_not_fail_the_transaction(self, workspace_connection: MagicMock) -> None:
+        responses = self._run([
+            "begin --store app",
+            "begin --store app",
+            "query 'SELECT 1' --store other",
+            "query 'SELECT 1' --store app --branch elsewhere",
+            "branch create trial",
+            "table info items --store app",
+            "transaction '[{\"execute\": \"SELECT 1\"}]' --store app",
+            "query 'SELECT 1' --store app",
+            "commit",
+            "commit",
+            "rollback",
+        ])
+        assert [r["exit_code"] for r in responses] == [0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1]
+        assert "already open" in responses[1]["error"]
+        assert "commit or roll back first" in responses[4]["error"]
+        assert "no transaction is open" in responses[9]["error"]
+        workspace_connection.create_branch.assert_not_called()
+        assert self._exits(self._session(workspace_connection)) == [(None, None, None)]
+
+    @pytest.mark.parametrize("args", [["begin", "--store", "app"], ["commit"], ["rollback"]])
+    def test_one_shot_needs_persistent_mode(self, workspace_connection: MagicMock, args: list[str]) -> None:
+        result = runner.invoke(app, args)
+        assert result.exit_code == 2
+        assert "persistent mode" in result.output
+        _workspace.open_workspace.assert_not_called()
