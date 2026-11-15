@@ -673,6 +673,14 @@ class DuckDBDatabaseAdapter(SQLDatabaseAdapter):
         return "BIGINT PRIMARY KEY"
 
     def table_defs(self, table: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        # DuckDB's PRAGMA raises for a missing table, and a failed statement
+        # can abort the open transaction; match the other adapters' empty result.
+        present = self.execute(
+            "SELECT 1 AS present FROM information_schema.tables WHERE table_name = ?",
+            (table,),
+        ).fetchall()
+        if not present:
+            return (), ()
         rows = self.execute(
             f"PRAGMA table_info({self.quote_identifier(table)})"
         ).fetchall()

@@ -457,6 +457,31 @@ class TestWorkspaceCommands:
         assert result.exit_code == 0, result.output
         session.execute.assert_called_once_with("UPDATE items SET id = :id", {"id": 2})
 
+    def test_table_info(self, workspace_connection: MagicMock) -> None:
+        from chronos_core.branching import TableColumn, TableInfo
+        store = workspace_connection.stores["app"]
+        store.describe_table.return_value = TableInfo(
+            "skill", True, True, ("key",), (TableColumn("key", "TEXT"), TableColumn("n", "INTEGER")),
+        )
+        expected = {
+            "table": "skill", "exists": True, "registered": True, "primary_key": ["key"],
+            "columns": [{"name": "key", "type": "TEXT"}, {"name": "n", "type": "INTEGER"}],
+        }
+        result = runner.invoke(app, ["table", "info", "skill", "--store", "app"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == expected
+        store.describe_table.assert_called_once_with("skill")
+        workspace_connection.checkout.assert_not_called()
+        workspace_connection.close.assert_called_once_with()
+        result = runner.invoke(app, ["--persistent"], input="table info skill --store app\n")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == {"ok": True, "exit_code": 0, "result": expected, "output": None, "error": None}
+        store.describe_table.side_effect = BranchingError("registry unavailable")
+        result = runner.invoke(app, ["table", "info", "skill", "--store", "app"])
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "registry unavailable" in result.stderr
+
     def test_store_branch_and_checkpoint_records(self, workspace_connection: MagicMock) -> None:
         from chronos_core.branching import BranchInfo, CheckpointInfo
         store = workspace_connection.stores["app"]
@@ -556,6 +581,9 @@ class TestWorkspaceCommands:
         ["table", "create", "--store", "app", "CREATE TABLE items (id INTEGER); DROP TABLE items"],
         ["table", "create", "--store", "app", "not sql"],
         ["table", "register", "--store", "app", "items"],
+        ["table", "info", "items"],
+        ["table", "info", "--store", "app"],
+        ["table", "info", "items", "--store", "missing"],
         ["qdrant", "--store", "app", "collection", "list"],
         ["qdrant", "collection", "list"],
         ["merge", "atomic-apply", "trial", "main"],
@@ -584,7 +612,7 @@ class TestWorkspaceCommands:
 
     def test_help_and_configuration_precedence(self, workspace_connection: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         for args in ([], ["branch"], ["query"], ["upsert"], ["transaction"], ["checkpoint", "list"],
-                     ["branch", "update-metadata"], ["qdrant"], ["qdrant", "point"], ["qdrant", "point", "upsert"], ["merge", "atomic-apply"]):
+                     ["branch", "update-metadata"], ["table", "info"], ["qdrant"], ["qdrant", "point"], ["qdrant", "point", "upsert"], ["merge", "atomic-apply"]):
             result = runner.invoke(app, ["--config", "missing.toml", *args, "--help"])
             assert result.exit_code == 0, result.output
         _workspace.open_workspace.assert_not_called()

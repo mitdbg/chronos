@@ -83,6 +83,12 @@ def register_table(ctx: typer.Context, table: str, store: str = typer.Option(...
         print_result(workspace.stores[store].register_table(table, primary_key))
 
 
+@table_app.command("info")
+def table_info(ctx: typer.Context, table: str, store: str = typer.Option(..., "--store")) -> None:
+    with connect_workspace(ctx, store) as workspace:
+        print_result(workspace.stores[store].describe_table(table))
+
+
 def query(
     ctx: typer.Context, sql: str | None = typer.Argument(None),
     store: str = typer.Option(..., "--store"), branch: str = typer.Option("main", "--branch"),

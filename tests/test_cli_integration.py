@@ -599,6 +599,40 @@ class TestWorkspaceSQLWorkflows:
             {"id": 1, "value": "updated"},
         ]
 
+    def test_table_info(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
+        config = _workspace_config_file(tmp_path, cli_database)
+        invoke = partial(_invoke_workspace, config)
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("CHRONOS_")}
+        environment["CHRONOS_WORKSPACE_CONFIG"] = str(config)
+        one_shot = partial(_run_cli, environment=environment)
+        assert invoke("table", "info", "skill", "--store", "app") == {
+            "table": "skill", "exists": False, "registered": False, "primary_key": None, "columns": [],
+        }
+        invoke("table", "create", "--store", "app", "CREATE TABLE skill (key TEXT PRIMARY KEY, body TEXT, n INTEGER NOT NULL)")
+        text = "VARCHAR" if cli_database.database_url.startswith("duckdb") else "TEXT"
+        columns = [{"name": "key", "type": text}, {"name": "body", "type": text}, {"name": "n", "type": "INTEGER"}]
+        assert invoke("table", "info", "skill", "--store", "app") == {
+            "table": "skill", "exists": True, "registered": False, "primary_key": None, "columns": columns,
+        }
+        invoke("table", "register", "--store", "app", "skill", "--primary-key", "key")
+        registered = {"table": "skill", "exists": True, "registered": True, "primary_key": ["key"], "columns": columns}
+        # Correct right after registration, in the same persistent process and in a new one.
+        assert invoke("table", "info", "skill", "--store", "app") == registered
+        assert one_shot(["table", "info", "skill", "--store", "app"]) == registered
+        # Schema is shared, so a branch sees the same registered columns.
+        invoke("branch", "create", "agent")
+        invoke("upsert", "skill", '[{"key": "a", "body": "x", "n": 1}]', "--store", "app", "--branch", "agent")
+        assert invoke("table", "info", "skill", "--store", "app") == registered
+        if not cli_database.database_url.startswith("duckdb"):
+            # DuckDB admits one process at a time; elsewhere an already open context
+            # rereads the registry after another process registers a table.
+            invoke("table", "create", "--store", "app", "CREATE TABLE audit (id INTEGER PRIMARY KEY)")
+            with open_workspace(load_workspace_config(config)) as workspace:
+                store = workspace.stores["app"]
+                assert store.describe_table("audit").registered is False
+                one_shot(["table", "register", "--store", "app", "audit", "--primary-key", "id"])
+                assert store.describe_table("audit").primary_key == ("id",)
+
     def test_upsert_transaction_and_metadata(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, cli_database)
         invoke = partial(_invoke_workspace, config)

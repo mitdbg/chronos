@@ -121,6 +121,25 @@ After registration, use the branch-session `query` and `execute` commands for
 managed reads and writes. See [integration](integration.md) before adopting
 application data; direct access to the original table bypasses Chronos.
 
+`table info --store NAME TABLE` calls `describe_table()` and prints whether the
+table exists, whether it is registered, its primary key, and its columns as
+`name`/`type` pairs. Registered tables are described from Chronos's table
+registry, reread on every call, so the answer is current right after
+registration, including registration by another process. A table that exists
+but is not registered is described from the database, with `primary_key` set to
+`null`; a missing table reports `exists: false` and exits 0. Schema is not
+branched, so the answer is the same on every branch and the command takes no
+`--branch`.
+
+```sh
+chronos table info --store app items
+```
+
+```json
+{"table": "items", "exists": true, "registered": true, "primary_key": ["id"],
+ "columns": [{"name": "id", "type": "INTEGER"}, {"name": "value", "type": "TEXT"}]}
+```
+
 SQL accepts text, `--file PATH`, or `--stdin`. Piped input is read automatically
 when no source is supplied. Sources are mutually exclusive; SQL is passed to the
 API without splitting scripts. `--params` accepts a JSON object of named values.

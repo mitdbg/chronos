@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 
 from chronos_core.branching._common import *
+from chronos_core.branching._common import _parse_table_registry
 from chronos_core.branching._copy_backend import _CopyBackend
 from chronos_core.branching._interval_backend import _IntervalBackend
 from chronos_core.branching._litetree_backend import _LiteTreeBackend
@@ -597,6 +598,40 @@ class ChronosBranchContext:
             self._rollback_autocommit()
             raise
         self._metadata_epoch += 1
+
+    def describe_table(self, table: str) -> TableInfo:
+        """Describe a table from Chronos's registry, or the database if unregistered.
+
+        The registry is reread so a table registered by another process is
+        reported. Unregistered tables have no Chronos primary key.
+        """
+
+        if getattr(self._backend, "enable_schema_branching", False):
+            raise BranchingError(
+                "describe_table reads the shared table registry; "
+                "branch-local schemas are enabled"
+            )
+        meta = _parse_table_registry(self._backend.db, self._backend.name).get(table)
+        if meta is not None:
+            names, defs = meta.columns, meta.column_defs
+            primary_key: tuple[str, ...] | None = meta.pk_columns
+        else:
+            names, defs = self._db.table_defs(table)
+            primary_key = None
+        columns = []
+        for name, definition in zip(names, defs):
+            # Adapters write each definition as "<quoted name> <type>".
+            prefix = self._db.quote_identifier(name) + " "
+            if not definition.startswith(prefix):
+                raise BranchingError(f"unexpected column definition for {table}.{name}")
+            columns.append(TableColumn(name, definition[len(prefix):]))
+        return TableInfo(
+            table=table,
+            exists=meta is not None or bool(names),
+            registered=meta is not None,
+            primary_key=primary_key,
+            columns=tuple(columns),
+        )
 
     def create_index(
         self, table: str, columns: list[str], name: str | None = None
