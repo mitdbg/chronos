@@ -22,6 +22,8 @@ from chronos_core.branching.api import (
     MergeResolver,
     RowDiff,
     ChronosBranchContext,
+    TableColumn,
+    TableInfo,
     TableNotRegisteredError,
     UnsupportedSQLError,
     IntervalDataPlane,
@@ -52,6 +54,8 @@ __all__ = [
     "MergeResolver",
     "RowDiff",
     "ChronosBranchContext",
+    "TableColumn",
+    "TableInfo",
     "TableNotRegisteredError",
     "UnsupportedSQLError",
 ]

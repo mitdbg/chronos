@@ -121,6 +121,25 @@ After registration, use the branch-session `query` and `execute` commands for
 managed reads and writes. See [integration](integration.md) before adopting
 application data; direct access to the original table bypasses Chronos.
 
+`table info --store NAME TABLE` calls `describe_table()` and prints whether the
+table exists, whether it is registered, its primary key, and its columns as
+`name`/`type` pairs. Registered tables are described from Chronos's table
+registry, reread on every call, so the answer is current right after
+registration, including registration by another process. A table that exists
+but is not registered is described from the database, with `primary_key` set to
+`null`; a missing table reports `exists: false` and exits 0. Schema is not
+branched, so the answer is the same on every branch and the command takes no
+`--branch`.
+
+```sh
+chronos table info --store app items
+```
+
+```json
+{"table": "items", "exists": true, "registered": true, "primary_key": ["id"],
+ "columns": [{"name": "id", "type": "INTEGER"}, {"name": "value", "type": "TEXT"}]}
+```
+
 SQL accepts text, `--file PATH`, or `--stdin`. Piped input is read automatically
 when no source is supplied. Sources are mutually exclusive; SQL is passed to the
 API without splitting scripts. `--params` accepts a JSON object of named values.
@@ -133,6 +152,34 @@ chronos execute --store app --branch experiment \
 chronos query --store app --file query.sql
 printf 'SELECT * FROM items' | chronos query --store app
 ```
+
+`upsert --store NAME TABLE ROWS` calls the branch session's `upsert_rows()`: rows
+are a JSON array of objects, inserted or replaced by the table's registered
+primary key. Use it where SQL `INSERT ... ON CONFLICT DO UPDATE` is not accepted.
+`transaction --store NAME OPERATIONS` runs several writes on one branch inside the
+session's `transaction()`, so they commit or roll back together. Operations are
+a JSON array; each one is keyed by the command it stands for:
+`{"execute": SQL, "params": {...}}` or `{"upsert": TABLE, "rows": [...]}`. The
+result is the list of the API's per-operation results. Both commands accept
+JSON text, `--file`, or `--stdin`, like the Qdrant point commands.
+
+```sh
+chronos upsert items '[{"id": 1, "value": "updated"}]' --store app --branch experiment
+chronos transaction --store app --branch experiment '[
+  {"upsert": "objects", "rows": [{"key": "a", "body": "..."}]},
+  {"execute": "INSERT INTO catalog (key) VALUES (:key)", "params": {"key": "a"}}
+]'
+```
+
+`branch create` and `checkpoint create` accept `--metadata` with a JSON object,
+passed to the workspace API. Branch and checkpoint records with metadata are
+read from one named SQL store, because the workspace API lists only branch
+names: `branch list --store NAME` prints that store's branch records,
+`branch update-metadata BRANCH METADATA --store NAME` replaces a branch's
+metadata, and `checkpoint list --store NAME` prints checkpoint records,
+optionally narrowed by `--branch` and `--metadata-filter` (a JSON object of
+values to match). Without shared metadata, `update-metadata` changes only the
+named store's record.
 
 Qdrant requires `chronos-core[qdrant]`. Register collections, then use point and
 search commands on a selected store. Dense vectors and payloads are JSON; point
@@ -154,6 +201,79 @@ use exit code 2. Help opens no connections. JSON output can be piped to `jq` or
 redirected to a file.
 Non-finite floats returned by the API fail clearly because JSON cannot represent
 them; query execution and the API's returned values are not modified.
+
+## Persistent mode
+
+Each ordinary invocation opens and closes the workspace. For many small calls,
+`chronos --persistent` opens the workspace once and then reads one command per
+stdin line, written exactly as its arguments would follow `chronos` (split with
+shell quoting rules). It writes one JSON line per command and exits when stdin
+closes, closing the workspace:
+
+```sh
+printf '%s\n' \
+  'branch create agent' \
+  'query --store app --branch agent "SELECT * FROM items"' |
+  chronos --config chronos.toml --persistent
+```
+
+```json
+{"ok": true, "exit_code": 0, "result": null, "output": null, "error": null}
+{"ok": true, "exit_code": 0, "result": [{"id": 1, "value": "base"}], "output": null, "error": null}
+```
+
+`result` is the JSON the one-shot command prints (or `null` when it prints
+nothing), and `exit_code` is its exit status. Errors that would go to stderr are
+in `error`; the process keeps serving after a failed command. Commands whose
+output is not JSON, such as `--help`, `fs read`, or `fs run` without `--json`,
+return it in `output` as text (or tagged base64 for non-UTF-8 bytes).
+
+The workspace is chosen at startup with `--config` or `CHRONOS_WORKSPACE_CONFIG`;
+command lines cannot change it. Stdin carries the command stream, so commands
+inside persistent mode take SQL and JSON as text or `--file`, not `--stdin`.
+`fs mount` is rejected because it runs in the foreground. Each command still
+checks out its branch and closes its sessions, so results match one-shot
+commands. Startup failures print to stderr and exit 1 before any command is read.
+
+### Open transactions
+
+Commands autocommit by default. In persistent mode, `begin --store NAME
+[--branch BRANCH]` enters that branch session's `transaction()` and keeps it
+open across lines; `commit` leaves it normally and `rollback` leaves it with an
+error, so the API commits or rolls back. Until then, `query`, `execute`, and
+`upsert` on the same store and branch run inside the transaction and see its
+earlier writes:
+
+```sh
+printf '%s\n' \
+  'table info skill --store app' \
+  'begin --store app --branch agent' \
+  'query --store app --branch agent "SELECT count(*) AS n FROM skill WHERE key = '\''a'\''"' \
+  'upsert skill '\''[{"key": "a", "body": "..."}]'\'' --store app --branch agent' \
+  'commit' |
+  chronos --persistent
+```
+
+Check and prepare tables (`table info`, `table create`, `table register`)
+before `begin`: table commands are refused inside a transaction, and table
+creation commits on the store's connection.
+
+- While a transaction is open, every other command is refused with exit code 1,
+  including `query`/`execute`/`upsert` on another store or branch, `begin`,
+  `transaction`, and branch, checkpoint, merge, and table commands. A refused
+  command does not affect the transaction.
+- If a command inside the transaction fails, only `rollback` is accepted;
+  everything else, including `commit`, is refused until then.
+- `commit` or `rollback` with no open transaction exits 1.
+- When stdin closes with a transaction open, it is rolled back.
+- `begin`, `commit`, and `rollback` exist only in persistent mode; one-shot
+  invocations exit 2. Use `transaction` to group statements in one call.
+
+With SQLite, a transaction holds the database's write lock from its first write
+until commit or rollback. Other processes using that database, including
+one-shot `chronos` commands, fail with `database is locked` during that time.
+Keep transactions short. PostgreSQL does not lock other readers out; they see
+the data as of the last commit.
 
 ## OverlayFS workspace
 

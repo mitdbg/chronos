@@ -411,10 +411,14 @@ class TestWorkspaceCommands:
 
     @pytest.mark.parametrize(("args", "method", "expected_args", "expected_kwargs"), [
         (["branch", "list"], "list_branches", (), {}),
-        (["branch", "create", "trial", "--from", "parent"], "create_branch", ("trial",), {"from_branch": "parent"}),
+        (["branch", "create", "trial", "--from", "parent"], "create_branch", ("trial",), {"from_branch": "parent", "metadata": None}),
+        (["branch", "create", "trial", "--metadata", '{"owner":"agent"}'], "create_branch", ("trial",),
+         {"from_branch": "main", "metadata": {"owner": "agent"}}),
         (["branch", "create-from-checkpoint", "trial", "saved"], "create_branch_from_checkpoint", ("trial", "saved"), {}),
         (["branch", "delete", "trial"], "delete_branch", ("trial",), {}),
-        (["checkpoint", "create", "saved", "--branch", "trial"], "create_checkpoint", ("saved",), {"branch": "trial"}),
+        (["checkpoint", "create", "saved", "--branch", "trial"], "create_checkpoint", ("saved",), {"branch": "trial", "metadata": None}),
+        (["checkpoint", "create", "saved", "--metadata", '{"step":2}'], "create_checkpoint", ("saved",),
+         {"branch": "main", "metadata": {"step": 2}}),
         (["diff", "main", "trial"], "diff", ("main", "trial"), {}),
         (["merge", "preview", "trial", "main"], "merge_preview", ("trial", "main"), {"policy": "abort_on_conflict"}),
         (["merge", "apply", "trial", "main", "--policy", "snapshot_isolation"], "merge_apply", ("trial", "main"), {"policy": "snapshot_isolation"}),
@@ -453,6 +457,108 @@ class TestWorkspaceCommands:
         assert result.exit_code == 0, result.output
         session.execute.assert_called_once_with("UPDATE items SET id = :id", {"id": 2})
 
+    def test_table_info(self, workspace_connection: MagicMock) -> None:
+        from chronos_core.branching import TableColumn, TableInfo
+        store = workspace_connection.stores["app"]
+        store.describe_table.return_value = TableInfo(
+            "skill", True, True, ("key",), (TableColumn("key", "TEXT"), TableColumn("n", "INTEGER")),
+        )
+        expected = {
+            "table": "skill", "exists": True, "registered": True, "primary_key": ["key"],
+            "columns": [{"name": "key", "type": "TEXT"}, {"name": "n", "type": "INTEGER"}],
+        }
+        result = runner.invoke(app, ["table", "info", "skill", "--store", "app"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == expected
+        store.describe_table.assert_called_once_with("skill")
+        workspace_connection.checkout.assert_not_called()
+        workspace_connection.close.assert_called_once_with()
+        result = runner.invoke(app, ["--persistent"], input="table info skill --store app\n")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == {"ok": True, "exit_code": 0, "result": expected, "output": None, "error": None}
+        store.describe_table.side_effect = BranchingError("registry unavailable")
+        result = runner.invoke(app, ["table", "info", "skill", "--store", "app"])
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "registry unavailable" in result.stderr
+
+    def test_store_branch_and_checkpoint_records(self, workspace_connection: MagicMock) -> None:
+        from chronos_core.branching import BranchInfo, CheckpointInfo
+        store = workspace_connection.stores["app"]
+        branch = BranchInfo("trial", "7", "interval", "2026-01-02", {"owner": "agent"})
+        store.list_branches.return_value = [branch]
+        store.update_branch_metadata.return_value = branch
+        store.list_checkpoints.return_value = [CheckpointInfo("saved", "trial", "7", "2026-01-02", {"step": 2})]
+        result = runner.invoke(app, ["branch", "list", "--store", "app"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == [{
+            "branch_id": "trial", "current_ref": "7", "backend": "interval",
+            "created_at": "2026-01-02", "metadata": {"owner": "agent"},
+        }]
+        workspace_connection.list_branches.assert_not_called()
+        result = runner.invoke(app, ["branch", "update-metadata", "trial", '{"owner":"agent"}', "--store", "app"])
+        assert result.exit_code == 0, result.output
+        store.update_branch_metadata.assert_called_once_with("trial", {"owner": "agent"})
+        assert json.loads(result.stdout)["metadata"] == {"owner": "agent"}
+        result = runner.invoke(app, ["checkpoint", "list", "--store", "app", "--branch", "trial",
+                                     "--metadata-filter", '{"step":2}'])
+        assert result.exit_code == 0, result.output
+        store.list_checkpoints.assert_called_once_with("trial", {"step": 2})
+        assert json.loads(result.stdout) == [{
+            "checkpoint_id": "saved", "branch_id": "trial", "ref": "7",
+            "created_at": "2026-01-02", "metadata": {"step": 2},
+        }]
+        result = runner.invoke(app, ["checkpoint", "list", "--store", "app"])
+        assert result.exit_code == 0, result.output
+        assert store.list_checkpoints.call_args.args == (None, None)
+
+    def test_upsert_and_transaction_forwarding(self, workspace_connection: MagicMock, tmp_path: Path) -> None:
+        from chronos_core.branching import ExecuteResult
+        workspace = workspace_connection
+        session = workspace.checkout.return_value.stores["app"]
+        session.upsert_rows.return_value = ExecuteResult(2)
+        session.execute.return_value = ExecuteResult(1)
+        rows = '[{"id":1,"value":"a"},{"id":2,"value":"b"}]'
+        result = runner.invoke(app, ["upsert", "items", rows, "--store", "app", "--branch", "trial"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == {"rowcount": 2}
+        session.upsert_rows.assert_called_once_with("items", [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}])
+        workspace.checkout.assert_called_once_with("trial")
+        rows_file = tmp_path / "rows.json"
+        rows_file.write_text('[{"id":3}]')
+        for args, input_text in [(["--file", str(rows_file)], None), (["--stdin"], '[{"id":3}]'), ([], '[{"id":3}]')]:
+            result = runner.invoke(app, ["upsert", "items", "--store", "app", *args], input=input_text)
+            assert result.exit_code == 0, result.output
+            assert session.upsert_rows.call_args.args == ("items", [{"id": 3}])
+        session.upsert_rows.reset_mock()
+        operations = json.dumps([
+            {"upsert": "objects", "rows": [{"key": "a", "body": "x"}]},
+            {"execute": "INSERT INTO catalog (key) VALUES (:key)", "params": {"key": "a"}},
+            {"execute": "DELETE FROM stale"},
+        ])
+        result = runner.invoke(app, ["transaction", operations, "--store", "app", "--branch", "trial"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == [{"rowcount": 2}, {"rowcount": 1}, {"rowcount": 1}]
+        session.transaction.assert_called_once_with()
+        session.transaction.return_value.__enter__.assert_called_once()
+        session.transaction.return_value.__exit__.assert_called_once()
+        session.upsert_rows.assert_called_once_with("objects", [{"key": "a", "body": "x"}])
+        assert session.execute.call_args_list[-2:] == [
+            (("INSERT INTO catalog (key) VALUES (:key)", {"key": "a"}),), (("DELETE FROM stale", None),),
+        ]
+
+    def test_transaction_failure_prints_nothing(self, workspace_connection: MagicMock) -> None:
+        session = workspace_connection.checkout.return_value.stores["app"]
+        session.execute.side_effect = BranchingError("statement failed")
+        result = runner.invoke(app, ["transaction", '[{"execute":"UPDATE items SET id = 1"}]', "--store", "app"])
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "statement failed" in result.stderr
+        exit_args = session.transaction.return_value.__exit__.call_args.args
+        assert exit_args[0] is BranchingError
+        session.close.assert_called_once_with()
+        workspace_connection.close.assert_called_once_with()
+
     def test_sql_input_modes(self, workspace_connection: MagicMock, tmp_path: Path) -> None:
         sql_file = tmp_path / "query.sql"
         sql_file.write_text("SELECT :id")
@@ -475,10 +581,29 @@ class TestWorkspaceCommands:
         ["table", "create", "--store", "app", "CREATE TABLE items (id INTEGER); DROP TABLE items"],
         ["table", "create", "--store", "app", "not sql"],
         ["table", "register", "--store", "app", "items"],
+        ["table", "info", "items"],
+        ["table", "info", "--store", "app"],
+        ["table", "info", "items", "--store", "missing"],
         ["qdrant", "--store", "app", "collection", "list"],
         ["qdrant", "collection", "list"],
         ["merge", "atomic-apply", "trial", "main"],
         ["merge", "apply", "trial", "main", "--policy", "unknown"],
+        ["branch", "create", "trial", "--metadata", "[]"],
+        ["branch", "list", "--store", "missing"],
+        ["branch", "update-metadata", "trial", '{"a":1}'],
+        ["branch", "update-metadata", "trial", "broken", "--store", "app"],
+        ["checkpoint", "create", "saved", "--metadata", "NaN"],
+        ["checkpoint", "list"],
+        ["checkpoint", "list", "--store", "app", "--metadata-filter", "[1]"],
+        ["upsert", "items", '{"id":1}', "--store", "app"],
+        ["upsert", "items", "[1]", "--store", "app"],
+        ["upsert", "items", "--store", "app"],
+        ["upsert", "items", "[]"],
+        ["transaction", "[]", "--store", "app"],
+        ["transaction", '[{"query":"SELECT 1"}]', "--store", "app"],
+        ["transaction", '[{"execute":"SELECT 1","params":[]}]', "--store", "app"],
+        ["transaction", '[{"upsert":"items"}]', "--store", "app"],
+        ["transaction", '[{"upsert":"items","rows":{}}]', "--store", "app"],
     ])
     def test_invalid_arguments_do_not_open_stores(self, workspace_connection: MagicMock, args) -> None:
         result = runner.invoke(app, [*args], input="")
@@ -486,7 +611,8 @@ class TestWorkspaceCommands:
         _workspace.open_workspace.assert_not_called()
 
     def test_help_and_configuration_precedence(self, workspace_connection: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        for args in ([], ["branch"], ["query"], ["qdrant"], ["qdrant", "point"], ["qdrant", "point", "upsert"], ["merge", "atomic-apply"]):
+        for args in ([], ["branch"], ["query"], ["upsert"], ["transaction"], ["checkpoint", "list"],
+                     ["branch", "update-metadata"], ["table", "info"], ["qdrant"], ["qdrant", "point"], ["qdrant", "point", "upsert"], ["merge", "atomic-apply"]):
             result = runner.invoke(app, ["--config", "missing.toml", *args, "--help"])
             assert result.exit_code == 0, result.output
         _workspace.open_workspace.assert_not_called()
@@ -828,3 +954,191 @@ def test_native_mount_delegates_and_closes(
     )
     workspace_connection.checkout.assert_not_called()
     workspace_connection.close.assert_called_once_with()
+
+
+class TestPersistentMode:
+    @staticmethod
+    def _responses(result) -> list[dict]:
+        return [json.loads(line) for line in result.stdout.splitlines()]
+
+    def test_one_workspace_serves_many_commands(self, workspace_connection: MagicMock) -> None:
+        session = workspace_connection.checkout.return_value.stores["app"]
+        script = "\n".join([
+            "branch list",
+            "",
+            "query 'SELECT :id' --store app --branch trial --params '{\"id\": 1}'",
+            "branch create trial --metadata '{\"owner\": \"agent\"}'",
+        ]) + "\n"
+        result = runner.invoke(app, ["--persistent"], input=script)
+        assert result.exit_code == 0, result.output
+        assert self._responses(result) == [
+            {"ok": True, "exit_code": 0, "result": ["main"], "output": None, "error": None},
+            {"ok": True, "exit_code": 0, "result": [{"id": 1}], "output": None, "error": None},
+            {"ok": True, "exit_code": 0, "result": None, "output": None, "error": None},
+        ]
+        _workspace.open_workspace.assert_called_once()
+        workspace_connection.close.assert_called_once_with()
+        session.query.assert_called_once_with("SELECT :id", {"id": 1})
+        session.close.assert_called_once_with()
+        workspace_connection.create_branch.assert_called_once_with("trial", from_branch="main", metadata={"owner": "agent"})
+        assert _workspace.held_workspace() is None
+
+    def test_failures_are_reported_and_serving_continues(self, workspace_connection: MagicMock, tmp_path: Path) -> None:
+        url = f"sqlite:///{tmp_path / 'app.sqlite'}"
+        workspace_connection.diff.side_effect = BranchingError(f"cannot open {url}")
+        workspace_connection.delete_branch.side_effect = KeyError("unexpected")
+        script = "\n".join([
+            "diff main trial",
+            "query 'SELECT 1' --store missing",
+            "query --store app",
+            "bogus",
+            "branch delete trial",
+            "unterminated 'quote",
+            "fs mount ./somewhere",
+            "--config other.toml branch list",
+            "--persistent",
+            "branch list",
+        ]) + "\n"
+        result = runner.invoke(app, ["--persistent"], input=script)
+        assert result.exit_code == 0, result.output
+        responses = self._responses(result)
+        assert [response["exit_code"] for response in responses] == [1, 2, 2, 2, 1, 2, 2, 2, 2, 0]
+        assert "<database>" in responses[0]["error"] and url not in responses[0]["error"]
+        assert "Unknown store 'missing'" in responses[1]["error"]
+        assert "Provide SQL text" in responses[2]["error"]
+        assert responses[4]["error"] == "Error: 'unexpected'"
+        assert responses[-1]["result"] == ["main"]
+        _workspace.open_workspace.assert_called_once()
+        workspace_connection.close.assert_called_once_with()
+
+    def test_each_command_releases_its_filesystem_mount(self, workspace_connection: MagicMock) -> None:
+        workspace_connection.checkout.return_value.branch_id = "trial"
+        result = runner.invoke(app, ["--persistent"], input="query 'SELECT 1' --store app --branch trial\n")
+        assert result.exit_code == 0, result.output
+        # Released after the command, not only when the workspace closes at exit.
+        workspace_connection.filesystem.unmount.assert_called_once_with("trial")
+        workspace_connection.filesystem = None
+        result = runner.invoke(app, ["--persistent"], input="query 'SELECT 1' --store app\n")
+        assert result.exit_code == 0, result.output
+
+    def test_non_json_output_is_returned_as_output(self, workspace_connection: MagicMock) -> None:
+        result = runner.invoke(app, ["--persistent"], input="checkpoint --help\n")
+        assert result.exit_code == 0, result.output
+        [response] = self._responses(result)
+        assert response["ok"] and response["result"] is None
+        assert "list" in response["output"]
+
+    def test_persistent_rejects_a_command_argument(self, workspace_connection: MagicMock) -> None:
+        result = runner.invoke(app, ["--persistent", "branch", "list"], input="")
+        assert result.exit_code == 2
+        _workspace.open_workspace.assert_not_called()
+
+    def test_open_failure_exits_before_reading(self, workspace_connection: MagicMock) -> None:
+        _workspace.open_workspace.side_effect = BranchingError("open failed")
+        result = runner.invoke(app, ["--persistent"], input="branch list\n")
+        assert result.exit_code == 1
+        assert result.stdout == ""
+        assert "open failed" in result.stderr
+
+    def test_missing_command_is_still_a_usage_error(self, workspace_connection: MagicMock) -> None:
+        result = runner.invoke(app, ["--config", "chronos.toml"])
+        assert result.exit_code == 2
+        assert "Missing command" in result.output
+        _workspace.open_workspace.assert_not_called()
+
+
+class TestPersistentTransactions:
+    @staticmethod
+    def _run(script: list[str]):
+        result = runner.invoke(app, ["--persistent"], input="\n".join(script) + "\n")
+        assert result.exit_code == 0, result.output
+        return [json.loads(line) for line in result.stdout.splitlines()]
+
+    @staticmethod
+    def _session(workspace: MagicMock) -> MagicMock:
+        return workspace.checkout.return_value.stores["app"]
+
+    @staticmethod
+    def _exits(session: MagicMock) -> list[tuple]:
+        # ExitStack calls __exit__ through the type, so the mock also records the
+        # context object; the last three arguments are the exception triple.
+        return [call.args[-3:] for call in session.transaction.return_value.__exit__.call_args_list]
+
+    def test_commit_keeps_one_session_between_lines(self, workspace_connection: MagicMock) -> None:
+        from chronos_core.branching import ExecuteResult
+        session = self._session(workspace_connection)
+        session.execute.return_value = ExecuteResult(1)
+        session.upsert_rows.return_value = ExecuteResult(1)
+        responses = self._run([
+            "begin --store app --branch trial",
+            "execute 'INSERT INTO items (id) VALUES (1)' --store app --branch trial",
+            "upsert items '[{\"id\": 2}]' --store app --branch trial",
+            "query 'SELECT id FROM items' --store app --branch trial",
+            "commit",
+        ])
+        assert [(r["exit_code"], r["result"]) for r in responses] == [
+            (0, None), (0, {"rowcount": 1}), (0, {"rowcount": 1}), (0, [{"id": 1}]), (0, None),
+        ]
+        workspace_connection.checkout.assert_called_once_with("trial")
+        session.transaction.assert_called_once_with()
+        assert self._exits(session) == [(None, None, None)]
+        session.close.assert_called_once_with()
+        workspace_connection.close.assert_called_once_with()
+
+    def test_rollback_and_end_of_input_roll_back(self, workspace_connection: MagicMock) -> None:
+        session = self._session(workspace_connection)
+        responses = self._run(["begin --store app", "rollback", "begin --store app"])
+        assert [r["exit_code"] for r in responses] == [0, 0, 0]
+        exits = self._exits(session)
+        # Rolled back explicitly, then again when stdin closed with the second one open.
+        assert len(exits) == 2
+        assert all(exc_type is not None for exc_type, _, _ in exits)
+        assert session.close.call_count == 2
+        workspace_connection.close.assert_called_once_with()
+
+    def test_failed_command_allows_only_rollback(self, workspace_connection: MagicMock) -> None:
+        session = self._session(workspace_connection)
+        session.execute.side_effect = BranchingError("duplicate key")
+        responses = self._run([
+            "begin --store app",
+            "execute 'INSERT INTO items (id) VALUES (1)' --store app",
+            "query 'SELECT 1' --store app",
+            "commit",
+            "rollback",
+            "branch list",
+        ])
+        assert [r["exit_code"] for r in responses] == [0, 1, 1, 1, 0, 0]
+        assert "duplicate key" in responses[1]["error"]
+        assert "only rollback is allowed" in responses[2]["error"]
+        assert "only rollback is allowed" in responses[3]["error"]
+        session.query.assert_not_called()
+        [(exc_type, _, _)] = self._exits(session)
+        assert exc_type is not None
+
+    def test_refusals_while_open_do_not_fail_the_transaction(self, workspace_connection: MagicMock) -> None:
+        responses = self._run([
+            "begin --store app",
+            "begin --store app",
+            "query 'SELECT 1' --store other",
+            "query 'SELECT 1' --store app --branch elsewhere",
+            "branch create trial",
+            "table info items --store app",
+            "transaction '[{\"execute\": \"SELECT 1\"}]' --store app",
+            "query 'SELECT 1' --store app",
+            "commit",
+            "commit",
+            "rollback",
+        ])
+        assert [r["exit_code"] for r in responses] == [0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1]
+        assert "already open" in responses[1]["error"]
+        assert "commit or roll back first" in responses[4]["error"]
+        assert "no transaction is open" in responses[9]["error"]
+        workspace_connection.create_branch.assert_not_called()
+        assert self._exits(self._session(workspace_connection)) == [(None, None, None)]
+
+    @pytest.mark.parametrize("args", [["begin", "--store", "app"], ["commit"], ["rollback"]])
+    def test_one_shot_needs_persistent_mode(self, workspace_connection: MagicMock, args: list[str]) -> None:
+        result = runner.invoke(app, args)
+        assert result.exit_code == 2
+        assert "persistent mode" in result.output
+        _workspace.open_workspace.assert_not_called()

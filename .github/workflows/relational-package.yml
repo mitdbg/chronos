@@ -111,6 +111,8 @@ jobs:
             tests/test_cli.py::TestWorkspaceConfiguration \
             tests/test_cli.py::TestWorkspaceCommands \
             tests/test_cli.py::TestWorkspaceFilesystemCommands \
+            tests/test_cli.py::TestPersistentMode \
+            tests/test_cli.py::TestPersistentTransactions \
             tests/test_cli_integration.py::TestWorkspaceSQLWorkflows \
             tests/test_cli_integration.py::TestWorkspaceResources::test_database_paths_preserve_reserved_characters \
             tests/test_cli_integration.py::TestWorkspaceResources::test_hash_directories_keep_workspace_state_separate \

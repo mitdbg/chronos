@@ -1,16 +1,14 @@
 """JSON input and commands for named Qdrant workspace participants."""
 from __future__ import annotations
 
-import json
 import math
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import typer
 
-from chronos_core.cli._terminal import print_result
+from chronos_core.cli._terminal import print_result, read_json_input
 from chronos_core.cli._workspace import connect_workspace, store_session
 
 @dataclass(frozen=True)
@@ -23,28 +21,6 @@ collection_app = typer.Typer(no_args_is_help=True)
 point_app = typer.Typer(no_args_is_help=True)
 app.add_typer(collection_app, name="collection", help="Register and inspect collections.")
 app.add_typer(point_app, name="point", help="Write, retrieve, and delete branch-visible points.")
-
-
-def read_json_input(text: str | None, file: Path | None, stdin: bool) -> Any:
-    if sum((text is not None, file is not None, stdin)) > 1:
-        raise typer.BadParameter("Choose JSON text, --file, or --stdin, not multiple sources.")
-    try:
-        if file is not None:
-            text = file.read_text(encoding="utf-8")
-        elif stdin or (text is None and not sys.stdin.isatty()):
-            text = sys.stdin.read()
-    except (OSError, UnicodeError) as error:
-        raise typer.BadParameter(f"Cannot read JSON input: {error}") from error
-    if text is None or not text.strip():
-        raise typer.BadParameter("Provide JSON text, --file, or JSON on stdin.")
-    try:
-        return json.loads(text, parse_constant=_reject_constant)
-    except ValueError as error:
-        raise typer.BadParameter(f"Invalid JSON: {error}") from error
-
-
-def _reject_constant(value: str) -> None:
-    raise ValueError(f"{value} is not a finite JSON number")
 
 
 def dense_vector(value: Any) -> list[float]:

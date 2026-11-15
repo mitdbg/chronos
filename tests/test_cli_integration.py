@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import select
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -10,7 +12,7 @@ import time
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, TemporaryFile
 from typing import Any, Iterator
 from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import uuid4
@@ -21,11 +23,75 @@ from typer.testing import CliRunner
 from psycopg import sql as postgres_sql
 
 from chronos_core import _native_interval
-from chronos_core.cli._config import DatabaseConfig, QdrantConfig, load_workspace_config, open_workspace
+from chronos_core.cli._config import DatabaseConfig, QdrantConfig, load_workspace_config
+from chronos_core.cli._config import open_workspace as _api_open_workspace
+
+
+class _PersistentCLI:
+    """One `chronos --persistent` process serving a test's commands for one config file."""
+
+    def __init__(self, config: Path, environment: dict[str, str]):
+        self.signature = config.read_bytes()
+        self._stderr = TemporaryFile(mode="w+")
+        self._process = subprocess.Popen(
+            [sys.executable, "-X", "faulthandler", "-m", "chronos_core.cli", "--persistent"],
+            env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr,
+            text=True, bufsize=1,
+        )
+
+    def call(self, arguments: list[str]) -> dict[str, Any]:
+        assert self._process.stdin is not None and self._process.stdout is not None
+        self._process.stdin.write(shlex.join(arguments) + "\n")
+        self._process.stdin.flush()
+        ready, _, _ = select.select([self._process.stdout], [], [], 60)
+        line = self._process.stdout.readline() if ready else ""
+        if not line:
+            self._stderr.seek(0)
+            raise AssertionError(f"persistent CLI gave no response to {arguments}: {self._stderr.read()}")
+        return json.loads(line)
+
+    def close(self) -> None:
+        try:
+            if self._process.stdin is not None:
+                self._process.stdin.close()
+            returncode = self._process.wait(timeout=30)
+            self._stderr.seek(0)
+            stderr = self._stderr.read()
+            assert returncode == 0, stderr
+            assert "Traceback" not in stderr
+        finally:
+            if self._process.poll() is None:
+                self._process.kill()
+            self._stderr.close()
+
+
+_sessions: dict[Path, _PersistentCLI] = {}
+
+
+def _close_sessions() -> None:
+    """Release every persistent CLI, e.g. before another process opens DuckDB or local Qdrant."""
+    sessions = list(_sessions.values())
+    _sessions.clear()
+    for session in sessions:
+        session.close()
+
+
+@pytest.fixture(autouse=True)
+def _persistent_cli_sessions() -> Iterator[None]:
+    try:
+        yield
+    finally:
+        _close_sessions()
+
+
+def open_workspace(config: Any) -> Any:
+    _close_sessions()
+    return _api_open_workspace(config)
 
 
 def _run_cli(arguments: list[str], *, environment: dict[str, str],
              ok: bool = True, input_text: str | None = None) -> Any:
+    _close_sessions()
     result = subprocess.run(
         [sys.executable, "-X", "faulthandler", "-m", "chronos_core.cli", *arguments],
         env=environment, input=input_text, capture_output=True, text=True, timeout=30,
@@ -135,6 +201,7 @@ def qdrant_target(request: pytest.FixtureRequest):
 def _open_qdrant_api(target: QdrantConfig):
     from chronos_core.workspace.qdrant import ChronosQdrantStore
 
+    _close_sessions()
     if target.path is not None:
         return ChronosQdrantStore.local(
             target.metadata_url, path=target.path, collection_prefix=target.collection_prefix,
@@ -143,6 +210,20 @@ def _open_qdrant_api(target: QdrantConfig):
         target.metadata_url, url=target.url, api_key=target.api_key,
         collection_prefix=target.collection_prefix,
     )
+
+
+def _reset_database(database: DatabaseConfig) -> None:
+    """Return a fixture database to empty so a second run starts from the same state."""
+    for url in {database.database_url, database.metadata_url} - {None}:
+        parsed = urlsplit(url)
+        if parsed.scheme in {"postgres", "postgresql"}:
+            with psycopg.connect(url, autocommit=True, connect_timeout=10) as connection:
+                connection.execute("DROP SCHEMA public CASCADE")
+                connection.execute("CREATE SCHEMA public")
+            continue
+        path = Path(url.split(":///", 1)[1])
+        for candidate in path.parent.glob(path.name + "*"):
+            candidate.unlink()
 
 
 def _workspace_config_file(root: Path, database: DatabaseConfig, vectors: QdrantConfig | None = None, *, atomic: bool = False) -> Path:
@@ -168,9 +249,26 @@ def _workspace_config_file(root: Path, database: DatabaseConfig, vectors: Qdrant
 
 
 def _invoke_workspace(config: Path, *args: str, ok: bool = True, input_text: str | None = None) -> Any:
+    """Run one CLI command; reuse a persistent process unless the command needs piped stdin."""
     environment = {key: value for key, value in os.environ.items() if not key.startswith("CHRONOS_")}
     environment["CHRONOS_WORKSPACE_CONFIG"] = str(config)
-    return _run_cli([*args], environment=environment, ok=ok, input_text=input_text)
+    if input_text is not None:
+        return _run_cli([*args], environment=environment, ok=ok, input_text=input_text)
+    key = config.resolve()
+    session = _sessions.get(key)
+    if session is not None and session.signature != config.read_bytes():
+        # Persistent mode fixes the workspace at startup; restart after config edits.
+        _close_sessions()
+        session = None
+    if session is None:
+        session = _sessions[key] = _PersistentCLI(config, environment)
+    response = session.call([*args])
+    assert response["exit_code"] == (0 if ok else 1), response["error"]
+    assert "Traceback" not in (response["error"] or "")
+    assert response["output"] is None
+    if not ok:
+        assert response["result"] is None
+    return response["result"]
 
 
 def _prepare_workspace_merge(root: Path, *, atomic: bool) -> Path:
@@ -501,6 +599,199 @@ class TestWorkspaceSQLWorkflows:
             {"id": 1, "value": "updated"},
         ]
 
+    def test_table_info(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
+        config = _workspace_config_file(tmp_path, cli_database)
+        invoke = partial(_invoke_workspace, config)
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("CHRONOS_")}
+        environment["CHRONOS_WORKSPACE_CONFIG"] = str(config)
+        one_shot = partial(_run_cli, environment=environment)
+        assert invoke("table", "info", "skill", "--store", "app") == {
+            "table": "skill", "exists": False, "registered": False, "primary_key": None, "columns": [],
+        }
+        invoke("table", "create", "--store", "app", "CREATE TABLE skill (key TEXT PRIMARY KEY, body TEXT, n INTEGER NOT NULL)")
+        text = "VARCHAR" if cli_database.database_url.startswith("duckdb") else "TEXT"
+        columns = [{"name": "key", "type": text}, {"name": "body", "type": text}, {"name": "n", "type": "INTEGER"}]
+        assert invoke("table", "info", "skill", "--store", "app") == {
+            "table": "skill", "exists": True, "registered": False, "primary_key": None, "columns": columns,
+        }
+        invoke("table", "register", "--store", "app", "skill", "--primary-key", "key")
+        registered = {"table": "skill", "exists": True, "registered": True, "primary_key": ["key"], "columns": columns}
+        # Correct right after registration, in the same persistent process and in a new one.
+        assert invoke("table", "info", "skill", "--store", "app") == registered
+        assert one_shot(["table", "info", "skill", "--store", "app"]) == registered
+        # Schema is shared, so a branch sees the same registered columns.
+        invoke("branch", "create", "agent")
+        invoke("upsert", "skill", '[{"key": "a", "body": "x", "n": 1}]', "--store", "app", "--branch", "agent")
+        assert invoke("table", "info", "skill", "--store", "app") == registered
+        if not cli_database.database_url.startswith("duckdb"):
+            # DuckDB admits one process at a time; elsewhere an already open context
+            # rereads the registry after another process registers a table.
+            invoke("table", "create", "--store", "app", "CREATE TABLE audit (id INTEGER PRIMARY KEY)")
+            with open_workspace(load_workspace_config(config)) as workspace:
+                store = workspace.stores["app"]
+                assert store.describe_table("audit").registered is False
+                one_shot(["table", "register", "--store", "app", "audit", "--primary-key", "id"])
+                assert store.describe_table("audit").primary_key == ("id",)
+
+    def test_persistent_open_transactions(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
+        config = _workspace_config_file(tmp_path, cli_database)
+        invoke = partial(_invoke_workspace, config)
+        invoke("table", "create", "--store", "app", "CREATE TABLE skill (key TEXT PRIMARY KEY, body TEXT)")
+        invoke("table", "register", "--store", "app", "skill", "--primary-key", "key")
+        invoke("branch", "create", "agent")
+        on_agent = ("--store", "app", "--branch", "agent")
+        keys = "SELECT key FROM skill ORDER BY key"
+
+        # Reads inside the transaction see its writes; rollback discards them.
+        invoke("begin", *on_agent)
+        invoke("table", "info", "skill", "--store", "app", ok=False)
+        invoke("query", "SELECT 1 AS one", "--store", "app", ok=False)  # branch main, not the open one
+        invoke("execute", "INSERT INTO skill (key, body) VALUES ('a', 'x')", *on_agent)
+        invoke("upsert", "skill", '[{"key": "b", "body": "y"}]', *on_agent)
+        assert invoke("query", keys, *on_agent) == [{"key": "a"}, {"key": "b"}]
+        invoke("rollback")
+        assert invoke("query", keys, *on_agent) == []
+
+        # Commit publishes everything; a check-then-create flow runs within it.
+        invoke("begin", *on_agent)
+        assert invoke("query", "SELECT count(*) AS n FROM skill WHERE key = 'c'", *on_agent) == [{"n": 0}]
+        invoke("upsert", "skill", '[{"key": "c", "body": "z"}]', *on_agent)
+        invoke("commit")
+        invoke("commit", ok=False)
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("CHRONOS_")}
+        environment["CHRONOS_WORKSPACE_CONFIG"] = str(config)
+        assert _run_cli(["query", keys, *on_agent], environment=environment) == [{"key": "c"}]
+
+        # A failed command leaves only rollback, which discards the earlier write.
+        invoke("begin", *on_agent)
+        invoke("execute", "INSERT INTO skill (key, body) VALUES ('d', 'w')", *on_agent)
+        invoke("execute", "INSERT INTO skill (key, body) VALUES ('c', 'dup')", *on_agent, ok=False)
+        invoke("query", keys, *on_agent, ok=False)
+        invoke("commit", ok=False)
+        invoke("rollback")
+        assert invoke("query", keys, *on_agent) == [{"key": "c"}]
+
+        # Another process during an open transaction after its first write.
+        invoke("begin", *on_agent)
+        invoke("execute", "INSERT INTO skill (key, body) VALUES ('e', 'open')", *on_agent)
+        scheme = urlsplit(cli_database.database_url).scheme
+        if scheme != "duckdb":  # DuckDB admits one process at a time regardless
+            outside = subprocess.run(
+                [sys.executable, "-m", "chronos_core.cli", "query", keys, *on_agent],
+                env=environment, capture_output=True, text=True, timeout=60,
+            )
+            if scheme == "sqlite":
+                assert outside.returncode == 1
+                assert "database is locked" in outside.stderr
+            else:
+                assert outside.returncode == 0, outside.stderr
+                assert json.loads(outside.stdout) == [{"key": "c"}]
+        # Closing stdin with the transaction open rolls it back.
+        _close_sessions()
+        assert invoke("query", keys, *on_agent) == [{"key": "c"}]
+
+    def test_upsert_transaction_and_metadata(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
+        config = _workspace_config_file(tmp_path, cli_database)
+        invoke = partial(_invoke_workspace, config)
+        invoke("table", "create", "--store", "app", "CREATE TABLE objects (key TEXT PRIMARY KEY, body TEXT)")
+        invoke("table", "register", "--store", "app", "objects", "--primary-key", "key")
+        invoke("table", "create", "--store", "app", "CREATE TABLE catalog (key TEXT PRIMARY KEY, kind TEXT)")
+        invoke("table", "register", "--store", "app", "catalog", "--primary-key", "key")
+        invoke("branch", "create", "agent", "--metadata", '{"owner": "harness"}')
+        branches = {info["branch_id"]: info for info in invoke("branch", "list", "--store", "app")}
+        assert branches["agent"]["metadata"] == {"owner": "harness"}
+        assert set(invoke("branch", "list")) == {"agent", "main"}
+        updated = invoke("branch", "update-metadata", "agent", '{"owner": "harness", "status": "open"}', "--store", "app")
+        assert updated["branch_id"] == "agent"
+        assert updated["metadata"] == {"owner": "harness", "status": "open"}
+
+        # Upsert inserts, then updates by registered primary key.
+        assert invoke("upsert", "objects", '[{"key": "a", "body": "first"}]', "--store", "app", "--branch", "agent") == {"rowcount": 1}
+        assert invoke("upsert", "objects", "--store", "app", "--branch", "agent", "--stdin",
+                      input_text='[{"key": "a", "body": "second"}, {"key": "b", "body": "new"}]') == {"rowcount": 2}
+        assert invoke("query", "SELECT * FROM objects ORDER BY key", "--store", "app", "--branch", "agent") == [
+            {"key": "a", "body": "second"}, {"key": "b", "body": "new"},
+        ]
+        assert invoke("query", "SELECT * FROM objects", "--store", "app") == []
+
+        # One transaction writes an object and its catalog row together.
+        operations = json.dumps([
+            {"upsert": "objects", "rows": [{"key": "c", "body": "together"}]},
+            {"execute": "INSERT INTO catalog (key, kind) VALUES (:key, :kind)", "params": {"key": "c", "kind": "doc"}},
+        ])
+        assert invoke("transaction", operations, "--store", "app", "--branch", "agent") == [{"rowcount": 1}, {"rowcount": 1}]
+        assert invoke("query", "SELECT kind FROM catalog WHERE key = 'c'", "--store", "app", "--branch", "agent") == [{"kind": "doc"}]
+        # A failing statement rolls back the earlier upsert in the same transaction.
+        failing = json.dumps([
+            {"upsert": "objects", "rows": [{"key": "d", "body": "orphan"}]},
+            {"execute": "INSERT INTO catalog (key, kind) VALUES ('c', 'duplicate')"},
+        ])
+        operations_file = tmp_path / "operations.json"
+        operations_file.write_text(failing, encoding="utf-8")
+        invoke("transaction", "--store", "app", "--branch", "agent", "--file", str(operations_file), ok=False)
+        assert invoke("query", "SELECT key FROM objects WHERE key = 'd'", "--store", "app", "--branch", "agent") == []
+        assert invoke("query", "SELECT kind FROM catalog WHERE key = 'c'", "--store", "app", "--branch", "agent") == [{"kind": "doc"}]
+
+        invoke("checkpoint", "create", "first", "--branch", "agent", "--metadata", '{"step": 1}')
+        invoke("checkpoint", "create", "base", "--metadata", '{"step": 0}')
+        listed = invoke("checkpoint", "list", "--store", "app", "--branch", "agent")
+        assert [(item["checkpoint_id"], item["branch_id"], item["metadata"]) for item in listed] == [
+            ("first", "agent", {"step": 1}),
+        ]
+        assert {item["checkpoint_id"] for item in invoke("checkpoint", "list", "--store", "app")} == {"first", "base"}
+        filtered = invoke("checkpoint", "list", "--store", "app", "--metadata-filter", '{"step": 0}')
+        assert [item["checkpoint_id"] for item in filtered] == ["base"]
+
+    def test_persistent_mode_matches_one_shot_commands(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
+        import shlex
+        script = [
+            ["table", "create", "--store", "app", "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)"],
+            ["table", "register", "--store", "app", "items", "--primary-key", "id"],
+            ["execute", "--store", "app", "INSERT INTO items (id, value) VALUES (:id, :value)", "--params", '{"id": 1, "value": "base"}'],
+            ["branch", "create", "agent", "--metadata", '{"owner": "harness"}'],
+            ["upsert", "items", '[{"id": 1, "value": "edited"}, {"id": 2, "value": "new"}]', "--store", "app", "--branch", "agent"],
+            ["transaction", "--store", "app", "--branch", "agent",
+             '[{"upsert": "items", "rows": [{"id": 3, "value": "t"}]}, {"execute": "INSERT INTO items (id, value) VALUES (1, \'dup\')"}]'],
+            ["query", "SELECT * FROM items ORDER BY id", "--store", "app", "--branch", "agent"],
+            ["query", "SELECT * FROM items ORDER BY id", "--store", "app"],
+            ["checkpoint", "create", "saved", "--branch", "agent", "--metadata", '{"step": 1}'],
+            ["checkpoint", "list", "--store", "app"],
+            ["branch", "list"],
+            ["query", "SELECT * FROM missing", "--store", "app"],
+        ]
+
+        def comparable(value: Any) -> Any:
+            # Timestamps and interval references legitimately differ between two fresh workspaces.
+            if isinstance(value, dict):
+                return {key: comparable(item) for key, item in value.items()
+                        if key not in {"created_at", "current_ref", "ref"}}
+            if isinstance(value, list):
+                return [comparable(item) for item in value]
+            return value
+
+        config = _workspace_config_file(tmp_path, cli_database)
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("CHRONOS_")}
+        environment["CHRONOS_WORKSPACE_CONFIG"] = str(config)
+        expected = []
+        for arguments in script:
+            completed = subprocess.run(
+                [sys.executable, "-m", "chronos_core.cli", *arguments],
+                env=environment, capture_output=True, text=True, timeout=30,
+            )
+            expected.append((completed.returncode, comparable(json.loads(completed.stdout) if completed.stdout.strip() else None)))
+        assert [code for code, _ in expected] == [0] * 5 + [1] + [0] * 5 + [1]
+
+        _reset_database(cli_database)
+        completed = subprocess.run(
+            [sys.executable, "-m", "chronos_core.cli", "--persistent"],
+            env=environment, input="".join(shlex.join(arguments) + "\n" for arguments in script),
+            capture_output=True, text=True, timeout=60,
+        )
+        assert completed.returncode == 0, completed.stderr
+        responses = [json.loads(line) for line in completed.stdout.splitlines()]
+        assert [(response["exit_code"], comparable(response["result"])) for response in responses] == expected
+        assert responses[5]["error"] and responses[-1]["error"]
+
     def test_relational_aggregation(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, cli_database)
         invoke = partial(_invoke_workspace, config)
@@ -656,6 +947,7 @@ class TestWorkspaceFailureWorkflows:
         arguments = ["--config", str(config), "merge", command, "experiment", "main"]
         if atomic:
             arguments.extend(["--operation-id", "failed-merge"])
+        _close_sessions()
         result = CliRunner().invoke(app, arguments)
         assert result.exit_code == 1, result.output
         assert result.stdout == ""
@@ -736,6 +1028,7 @@ class TestWorkspaceFilesystemWorkflows:
         assert (tmp_path / 'state' / 'metadata.json').exists()
         assert str(tmp_path / 'state' / 'mounts') not in Path('/proc/self/mountinfo').read_text()
 
+        _close_sessions()
         environment = {key: value for key, value in os.environ.items() if not key.startswith('CHRONOS_')}
         command = [sys.executable, '-m', 'chronos_core.cli', '--config', str(config), 'fs', 'run']
         failed = subprocess.run([*command, '--', sys.executable, '-c',
@@ -759,6 +1052,7 @@ class TestNativeChronosFSWorkflows:
 
     @staticmethod
     def file_command(config: Path, *args: str, payload: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+        _close_sessions()
         return subprocess.run(
             [sys.executable, "-m", "chronos_core.cli", "--config", str(config), "fs", *args],
             input=payload, capture_output=True, timeout=30,
@@ -826,6 +1120,7 @@ class TestNativeChronosFSWorkflows:
         mountpoint = tmp_path / "mount"
         mountpoint.mkdir()
         _invoke_workspace(config, "branch", "create", "draft")
+        _close_sessions()
         command = [
             sys.executable, "-m", "chronos_core.cli", "--config", str(config),
             "fs", "mount", str(mountpoint), "--branch", "draft",

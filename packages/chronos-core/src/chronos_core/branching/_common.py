@@ -265,6 +265,23 @@ class IndexInfo:
 
 
 @dataclass(frozen=True)
+class TableColumn:
+    name: str
+    type: str
+
+
+@dataclass(frozen=True)
+class TableInfo:
+    """A logical table as Chronos sees it; schema is shared by every branch."""
+
+    table: str
+    exists: bool
+    registered: bool
+    primary_key: tuple[str, ...] | None
+    columns: tuple[TableColumn, ...]
+
+
+@dataclass(frozen=True)
 class _TableMeta:
     name: str
     physical_name: str
