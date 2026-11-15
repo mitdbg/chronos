@@ -3,9 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import click
 import typer
-from click.core import ParameterSource
 
 from chronos_core.cli._filesystem import app as filesystem_app
 from chronos_core.cli._qdrant import app as qdrant_app
@@ -17,6 +15,12 @@ app.add_typer(filesystem_app, name="fs", help="Use the configured workspace file
 register_workspace_commands(app)
 register_relational_commands(app)
 app.add_typer(qdrant_app, name="qdrant", help="Use a named Qdrant participant.")
+
+
+def _from_command_line(ctx: typer.Context, name: str) -> bool:
+    # Compare by name: typer >= 0.29 bundles its own click instead of depending on it.
+    source = ctx.get_parameter_source(name)
+    return source is not None and source.name == "COMMANDLINE"
 
 
 @app.callback(invoke_without_command=True)
@@ -34,7 +38,7 @@ def main(
     """Use configured Chronos stores together, including workspaces with just one store."""
     if held_workspace() is not None:
         # A command line inside persistent mode: the workspace is already open.
-        if persistent or ctx.get_parameter_source("config") is ParameterSource.COMMANDLINE:
+        if persistent or _from_command_line(ctx, "config"):
             raise typer.BadParameter("Persistent mode fixes the workspace at startup.",
                                      param_hint="--persistent" if persistent else "--config")
         return
@@ -47,7 +51,7 @@ def main(
         run_persistent(ctx, typer.main.get_command(app))
         raise typer.Exit(0)
     if ctx.invoked_subcommand is None:
-        raise click.UsageError("Missing command.", ctx)
+        ctx.fail("Missing command.")
 
 
 if __name__ == "__main__":

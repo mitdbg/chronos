@@ -15,11 +15,15 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import IO, Any
 
-import click
 import typer
 
 from chronos_core.cli._terminal import report_error
 from chronos_core.cli._workspace import held_workspace, hold_workspace
+
+
+# Usage errors (exit code 2) share a base class named ClickException. typer < 0.29
+# takes it from click and typer >= 0.29 bundles its own copy, so find it via typer.
+_UsageErrorBase = next(cls for cls in typer.BadParameter.__mro__ if cls.__name__ == "ClickException")
 
 
 @contextmanager
@@ -57,7 +61,7 @@ def _output_value(data: bytes) -> tuple[Any, Any]:
         return None, text
 
 
-def run_line(command: click.Command, line: str) -> dict[str, Any]:
+def run_line(command: Any, line: str) -> dict[str, Any]:
     try:
         args = shlex.split(line)
     except ValueError as error:
@@ -69,10 +73,10 @@ def run_line(command: click.Command, line: str) -> dict[str, Any]:
         try:
             code = command.main(args, prog_name="chronos", standalone_mode=False)
             code = code if isinstance(code, int) else 0
-        except click.ClickException as error:
+        except _UsageErrorBase as error:
             error.show()
             code = error.exit_code
-        except click.Abort:
+        except typer.Abort:
             typer.echo("Aborted!", err=True)
             code = 1
         except Exception as error:
@@ -80,7 +84,7 @@ def run_line(command: click.Command, line: str) -> dict[str, Any]:
             held = held_workspace()
             try:
                 (held.policy.report if held is not None else report_error)(error)
-            except click.exceptions.Exit:
+            except typer.Exit:
                 pass
             code = 1
     result, output = _output_value(out.getvalue())
@@ -88,7 +92,7 @@ def run_line(command: click.Command, line: str) -> dict[str, Any]:
     return {"ok": code == 0, "exit_code": code, "result": result, "output": output, "error": message or None}
 
 
-def run_persistent(ctx: typer.Context, command: click.Command,
+def run_persistent(ctx: typer.Context, command: Any,
                    stdin: IO[str] | None = None, stdout: IO[str] | None = None) -> None:
     source = stdin or sys.stdin
     sink = stdout or sys.stdout
