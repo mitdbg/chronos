@@ -107,10 +107,18 @@ class BranchSession:
     @_session_epoch_operation
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> ExecuteResult:
         self._ensure_fresh()
-        if self._transaction_depth == 0 and self._context._db.in_transaction:
+        if (
+            self._transaction_depth == 0
+            and self._context._autocommit
+            and self._context._db.in_transaction
+        ):
             self._context._db.commit()
             self._context._backend.after_commit()
-        if self._transaction_depth == 0 and not self._context._autocommit:
+        if (
+            self._transaction_depth == 0
+            and not self._context._autocommit
+            and not self._context._db.in_transaction
+        ):
             self._context._db.begin()
         retry_limit = (
             _INTERVAL_UNIQUE_RETRY_LIMIT if self._transaction_depth == 0 else 1
@@ -223,7 +231,11 @@ class BranchSession:
         self._ensure_fresh()
         if self._ref.readonly:
             raise BranchingError("checkpoint sessions are read-only")
-        if self._transaction_depth == 0 and self._context._db.in_transaction:
+        if (
+            self._transaction_depth == 0
+            and self._context._autocommit
+            and self._context._db.in_transaction
+        ):
             self._context._db.commit()
             self._context._backend.after_commit()
         try:
@@ -243,7 +255,11 @@ class BranchSession:
         self._ensure_fresh()
         if self._ref.readonly:
             raise BranchingError("checkpoint sessions are read-only")
-        if self._transaction_depth == 0 and self._context._db.in_transaction:
+        if (
+            self._transaction_depth == 0
+            and self._context._autocommit
+            and self._context._db.in_transaction
+        ):
             self._context._db.commit()
             self._context._backend.after_commit()
         try:
