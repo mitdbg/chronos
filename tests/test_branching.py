@@ -4823,3 +4823,23 @@ def test_log_session_reuses_lineage_for_reads_and_refreshes_after_writes(
     ]
     assert branch_reads > 0
     ctx.close()
+
+
+def test_postgres_named_params_escape_literal_percent_patterns() -> None:
+    sql = "SELECT :a AS a WHERE 'status' LIKE '%status%' AND 'total' LIKE '%total%'"
+
+    adapter = connect_sql_database(_postgres_dsn())
+    try:
+        assert adapter.execute(sql, {"a": 1}).fetchall() == [{"a": 1}]
+    finally:
+        adapter.close()
+
+
+def test_postgres_percent_escaping_for_named_params_keeps_only_named_placeholders() -> None:
+    sql = "SELECT 1 WHERE x LIKE '%status%' AND y = %(id)s AND z = %(bad name)s"
+
+    escaped = PostgresDatabaseAdapter._escape_pyformat_percents(sql, named=True)
+
+    assert "'%%status%%'" in escaped
+    assert "%(id)s" in escaped
+    assert "%%(bad name)s" in escaped

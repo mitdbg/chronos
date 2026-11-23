@@ -230,7 +230,9 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
         if not params:
             return execute(sql)
         translated_sql, translated_params = self._translate_params(sql, params)
-        translated_sql = self._escape_pyformat_percents(translated_sql)
+        translated_sql = self._escape_pyformat_percents(
+            translated_sql, named=isinstance(params, Mapping)
+        )
         translated_params = self._adapt_params(translated_params)
         return execute(translated_sql, translated_params)
 
@@ -371,14 +373,16 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
         return cls._rewrite_outside_sql_literals(sql, replace)
 
     @staticmethod
-    def _escape_pyformat_percents(sql: str) -> str:
+    def _escape_pyformat_percents(sql: str, named: bool = False) -> str:
         """Escape literal percent signs for psycopg's pyformat parser.
 
         psycopg scans the full SQL string for ``%`` placeholders even inside
         quoted SQL literals. Chronos injects internal bound parameters into
         checked-out queries, so user SQL like ``LIKE 'doc:%'`` must become
         ``LIKE 'doc:%%'`` while generated placeholders such as ``%(id)s`` and
-        ``%s`` remain intact.
+        ``%s`` remain intact. With ``named=True`` only ``%(name)s``
+        placeholders remain, so a literal ``%s`` such as ``LIKE '%status%'``
+        is escaped instead of being mixed with the named placeholders.
         """
         if "%" not in sql:
             return sql
@@ -391,13 +395,19 @@ class PostgresDatabaseAdapter(SQLDatabaseAdapter):
                 output.append(char)
                 index += 1
                 continue
-            if index + 1 < length and sql[index + 1] in {"s", "b", "t"}:
+            if (
+                not named
+                and index + 1 < length
+                and sql[index + 1] in {"s", "b", "t"}
+            ):
                 output.append(sql[index:index + 2])
                 index += 2
                 continue
             if index + 1 < length and sql[index + 1] == "(":
                 end = sql.find(")s", index + 2)
-                if end != -1:
+                if end != -1 and (
+                    not named or sql[index + 2:end].isidentifier()
+                ):
                     output.append(sql[index:end + 2])
                     index = end + 2
                     continue
